@@ -1,0 +1,45 @@
+# ===== 依赖 / 构建产物 =====
+node_modules/
+**/node_modules/
+web/dist/
+**/dist/
+
+# ===== ★ 凭证与运行数据(绝不上传:含真实账号密码/token/cookie/代理密钥) =====
+# 数据库(226 真实账号+密码+token)及其备份/WAL
+**/data/
+*.db
+*.db-*
+*.db.*
+# 授权文件(access token / session / refresh token,真实邮箱)
+**/auth/
+# 邮箱账密池
+**/mailcom/tokens.txt
+**/tokens.txt
+# 各类导入/hotmail 账号池
+**/hotmail/
+# 运行时配置(含默认密码/代理/接码 key/模板)
+codex_register/config.json
+**/settings.json
+**/daily.json
+# 独立代理节点配置(vless uuid/reality 密钥)
+.xray-proxy/
+**/.xray-proxy/
+# 浏览器会话/抓包(cookie / sid / Bearer)
+storage_state*.json
+sid_result*.json
+*.har
+# 逆向调研记录(内含真实账密/Bearer/sid)
+mailcom_调研记录.md
+
+# ===== 环境变量 / 密钥 =====
+*.env
+.env
+.env.*
+*.pem
+*.key
+
+# ===== 编辑器 / 系统 =====
+.vscode/
+.devkit/
+.DS_Store
+*.log

@@ -1,0 +1,15 @@
+node_modules/
+bundle/
+
+# 含账密/密钥，切勿提交
+config.json
+mailcom/tokens.txt
+hotmail/tokens.txt
+hotmail/*.txt
+
+# 注册产出(含 access_token)
+auth/at/
+auth/**/*.json
+
+# 运行临时输出
+*.output
