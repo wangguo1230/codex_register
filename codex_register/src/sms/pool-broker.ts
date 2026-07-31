@@ -26,11 +26,11 @@ export function createPoolBroker({email, linkTemplate = "", attempts = 24, inter
             // rt 过期重取：首次优先复用账号已绑定的号(该号 OpenAI 侧已验证，同号再收一次码即可)
             if (preferPhone && !preferTried) {
                 preferTried = true;
-                s = claimSmsByPhone(preferPhone, email);
+                s = await claimSmsByPhone(preferPhone, email);
                 if (s) log(`♻️ 复用已绑定接码号 +${s.phone}(rt 重取)`);
                 else log(`⚠️ 绑定号 +${preferPhone} 不在接码池，回落到可用号池`);
             }
-            if (!s) s = claimSms(email, maxBind);
+            if (!s) s = await claimSms(email, maxBind);
             if (!s) throw new Error("接码池已空，无可用号码(请导入接码，或已全部成坏号/达绑定上限)");
             // 收码链接：优先用号自带的 link(老格式)，否则用模板+手机号拼(eccaptcha 通用 key)
             const link = s.link || buildSmsLink(linkTemplate, s.phone);
@@ -52,7 +52,7 @@ export function createPoolBroker({email, linkTemplate = "", attempts = 24, inter
         // 提交手机号成功 = 号真正消耗：claimed → used(此后即使收码超时也不释放、不换号)
         async markAsUsed() {
             if (current) {
-                try { markSmsUsed(current.id, email); } catch (_) { /* ignore */ }
+                try { await markSmsUsed(current.id, email); } catch (_) { /* ignore */ }
                 boundPhone = current.phone;
                 boundCard = current.card || "";
                 log(`📌 +${current.phone}${current.card ? ` 卡密${current.card}` : ""} 提交成功，标记已消耗(used)`);
@@ -63,17 +63,20 @@ export function createPoolBroker({email, linkTemplate = "", attempts = 24, inter
             if (current) { boundPhone = current.phone; boundCard = current.card || ""; log(`✅ +${current.phone} 手机验证通过`); current = null; }
         },
         // 提交/验证失败：rotate=false→恢复原状态(临时失败,号未消耗)；rotate=true→标坏号换号。
-        // ★ 但【复用的 used 号】(之前已成功绑过账号,是好号)即使要求换号也【不标坏】——这次失败多为 OpenAI 对新账号的风控/旧码残留,不是号坏,标坏会浪费好号。
-        async markAsFailed(rotate) {
+        // ★ 【复用的 used 号】(之前已成功绑过账号,是好号)即使要求换号也【不标坏】——这次失败多为 OpenAI 对新账号的风控/旧码残留,不是号坏,标坏会浪费好号。
+        // ★★ 例外:opts.exhausted(phone_max_usage_exceeded,号在 OpenAI 侧绑定已达上限)= 该号对任何新账号都永久失效,
+        //     必须无条件标坏剔除,不受"复用好号不标坏"豁免——否则恢复回 used 又被优先复用,同一坏号死循环空转。
+        async markAsFailed(rotate, opts = {}) {
             if (current) {
+                const exhausted = !!opts.exhausted;
                 const wasReused = current.status === "used"; // claim 时已是 used = 复用的在用好号
-                if (rotate === false || wasReused) {
+                if (!exhausted && (rotate === false || wasReused)) {
                     const orig = current.status && current.status !== "claimed" ? current.status : "free";
-                    try { restoreSms(current.id, orig); } catch (_) { /* ignore */ }
+                    try { await restoreSms(current.id, orig); } catch (_) { /* ignore */ }
                     log(`↩️ +${current.phone} 失败，恢复为 ${orig}${wasReused && rotate !== false ? "(复用好号，不标坏)" : "(未消耗)"}`);
                 } else {
-                    try { markSmsBad(current.id, email); } catch (_) { /* ignore */ }
-                    log(`⚠️ +${current.phone} 号作废，标坏号并换号`);
+                    try { await markSmsBad(current.id, email); } catch (_) { /* ignore */ }
+                    log(`⚠️ +${current.phone} 号作废，标坏号并换号${exhausted ? "(已达绑定上限，永久剔除)" : ""}`);
                 }
                 if (boundPhone === current.phone) { boundPhone = ""; boundCard = ""; }
                 current = null;

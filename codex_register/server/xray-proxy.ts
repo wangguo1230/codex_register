@@ -67,32 +67,42 @@ function buildConfig({uuid, host, port, q}, localPort) {
     };
 }
 
-// 模块级单例:一次只跑一个注册专用 vless 代理
-let proc = null;     // 子进程
-let state = {running: false, port: 0, node: "", vless: "", pid: 0, error: ""};
+// 多实例:按名字各跑一个 vless 代理(reg=GPT 注册/10809,claude=Claude 注册/10810,互不干扰)。
+const INSTANCES = {}; // name -> {proc, state}
+const DEFAULT_PORT = {reg: 10809, claude: 10810};
+function inst(name) { if (!INSTANCES[name]) INSTANCES[name] = {proc: null, state: {running: false, port: 0, node: "", vless: "", pid: 0, error: ""}}; return INSTANCES[name]; }
 
-export function xrayStatus() { return {...state}; }
+export function xrayStatus(name = "reg") { return {...inst(name).state}; }
 
-/** 起独立 xray:解析 vless → 生成 config → spawn → 返回 {ok, port, node}。localPort 默认 10809。 */
-export function startXray(vlessUrl, localPort = 10809) {
-    stopXray(); // 先停旧的(单例)
-    const v = parseVless(vlessUrl); // 解析失败直接抛，路由捕获
+/** 起独立 xray(命名实例):解析 vless → config → spawn。opts.name(reg/claude)、opts.localPort。 */
+export function startXray(vlessUrl, opts = {}) {
+    const name = opts.name || "reg";
+    const localPort = opts.localPort || DEFAULT_PORT[name] || 10809;
+    stopXray(name); // 先停该实例旧的(内存 it.proc)
+    const v = parseVless(vlessUrl); // 解析失败直接抛，路由捕获(放在清理端口前,避免清了端口又没起成)
+    // ★ 再按端口清理【跨 server 重启残留的僵尸 xray】:内存 it.proc 丢失后无法按引用杀,
+    //   多个 xray 抢同一端口 → 内核把连接随机分给不同进程 → 代理行为不确定(时通时断/协议错乱)。
+    try {
+        const pids = execSync(`lsof -ti tcp:${localPort} -sTCP:LISTEN 2>/dev/null || true`).toString().trim().split(/\s+/).filter(Boolean);
+        for (const pid of pids) { try { execSync(`kill -9 ${pid} 2>/dev/null || true`); } catch { /* ignore */ } }
+        if (pids.length) console.log(`[xray] 清理端口 ${localPort} 上 ${pids.length} 个残留进程`);
+    } catch { /* lsof 不可用则跳过 */ }
     const bin = findXrayBin();
     mkdirSync(CFG_DIR, {recursive: true});
-    writeFileSync(CFG_FILE, JSON.stringify(buildConfig(v, localPort), null, 2), "utf8");
-    proc = spawn(bin, ["run", "-c", CFG_FILE], {stdio: ["ignore", "pipe", "pipe"], detached: false});
-    state = {running: true, port: localPort, node: v.name, vless: vlessUrl, pid: proc.pid, error: ""};
+    const cfgFile = path.join(CFG_DIR, `${name}-vless.json`);
+    writeFileSync(cfgFile, JSON.stringify(buildConfig(v, localPort), null, 2), "utf8");
+    const it = inst(name);
+    const child = spawn(bin, ["run", "-c", cfgFile], {stdio: ["ignore", "pipe", "pipe"], detached: false});
+    it.proc = child;
+    it.state = {running: true, port: localPort, node: v.name, vless: vlessUrl, pid: child.pid, error: ""};
     let errBuf = "";
-    proc.stderr?.on("data", (d) => { errBuf = (errBuf + d.toString()).slice(-500); });
-    proc.on("exit", (code) => {
-        // 非主动 stop 退出 → 标记失败(用户可看错误)
-        if (state.pid === proc?.pid) state = {...state, running: false, error: `xray 退出(code=${code}) ${errBuf.slice(-160)}`};
-        proc = null;
-    });
-    return {ok: true, port: localPort, node: v.name, pid: proc.pid};
+    child.stderr?.on("data", (d) => { errBuf = (errBuf + d.toString()).slice(-500); });
+    child.on("exit", (code) => { if (it.proc === child) { it.state = {...it.state, running: false, error: `xray 退出(code=${code}) ${errBuf.slice(-160)}`}; it.proc = null; } });
+    return {ok: true, port: localPort, node: v.name, pid: child.pid};
 }
 
-export function stopXray() {
-    if (proc) { try { proc.kill("SIGTERM"); } catch { /* ignore */ } proc = null; }
-    state = {running: false, port: 0, node: "", vless: state.vless, pid: 0, error: ""};
+export function stopXray(name = "reg") {
+    const it = inst(name);
+    if (it.proc) { try { it.proc.kill("SIGTERM"); } catch { /* ignore */ } it.proc = null; }
+    it.state = {running: false, port: 0, node: "", vless: it.state.vless, pid: 0, error: ""};
 }

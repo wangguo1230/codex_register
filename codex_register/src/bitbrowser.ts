@@ -43,8 +43,10 @@ export async function createBitWindow({proxy = "", name = "reg", remark = "codex
 }
 
 // 打开窗口 → 返回 CDP 端点。data.ws 是 Playwright connectOverCDP 用的 ws:// 端点。
+// extractIp:true = 打开时按代理出口 IP 自动对齐浏览器时区/地理位置(消除"IP地理≠时区≠locale"的风控信号,
+//   注册即封的高权重原因之一)。因此 worker 不再手动硬编码时区。
 export async function openBitWindow(id) {
-    const d = await bitPost("/browser/open", {id, args: [], loadExtensions: false, extractIp: false});
+    const d = await bitPost("/browser/open", {id, args: [], loadExtensions: false, extractIp: true});
     return {ws: d.ws, http: d.http, driver: d.driver};
 }
 

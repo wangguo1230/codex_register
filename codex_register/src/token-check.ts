@@ -61,6 +61,70 @@ export async function probeAt(accessToken, accountId, dispatcher, timeoutMs = 12
     }
 }
 
+function inferPlanType(raw) {
+    const s = String(raw || "").toLowerCase();
+    if (s.includes("enterprise")) return "enterprise";
+    if (s.includes("team")) return "team";
+    if (s.includes("pro")) return "pro";
+    if (s.includes("plus")) return "plus";
+    if (s.includes("free")) return "free";
+    return "";
+}
+
+export async function probePlan(accessToken, accountId, dispatcher, timeoutMs = 12000, refreshToken?) {
+    if (!accessToken && !refreshToken) return {ok: false, plan_type: "", error: "无 access_token"};
+
+    let at = accessToken;
+    if (!at) return {ok: false, plan_type: "", error: "无可用 access_token"};
+
+    if (!accountId) {
+        const jwt = decodeJwt(at) || {};
+        const authInfo = jwt["https://api.openai.com/auth"] || {};
+        accountId = authInfo.chatgpt_account_id || "";
+    }
+
+    const headers = {
+        authorization: `Bearer ${at}`,
+        accept: "application/json",
+        "user-agent": DEFAULT_USER_AGENT,
+        origin: CHATGPT_BASE_URL,
+        referer: `${CHATGPT_BASE_URL}/`,
+        "oai-language": "zh-CN",
+        ...(accountId ? {"chatgpt-account-id": accountId} : {}),
+    };
+
+    // 主：/backend-api/subscriptions（/me 对 CDK 充值后的 pro 不可靠）
+    try {
+        const url = `${CHATGPT_BASE_URL}/backend-api/subscriptions` + (accountId ? `?account_id=${accountId}` : "");
+        const res = await fetchWithTimeout(url, {method: "GET", headers, dispatcher}, timeoutMs);
+        if (res.status === 200) {
+            const data = await res.json();
+            const planType = inferPlanType(data.plan_type || "") || "free";
+            const hasSub = !!(data.has_active_subscription);
+            return {ok: true, plan_type: planType, has_active_subscription: hasSub, _debug: {endpoint: "subscriptions", raw: data.plan_type}};
+        }
+        if (res.status === 401) return {ok: false, plan_type: "", error: "AT 失效(401)"};
+    } catch {}
+
+    // 备：/backend-api/accounts/check/v4-2023-04-27
+    try {
+        const res = await fetchWithTimeout(`${CHATGPT_BASE_URL}/backend-api/accounts/check/v4-2023-04-27`, {method: "GET", headers, dispatcher}, timeoutMs);
+        if (res.status === 200) {
+            const data = await res.json();
+            const accounts = data.accounts || {};
+            for (const key of Object.keys(accounts)) {
+                const acc = accounts[key];
+                if (!acc || typeof acc !== "object") continue;
+                const accPlan = inferPlanType(acc.account?.plan_type || "");
+                const hasSub = !!(acc.entitlement?.has_active_subscription);
+                if (accPlan) return {ok: true, plan_type: accPlan, has_active_subscription: hasSub, _debug: {endpoint: "accounts/check", raw: acc.account?.plan_type}};
+            }
+        }
+    } catch {}
+
+    return {ok: false, plan_type: "", error: "两个接口均未返回有效套餐"};
+}
+
 /**
  * 测 rt：用 refresh_token 走 OAuth token 端点刷新。成功=rt 有效，返回新 token。
  * 走 auth.openai.com，不被 CF 拦，不需特殊代理(dispatcher 可选)。

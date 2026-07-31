@@ -6,15 +6,18 @@ import {api} from "./api";
 
 type Row = {email: string; status: "pending" | "checking" | "ok" | "fail"; ok?: boolean; reason?: string; changed?: boolean; newPassword?: string};
 
-function parseMailLines(text: string) {
+function parseMailLines(text: string, separator = "----") {
     return text.split("\n").map((l) => l.trim()).filter(Boolean).map((l) => {
-        if (l.includes("----")) { const p = l.split("----"); return {email: p[0].trim(), password: p.slice(1).join("----").trim()}; }
+        if (l.includes(separator)) {
+            const parts = l.split(separator);
+            return {email: parts[0].trim(), password: (parts[1] || "").trim(), parts};
+        }
         const m = l.match(/^(\S+?)[\s:]+(.+)$/);
-        return m ? {email: m[1].trim(), password: m[2].trim()} : {email: l, password: ""};
+        return m ? {email: m[1].trim(), password: m[2].trim(), parts: [m[1].trim(), m[2].trim()]} : {email: l, password: "", parts: [l]};
     }).filter((x) => x.email);
 }
 
-export function MailCheckTool({notify}: {notify?: (m: string) => void}) {
+export function MailCheckTool({notify, separator = "----"}: {notify?: (m: string) => void; separator?: string}) {
     const [show, setShow] = useState(false);
     const [input, setInput] = useState("");
     const [changePw, setChangePw] = useState(false);
@@ -23,8 +26,8 @@ export function MailCheckTool({notify}: {notify?: (m: string) => void}) {
     const toast = (m: string) => notify?.(m);
 
     async function run() {
-        const items = parseMailLines(input);
-        if (!items.length) { toast("请粘贴 邮箱----密码(每行一个)"); return; }
+        const items = parseMailLines(input, separator);
+        if (!items.length) { toast(`请粘贴 邮箱${separator}密码(每行一个)`); return; }
         setRunning(true);
         // 逐个请求 + 前端并发池,实时更新每行进度(pending→checking→ok/fail)
         const rows: Row[] = items.map((it) => ({email: it.email, status: "pending"}));
@@ -50,10 +53,18 @@ export function MailCheckTool({notify}: {notify?: (m: string) => void}) {
         setRunning(false);
         toast("校验完成");
     }
-    // 结果导出文本:成功项 邮箱----密码(改密用新密码,验证用原密码)
+    // 结果导出:保留原始行格式,只替换密码段(第2段)为新密码
     const exportText = () => {
-        const src = parseMailLines(input);
-        return results.map((r, i) => r.ok ? `${r.email}----${r.newPassword || src[i]?.password || ""}` : null).filter(Boolean).join("\n");
+        const src = parseMailLines(input, separator);
+        return results.map((r, i) => {
+            if (!r.ok) return null;
+            const s = src[i];
+            if (!s) return null;
+            const newPw = r.newPassword || s.password;
+            const parts = [...s.parts];
+            parts[1] = newPw;
+            return parts.join(separator);
+        }).filter(Boolean).join("\n");
     };
 
     return (

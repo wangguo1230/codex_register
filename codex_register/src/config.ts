@@ -1,7 +1,7 @@
 import {readFileSync} from "node:fs";
 import path from "node:path";
 
-export type MailProviderName = "2925" | "gmail" | "proxiedmail" | "cloudflare" | "hotmail" | "gptmail" | "mailcom";
+export type MailProviderName = "2925" | "gmail" | "proxiedmail" | "cloudflare" | "hotmail" | "gptmail" | "mailcom" | "icloud";
 
 interface AppConfigFile {
     provider?: unknown;
@@ -88,7 +88,7 @@ function normalizeNumber(value: unknown, fallback: number): number {
 }
 
 function normalizeProvider(value: unknown): MailProviderName {
-    if (value === "2925" || value === "gmail" || value === "proxiedmail" || value === "cloudflare" || value === "hotmail" || value === "gptmail" || value === "mailcom") {
+    if (value === "2925" || value === "gmail" || value === "proxiedmail" || value === "cloudflare" || value === "hotmail" || value === "gptmail" || value === "mailcom" || value === "icloud") {
         return value;
     }
     return DEFAULT_CONFIG.provider;
@@ -121,7 +121,7 @@ function loadConfig(): AppConfig {
 
     const parsed = JSON.parse(raw) as AppConfigFile;
     return {
-        provider: normalizeProvider(parsed.provider),
+        provider: normalizeProvider(process.env.MAIL_PROVIDER || parsed.provider),
         defaultPassword:
             typeof parsed.defaultPassword === "string" && parsed.defaultPassword.trim()
                 ? parsed.defaultPassword

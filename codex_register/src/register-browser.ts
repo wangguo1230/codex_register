@@ -90,8 +90,14 @@ async function fillField(page, selectors, value, log, label) {
  * @returns {ok, token?, session?, cookies?, error?}
  */
 export async function registerViaBrowser(email, {password = "", proxyUrl = "", headless = false, chatMessage = "", cdpEndpoint = "", log = () => {}} = {}) {
-    // cdpEndpoint(比特浏览器窗口):连接已有【独立指纹+代理】窗口;否则 launch 临时 Chrome(旧方式,同机器指纹一致)
     let browser, ctx;
+    // 信号清理:worker 被 kill 时确保 Chrome 进程不泄漏(同步 kill Chrome 进程,不走 async close)
+    const cleanup = () => {
+        try { const p = browser?.process?.(); if (p?.pid) process.kill(p.pid, "SIGKILL"); } catch {}
+        process.exit(1);
+    };
+    process.on("SIGTERM", cleanup);
+    process.on("SIGINT", cleanup);
     if (cdpEndpoint) {
         browser = await chromium.connectOverCDP(cdpEndpoint);
         ctx = browser.contexts()[0] || await browser.newContext();
@@ -299,6 +305,8 @@ export async function registerViaBrowser(email, {password = "", proxyUrl = "", h
     } catch (e: any) {
         return {ok: false, error: String(e?.message ?? e)};
     } finally {
+        process.removeListener("SIGTERM", cleanup);
+        process.removeListener("SIGINT", cleanup);
         try { await browser.close(); } catch { /* ignore */ }
     }
 }

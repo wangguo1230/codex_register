@@ -13,3 +13,7 @@ auth/**/*.json
 
 # 运行临时输出
 *.output
+
+# Claude Code 本地工件
+.agents/
+skills-lock.json

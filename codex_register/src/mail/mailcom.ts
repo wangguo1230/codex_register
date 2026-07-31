@@ -104,100 +104,157 @@ function htmlToText(s) {
         .trim();
 }
 
+// 正文显示专用:保留 <a> 链接的真实 URL(否则 href 被丢,邮件里的链接看不到)+ 保留换行结构。
+// 与 htmlToText(取验证码用,只要可见文本)分开,互不影响。
+function htmlToReadable(s) {
+    let t = String(s ?? "")
+        .replace(/<(script|style)\b[^>]*>[\s\S]*?<\/\1>/gi, " ")
+        // <a href="URL">文字</a> → 文字 (URL);无文字则只留 URL
+        .replace(/<a\b[^>]*\bhref\s*=\s*["']?([^"'\s>]+)["']?[^>]*>([\s\S]*?)<\/a>/gi, (_m, href, txt) => {
+            const text = String(txt).replace(/<[^>]+>/g, "").replace(/&nbsp;/gi, " ").trim();
+            return text && !text.includes(href) ? `${text} (${href})` : (text || href);
+        })
+        .replace(/<\/(p|div|tr|li|h[1-6]|table)>/gi, "\n") // 块级结束 → 换行
+        .replace(/<br\s*\/?>/gi, "\n")
+        .replace(/<[^>]+>/g, " ");                          // 去掉剩余标签
+    t = t.replace(/&nbsp;/gi, " ").replace(/&amp;/gi, "&").replace(/&lt;/gi, "<").replace(/&gt;/gi, ">")
+        .replace(/&quot;/gi, '"').replace(/&#39;/gi, "'").replace(/&#(\d+);/g, (_m, n) => String.fromCharCode(+n));
+    return t.split("\n").map((l) => l.replace(/[ \t]+/g, " ").trim()).join("\n").replace(/\n{3,}/g, "\n\n").trim();
+}
+
+async function dismissPopups(page) {
+    // 通用弹窗关闭：推广/升级/安全提醒/引导等遮罩层
+    for (const sel of [
+        'button[aria-label="Close"]', 'button[aria-label="close"]',
+        '[data-testid="close-button"]', '[data-testid="modal-close"]',
+        '.modal-close', '.dialog-close', '.overlay-close',
+        'button.close', '[class*="dismiss"]', '[class*="Close"]',
+        // mail.com 常见弹窗关闭按钮
+        'a.pos-button--ghost', 'button.pos-button--ghost',
+        '[id*="closeButton"]', '[id*="dismissButton"]',
+        'button[title="Close"]', 'button[title="Dismiss"]',
+    ]) {
+        try {
+            const el = page.locator(sel).first();
+            if (await el.isVisible({timeout: 300}).catch(() => false)) {
+                await el.click({timeout: 2000}).catch(() => {});
+                await page.waitForTimeout(500);
+            }
+        } catch { /* ignore */ }
+    }
+    // "Not now" / "Later" / "Skip" / "No thanks" 文字按钮
+    for (const name of [/Not now/i, /Later/i, /Skip/i, /No thanks/i, /Maybe later/i, /Remind me later/i]) {
+        try {
+            const btn = page.getByRole("button", {name});
+            if (await btn.count()) { await btn.first().click({timeout: 2000}).catch(() => {}); await page.waitForTimeout(500); break; }
+        } catch { /* ignore */ }
+    }
+}
+
 async function loginMailcom(email, password, opts = {}) {
     const launchOpts: any = {
         channel: "chrome",
-        headless: opts.headless ?? HEADLESS, // 可覆盖(改密强制 headed,SSO+Wicket 在 headless 下不稳)
+        headless: opts.headless ?? HEADLESS,
         args: ["--disable-blink-features=AutomationControlled"],
     };
     const proxyOpt = parseProxyOpt(mailProxy);
     if (proxyOpt) launchOpts.proxy = proxyOpt;
     const browser = await chromium.launch(launchOpts);
-    const context = await browser.newContext({
-        viewport: {width: 1139, height: 974},
-        locale: "en-US",
-        timezoneId: "America/New_York",
-    });
-    const session = {browser, context, page: null, bearer: null};
-    const page = await context.newPage();
-    session.page = page;
-    page.on("request", (req) => {
-        if (session.bearer) return;
-        if (req.url().includes("maillist.mail.com/Mailbox/Mail")) {
-            const a = req.headers()["authorization"];
-            if (a && a.toLowerCase().startsWith("bearer ")) {
-                session.bearer = a;
-                console.log(`[mailcom] 截获 Bearer: ${a.slice(0, 32)}...`);
-            }
-        }
-    });
-    page.setDefaultTimeout(20000);
-
-    console.log(`[mailcom] 登录 ${email} ...`);
-    await page.goto("https://www.mail.com/", {waitUntil: "commit", timeout: 90000});
-    await page.waitForTimeout(4000);
-
-    // consent
-    for (const name of [/Continue to Mail/i, /Accept All/i, /Accept/i, /Agree/i]) {
-        try {
-            const btn = page.getByRole("button", {name});
-            if (await btn.count()) {
-                await btn.first().click({timeout: 4000});
-                await page.waitForTimeout(1500);
-                break;
-            }
-        } catch { /* ignore */ }
-    }
-
-    // 登录表单(复刻录制)
-    if (!page.url().includes("navigator-lxa")) {
-        try {
-            await page.click("#login-button", {timeout: 10000});
-            await page.waitForTimeout(1000);
-        } catch { /* 已展开/无需 */ }
-        await page.fill("#login-email", email, {timeout: 15000});
-        await page.fill("#login-password", password);
-        let submitted = false;
-        for (const sel of ["#header-login-box span", "#header-login-box button"]) {
-            try {
-                await page.click(sel, {timeout: 5000});
-                submitted = true;
-                break;
-            } catch { /* try next */ }
-        }
-        if (!submitted && (await page.locator("#login-password").count())) {
-            try { await page.press("#login-password", "Enter"); } catch { /* ignore */ }
-        }
-    }
     try {
-        await page.waitForURL("**navigator-lxa.mail.com**", {timeout: 45000, waitUntil: "commit"});
-    } catch { /* 用下方判定成败 */ }
-
-    // 账密无效会跳 logout 页，提前识别、快速失败(不用再等 30s)
-    if (!session.bearer && /\/logout/i.test(page.url())) {
-        await browser.close();
-        throw new Error(`mail.com 账密无效或账号已停用(登录被拒, 跳转 logout): ${email}`);
-    }
-
-    // 等收件箱自动加载、截获 Bearer
-    for (let i = 0; i < 30 && !session.bearer; i += 1) {
-        await page.waitForTimeout(1000);
-    }
-    if (!session.bearer) {
-        // 给出明确失败原因
-        let reason = "登录后未截获 Bearer(账号可能需二次验证或网络异常)";
-        try {
-            const body = await page.innerText("body").catch(() => "");
-            if (/invalid email address|password combination|try again/i.test(body)) {
-                reason = "mail.com 账密无效(邮箱/密码组合错误)";
-            } else if (/\/logout/i.test(page.url())) {
-                reason = "mail.com 账密无效或账号已停用(登录被拒)";
+        const context = await browser.newContext({
+            viewport: {width: 1139, height: 974},
+            locale: "en-US",
+            timezoneId: "America/New_York",
+        });
+        const session = {browser, context, page: null, bearer: null};
+        const page = await context.newPage();
+        session.page = page;
+        page.on("request", (req) => {
+            if (session.bearer) return;
+            if (req.url().includes("maillist.mail.com/Mailbox/Mail")) {
+                const a = req.headers()["authorization"];
+                if (a && a.toLowerCase().startsWith("bearer ")) {
+                    session.bearer = a;
+                    console.log(`[mailcom] 截获 Bearer: ${a.slice(0, 32)}...`);
+                }
             }
-        } catch { /* ignore */ }
-        await browser.close();
-        throw new Error(`${reason}: ${email}`);
+        });
+        page.setDefaultTimeout(20000);
+
+        console.log(`[mailcom] 登录 ${email} ...`);
+        await page.goto("https://www.mail.com/", {waitUntil: "commit", timeout: 90000});
+        await page.waitForTimeout(4000);
+
+        // consent
+        for (const name of [/Continue to Mail/i, /Accept All/i, /Accept/i, /Agree/i]) {
+            try {
+                const btn = page.getByRole("button", {name});
+                if (await btn.count()) {
+                    await btn.first().click({timeout: 4000});
+                    await page.waitForTimeout(1500);
+                    break;
+                }
+            } catch { /* ignore */ }
+        }
+        await dismissPopups(page);
+
+        // 登录表单(复刻录制)
+        if (!page.url().includes("navigator-lxa")) {
+            try {
+                await page.click("#login-button", {timeout: 10000});
+                await page.waitForTimeout(1000);
+            } catch { /* 已展开/无需 */ }
+            await page.fill("#login-email", email, {timeout: 15000});
+            await page.fill("#login-password", password);
+            let submitted = false;
+            for (const sel of ["#header-login-box span", "#header-login-box button"]) {
+                try {
+                    await page.click(sel, {timeout: 5000});
+                    submitted = true;
+                    break;
+                } catch { /* try next */ }
+            }
+            if (!submitted && (await page.locator("#login-password").count())) {
+                try { await page.press("#login-password", "Enter"); } catch { /* ignore */ }
+            }
+        }
+        try {
+            await page.waitForURL("**navigator-lxa.mail.com**", {timeout: 45000, waitUntil: "commit"});
+        } catch { /* 用下方判定成败 */ }
+
+        // 账密无效会跳 logout 页，提前识别、快速失败
+        if (!session.bearer && /\/logout/i.test(page.url())) {
+            throw new Error(`mail.com 账密无效或账号已停用(登录被拒, 跳转 logout): ${email}`);
+        }
+
+        // 等收件箱自动加载、截获 Bearer(风控页面提前跳出,不白等 30s)
+        for (let i = 0; i < 30 && !session.bearer; i += 1) {
+            await page.waitForTimeout(1000);
+            if (i === 3 || i === 10) await dismissPopups(page);
+            if (i === 5 || i === 15) {
+                const body = await page.innerText("body").catch(() => "");
+                if (/blocked your account|irregular activity|contact.*support/i.test(body)) break;
+            }
+        }
+        if (!session.bearer) {
+            let reason = "登录后未截获 Bearer(账号可能需二次验证或网络异常)";
+            try {
+                const body = await page.innerText("body").catch(() => "");
+                if (/blocked your account|irregular activity|contact.*support|precautionary measure/i.test(body)) {
+                    reason = "mail.com 账号被风控封禁(irregular activity blocked)";
+                } else if (/invalid email address|password combination|try again/i.test(body)) {
+                    reason = "mail.com 账密无效(邮箱/密码组合错误)";
+                } else if (/\/logout/i.test(page.url())) {
+                    reason = "mail.com 账密无效或账号已停用(登录被拒)";
+                }
+            } catch { /* ignore */ }
+            throw new Error(`${reason}: ${email}`);
+        }
+        return session;
+    } catch (e) {
+        await browser.close().catch(() => {});
+        throw e;
     }
-    return session;
 }
 
 async function ensureSession(email) {
@@ -253,6 +310,7 @@ export async function changeMailcomPassword(email, oldPassword, newPassword, log
             {waitUntil: "domcontentloaded", timeout: 60000}).catch(() => {});
         await page.waitForURL(/account-lxa\.mail\.com/i, {timeout: 25000}).catch(() => {});
         await page.waitForTimeout(4000);
+        await dismissPopups(page);
         const acct = page;
         acct.setDefaultTimeout(20000);
         const acctBody = (await acct.evaluate(() => document.body ? document.body.innerText : "").catch(() => "")).replace(/\s+/g, " ").slice(0, 120);
@@ -262,6 +320,7 @@ export async function changeMailcomPassword(email, oldPassword, newPassword, log
         const hasForm = async () => (await acct.locator('input[name*="currentPasswordPanel"]').first().count()) > 0;
 
         // 3) 概览页 → 点"Change password"链接(→302→ security/edit/passwordChange?srttkn=)
+        await dismissPopups(acct);
         const cpLink = acct.locator('a[href*="changePasswordLink"]').first();
         try { await cpLink.waitFor({state: "visible", timeout: 15000}); } catch { /* */ }
         if (await cpLink.count()) {
@@ -275,8 +334,12 @@ export async function changeMailcomPassword(email, oldPassword, newPassword, log
         const cur = acct.locator('input[name*="currentPasswordPanel"]').first();
         try { await cur.waitFor({state: "visible", timeout: 15000}); }
         catch {
-            const b = (await acct.evaluate(() => document.body ? document.body.innerText : "").catch(() => "")).replace(/\s+/g, " ").slice(0, 160);
-            throw new Error(`改密表单未出现(url=${acct.url().slice(0, 60)} 内容=${b})`);
+            await dismissPopups(acct);
+            try { await cur.waitFor({state: "visible", timeout: 8000}); }
+            catch {
+                const b = (await acct.evaluate(() => document.body ? document.body.innerText : "").catch(() => "")).replace(/\s+/g, " ").slice(0, 160);
+                throw new Error(`改密表单未出现(url=${acct.url().slice(0, 60)} 内容=${b})`);
+            }
         }
         // Wicket 每字段挂 change AJAX 校验:必须逐字符输入 + Tab 触发 blur,否则后端 model 收不到值 → 提交 OOOPS
         const fillField = async (sel, val) => {
@@ -543,7 +606,32 @@ export async function fetchMailBodyFor(email, mailId) {
         throw new Error("收件箱会话已过期，请重新打开或点刷新");
     }
     cached.lastUsed = Date.now();
-    return htmlToText(await fetchBody(cached.session, mailId));
+    return htmlToReadable(await fetchBody(cached.session, mailId)); // 显示用:保留链接 URL + 换行
+}
+
+/**
+ * 轮询收件箱,提取 Claude 注册/登录的 magic link(https://claude.ai/magic-link#...)。
+ * 用于 Claude 注册:提交邮箱后 Claude 发一封含 magic link 的邮件,取出来打开完成注册。
+ * @param sinceMs 只认此时间戳之后到达的 Anthropic 邮件(避免拿到旧链接)
+ */
+export async function findLatestClaudeMagicLink(email, password, {attempts = 20, intervalMs = 6000, sinceMs = 0, log = () => {}} = {}) {
+    const LINK_RE = /https?:\/\/claude\.ai\/magic-link#[^\s"'()<>]+/i;
+    for (let i = 0; i < attempts; i++) {
+        let mails = [];
+        try { mails = await fetchInboxList(email, password); } catch (e: any) { log(`[magic] 收信失败(${i + 1}/${attempts}): ${e?.message || e}`); }
+        // Anthropic/Claude 来信,且(若给了 sinceMs)时间新
+        const cand = mails.filter((m: any) => /anthropic|claude/i.test(`${m.from} ${m.subject}`) && (!sinceMs || (m.timestamp || 0) >= sinceMs - 120000));
+        for (const m of cand) {
+            try {
+                const body = await fetchMailBodyFor(email, m.id);
+                const match = String(body).match(LINK_RE);
+                if (match) { log(`[magic] 命中 magic link(subject: ${m.subject})`); return match[0]; }
+            } catch { /* 该封取正文失败,试下一封 */ }
+        }
+        log(`[magic] 第 ${i + 1}/${attempts} 轮未见 Claude magic link,${intervalMs}ms 后重试…`);
+        await new Promise((r) => setTimeout(r, intervalMs));
+    }
+    return null;
 }
 
 export async function closeMailcomSessions() {

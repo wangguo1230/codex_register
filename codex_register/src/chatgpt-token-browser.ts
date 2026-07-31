@@ -62,6 +62,8 @@ export async function fetchChatGPTAccessTokenViaBrowser(
         executablePath: resolveBrowserExecutablePath(),
         proxy: proxyCfg,
     });
+    const _cleanup = () => { try { const p = browser?.process?.(); if (p?.pid) process.kill(p.pid, "SIGKILL"); } catch {} process.exit(1); };
+    process.on("SIGTERM", _cleanup); process.on("SIGINT", _cleanup);
 
     try {
         const context = await browser.newContext({
@@ -108,6 +110,7 @@ export async function fetchChatGPTAccessTokenViaBrowser(
         }
         return accessToken;
     } finally {
+        process.removeListener("SIGTERM", _cleanup); process.removeListener("SIGINT", _cleanup);
         await browser.close().catch(() => undefined);
     }
 }

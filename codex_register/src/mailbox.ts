@@ -4,6 +4,7 @@ import {createCloudflareProvider} from "./mail/cloudflare.js";
 import {createGmailProvider} from "./mail/gmail.js";
 import {createGPTMailProvider} from "./mail/gptmail.js";
 import {createHotmailProvider} from "./mail/hotmail.js";
+import {createIcloudProvider} from "./mail/icloud.js";
 import {createMailcomProvider} from "./mail/mailcom.js";
 import {createProxiedMailProvider} from "./mail/proxiedmail.js";
 
@@ -39,6 +40,8 @@ function createProvider(): EmailCodeProvider {
       return create2925Provider();
     case "cloudflare":
       return createCloudflareProvider();
+    case "icloud":
+      return createIcloudProvider();
     default:
       throw new Error(`不支持的邮箱 provider: ${MAILBOX_CONFIG.provider}`);
   }

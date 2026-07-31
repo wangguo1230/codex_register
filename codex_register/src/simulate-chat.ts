@@ -165,6 +165,8 @@ export async function openBrowserWithAuth(auth, proxyUrl, log = (m: string) => {
     if (po) launchOpts.proxy = po;
 
     const browser = await chromium.launch(launchOpts);
+    const _cleanup1 = () => { try { const p = browser?.process?.(); if (p?.pid) process.kill(p.pid, "SIGKILL"); } catch {} process.exit(1); };
+    process.on("SIGTERM", _cleanup1); process.on("SIGINT", _cleanup1);
     try {
         const ctx = await browser.newContext({locale: "zh-CN", viewport: {width: 1280, height: 860}});
         let okc = 0; // 逐个注入,跳过个别非法 cookie(避免一个坏的导致整体失败)
@@ -197,6 +199,8 @@ export async function simulateChat(auth, message, proxyUrl, log = (m: string) =>
     if (po) launchOpts.proxy = po;
 
     const browser = await chromium.launch(launchOpts);
+    const _cleanup2 = () => { try { const p = browser?.process?.(); if (p?.pid) process.kill(p.pid, "SIGKILL"); } catch {} process.exit(1); };
+    process.on("SIGTERM", _cleanup2); process.on("SIGINT", _cleanup2);
     try {
         const ctx = await browser.newContext({locale: "en-US", viewport: {width: 1280, height: 800}});
         if (cookies.length) await ctx.addCookies(cookies);
@@ -212,6 +216,7 @@ export async function simulateChat(auth, message, proxyUrl, log = (m: string) =>
         log(`已打开: ${page.url().slice(0, 55)} | 标题: ${(await page.title().catch(() => "")).slice(0, 40)}`);
         return await chatOnPage(page, message, log);
     } finally {
+        process.removeListener("SIGTERM", _cleanup2); process.removeListener("SIGINT", _cleanup2);
         try { await browser.close(); } catch { /* ignore */ }
     }
 }

@@ -598,8 +598,9 @@ export class OpenAIClient {
             } catch (e) {
                 lastErr = e;
                 const rejected = !!(e && e.phoneRejected);
-                console.warn(`[add-phone] ${phoneNumber} 提交${rejected ? "被拒(号作废)" : "临时失败(号保留)"}: ${(e && e.message) || e}`);
-                await this.smsBroker.markAsFailed(rejected); // true=标坏号；false=释放回池；两者都未消耗接码
+                const exhausted = !!(e && e.phoneExhausted);
+                console.warn(`[add-phone] ${phoneNumber} 提交${exhausted ? "被拒(号已达绑定上限，永久剔除)" : rejected ? "被拒(号作废)" : "临时失败(号保留)"}: ${(e && e.message) || e}`);
+                await this.smsBroker.markAsFailed(rejected, {exhausted}); // true=标坏号；false=释放回池；exhausted=达上限强制剔除(绕过复用豁免)
                 continue;
             }
             // ② 提交成功 = OpenAI 已发短信、【此号已消耗】→ 此刻才标记 used；专等此号收码，收码超时也【不换号】
@@ -1100,6 +1101,9 @@ export class OpenAIClient {
             // 4xx(非429)= OpenAI 明确拒号(已用过/黑名单/无效) → 该号作废换新号；
             // 429限流 / 5xx服务端错 = 临时问题，非号本身问题 → 号应保留可重用(省接码费)。
             err.phoneRejected = response.status >= 400 && response.status < 500 && response.status !== 429;
+            // 号在 OpenAI 侧绑定已达上限(phone_max_usage_exceeded)= 该号对任何新账号都永久不可用。
+            // 必须强制作废,即使是"复用好号"也不能再借出——否则该号被恢复回 used 后又被优先复用,死循环空转。
+            err.phoneExhausted = /phone_max_usage_exceeded|maximum number|already.*linked to the maximum/i.test(err.message);
             throw err;
         }
         const payload = (await response.json()) as ContinueResponse;

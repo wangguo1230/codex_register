@@ -1,7 +1,8 @@
 import React, {useEffect, useMemo, useRef, useState} from "react";
-import {api, connectStream, type Account, type Stats, type Daily, type XrayStatus} from "./api";
+import {api, connectStream, type Account, type Stats, type Daily, type XrayStatus, type Mailbox} from "./api";
 import {MailboxPanel} from "./MailboxPanel";
 import {ClaudePanel} from "./ClaudePanel";
+import {RechargePanel} from "./RechargePanel";
 
 const STATUS_STYLE: Record<string, string> = {
     pending: "bg-gray-200 text-gray-700",
@@ -19,17 +20,19 @@ function fmtDateTime(ts?: number | null): string {
     const d = new Date(ts);
     return `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
 }
-// 存活天数：账号确认死亡(deadAt)后定格 = 死亡时间 - 注册时间；否则 = 现在 - 注册时间
-function aliveDays(ts?: number | null, deadAt?: number | null): string {
-    if (!ts) return "—";
+// 存活天数：账号确认死亡(deadAt)后定格 = 死亡时间 - 注册时间；否则 = 现在 - 注册时间。ts=finished_at 优先,无则回退 createdAt
+function aliveDays(ts?: number | null, deadAt?: number | null, createdAt?: number | null): string {
+    const start = ts || createdAt;
+    if (!start) return "—";
     const end = deadAt ? deadAt : Date.now();
-    return Math.max(0, Math.floor((end - ts) / 86400000)) + "天";
+    return Math.max(0, Math.floor((end - start) / 86400000)) + "天";
 }
-// 数字版存活天数(用于过期/正常筛选)
-function aliveDaysNum(ts?: number | null, deadAt?: number | null): number {
-    if (!ts) return 0;
+// 数字版存活天数(用于过期/正常筛选)。ts=finished_at 优先,无则回退 createdAt
+function aliveDaysNum(ts?: number | null, deadAt?: number | null, createdAt?: number | null): number {
+    const start = ts || createdAt;
+    if (!start) return 0;
     const end = deadAt ? deadAt : Date.now();
-    return Math.max(0, Math.floor((end - ts) / 86400000));
+    return Math.max(0, Math.floor((end - start) / 86400000));
 }
 // 注册耗时:完成 - 开始(started_at→finished_at),显示 X分X秒
 function fmtDuration(startAt?: number | null, endAt?: number | null): string {
@@ -56,23 +59,51 @@ export default function App() {
     const [smsEnabled, setSmsEnabled] = useState(true);
     const [rtEnabled, setRtEnabled] = useState(false);
     const [bitBrowser, setBitBrowser] = useState(false); // 比特浏览器:每号独立指纹窗口
+    const [delMailbox, setDelMailbox] = useState(true); // 删账号时是否连带删邮箱(关=邮箱退回 free 池)
     const [daily, setDaily] = useState<Daily | null>(null);
     const [showDaily, setShowDaily] = useState(false);
     const [xray, setXray] = useState<XrayStatus | null>(null);
+    const [regPortInput, setRegPortInput] = useState("10809");   // 独立 xray 本地端口(可配置持久化)
+    const [claudePortInput, setClaudePortInput] = useState("10810");
     const [showXray, setShowXray] = useState(false);
     const [vlessInput, setVlessInput] = useState("");
     const [smsLinkTemplate, setSmsLinkTemplate] = useState("");
     const [smsMaxBind, setSmsMaxBind] = useState(3);
     const [batchFilter, setBatchFilter] = useState(""); // 按批次筛选("" =全部)
     const [batches, setBatches] = useState<{name: string; count: number}[]>([]);
-    const [showExport, setShowExport] = useState(false); // 高级导出弹窗
+    const [showExport, setShowExport] = useState(false); // 统一导出弹窗
+    const [exportRange, setExportRange] = useState<"all" | "filtered" | "selected" | "batch">("all"); // 导出范围
     const [exportScope, setExportScope] = useState<"all" | "hasRt" | "atOnly">("all");
-    const [exportFormat, setExportFormat] = useState<"txt" | "csv">("txt");
-    const [exportBatch, setExportBatch] = useState(""); // 导出选的批次("" =全部)
+    const [exportFormat, setExportFormat] = useState<"full" | "at" | "session" | "jsonl" | "csv">("full");
+    const [exportBatch, setExportBatch] = useState(""); // 范围=按批次时选的批次
     const [batchAssign, setBatchAssign] = useState(""); // 批量设置批次的输入
-    const [exportMarkSold, setExportMarkSold] = useState(false); // 高级导出时是否标记已售出
+    const [exportMarkSold, setExportMarkSold] = useState(false); // 导出时是否标记已售出
+    // 批量刷新 AT 弹窗
+    const [showRefreshAt, setShowRefreshAt] = useState(false);
+    const [refreshAtInput, setRefreshAtInput] = useState("");
+    const [refreshAtResults, setRefreshAtResults] = useState<{email: string; password?: string; accessToken?: string; sessionJson?: any; ok: boolean; reason?: string; status: "pending"|"done"}[]>([]);
+    const [refreshAtRunning, setRefreshAtRunning] = useState(false);
+    // 批量获取 RT 弹窗
+    const [showAcquireRt, setShowAcquireRt] = useState(false);
+    const [acquireRtInput, setAcquireRtInput] = useState("");
+    const [acquireRtResults, setAcquireRtResults] = useState<{email: string; password?: string; rt?: string; accessToken?: string; ok: boolean; reason?: string; status: "pending"|"done"}[]>([]);
+    const [acquireRtRunning, setAcquireRtRunning] = useState(false);
+    // 「从邮箱选号」弹窗:从待分配(free)邮箱勾选 → 设批次 → 可选先改密 → 分配进 GPT 注册队列
+    const [showPicker, setShowPicker] = useState(false);
+    const [pickerList, setPickerList] = useState<Mailbox[]>([]);   // free 邮箱列表
+    const [pickerGrps, setPickerGrps] = useState<{grp: string; n: number}[]>([]); // free 邮箱分组分布
+    const [pickerGrp, setPickerGrp] = useState("");               // 分组筛选(""=全部)
+    const [pickerSel, setPickerSel] = useState<Set<number>>(new Set()); // 勾选的邮箱 id
+    const [pickerBatch, setPickerBatch] = useState("");           // 分配批次名
+    const [pickerChangePw, setPickerChangePw] = useState(false);  // 先改密开关(默认关)
+    const [pickerPw, setPickerPw] = useState("");                // 改密状态筛选(""=全部, "yes"=已改密, "no"=未改密, "fail"=失败)
+    const [pickerLoading, setPickerLoading] = useState(false);
     // 邮箱密码校验工具已迁至邮箱管理域(web/src/MailCheckTool.tsx,由 MailboxPanel 挂载)
-    const [filter, setFilter] = useState<string>("all");
+    // 筛选三层:①注册状态(互斥单选) ②质量facet(多选,跨组AND、组内OR) ③售出(独立三态)
+    const [statusFilter, setStatusFilter] = useState<"all" | "pending" | "running" | "success" | "failed">("all");
+    const [facets, setFacets] = useState<Set<string>>(new Set()); // 选中的 facet key 集合,空=不额外收窄
+    const [soldFilter, setSoldFilter] = useState<"all" | "sold" | "unsold">("all"); // 第三层:售出(全部/未售/已售)
+    const toggleFacet = (k: string) => setFacets((prev) => { const s = new Set(prev); s.has(k) ? s.delete(k) : s.add(k); return s; });
     const [search, setSearch] = useState(""); // 邮箱名搜索
     const [selectedId, setSelectedId] = useState<number | null>(null);
     const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set());
@@ -80,9 +111,8 @@ export default function App() {
     const [logs, setLogs] = useState<{ts: number; line: string}[]>([]);
     const [allLogs, setAllLogs] = useState<{id: number; email: string; ts: number; line: string}[]>([]);
     const [logMode, setLogMode] = useState<"all" | "single">("all");
-    const [detailTab, setDetailTab] = useState<"log" | "inbox">("log"); // 详情抽屉内 tab：日志/收件箱
     const [panelOpen, setPanelOpen] = useState(true); // 右侧抽屉是否展开(收起则表格占满)
-    const [domain, setDomain] = useState<"gpt" | "mailbox" | "claude">("gpt"); // 顶层业务域:GPT注册 / 邮箱管理 / Claude注册(三域隔离)
+    const [domain, setDomain] = useState<"gpt" | "mailbox" | "claude" | "recharge">("gpt"); // 顶层业务域:GPT注册 / 邮箱管理 / Claude注册 / 充值提交
     const [dark, setDark] = useState<boolean>(() => (localStorage.getItem("theme") ?? "dark") === "dark"); // 默认暗色
     useEffect(() => { document.documentElement.classList.toggle("dark", dark); localStorage.setItem("theme", dark ? "dark" : "light"); }, [dark]);
     const [editMode, setEditMode] = useState(false); // 详情抽屉是否处于编辑记录态
@@ -94,13 +124,6 @@ export default function App() {
     const [scrollTop, setScrollTop] = useState(0);
     const [viewH, setViewH] = useState(600);
     const [toast, setToast] = useState("");
-    const [inboxAccount, setInboxAccount] = useState<Account | null>(null);
-    const [inboxData, setInboxData] = useState<{email: string; mails: any[]} | null>(null);
-    const [inboxLoading, setInboxLoading] = useState(false);
-    const [inboxError, setInboxError] = useState("");
-    const [expandedMail, setExpandedMail] = useState<string | null>(null);
-    const [mailBodies, setMailBodies] = useState<Record<string, string>>({});
-    const [mailLoadingId, setMailLoadingId] = useState<string | null>(null);
     const logEndRef = useRef<HTMLDivElement>(null);
     const selectedIdRef = useRef<number | null>(null);
     selectedIdRef.current = selectedId;
@@ -111,7 +134,7 @@ export default function App() {
 
     // 初次加载 + SSE
     useEffect(() => {
-        api.state().then((s) => { setPaused(s.state.paused); setConcurrency(s.state.concurrency); setOtpSingle(s.state.otpSingle); setChatSim(s.state.simulateChat); setSmsEnabled(s.state.smsEnabled); setRtEnabled(s.state.rtEnabled); setDaily(s.state.daily); setXray(s.state.xray); setRegEngine(s.state.regEngine || "http"); setBitBrowser(!!s.state.bitBrowser); setSmsLinkTemplate(s.state.smsLinkTemplate || ""); setSmsMaxBind(s.state.smsMaxBind ?? 3); setRegProxy(s.state.regProxy || ""); setMailProxy(s.state.mailProxy || ""); setStats(s.stats); }).catch(() => {});
+        api.state().then((s) => { setPaused(s.state.paused); setConcurrency(s.state.concurrency); setOtpSingle(s.state.otpSingle); setChatSim(s.state.simulateChat); setSmsEnabled(s.state.smsEnabled); setRtEnabled(s.state.rtEnabled); setDaily(s.state.daily); setXray(s.state.xray); setRegEngine(s.state.regEngine || "http"); setBitBrowser(!!s.state.bitBrowser); setDelMailbox(s.state.deleteMailboxWithAccount !== false); setSmsLinkTemplate(s.state.smsLinkTemplate || ""); setSmsMaxBind(s.state.smsMaxBind ?? 3); setRegProxy(s.state.regProxy || ""); setMailProxy(s.state.mailProxy || ""); setRegPortInput(String(s.state.regProxyPort ?? 10809)); setClaudePortInput(String(s.state.claudeProxyPort ?? 10810)); setStats(s.stats); }).catch(() => {});
         api.listAccounts().then(setAccounts).catch(() => {});
         // 批次数据来自数据库(筛选/导出用;导入已迁至邮箱管理)
         api.batches().then(setBatches).catch(() => {});
@@ -121,6 +144,8 @@ export default function App() {
             if (event === "sms") { api.listSms().then(setSmsData).catch(() => {}); return; }
             if (event === "daily") { setDaily(data); return; }
             if (event === "batchAt") { setBatchAt(data); if (!data.running) api.listAccounts().then(setAccounts).catch(() => {}); return; }
+            if (event === "refreshAt") { setRefreshAtResults(data.results.map((r: any) => ({...r, status: r.status || "done"}))); if (data.done) setRefreshAtRunning(false); return; }
+            if (event === "batchRtAcquire") { setAcquireRtResults(data.results.map((r: any) => ({...r, status: r.status || "done"}))); if (data.done) setAcquireRtRunning(false); return; }
             if (event === "batchPw") { api.listAccounts().then(setAccounts).catch(() => {}); return; } // 邮箱改密在邮箱管理页;这里仅刷新账号让 gpt 邮箱密码同步
             if (event === "stats") setStats(data);
             else if (event === "snapshot") setAccounts(data);
@@ -148,47 +173,56 @@ export default function App() {
     // 测量表格滚动容器高度(用于虚拟滚动可视区计算)
     useEffect(() => {
         const el = scrollRef.current; if (!el) return;
-        const measure = () => setViewH(el.clientHeight);
-        measure();
+        const measure = () => { const h = el.clientHeight; if (h > 0) setViewH(h); };
+        requestAnimationFrame(measure); // 等首帧 layout 完成再测,避免挂载瞬间 clientHeight 读到过渡/0 值致列表半截
         const ro = new ResizeObserver(measure); ro.observe(el);
         return () => ro.disconnect();
     }, []);
 
     // 过期判定:成功注册且【注册满 expDays 天】(存活天数≥阈值,dead_at 优先定格)。正常=成功且未到阈值。
-    const isExpired = (a: Account) => a.status === "success" && aliveDaysNum(a.finished_at, a.dead_at) >= expDays;
+    const isExpired = (a: Account) => a.status === "success" && aliveDaysNum(a.finished_at, a.dead_at, a.created_at) >= expDays;
+    const succ = (a: Account) => a.status === "success"; // facet 一律限定成功号,口径统一
+    // 质量 facet 定义:key→谓词。分组用于「组内 OR、跨组 AND」。expDays 变则时效组谓词跟着变,故用 useMemo。
+    const FACET_DEFS = useMemo(() => ({
+        hasRt: {group: "token", label: "带rt", pred: (a: Account) => succ(a) && !!a.rt_file},
+        atOnly: {group: "token", label: "只有at", pred: (a: Account) => succ(a) && !a.rt_file},
+        atOk: {group: "at", label: "at有效", pred: (a: Account) => succ(a) && /✅/.test(a.at_status || "")},
+        atFail: {group: "at", label: "at失效", pred: (a: Account) => succ(a) && /❌/.test(a.at_status || "")},
+        normal: {group: "age", label: "正常", pred: (a: Account) => succ(a) && !isExpired(a)},
+        expired: {group: "age", label: "过期", pred: (a: Account) => isExpired(a)},
+        noPw: {group: "pw", label: "未改密", pred: (a: Account) => succ(a) && !String(a.pw_status || "").includes("✅")},
+        pwFail: {group: "pw", label: "改密失败", pred: (a: Account) => succ(a) && String(a.pw_status || "").includes("❌")},
+        deactivated: {group: "misc", label: "已停用", pred: (a: Account) => /account_deactivated/i.test(a.error || "")},
+    }), [expDays]);
+    type FacetKey = keyof typeof FACET_DEFS;
+    // facet 按组归并:同组多个选中=OR;不同组之间=AND(如 令牌组选带rt + at组选有效 → 带rt且at有效)
+    const applyFacets = (list: Account[], active: Set<string>) => {
+        if (!active.size) return list;
+        const byGroup = new Map<string, ((a: Account) => boolean)[]>();
+        for (const k of active) {
+            const d = FACET_DEFS[k as FacetKey]; if (!d) continue;
+            if (!byGroup.has(d.group)) byGroup.set(d.group, []);
+            byGroup.get(d.group)!.push(d.pred);
+        }
+        return list.filter((a) => [...byGroup.values()].every((preds) => preds.some((p) => p(a))));
+    };
     const filtered = useMemo(() => {
-        const base = (() => {
-            if (filter === "all") return accounts;
-            if (filter === "hasRt") return accounts.filter((a) => a.rt_file);              // 带 rt(可续期)
-            if (filter === "atOnly") return accounts.filter((a) => a.status === "success" && !a.rt_file); // 只有 at(无 rt)
-            if (filter === "sold") return accounts.filter((a) => a.sold_at);               // 已售出
-            if (filter === "noPw") return accounts.filter((a) => a.status === "success" && !String(a.pw_status || "").includes("✅")); // 未改过密码
-            if (filter === "pwFail") return accounts.filter((a) => String(a.pw_status || "").includes("❌")); // 改密失败
-        if (filter === "deactivated") return accounts.filter((a) => /account_deactivated/i.test(a.error || "")); // 账号被停用(死号)
-        if (filter === "atFail") return accounts.filter((a) => a.status === "success" && /❌/.test(a.at_status || "")); // at 测试失效
-        if (filter === "atOk") return accounts.filter((a) => /✅/.test(a.at_status || "")); // at 测试有效
-            if (filter === "expired") return accounts.filter(isExpired);                   // 过期(注册满阈值天)
-            if (filter === "normal") return accounts.filter((a) => a.status === "success" && !isExpired(a)); // 正常(成功且未过期)
-            return accounts.filter((a) => a.status === filter);
-        })();
+        let list = statusFilter === "all" ? accounts : accounts.filter((a) => a.status === statusFilter); // ①注册状态
+        list = applyFacets(list, facets); // ②质量 facet(跨组 AND、组内 OR)
         const q = search.trim().toLowerCase();
-        let list = q ? base.filter((a) => a.email.toLowerCase().includes(q)) : base; // 邮箱名搜索(在筛选结果上再过滤)
+        if (q) list = list.filter((a) => a.email.toLowerCase().includes(q)); // 邮箱名搜索
         if (batchFilter) list = list.filter((a) => (a.batch || "") === batchFilter); // 批次筛选
+        if (soldFilter === "sold") list = list.filter((a) => a.sold_at);        // ③售出:仅已售
+        else if (soldFilter === "unsold") list = list.filter((a) => !a.sold_at); // ③售出:仅未售
         return list;
-    }, [accounts, filter, expDays, search, batchFilter]);
-    // 带rt/只有at/已售出/过期/正常 计数(stats 只有 status 维度，这些前端算)
-    const tokenCnt = useMemo(() => ({
-        hasRt: accounts.filter((a) => a.rt_file).length,
-        atOnly: accounts.filter((a) => a.status === "success" && !a.rt_file).length,
-        sold: accounts.filter((a) => a.sold_at).length,
-        noPw: accounts.filter((a) => a.status === "success" && !String(a.pw_status || "").includes("✅")).length,
-        pwFail: accounts.filter((a) => String(a.pw_status || "").includes("❌")).length,
-        deactivated: accounts.filter((a) => /account_deactivated/i.test(a.error || "")).length,
-        atFail: accounts.filter((a) => a.status === "success" && /❌/.test(a.at_status || "")).length,
-        atOk: accounts.filter((a) => /✅/.test(a.at_status || "")).length,
-        expired: accounts.filter(isExpired).length,
-        normal: accounts.filter((a) => a.status === "success" && !isExpired(a)).length,
-    }), [accounts, expDays]);
+    }, [accounts, statusFilter, facets, FACET_DEFS, expDays, search, batchFilter, soldFilter]);
+    // facet 计数:在【当前注册状态】的基数上算(不受其他 facet 影响,数字稳定可预测)。售出单列。
+    const statusBase = useMemo(() => statusFilter === "all" ? accounts : accounts.filter((a) => a.status === statusFilter), [accounts, statusFilter]);
+    const facetCnt = useMemo(() => {
+        const out: Record<string, number> = {sold: accounts.filter((a) => a.sold_at).length, unsold: accounts.filter((a) => !a.sold_at).length};
+        for (const [k, d] of Object.entries(FACET_DEFS)) out[k] = statusBase.filter(d.pred).length;
+        return out;
+    }, [accounts, statusBase, FACET_DEFS]);
     // 选中批次时,统计该批的成功率(成功/失败/进行中 + 已完成里的成功占比)
     const batchStats = useMemo(() => {
         if (!batchFilter) return null;
@@ -205,22 +239,14 @@ export default function App() {
     const ROW_H = 41;
     const vTotal = filtered.length;
     const vStart = Math.max(0, Math.floor(scrollTop / ROW_H) - 8);
-    const vEnd = Math.min(vTotal, Math.ceil((scrollTop + viewH) / ROW_H) + 8);
+    // 兜底:viewH 万一测偏小也按视口高渲染,保证充满可视区(数据量小,多渲染一屏无性能压力),杜绝下半屏空白
+    const effViewH = Math.max(viewH, typeof window !== "undefined" ? window.innerHeight : 800);
+    const vEnd = Math.min(vTotal, Math.ceil((scrollTop + effViewH) / ROW_H) + 8);
     const vRows = filtered.slice(vStart, vEnd);
     const vTopPad = vStart * ROW_H;
     const vBotPad = Math.max(0, (vTotal - vEnd) * ROW_H);
 
-    async function openInbox(a: Account) {
-        setInboxAccount(a); setInboxData(null); setInboxError(""); setInboxLoading(true); setExpandedMail(null); setMailBodies({});
-        try { setInboxData(await api.inbox(a.id)); }
-        catch (e: any) { setInboxError(e.message); }
-        finally { setInboxLoading(false); }
-    }
-
-    // 切到「收件箱」tab 且当前详情号尚未加载 → 自动拉取
-    useEffect(() => {
-        if (detailTab === "inbox" && selected && inboxAccount?.id !== selected.id && !inboxLoading) openInbox(selected);
-    }, [detailTab, selectedId]);
+    // 收件箱已迁至邮箱管理(在「📮 邮箱管理」点邮箱「详情」查看收件箱/正文,覆盖所有邮箱)
 
     // 进入编辑记录态:把当前号字段拷进表单
     function startEdit(a: Account) {
@@ -251,20 +277,7 @@ export default function App() {
         catch (e: any) { notify("打开失败：" + e.message); }
     }
 
-    // 打开自定义改密弹窗(替代 window.prompt/confirm)
-    // 邮箱改密已迁至邮箱管理域(单个/批量改密都在 MailboxPanel 操作,GPT 只做注册)
-
-    function toggleMail(mailId: string) {
-        if (expandedMail === mailId) { setExpandedMail(null); return; }
-        setExpandedMail(mailId);
-        if (mailBodies[mailId] === undefined && inboxAccount) {
-            setMailLoadingId(mailId);
-            api.mailBody(inboxAccount.id, mailId)
-                .then((r) => setMailBodies((p) => ({...p, [mailId]: r.body || "(无正文)"})))
-                .catch((e: any) => setMailBodies((p) => ({...p, [mailId]: "加载失败: " + e.message})))
-                .finally(() => setMailLoadingId(null));
-        }
-    }
+    // 邮箱改密/收件箱均已迁至邮箱管理域,GPT 只做注册
 
     const refreshSms = () => api.listSms().then(setSmsData).catch(() => {});
     async function doImportSms() {
@@ -280,16 +293,64 @@ export default function App() {
         } catch (e: any) { notify("接码导入失败: " + e.message); }
     }
 
-    async function doExportFull() {
-        if (exportMarkSold && !window.confirm("导出并把这批号标记为【已售出】？")) return;
+    // 打开「从邮箱选号」弹窗:拉 free 邮箱列表 + 分组,重置勾选。批次默认沿用当前批次筛选。
+    async function openPicker() {
+        setShowPicker(true); setPickerLoading(true); setPickerSel(new Set()); setPickerGrp(""); setPickerPw(""); setPickerBatch(batchFilter || "");
+        try { const r = await api.listMailboxes("free"); setPickerList(r.list); setPickerGrps(r.groups); }
+        catch (e: any) { notify("拉取待分配邮箱失败: " + e.message); }
+        finally { setPickerLoading(false); }
+    }
+    const pickerVisible = useMemo(() => {
+        const pwState = (m: Mailbox) => { const s = m.pw_status || ""; return s.startsWith("✅") ? "yes" : s.startsWith("❌") ? "fail" : "no"; };
+        return pickerList.filter((m) => {
+            if (pickerGrp === "__NONE__") { if (m.grp) return false; } else if (pickerGrp && (m.grp || "") !== pickerGrp) return false;
+            if (pickerPw && pwState(m) !== pickerPw) return false;
+            return true;
+        });
+    }, [pickerList, pickerGrp, pickerPw]);
+    async function doPickAllocate() {
+        const ids = [...pickerSel];
+        if (!ids.length) { notify("未勾选邮箱"); return; }
+        const tip = pickerChangePw
+            ? `对选中的 ${ids.length} 个邮箱【先改密】(真实修改 mail.com 密码,串行·较慢),改完再分配进 GPT 注册队列?`
+            : `把选中的 ${ids.length} 个邮箱分配给 GPT 注册${pickerBatch ? `(批次「${pickerBatch}」)` : ""}?`;
+        if (!window.confirm(tip)) return;
         try {
-            const res = await fetch(api.exportFullUrl({format: exportFormat, scope: exportScope, batch: exportBatch || undefined, markSold: exportMarkSold}));
-            if (!res.ok) throw new Error(await res.text());
-            const text = await res.text();
+            const r = await api.allocateMailboxIds("gpt", ids, pickerBatch.trim(), pickerChangePw);
+            if (r.changePwFirst) notify(`已启动 ${r.willChange} 个邮箱改密,改完自动分配进注册队列(进度见邮箱改密提示)`);
+            else notify(`已分配 ${r.allocated ?? 0} 个进 GPT 注册队列${r.skipped ? `(跳过 ${r.skipped} 个非待分配)` : ""}`);
+            setShowPicker(false);
+            await api.listAccounts().then(setAccounts);
+            api.batches().then(setBatches).catch(() => {});
+        } catch (e: any) { notify("分配失败: " + e.message); }
+    }
+
+    // 导出弹窗实时条数预估(与服务端口径一致:任何范围都只导「可用」号=success 且未失效;排除数明示,不悄悄丢行)
+    const {exportCount, exportSkipped} = useMemo(() => {
+        let list = exportRange === "selected" ? accounts.filter((a) => selectedIds.has(a.id))
+            : exportRange === "filtered" ? filtered
+            : exportRange === "batch" ? accounts.filter((a) => !!exportBatch && (a.batch || "") === exportBatch)
+            : accounts;
+        if (exportScope === "hasRt") list = list.filter((a) => a.rt_file);
+        else if (exportScope === "atOnly") list = list.filter((a) => !a.rt_file);
+        const usable = list.filter((a) => a.status === "success" && !a.dead_at);
+        return {exportCount: usable.length, exportSkipped: list.length - usable.length};
+    }, [accounts, filtered, selectedIds, exportRange, exportBatch, exportScope]);
+    async function doExportFull() {
+        // 范围 → ids/batch:选中/当前筛选传 ids;按批次传 batch;全部都不传。ids/batch 显式范围服务端不限状态全导。
+        let ids: number[] | undefined, batch: string | undefined;
+        if (exportRange === "selected") { ids = [...selectedIds]; if (!ids.length) { notify("未选中任何账号"); return; } }
+        else if (exportRange === "filtered") { ids = filtered.map((a) => a.id); if (!ids.length) { notify("当前筛选无账号"); return; } }
+        else if (exportRange === "batch") { if (!exportBatch) { notify("请选择批次"); return; } batch = exportBatch; }
+        if (!exportCount) { notify("该范围没有可导出的账号"); return; }
+        if (exportMarkSold && !window.confirm(`导出并把这 ${exportCount} 个号标记为【已售出】？`)) return;
+        try {
+            const text = await api.exportFull({format: exportFormat, scope: exportScope, batch, ids, markSold: exportMarkSold});
+            const ext = exportFormat === "csv" ? "csv" : exportFormat === "jsonl" ? "jsonl" : "txt";
             const blob = new Blob([text], {type: exportFormat === "csv" ? "text/csv;charset=utf-8" : "text/plain;charset=utf-8"});
-            const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = `export.${exportFormat}`; a.click(); URL.revokeObjectURL(a.href);
+            const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = `export-${exportFormat}.${ext}`; a.click(); URL.revokeObjectURL(a.href);
             if (exportMarkSold) await api.listAccounts().then(setAccounts);
-            notify(`已导出${exportMarkSold ? "并标记已售出" : ""}`);
+            notify(`已导出 ${exportCount} 条${exportMarkSold ? "并标记已售出" : ""}`);
             setShowExport(false);
         } catch (e: any) { notify("导出失败: " + e.message); }
     }
@@ -312,11 +373,32 @@ export default function App() {
     async function start() { try { await api.start(concurrency); setPaused(false); notify("已开始/恢复"); } catch (e: any) { notify(e.message); } }
     async function pause() { try { await api.pause(); setPaused(true); notify("已暂停(运行中的会跑完)"); } catch (e: any) { notify(e.message); } }
 
-    const StatBadge = ({label, n, color, active, onClick}: any) => (
-        <button onClick={onClick}
-                className={`px-3 py-1.5 rounded-lg text-sm font-medium border transition ${active ? "ring-2 ring-offset-1 " + color : color} `}>
-            {label} <span className="font-bold">{n}</span>
-        </button>
+    // ①注册状态:互斥单选。中性底,只有 成功=绿/失败=红 带语义色,选中填实。
+    const StatusTab = ({label, n, tone, active, onClick}: {label: string; n: number; tone?: "ok" | "bad"; active: boolean; onClick: () => void}) => {
+        const base = tone === "ok" ? "text-green-700" : tone === "bad" ? "text-red-600" : "text-gray-600";
+        const on = tone === "ok" ? "bg-green-600 text-white border-green-600" : tone === "bad" ? "bg-red-500 text-white border-red-500" : "bg-gray-800 text-white border-gray-800";
+        return (
+            <button onClick={onClick} className={`px-3 py-1 rounded-md text-sm border transition ${active ? on : `bg-white ${base} border-gray-200 hover:bg-gray-50`}`}>
+                {label} <span className="font-bold">{n}</span>
+            </button>
+        );
+    };
+    // ②质量 facet:多选开关。统一中性描边,选中才填靛蓝;计数为 0 时置灰但不消失(位置稳定)。
+    const FacetChip = ({fkey, label}: {fkey: string; label: string}) => {
+        const n = facetCnt[fkey] ?? 0;
+        const active = facets.has(fkey);
+        return (
+            <button onClick={() => toggleFacet(fkey)} title={active ? "点击取消该条件" : "点击叠加该条件(跨组 AND)"}
+                    className={`px-2 py-0.5 rounded-md text-xs border transition ${active ? "bg-indigo-600 text-white border-indigo-600" : n ? "bg-white text-gray-600 border-gray-200 hover:bg-gray-50" : "bg-white text-gray-300 border-gray-100"}`}>
+                {label} <span className="font-semibold">{n}</span>
+            </button>
+        );
+    };
+    // facet 分组容器:左侧组名 + 一排 chip
+    const FacetGroup = ({name, children}: {name: string; children: React.ReactNode}) => (
+        <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md bg-gray-50 border border-gray-100">
+            <span className="text-[11px] text-gray-400 mr-0.5">{name}</span>{children}
+        </span>
     );
 
     // 顶层三域导航 tab(架构 v2:GPT注册 / 邮箱管理 / Claude注册,三域隔离)
@@ -335,46 +417,62 @@ export default function App() {
                 <DomainTab active={domain === "gpt"} onClick={() => setDomain("gpt")}>⚡ GPT 注册</DomainTab>
                 <DomainTab active={domain === "mailbox"} onClick={() => setDomain("mailbox")}>📮 邮箱管理</DomainTab>
                 <DomainTab active={domain === "claude"} onClick={() => setDomain("claude")}>🧠 Claude 注册</DomainTab>
+                <DomainTab active={domain === "recharge"} onClick={() => setDomain("recharge")}>💳 充值提交</DomainTab>
             </nav>
             {domain === "mailbox" && <MailboxPanel notify={notify}/>}
             {domain === "claude" && <ClaudePanel notify={notify}/>}
+            {domain === "recharge" && <RechargePanel notify={notify}/>}
             {domain === "gpt" && (<>
             {/* 顶栏 */}
             <header className="bg-white border-b px-6 py-3 flex items-center gap-4 flex-wrap shadow-sm">
                 <h1 className="text-lg font-bold">⚡ GPT 批量注册控制台</h1>
-                <div className="flex gap-2">
-                    <StatBadge label="全部" n={stats.total} color="bg-gray-100 text-gray-700 border-gray-200" active={filter === "all"} onClick={() => setFilter("all")}/>
-                    <StatBadge label="等待" n={stats.pending} color="bg-gray-100 text-gray-600 border-gray-200" active={filter === "pending"} onClick={() => setFilter("pending")}/>
-                    <StatBadge label="运行" n={stats.running} color="bg-blue-50 text-blue-700 border-blue-200" active={filter === "running"} onClick={() => setFilter("running")}/>
-                    <StatBadge label="成功" n={stats.success} color="bg-green-50 text-green-700 border-green-200" active={filter === "success"} onClick={() => setFilter("success")}/>
-                    <StatBadge label="失败" n={stats.failed} color="bg-red-50 text-red-700 border-red-200" active={filter === "failed"} onClick={() => setFilter("failed")}/>
-                    <StatBadge label="带rt" n={tokenCnt.hasRt} color="bg-teal-50 text-teal-700 border-teal-200" active={filter === "hasRt"} onClick={() => setFilter("hasRt")}/>
-                    <StatBadge label="只有at" n={tokenCnt.atOnly} color="bg-sky-50 text-sky-700 border-sky-200" active={filter === "atOnly"} onClick={() => setFilter("atOnly")}/>
-                    <StatBadge label="已售出" n={tokenCnt.sold} color="bg-amber-50 text-amber-700 border-amber-200" active={filter === "sold"} onClick={() => setFilter("sold")}/>
-                    <StatBadge label="未改密" n={tokenCnt.noPw} color="bg-rose-50 text-rose-700 border-rose-200" active={filter === "noPw"} onClick={() => setFilter("noPw")}/>
-                    {tokenCnt.pwFail > 0 && <StatBadge label="改密失败" n={tokenCnt.pwFail} color="bg-red-50 text-red-700 border-red-200" active={filter === "pwFail"} onClick={() => setFilter("pwFail")}/>}
-                    {tokenCnt.deactivated > 0 && <StatBadge label="已停用" n={tokenCnt.deactivated} color="bg-gray-200 text-gray-600 border-gray-300" active={filter === "deactivated"} onClick={() => setFilter("deactivated")}/>}
-                    {tokenCnt.atFail > 0 && <StatBadge label="at失效" n={tokenCnt.atFail} color="bg-red-50 text-red-700 border-red-200" active={filter === "atFail"} onClick={() => setFilter("atFail")}/>}
-                    {tokenCnt.atOk > 0 && <StatBadge label="at有效" n={tokenCnt.atOk} color="bg-green-50 text-green-700 border-green-200" active={filter === "atOk"} onClick={() => setFilter("atOk")}/>}
-                    <StatBadge label="正常" n={tokenCnt.normal} color="bg-green-50 text-green-700 border-green-200" active={filter === "normal"} onClick={() => setFilter("normal")}/>
-                    <StatBadge label="过期" n={tokenCnt.expired} color="bg-orange-50 text-orange-700 border-orange-200" active={filter === "expired"} onClick={() => setFilter("expired")}/>
-                    <label className="inline-flex items-center gap-1 text-xs text-gray-500" title="注册满 N 天视为过期(网页 token 约 10 天;有 rt 的可续期)">
-                        满<input type="number" min={1} value={expDays} onChange={(e) => setExpDays(Math.max(1, Number(e.target.value) || 1))} className="w-12 px-1 py-0.5 border rounded"/>天
-                    </label>
-                    <div className="relative">
-                        <input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="🔍 搜索邮箱名"
-                               className="w-44 pl-2 pr-6 py-1 border rounded-lg text-sm"/>
-                        {search && <button onClick={() => setSearch("")} title="清除" className="absolute right-1.5 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-600 text-sm">✕</button>}
+                <div className="flex flex-col gap-1.5">
+                    {/* 第①层:注册状态(互斥单选)。右侧「清除筛选」在选了 facet/售出时出现 */}
+                    <div className="flex items-center gap-1.5 flex-wrap">
+                        <StatusTab label="全部" n={stats.total} active={statusFilter === "all"} onClick={() => setStatusFilter("all")}/>
+                        <StatusTab label="等待" n={stats.pending} active={statusFilter === "pending"} onClick={() => setStatusFilter("pending")}/>
+                        <StatusTab label="运行" n={stats.running} active={statusFilter === "running"} onClick={() => setStatusFilter("running")}/>
+                        <StatusTab label="成功" n={stats.success} tone="ok" active={statusFilter === "success"} onClick={() => setStatusFilter("success")}/>
+                        <StatusTab label="失败" n={stats.failed} tone="bad" active={statusFilter === "failed"} onClick={() => setStatusFilter("failed")}/>
+                        <div className="relative ml-1">
+                            <input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="🔍 搜索邮箱名"
+                                   className="w-44 pl-2 pr-6 py-1 border rounded-lg text-sm"/>
+                            {search && <button onClick={() => setSearch("")} title="清除" className="absolute right-1.5 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-600 text-sm">✕</button>}
+                        </div>
+                        {batches.length > 0 &&
+                            <select value={batchFilter} onChange={(e) => setBatchFilter(e.target.value)} title="按批次筛选" className="px-2 py-1 border rounded-lg text-sm">
+                                <option value="">全部批次</option>
+                                {batches.map((b) => <option key={b.name} value={b.name}>{b.name} ({b.count})</option>)}
+                            </select>}
+                        {(facets.size > 0 || soldFilter !== "all") &&
+                            <button onClick={() => { setFacets(new Set()); setSoldFilter("all"); }} className="text-xs text-gray-400 hover:text-gray-600 underline">清除筛选</button>}
+                        {batchStats &&
+                            <span className="text-xs px-2 py-1 rounded bg-slate-100 text-slate-700 whitespace-nowrap" title="该批次:成功/失败/进行中 + 成功率(成功占已完成的比例)">
+                                共{batchStats.total} · <b className="text-green-600">成{batchStats.success}</b> <b className="text-red-500">败{batchStats.failed}</b>{batchStats.busy > 0 ? ` ⏳${batchStats.busy}` : ""}{batchStats.dead > 0 ? ` 停用${batchStats.dead}` : ""} · 成功率<b>{batchStats.rate}%</b>
+                            </span>}
                     </div>
-                    {batches.length > 0 &&
-                        <select value={batchFilter} onChange={(e) => setBatchFilter(e.target.value)} title="按批次筛选" className="px-2 py-1 border rounded-lg text-sm">
-                            <option value="">全部批次</option>
-                            {batches.map((b) => <option key={b.name} value={b.name}>{b.name} ({b.count})</option>)}
-                        </select>}
-                    {batchStats &&
-                        <span className="text-xs px-2 py-1 rounded bg-slate-100 text-slate-700 whitespace-nowrap" title="该批次:成功/失败/进行中 + 成功率(成功占已完成的比例)">
-                            共{batchStats.total} · <b className="text-green-600">成{batchStats.success}</b> <b className="text-red-500">败{batchStats.failed}</b>{batchStats.busy > 0 ? ` ⏳${batchStats.busy}` : ""}{batchStats.dead > 0 ? ` 停用${batchStats.dead}` : ""} · 成功率<b>{batchStats.rate}%</b>
-                        </span>}
+                    {/* 第②层:质量 facet(多选,组内 OR、跨组 AND)+ 第③层:售出(独立三段)。基数随①层状态变化 */}
+                    <div className="flex items-center gap-1.5 flex-wrap">
+                        <FacetGroup name="令牌"><FacetChip fkey="hasRt" label="带rt"/><FacetChip fkey="atOnly" label="只有at"/></FacetGroup>
+                        <FacetGroup name="at"><FacetChip fkey="atOk" label="有效"/><FacetChip fkey="atFail" label="失效"/></FacetGroup>
+                        <FacetGroup name="时效">
+                            <FacetChip fkey="normal" label="正常"/><FacetChip fkey="expired" label="过期"/>
+                            <span className="inline-flex items-center gap-0.5 text-[11px] text-gray-400 ml-0.5" title="注册满 N 天视为过期(网页 token 约 10 天;有 rt 的可续期)">
+                                满<input type="number" min={1} value={expDays} onChange={(e) => { setExpDays(Math.max(1, Number(e.target.value) || 1)); setFacets((prev) => { const s = new Set(prev); s.add("expired"); s.delete("normal"); return s; }); }} className="w-10 px-1 py-0.5 border rounded"/>天
+                            </span>
+                        </FacetGroup>
+                        <FacetGroup name="改密"><FacetChip fkey="noPw" label="未改"/><FacetChip fkey="pwFail" label="失败"/></FacetGroup>
+                        <FacetGroup name="停用"><FacetChip fkey="deactivated" label="已停用"/></FacetGroup>
+                        <span className="inline-flex items-center rounded-md border border-gray-200 overflow-hidden text-xs ml-0.5">
+                            <span className="px-1.5 text-gray-400">售出</span>
+                            {([["all", "全部", 0], ["unsold", "未售", facetCnt.unsold], ["sold", "已售", facetCnt.sold]] as const).map(([v, l, n]) => (
+                                <button key={v} onClick={() => setSoldFilter(v)}
+                                        className={`px-2 py-0.5 border-l border-gray-200 ${soldFilter === v ? "bg-amber-500 text-white" : "bg-white text-gray-600 hover:bg-gray-50"}`}>
+                                    {l}{v !== "all" ? <span className="font-semibold ml-0.5">{n}</span> : null}
+                                </button>
+                            ))}
+                        </span>
+                    </div>
                 </div>
                 <div className="flex-1"/>
                 <div className="flex items-center gap-2">
@@ -413,15 +511,12 @@ export default function App() {
                     <button onClick={ctrl(api.stop, "已停止全部运行中任务")} className="px-3 py-1.5 bg-red-500 text-white rounded-lg text-sm hover:bg-red-600">⏹ 停止</button>
                     <button onClick={ctrl(api.retryFailed, "已把失败项重置为等待")} className="px-3 py-1.5 bg-gray-200 rounded-lg text-sm hover:bg-gray-300">↻ 重试失败</button>
                     <button onClick={() => { setShowProxy(true); notify("代理设置已在下方展开"); }} className="px-3 py-1.5 bg-gray-200 rounded-lg text-sm hover:bg-gray-300">⚙ 代理</button>
-                    <div className="relative group">
-                        <button className="px-3 py-1.5 bg-indigo-600 text-white rounded-lg text-sm hover:bg-indigo-700">⬇ 下载</button>
-                        <div className="absolute right-0 mt-1 hidden group-hover:block bg-white border rounded-lg shadow-lg z-10 w-64">
-                            <button onClick={() => { setExportBatch(batchFilter); setShowExport(true); }} className="block w-full text-left px-3 py-2 text-sm hover:bg-gray-100 font-medium text-emerald-700">⚙ 按批次/格式导出…</button>
-                            <a href={api.exportUrl("txt")} className="block px-3 py-2 text-sm hover:bg-gray-100 font-medium text-indigo-700">TXT(邮箱----密码----rt----at)</a>
-                            <a href={api.exportUrl("jsonl")} className="block px-3 py-2 text-sm hover:bg-gray-100">JSONL(含 session)</a>
-                            <a href={api.exportUrl("csv")} className="block px-3 py-2 text-sm hover:bg-gray-100">CSV(含 session)</a>
-                        </div>
-                    </div>
+                    {/* 从待分配邮箱选号 → 设批次 → 可选先改密 → 进注册队列(补邮箱管理按数量盲分、无法设批次的缺口) */}
+                    <button onClick={openPicker} title="从待分配(free)邮箱里勾选具体账号,设批次、可选先改密后分配进 GPT 注册队列" className="px-3 py-1.5 bg-emerald-600 text-white rounded-lg text-sm hover:bg-emerald-700">📥 从邮箱选号</button>
+                    {/* ★唯一导出入口:范围×格式×标记已售出全在弹窗里。打开时按 选中>批次筛选>全部 智能预选范围 */}
+                    <button onClick={() => { setExportRange(selectedIds.size ? "selected" : batchFilter ? "batch" : "all"); setExportBatch(batchFilter); setShowExport(true); }} className="px-3 py-1.5 bg-indigo-600 text-white rounded-lg text-sm hover:bg-indigo-700">⬇ 导出…</button>
+                    <button onClick={() => setShowRefreshAt(true)} className="px-3 py-1.5 bg-cyan-600 text-white rounded-lg text-sm hover:bg-cyan-700" title="粘贴邮箱列表,走浏览器登录重新获取 accessToken">🔄 批量刷新AT</button>
+                    <button onClick={() => setShowAcquireRt(true)} className="px-3 py-1.5 bg-amber-600 text-white rounded-lg text-sm hover:bg-amber-700" title="粘贴邮箱----密码,走 OAuth 获取全新 refresh_token(Pro号无需接码)">🔑 批量获取RT</button>
                 </div>
             </header>
 
@@ -444,6 +539,13 @@ export default function App() {
                 {showXray && (
                     <div className="mt-2 flex flex-col gap-2 bg-cyan-50 p-3 rounded-lg text-sm">
                         <div className="text-xs text-gray-600">粘贴 <span className="font-mono">vless://…</span> 链接，一键起独立 xray 进程做注册代理（独立端口，不影响你自己的 v2rayN/其它代理）。注册代理会自动指向它。</div>
+                        <div className="flex gap-2 items-center flex-wrap text-xs bg-white/70 px-2 py-1.5 rounded border border-cyan-200">
+                            <span className="text-gray-600 font-medium">本地端口(专属，避免与系统 v2rayN 等冲突/清理误杀):</span>
+                            <label className="flex items-center gap-1">GPT/reg <input value={regPortInput} onChange={(e) => setRegPortInput(e.target.value)} className="w-20 px-1 py-0.5 border rounded font-mono"/></label>
+                            <label className="flex items-center gap-1">Claude <input value={claudePortInput} onChange={(e) => setClaudePortInput(e.target.value)} className="w-20 px-1 py-0.5 border rounded font-mono"/></label>
+                            <button onClick={() => { const rp = Number(regPortInput), cp = Number(claudePortInput); if (!(rp >= 1024 && rp <= 65535) || !(cp >= 1024 && cp <= 65535)) { notify("端口需为 1024-65535"); return; } if (rp === cp) { notify("两个端口不能相同"); return; } api.setProxyPorts(rp, cp).then((r) => { setRegProxy(r.regProxy || regProxy); notify(`端口已保存 reg=${r.regProxyPort} claude=${r.claudeProxyPort}${r.regProxy ? `，代理→${r.regProxy}` : "（重启或起 vless 后生效）"}`); }).catch((e: any) => notify(e.message)); }}
+                                    className="px-2 py-1 bg-cyan-700 text-white rounded">保存端口</button>
+                        </div>
                         <div className="flex gap-2 items-start flex-wrap">
                             <textarea value={vlessInput} onChange={(e) => setVlessInput(e.target.value)} placeholder="vless://uuid@host:port?security=reality&pbk=…&sid=…&sni=…&flow=…&type=tcp#name"
                                       className="flex-1 min-w-[360px] h-14 px-2 py-1 border rounded text-xs font-mono"/>
@@ -586,20 +688,22 @@ export default function App() {
                         {batchAt.running
                             ? <button onClick={() => api.stopBatchAt().then(() => notify("已请求停止(当前号跑完即停)")).catch((e) => notify(e.message))} className="px-2 py-1 bg-red-600 text-white rounded text-xs animate-pulse">⏹ 停止重登 {batchAt.done}/{batchAt.total}</button>
                             : <button onClick={() => { const ids = selectedIds.size ? [...selectedIds] : filtered.map((a) => a.id); if (!ids.length) { notify("无账号"); return; } if (!window.confirm(`对 ${ids.length} 个号【串行】测 at，失效的走浏览器登录重新获取(一次一个、每个约1-2分钟、可停止)。开始？`)) return; api.batchTestAt(ids, true).then((r) => notify(`已开始串行重登 ${r.count} 个`)).catch((e) => notify(e.message)); }} title="批量测 at,失效的号串行(一次一个)走浏览器登录重新获取 at" className="px-2 py-1 bg-blue-700 text-white rounded text-xs">批量重登at(串行)</button>}
-                        <button onClick={() => api.batchTestRt(selectedIds.size ? [...selectedIds] : filtered.map((a) => a.id)).then((r) => notify(`批量测 rt：${r.count} 个`)).catch((e) => notify(e.message))} className="px-2 py-1 bg-teal-600 text-white rounded text-xs">批量测 rt</button>
+                        <button onClick={() => api.batchTestRt(selectedIds.size ? [...selectedIds] : filtered.map((a) => a.id)).then((r) => notify(`批量测 rt：${r.count} 个(只刷新有效的)`)).catch((e) => notify(e.message))} title="只刷新有效 rt、标记失效的;不重登、不耗接码" className="px-2 py-1 bg-teal-600 text-white rounded text-xs">批量测 rt</button>
+                        <button onClick={() => { const ids = selectedIds.size ? [...selectedIds] : filtered.map((a) => a.id); if (!ids.length) { notify("无账号"); return; } if (!window.confirm(`对 ${ids.length} 个号批量测 rt，过期/无rt 的会【重登获取 rt】(走 codex OAuth + add-phone 接码，每号消耗一个接码号、有成本、较慢)。开始？`)) return; api.batchTestRt(ids, true).then((r) => notify(`已开始批量重取 rt ${r.count} 个(过期/无rt 会重登获取)`)).catch((e) => notify(e.message)); }} title="过期/无rt 的号重登获取 rt(codex OAuth+接码,有成本)" className="px-2 py-1 bg-teal-700 text-white rounded text-xs">批量重取rt(耗接码)</button>
                         <button onClick={() => api.batchTestChat(selectedIds.size ? [...selectedIds] : filtered.map((a) => a.id)).then((r) => notify(`批量测聊天：${r.count} 个（逐个开浏览器）`)).catch((e) => notify(e.message))} className="px-2 py-1 bg-fuchsia-600 text-white rounded text-xs">批量测聊天</button>
+                        {/* 已售出改回未售出:误标/退回重新上架。只对已售出的号生效 */}
                         <button onClick={async () => {
-                            const ids = selectedIds.size ? [...selectedIds] : filtered.map((a) => a.id);
-                            if (!ids.length) { notify("无可导出的账号"); return; }
-                            if (!window.confirm(`导出 ${ids.length} 个账号(邮箱----密码----rt----at)并标记为【已售出】？`)) return;
+                            const pool = selectedIds.size ? filtered.filter((a) => selectedIds.has(a.id)) : filtered;
+                            const ids = pool.filter((a) => a.sold_at).map((a) => a.id);
+                            if (!ids.length) { notify("选中(或当前列表)里没有已售出的账号"); return; }
+                            if (!window.confirm(`把 ${ids.length} 个已售出账号改回【未售出】？(重新参与保活)`)) return;
                             try {
-                                const text = await api.exportSelected(ids, true);
-                                const url = URL.createObjectURL(new Blob([text], {type: "text/plain;charset=utf-8"}));
-                                const el = document.createElement("a"); el.href = url; el.download = "sold.txt"; el.click(); URL.revokeObjectURL(url);
+                                const r = await api.setSold(ids, false);
                                 setSelectedIds(new Set());
-                                notify(`已导出 ${ids.length} 个并标记已售出`);
+                                await api.listAccounts().then(setAccounts);
+                                notify(`已把 ${r.count} 个账号改回未售出`);
                             } catch (e: any) { notify(e.message); }
-                        }} className="px-2 py-1 bg-amber-600 text-white rounded text-xs">导出选中+标记已售出</button>
+                        }} title="把选中(或当前列表)里已售出的号改回未售出,误标/退回时用" className="px-2 py-1 bg-amber-500 text-white rounded text-xs">改回未售出</button>
                         <span className="mx-1 text-gray-300">|</span>
                         <input value={batchAssign} onChange={(e) => setBatchAssign(e.target.value)} placeholder="批次名" list="batch-list" className="w-24 px-2 py-1 border rounded text-xs"/>
                         <datalist id="batch-list">{batches.map((b) => <option key={b.name} value={b.name}/>)}</datalist>
@@ -608,10 +712,14 @@ export default function App() {
                             const ids = selectedIds.size ? [...selectedIds] : filtered.map((a) => a.id);
                             if (!ids.length) { notify("无可删除的账号"); return; }
                             const who = selectedIds.size ? `选中的 ${ids.length} 个` : `当前列表全部 ${ids.length} 个`;
-                            if (!window.confirm(`确认删除${who}账号？此操作不可恢复（运行中的会跳过）。`)) return;
+                            const mbNote = delMailbox ? "邮箱将一并删除" : "邮箱将退回邮箱管理(free 池)";
+                            if (!window.confirm(`确认删除${who}账号？${mbNote}。运行中的会跳过。`)) return;
                             try { const r = await api.batchDelete(ids); setSelectedIds(new Set()); await api.listAccounts().then(setAccounts); notify(`已删除 ${r.count} 个${r.skipped ? `（跳过运行中 ${r.skipped}）` : ""}`); }
                             catch (e: any) { notify(e.message); }
-                        }} title="删除选中(或当前列表全部)的号,不可恢复" className="px-2 py-1 bg-red-600 text-white rounded text-xs">🗑 删除选中</button>
+                        }} title="删除选中(或当前列表全部)的号" className="px-2 py-1 bg-red-600 text-white rounded text-xs">🗑 删除选中</button>
+                        <label className="inline-flex items-center gap-1 text-xs text-gray-500 cursor-pointer" title="开=删账号连带删邮箱;关=只删 GPT 业务记录,邮箱退回 free 池保留在邮箱管理,可重新分配/纯管理">
+                            <input type="checkbox" checked={delMailbox} onChange={(e) => { const v = e.target.checked; api.setDeleteMailbox(v).then((r) => { setDelMailbox(r.deleteMailboxWithAccount); notify(r.deleteMailboxWithAccount ? "删账号将连带删邮箱" : "删账号时邮箱退回 free 池(保留在邮箱管理)"); }).catch((err: any) => notify(err.message)); }} />连带删邮箱
+                        </label>
                         {selectedIds.size > 0 && <button onClick={() => setSelectedIds(new Set())} className="text-gray-400 hover:underline text-xs">清空</button>}
                     </div>
                     <div ref={scrollRef} onScroll={(e) => setScrollTop((e.target as HTMLDivElement).scrollTop)} className="flex-1 overflow-auto min-h-0">
@@ -633,7 +741,7 @@ export default function App() {
                         {vTopPad > 0 && <tr style={{height: vTopPad}}><td colSpan={7} className="p-0"/></tr>}
                         {vRows.map((a, idx) => { const i = vStart + idx; return (
                             <tr key={a.id} style={{height: ROW_H}}
-                                onClick={() => { setSelectedId(a.id); setLogMode("single"); setDetailTab("log"); setPanelOpen(true); setEditMode(false); api.getAccount(a.id).then((r) => setAccounts((prev) => prev.map((x) => (x.id === a.id ? r : x)))).catch(() => {}); }}
+                                onClick={() => { setSelectedId(a.id); setLogMode("single"); setPanelOpen(true); setEditMode(false); api.getAccount(a.id).then((r) => setAccounts((prev) => prev.map((x) => (x.id === a.id ? r : x)))).catch(() => {}); }}
                                 className={`border-b cursor-pointer hover:bg-indigo-50 ${selectedId === a.id ? "bg-indigo-100" : ""}`}>
                                 <td className="px-2 py-2" onClick={(e) => e.stopPropagation()}>
                                     <input type="checkbox" checked={selectedIds.has(a.id)} onChange={() => toggleSel(a.id)}/>
@@ -654,7 +762,7 @@ export default function App() {
                                     {a.status === "success"
                                         ? <span className="text-gray-500">
                                             {fmtDateTime(a.finished_at)}{" "}
-                                            <span className={a.dead_at ? "text-red-500 font-medium" : "text-green-600 font-medium"}>· 存活{aliveDays(a.finished_at, a.dead_at)}{a.dead_at ? "(已失效)" : ""}</span>
+                                            <span className={a.dead_at ? "text-red-500 font-medium" : "text-green-600 font-medium"}>· 存活{aliveDays(a.finished_at, a.dead_at, a.created_at)}{a.dead_at ? "(已失效)" : ""}</span>
                                             {a.started_at && a.finished_at ? <span className="text-gray-400"> · 耗时{fmtDuration(a.started_at, a.finished_at)}</span> : null}
                                           </span>
                                         : <span className="text-gray-300">—</span>}
@@ -749,7 +857,7 @@ export default function App() {
                                     <span className="text-gray-400">套餐</span><span>{selected.plan ? <span className="px-2 py-0.5 bg-purple-100 text-purple-700 rounded text-xs">{selected.plan}</span> : "—"}</span>
                                     <span className="text-gray-400">批次</span><span className="text-xs text-gray-600">{selected.batch ? <span className="px-2 py-0.5 bg-cyan-100 text-cyan-700 rounded">{selected.batch}</span> : "—"}</span>
                                     <span className="text-gray-400">手机</span><span className="font-mono text-xs text-gray-600 select-text">{selected.phone ? "+" + selected.phone : "—"}{selected.card ? ` · 卡密 ${selected.card}` : ""}</span>
-                                    <span className="text-gray-400">注册</span><span className="text-gray-600">{selected.finished_at ? <>{fmtDateTime(selected.finished_at)} <span className={selected.dead_at ? "text-red-500" : "text-green-600"}>· 存活{aliveDays(selected.finished_at, selected.dead_at)}{selected.dead_at ? "(已失效)" : ""}</span>{selected.sold_at ? <span className="ml-1 px-1 rounded bg-amber-100 text-amber-700 text-xs">已售</span> : null}</> : "—"}</span>
+                                    <span className="text-gray-400">注册</span><span className="text-gray-600">{selected.finished_at ? <>{fmtDateTime(selected.finished_at)} <span className={selected.dead_at ? "text-red-500" : "text-green-600"}>· 存活{aliveDays(selected.finished_at, selected.dead_at, selected.created_at)}{selected.dead_at ? "(已失效)" : ""}</span>{selected.sold_at ? <span className="ml-1 px-1 rounded bg-amber-100 text-amber-700 text-xs">已售</span> : null}</> : "—"}</span>
                                     <span className="text-gray-400">耗时</span><span className="text-gray-600 text-xs" title="注册开始→完成的花费时长(started_at→finished_at)">{fmtDuration(selected.started_at, selected.finished_at)}</span>
                                     <span className="text-gray-400">创建</span><span className="text-gray-500 text-xs">{fmtDateTime(selected.created_at)}</span>
                                     <span className="text-gray-400">at令牌</span><span className="font-mono text-xs break-all text-gray-500 select-text cursor-text">{selected.token ? selected.token.slice(0, 48) + "…" : "—"}</span>
@@ -774,59 +882,29 @@ export default function App() {
                                 <div className="px-4 py-2.5 border-b flex flex-wrap gap-2 shrink-0" onClick={(e) => e.stopPropagation()}>
                                     <button onClick={() => startEdit(selected)} title="编辑本地库记录(全字段,不动真邮箱)" className="px-2.5 py-1 bg-slate-600 hover:bg-slate-700 text-white rounded text-xs">✏️ 编辑</button>
                                     <button onClick={() => doOpenBrowser(selected)} disabled={!selected.auth_file} title={selected.auth_file ? "注入 at 打开已登录的 chatgpt 浏览器" : "无 at 授权文件，不能打开"} className={`px-2.5 py-1 rounded text-xs text-white ${selected.auth_file ? "bg-emerald-600 hover:bg-emerald-700" : "bg-gray-300 cursor-not-allowed"}`}>🌐 打开浏览器</button>
+                                    <button onClick={() => api.getSession(selected.id).then((r) => { navigator.clipboard?.writeText(JSON.stringify(r.session)); notify("session json 已复制"); }).catch((e) => notify(`复制失败: ${e.message}`))} disabled={!selected.auth_file} title={selected.auth_file ? "复制该号 session json(可恢复登录态,同导出 session 格式)" : "无 at 授权文件，没有 session"} className={`px-2.5 py-1 rounded text-xs text-white ${selected.auth_file ? "bg-cyan-600 hover:bg-cyan-700" : "bg-gray-300 cursor-not-allowed"}`}>📋 复制session</button>
                                     {(selected.status === "failed" || selected.status === "success") &&
                                         <button onClick={() => api.retry(selected.id).then(() => notify("已重新排队")).catch((e) => notify(e.message))} className="px-2.5 py-1 bg-indigo-500 hover:bg-indigo-600 text-white rounded text-xs">重跑</button>}
-                                    <button onClick={() => { if (!window.confirm(`删除 ${selected.email}？`)) return; api.remove(selected.id).then(() => { setSelectedId(null); setLogMode("all"); api.listAccounts().then(setAccounts); }).catch((e) => notify(e.message)); }} className="px-2.5 py-1 bg-red-500 hover:bg-red-600 text-white rounded text-xs">删除</button>
+                                    <button onClick={() => { if (!window.confirm(`删除 ${selected.email}？${delMailbox ? "邮箱将一并删除" : "邮箱将退回邮箱管理(free 池)"}。`)) return; api.remove(selected.id).then(() => { setSelectedId(null); setLogMode("all"); api.listAccounts().then(setAccounts); }).catch((e) => notify(e.message)); }} className="px-2.5 py-1 bg-red-500 hover:bg-red-600 text-white rounded text-xs">删除</button>
                                 </div>
                               </>
                             ))}
-                            {/* Tab 栏 */}
+                            {/* 日志(注册过程日志;收件箱已迁至「📮 邮箱管理」的邮箱详情) */}
                             <div className="px-3 pt-2 flex items-center gap-1 text-sm shrink-0">
-                                {(["log", "inbox"] as const).map((t) => (
-                                    <button key={t} onClick={() => setDetailTab(t)}
-                                            className={`px-3 py-1.5 rounded-t text-xs font-medium ${detailTab === t ? "bg-gray-900 text-white" : "bg-gray-100 text-gray-500 hover:bg-gray-200"}`}>
-                                        {t === "log" ? "📋 日志" : "📥 收件箱"}
-                                    </button>
-                                ))}
-                                {detailTab === "inbox" && <button onClick={() => selected && openInbox(selected)} disabled={inboxLoading} className={`ml-auto text-xs ${inboxLoading ? "text-gray-300" : "text-indigo-600 hover:underline"}`}>{inboxLoading ? "刷新中…" : "🔄 刷新"}</button>}
+                                <span className="px-3 py-1.5 rounded-t text-xs font-medium bg-gray-900 text-white">📋 日志</span>
                             </div>
-                            {/* Tab 内容 */}
                             <div className="flex-1 overflow-auto min-h-0">
-                                {detailTab === "log" ? (
-                                    <div className="px-3 py-2 font-mono text-xs leading-relaxed bg-gray-900 text-gray-100 min-h-full">
-                                        {logs.length === 0
-                                            ? <div className="text-gray-500">（暂无该号日志）</div>
-                                            : logs.map((l, i) => (
-                                                <div key={i} className="whitespace-pre-wrap break-all">
-                                                    <span className="text-gray-600">{new Date(l.ts).toLocaleTimeString()} </span>
-                                                    <span className={l.line.includes("✅") ? "text-green-400" : l.line.includes("❌") ? "text-red-400" : ""}>{l.line}</span>
-                                                </div>
-                                            ))}
-                                        <div ref={logEndRef}/>
-                                    </div>
-                                ) : (
-                                    <div className="p-4">
-                                        {inboxLoading && <div className="text-center py-10 text-gray-500">正在登录 mail.com 拉取收件箱…（约 20~30s）</div>}
-                                        {inboxError && !inboxLoading && <div className="text-red-500 text-sm py-4">❌ 登录/收信失败：{inboxError}</div>}
-                                        {inboxData && !inboxLoading && inboxData.mails.length === 0 && <div className="text-emerald-600 text-center py-10">✓ 登录成功，收件箱为空</div>}
-                                        {inboxData && inboxData.mails.map((m: any) => (
-                                            <div key={m.id} className="border-b py-2 cursor-pointer hover:bg-gray-50 -mx-2 px-2 rounded" onClick={() => toggleMail(m.id)}>
-                                                <div className="flex justify-between text-xs text-gray-400 mb-0.5">
-                                                    <span className="truncate max-w-[60%]">{m.from}</span><span>{m.date}</span>
-                                                </div>
-                                                <div className="text-sm text-gray-800 flex items-center gap-1">
-                                                    <span className="text-gray-400 text-xs">{expandedMail === m.id ? "▾" : "▸"}</span>
-                                                    {m.subject || "(无主题)"}
-                                                </div>
-                                                {expandedMail === m.id && (
-                                                    <div className="mt-2 text-xs text-gray-600 whitespace-pre-wrap bg-gray-50 border rounded p-2 max-h-64 overflow-auto leading-relaxed select-text cursor-text" onClick={(e) => e.stopPropagation()}>
-                                                        {mailLoadingId === m.id ? "正在加载正文…" : (mailBodies[m.id] ?? "(点击加载)")}
-                                                    </div>
-                                                )}
+                                <div className="px-3 py-2 font-mono text-xs leading-relaxed bg-gray-900 text-gray-100 min-h-full">
+                                    {logs.length === 0
+                                        ? <div className="text-gray-500">（暂无该号日志）</div>
+                                        : logs.map((l, i) => (
+                                            <div key={i} className="whitespace-pre-wrap break-all">
+                                                <span className="text-gray-600">{new Date(l.ts).toLocaleTimeString()} </span>
+                                                <span className={l.line.includes("✅") ? "text-green-400" : l.line.includes("❌") ? "text-red-400" : ""}>{l.line}</span>
                                             </div>
                                         ))}
-                                    </div>
-                                )}
+                                    <div ref={logEndRef}/>
+                                </div>
                             </div>
                         </>
                     )}
@@ -841,31 +919,39 @@ export default function App() {
                 <div className="fixed inset-0 bg-black/40 flex items-center justify-center z-30" onClick={() => setShowExport(false)}>
                     <div className="bg-white rounded-xl w-[480px] shadow-2xl" onClick={(e) => e.stopPropagation()}>
                         <div className="px-5 py-3 border-b flex items-center justify-between">
-                            <span className="font-medium">⚙ 按批次/格式导出</span>
+                            <span className="font-medium">⬇ 导出账号</span>
                             <button onClick={() => setShowExport(false)} className="text-gray-400 hover:text-gray-700 text-lg leading-none">✕</button>
                         </div>
                         <div className="px-5 py-4 space-y-3 text-sm">
-                            <div className="text-xs text-gray-500">
-                                带 rt 的：<span className="font-mono">邮箱----邮箱密码----GPT密码----rt----sessjson</span><br/>
-                                只有 at 的：<span className="font-mono">邮箱----邮箱密码----GPT密码----sessjson</span>
-                            </div>
-                            <label className="flex items-center gap-2"><span className="w-14 text-gray-400">批次</span>
-                                <select value={exportBatch} onChange={(e) => setExportBatch(e.target.value)} className="flex-1 px-2 py-1.5 border rounded">
-                                    <option value="">全部批次</option>
-                                    {batches.map((b) => <option key={b.name} value={b.name}>{b.name} ({b.count})</option>)}
+                            <label className="flex items-center gap-2"><span className="w-14 text-gray-400 shrink-0">范围</span>
+                                <select value={exportRange} onChange={(e) => setExportRange(e.target.value as any)} className="flex-1 px-2 py-1.5 border rounded">
+                                    <option value="all">全部可用号(成功且未失效)</option>
+                                    <option value="filtered">当前筛选({filtered.length})</option>
+                                    <option value="selected">选中的号({selectedIds.size})</option>
+                                    <option value="batch">按批次…</option>
                                 </select>
                             </label>
-                            <label className="flex items-center gap-2"><span className="w-14 text-gray-400">范围</span>
+                            {exportRange === "batch" &&
+                                <label className="flex items-center gap-2"><span className="w-14 text-gray-400 shrink-0">批次</span>
+                                    <select value={exportBatch} onChange={(e) => setExportBatch(e.target.value)} className="flex-1 px-2 py-1.5 border rounded">
+                                        <option value="">请选择批次…</option>
+                                        {batches.map((b) => <option key={b.name} value={b.name}>{b.name} ({b.count})</option>)}
+                                    </select>
+                                </label>}
+                            <label className="flex items-center gap-2"><span className="w-14 text-gray-400 shrink-0">rt 筛选</span>
                                 <select value={exportScope} onChange={(e) => setExportScope(e.target.value as any)} className="flex-1 px-2 py-1.5 border rounded">
-                                    <option value="all">全部成功号</option>
+                                    <option value="all">不限(带rt+只有at)</option>
                                     <option value="hasRt">仅带 rt 的</option>
                                     <option value="atOnly">仅只有 at 的</option>
                                 </select>
                             </label>
-                            <label className="flex items-center gap-2"><span className="w-14 text-gray-400">格式</span>
+                            <label className="flex items-center gap-2"><span className="w-14 text-gray-400 shrink-0">格式</span>
                                 <select value={exportFormat} onChange={(e) => setExportFormat(e.target.value as any)} className="flex-1 px-2 py-1.5 border rounded">
-                                    <option value="txt">TXT(每行一条, ---- 分隔)</option>
-                                    <option value="csv">CSV(统一列, 逗号分隔)</option>
+                                    <option value="full">账号(带rt:邮箱--邮箱密码--GPT密码--rt--卡密;只有at:邮箱--邮箱密码)</option>
+                                    <option value="at">账号+AT(邮箱--邮箱密码--accessToken)</option>
+                                    <option value="session">session(邮箱--邮箱密码--session json)</option>
+                                    <option value="jsonl">JSONL(含 accessToken)</option>
+                                    <option value="csv">CSV(统一列, 含 rt/卡密)</option>
                                 </select>
                             </label>
                             <label className="flex items-center gap-2 cursor-pointer text-amber-700 pt-1">
@@ -873,9 +959,214 @@ export default function App() {
                                 导出后把这批号标记为【已售出】
                             </label>
                         </div>
-                        <div className="px-5 py-3 border-t flex justify-end gap-2">
+                        <div className="px-5 py-3 border-t flex items-center gap-2">
+                            <span className="text-sm text-gray-500 mr-auto">将导出 <b className={exportCount ? "text-emerald-600" : "text-red-500"}>{exportCount}</b> 条{exportSkipped > 0 && <span className="text-gray-400">（排除不可用 {exportSkipped} 条）</span>}</span>
                             <button onClick={() => setShowExport(false)} className="px-4 py-1.5 bg-gray-200 hover:bg-gray-300 rounded text-sm">取消</button>
                             <button onClick={doExportFull} className="px-4 py-1.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded text-sm">⬇ 导出</button>
+                        </div>
+                    </div>
+                </div>
+            )}
+            {showRefreshAt && (
+                <div className="fixed inset-0 bg-black/40 flex items-center justify-center z-30" onClick={() => !refreshAtRunning && setShowRefreshAt(false)}>
+                    <div className="bg-white rounded-xl w-[700px] max-h-[85vh] flex flex-col shadow-2xl" onClick={(e) => e.stopPropagation()}>
+                        <div className="px-5 py-3 border-b flex items-center justify-between">
+                            <span className="font-medium">🔄 批量获取 AccessToken <span className="text-xs text-gray-400 font-normal">粘贴邮箱列表，走浏览器登录重新拿 at</span></span>
+                            <button onClick={() => !refreshAtRunning && setShowRefreshAt(false)} disabled={refreshAtRunning} className="text-gray-400 hover:text-gray-700 text-lg leading-none disabled:opacity-40">✕</button>
+                        </div>
+                        <div className="px-5 py-4 space-y-3 text-sm overflow-auto">
+                            <div className="text-xs text-gray-500">每行一个邮箱，或 <span className="font-mono">邮箱----密码----at</span> 格式（取第一段邮箱匹配数据库账号，走浏览器登录重新获取 at）。</div>
+                            <textarea value={refreshAtInput} onChange={(e) => setRefreshAtInput(e.target.value)} placeholder={"a@mail.com\nb@mail.com----pass----oldAt"} disabled={refreshAtRunning}
+                                      className="w-full h-24 px-2 py-1.5 border rounded text-xs font-mono resize-y disabled:bg-gray-50"/>
+                            <div className="flex items-center gap-3">
+                                <button onClick={async () => {
+                                    const sep = "----";
+                                    const lines = refreshAtInput.split("\n").map(l => l.trim()).filter(Boolean);
+                                    const emails = lines.map(l => l.split(sep)[0].trim().toLowerCase()).filter(Boolean);
+                                    if (!emails.length) { notify("请粘贴邮箱列表"); return; }
+                                    setRefreshAtRunning(true);
+                                    setRefreshAtResults(emails.map(e => ({email: e, ok: false, status: "pending" as const})));
+                                    try {
+                                        await api.batchRefreshAt(refreshAtInput);
+                                    } catch (e: any) { notify("请求失败: " + e.message); setRefreshAtRunning(false); }
+                                }} disabled={refreshAtRunning} className={`px-4 py-1.5 rounded text-sm font-medium text-white ${refreshAtRunning ? "bg-gray-400 cursor-not-allowed" : "bg-cyan-600 hover:bg-cyan-700"}`}>
+                                    {refreshAtRunning ? "获取中(浏览器登录)…" : "▶ 开始获取"}
+                                </button>
+                                {refreshAtRunning && <button onClick={() => { api.stopBatchRefreshAt(); setRefreshAtRunning(false); }} className="px-3 py-1.5 rounded text-sm font-medium text-white bg-red-500 hover:bg-red-600">⏹ 停止</button>}
+                                {refreshAtResults.length > 0 && <span className="text-xs text-gray-500">成功 {refreshAtResults.filter(r => r.ok).length}/{refreshAtResults.length}</span>}
+                            </div>
+                            {refreshAtResults.length > 0 && (
+                                <>
+                                    <div className="max-h-52 overflow-auto border rounded">
+                                        <table className="w-full text-xs">
+                                            <thead className="bg-gray-100 text-gray-500 sticky top-0"><tr><th className="text-left px-2 py-1 w-8">#</th><th className="text-left px-2 py-1">邮箱</th><th className="text-left px-2 py-1">结果</th></tr></thead>
+                                            <tbody>
+                                                {refreshAtResults.map((r, i) => (
+                                                    <tr key={i} className="border-t">
+                                                        <td className="px-2 py-1 text-gray-400">{i + 1}</td>
+                                                        <td className="px-2 py-1 font-mono">{r.email}</td>
+                                                        <td className="px-2 py-1">{r.status === "pending" ? <span className="text-blue-500">⏳ 等待</span> : r.ok ? <span className="text-green-600">✅ {r.reason}</span> : <span className="text-red-500">❌ {r.reason}</span>}</td>
+                                                    </tr>
+                                                ))}
+                                            </tbody>
+                                        </table>
+                                    </div>
+                                    <div>
+                                        <div className="flex items-center gap-2 mb-1">
+                                            <span className="text-xs text-gray-500">成功项（邮箱----密码----accessToken，点击全选复制）:</span>
+                                            <button onClick={() => {
+                                                const ok = refreshAtResults.filter(r => r.ok);
+                                                if (!ok.length) { notify("无成功项可导出"); return; }
+                                                const esc = (v: string) => `"${String(v ?? "").replace(/"/g, '""')}"`;
+                                                const head = "﻿邮箱,密码,SessionJSON\n";
+                                                const body = ok.map(r => [esc(r.email), esc(r.password || ""), esc(r.sessionJson ? JSON.stringify(r.sessionJson) : "")].join(",")).join("\n");
+                                                const blob = new Blob([head + body], {type: "text/csv;charset=utf-8"});
+                                                const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = "batch-at-session.csv"; a.click(); URL.revokeObjectURL(a.href);
+                                                notify(`已导出 ${ok.length} 条`);
+                                            }} disabled={!refreshAtResults.some(r => r.ok)} className="px-2 py-0.5 rounded text-xs border border-green-300 text-green-700 hover:bg-green-50 disabled:opacity-40 disabled:cursor-not-allowed">
+                                                📊 导出Excel(邮箱+密码+SessionJSON)
+                                            </button>
+                                        </div>
+                                        <textarea readOnly value={(() => {
+                                            const sep = "----";
+                                            const lines = refreshAtInput.split("\n").map(l => l.trim()).filter(Boolean);
+                                            return refreshAtResults.map((r, i) => {
+                                                if (!r.ok || !r.accessToken) return null;
+                                                const origParts = (lines[i] || "").split(sep);
+                                                if (origParts.length >= 3) { origParts[2] = r.accessToken; if (r.password && !origParts[1]) origParts[1] = r.password; return origParts.join(sep); }
+                                                return `${r.email}${sep}${r.password || ""}${sep}${r.accessToken}`;
+                                            }).filter(Boolean).join("\n");
+                                        })()} onClick={(e) => (e.target as HTMLTextAreaElement).select()} className="w-full h-20 px-2 py-1 border rounded text-xs font-mono bg-gray-50 select-text"/>
+                                    </div>
+                                </>
+                            )}
+                        </div>
+                    </div>
+                </div>
+            )}
+            {showAcquireRt && (
+                <div className="fixed inset-0 bg-black/40 flex items-center justify-center z-30" onClick={() => !acquireRtRunning && setShowAcquireRt(false)}>
+                    <div className="bg-white rounded-xl w-[700px] max-h-[85vh] flex flex-col shadow-2xl" onClick={(e) => e.stopPropagation()}>
+                        <div className="px-5 py-3 border-b flex items-center justify-between">
+                            <span className="font-medium">🔑 批量获取 RefreshToken <span className="text-xs text-gray-400 font-normal">走 OAuth 登录获取全新 rt（Pro号无需接码）</span></span>
+                            <button onClick={() => !acquireRtRunning && setShowAcquireRt(false)} disabled={acquireRtRunning} className="text-gray-400 hover:text-gray-700 text-lg leading-none disabled:opacity-40">✕</button>
+                        </div>
+                        <div className="px-5 py-4 space-y-3 text-sm overflow-auto">
+                            <div className="text-xs text-gray-500">每行 <span className="font-mono">邮箱----密码</span>，走 codex OAuth 登录获取 refresh_token。</div>
+                            <textarea value={acquireRtInput} onChange={(e) => setAcquireRtInput(e.target.value)} placeholder={"a@mail.com----password1\nb@mail.com----password2"} disabled={acquireRtRunning}
+                                      className="w-full h-24 px-2 py-1.5 border rounded text-xs font-mono resize-y disabled:bg-gray-50"/>
+                            <div className="flex items-center gap-3">
+                                <button onClick={async () => {
+                                    const sep = "----";
+                                    const lines = acquireRtInput.split("\n").map(l => l.trim()).filter(Boolean);
+                                    const emails = lines.map(l => l.split(sep)[0].trim().toLowerCase()).filter(Boolean);
+                                    if (!emails.length) { notify("请粘贴邮箱----密码列表"); return; }
+                                    setAcquireRtRunning(true);
+                                    setAcquireRtResults(emails.map(e => ({email: e, ok: false, status: "pending" as const})));
+                                    try { await api.batchAcquireRt(acquireRtInput); } catch (e: any) { notify("请求失败: " + e.message); setAcquireRtRunning(false); }
+                                }} disabled={acquireRtRunning} className={`px-4 py-1.5 rounded text-sm font-medium text-white ${acquireRtRunning ? "bg-gray-400 cursor-not-allowed" : "bg-amber-600 hover:bg-amber-700"}`}>
+                                    {acquireRtRunning ? "获取中(OAuth登录)…" : "▶ 开始获取"}
+                                </button>
+                                {acquireRtRunning && <button onClick={() => { api.stopBatchAcquireRt(); setAcquireRtRunning(false); }} className="px-3 py-1.5 rounded text-sm font-medium text-white bg-red-500 hover:bg-red-600">⏹ 停止</button>}
+                                {acquireRtResults.length > 0 && <span className="text-xs text-gray-500">成功 {acquireRtResults.filter(r => r.ok).length}/{acquireRtResults.length}</span>}
+                            </div>
+                            {acquireRtResults.length > 0 && (
+                                <>
+                                    <div className="max-h-52 overflow-auto border rounded">
+                                        <table className="w-full text-xs">
+                                            <thead className="bg-gray-100 text-gray-500 sticky top-0"><tr><th className="text-left px-2 py-1 w-8">#</th><th className="text-left px-2 py-1">邮箱</th><th className="text-left px-2 py-1">结果</th></tr></thead>
+                                            <tbody>
+                                                {acquireRtResults.map((r, i) => (
+                                                    <tr key={i} className="border-t">
+                                                        <td className="px-2 py-1 text-gray-400">{i + 1}</td>
+                                                        <td className="px-2 py-1 font-mono">{r.email}</td>
+                                                        <td className="px-2 py-1">{r.status === "pending" ? <span className="text-blue-500">⏳ 等待</span> : r.ok ? <span className="text-green-600">✅ {r.reason}</span> : <span className="text-red-500">❌ {r.reason}</span>}</td>
+                                                    </tr>
+                                                ))}
+                                            </tbody>
+                                        </table>
+                                    </div>
+                                    <div>
+                                        <div className="flex items-center gap-2 mb-1">
+                                            <span className="text-xs text-gray-500">成功项（邮箱----密码----rt，点击全选复制）:</span>
+                                            <button onClick={() => {
+                                                const ok = acquireRtResults.filter(r => r.ok && r.rt);
+                                                if (!ok.length) { notify("无成功项可导出"); return; }
+                                                const data = ok.map(r => ({email: r.email, password: r.password || "", refresh_token: r.rt || "", access_token: r.accessToken || ""}));
+                                                const blob = new Blob([JSON.stringify(data, null, 2)], {type: "application/json;charset=utf-8"});
+                                                const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = "batch-rt-sub2json.json"; a.click(); URL.revokeObjectURL(a.href);
+                                                notify(`已导出 ${ok.length} 条 sub2json`);
+                                            }} disabled={!acquireRtResults.some(r => r.ok)} className="px-2 py-0.5 rounded text-xs border border-amber-300 text-amber-700 hover:bg-amber-50 disabled:opacity-40 disabled:cursor-not-allowed">
+                                                📦 导出 sub2json
+                                            </button>
+                                        </div>
+                                        <textarea readOnly value={acquireRtResults.filter(r => r.ok && r.rt).map(r => `${r.email}----${r.password || ""}----${r.rt}`).join("\n")}
+                                                  onClick={(e) => (e.target as HTMLTextAreaElement).select()} className="w-full h-20 px-2 py-1 border rounded text-xs font-mono bg-gray-50 select-text"/>
+                                    </div>
+                                </>
+                            )}
+                        </div>
+                    </div>
+                </div>
+            )}
+            {showPicker && (
+                <div className="fixed inset-0 bg-black/40 flex items-center justify-center z-30" onClick={() => setShowPicker(false)}>
+                    <div className="bg-white rounded-xl w-[560px] max-h-[80vh] flex flex-col shadow-2xl" onClick={(e) => e.stopPropagation()}>
+                        <div className="px-5 py-3 border-b flex items-center justify-between">
+                            <span className="font-medium">📥 从邮箱选号分配到 GPT</span>
+                            <button onClick={() => setShowPicker(false)} className="text-gray-400 hover:text-gray-700 text-lg leading-none">✕</button>
+                        </div>
+                        <div className="px-5 py-3 space-y-3 text-sm overflow-hidden flex flex-col min-h-0">
+                            {/* 分组筛选 + 批次 */}
+                            <div className="flex items-center gap-2">
+                                <span className="w-14 text-gray-400 shrink-0">分组</span>
+                                <select value={pickerGrp} onChange={(e) => setPickerGrp(e.target.value)} className="flex-1 px-2 py-1.5 border rounded">
+                                    <option value="">全部待分配({pickerList.length})</option>
+                                    <option value="__NONE__">未分组</option>
+                                    {pickerGrps.filter((g) => g.grp).map((g) => <option key={g.grp} value={g.grp}>{g.grp}({g.n})</option>)}
+                                </select>
+                                <select value={pickerPw} onChange={(e) => setPickerPw(e.target.value)} className="px-2 py-1.5 border rounded">
+                                    <option value="">改密:全部</option>
+                                    <option value="no">未改密</option>
+                                    <option value="yes">已改密</option>
+                                    <option value="fail">改密失败</option>
+                                </select>
+                            </div>
+                            <div className="flex items-center gap-2">
+                                <span className="w-14 text-gray-400 shrink-0">批次</span>
+                                <input value={pickerBatch} onChange={(e) => setPickerBatch(e.target.value)} placeholder="分配批次名(选填,便于后续筛选/导出)" list="batch-list" className="flex-1 px-2 py-1.5 border rounded"/>
+                            </div>
+                            {/* 邮箱勾选列表 */}
+                            <div className="flex items-center justify-between text-xs text-gray-500">
+                                <label className="inline-flex items-center gap-1 cursor-pointer">
+                                    <input type="checkbox" checked={pickerVisible.length > 0 && pickerVisible.every((m) => pickerSel.has(m.id))}
+                                           onChange={(e) => setPickerSel((prev) => { const s = new Set(prev); pickerVisible.forEach((m) => e.target.checked ? s.add(m.id) : s.delete(m.id)); return s; })}/>
+                                    全选当前({pickerVisible.length})
+                                </label>
+                                <span>已勾选 <b className="text-emerald-600">{pickerSel.size}</b> 个</span>
+                            </div>
+                            <div className="border rounded overflow-auto min-h-[120px] max-h-[38vh]">
+                                {pickerLoading ? <div className="p-4 text-center text-gray-400">加载中…</div>
+                                    : pickerVisible.length === 0 ? <div className="p-4 text-center text-gray-400">没有待分配邮箱</div>
+                                    : pickerVisible.map((m) => (
+                                        <label key={m.id} className="flex items-center gap-2 px-3 py-1.5 border-b last:border-0 hover:bg-gray-50 cursor-pointer">
+                                            <input type="checkbox" checked={pickerSel.has(m.id)} onChange={() => setPickerSel((prev) => { const s = new Set(prev); s.has(m.id) ? s.delete(m.id) : s.add(m.id); return s; })}/>
+                                            <span className="font-mono text-gray-700 flex-1 truncate">{m.email}</span>
+                                            {m.grp ? <span className="text-xs px-1 rounded bg-gray-100 text-gray-500">{m.grp}</span> : null}
+                                            {String(m.pw_status || "").includes("✅") ? <span className="text-xs text-green-600" title={m.pw_status}>已改密</span> : null}
+                                        </label>
+                                    ))}
+                            </div>
+                            {/* 先改密开关 */}
+                            <label className="flex items-center gap-2 cursor-pointer text-amber-700">
+                                <input type="checkbox" checked={pickerChangePw} onChange={(e) => setPickerChangePw(e.target.checked)}/>
+                                先改密再分配<span className="text-xs text-gray-400">(串行改 mail.com 密码后进注册队列;改密失败的仍照常分配)</span>
+                            </label>
+                        </div>
+                        <div className="px-5 py-3 border-t flex items-center gap-2">
+                            <span className="text-sm text-gray-500 mr-auto">将分配 <b className={pickerSel.size ? "text-emerald-600" : "text-red-500"}>{pickerSel.size}</b> 个进 GPT 注册队列</span>
+                            <button onClick={() => setShowPicker(false)} className="px-4 py-1.5 bg-gray-200 hover:bg-gray-300 rounded text-sm">取消</button>
+                            <button onClick={doPickAllocate} className="px-4 py-1.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded text-sm">{pickerChangePw ? "🔑 改密并分配" : "→ 分配"}</button>
                         </div>
                     </div>
                 </div>
