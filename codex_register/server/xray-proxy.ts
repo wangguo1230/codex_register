@@ -111,6 +111,7 @@ export function startXray(vlessUrl, opts: {name?: string; localPort?: number; bi
     it.state = {running: true, port: localPort, node: v.name, vless: vlessUrl, pid: child.pid, error: ""};
     let errBuf = "";
     child.stderr?.on("data", (d) => { errBuf = (errBuf + d.toString()).slice(-500); });
+    child.on("error", (e) => { if (it.proc === child) { it.state = {...it.state, running: false, error: `xray 启动失败: ${e?.message || e}`}; it.proc = null; } console.warn(`[xray:${name}] 启动失败(不影响服务): ${e?.message || e}`); });
     child.on("exit", (code) => { if (it.proc === child) { it.state = {...it.state, running: false, error: `xray 退出(code=${code}) ${errBuf.slice(-160)}`}; it.proc = null; } });
     return {ok: true, port: localPort, node: v.name, pid: child.pid};
 }
