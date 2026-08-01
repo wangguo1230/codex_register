@@ -233,20 +233,72 @@ export async function registerViaBrowser(email, {password = "", proxyUrl = "", h
             throw new Error(`提交邮箱后未进验证码/密码/登录页(url=${page.url().slice(0, 60)}) 页面:${body}`);
         }
 
-        // 4) 资料页(全名+年龄):仅【全新号注册】有;已注册号登录路径无资料页 → 已登录则跳过(避免找不到框空转、拿到空 token)
+        // 4) 资料页(全名 + 年龄 或 全名 + 生日):仅【全新号注册】有;已注册号登录路径无资料页 → 已登录则跳过
         await page.waitForTimeout(1500);
         if (!isLoggedIn()) {
             const name = rand(NAMES) + " " + rand(NAMES);
             const age = String(18 + Math.floor(Math.random() * 22));
+            const birthYear = String(2006 - 18 - Math.floor(Math.random() * 22)); // 18-40岁
+            const birthMonth = String(1 + Math.floor(Math.random() * 12));
+            const birthDay = String(1 + Math.floor(Math.random() * 28));
             const nameSel = [() => page.getByLabel(/全名|Full name|name/i).first(), 'input[name*="name" i]', 'input[autocomplete="name"]'];
             const ageSel = [() => page.getByLabel(/年龄|Age|old/i).first(), 'input[name*="age" i]', 'input[type="number"]', 'input[inputmode="numeric"]'];
-            // ★ 年龄框可能渲染晚(慢/英文环境),没填上→about-you 表单不完整→提交被拒卡住。填不齐就等待重试,确保 name+age 都填好再提交。
+
             let filled = false;
             for (let t = 0; t < 4 && !filled; t += 1) {
                 const nameOk = await fillField(page, nameSel, name, log, "全名");
+
+                // 检测页面类型：年龄 input 还是生日(select/date)
                 let ageOk = await fillField(page, ageSel, age, log, "年龄");
+
                 if (!ageOk) {
-                    // 标准选择器找不到年龄框(英文版结构可能不同)→ ①dump 页面可见 input 结构(便于精修) ②兜底:第2个可见 input(通常 全名=1、年龄=2)
+                    // 尝试生日模式：select[name*=month/day/year] 或 input[type=date] 或多个 select
+                    const monthSel = page.locator('select[name*="month" i], select[id*="month" i], select[aria-label*="Month" i], select[aria-label*="月" i]').first();
+                    const daySel = page.locator('select[name*="day" i], select[id*="day" i], select[aria-label*="Day" i], select[aria-label*="日" i]').first();
+                    const yearSel = page.locator('select[name*="year" i], select[id*="year" i], select[aria-label*="Year" i], select[aria-label*="年" i]').first();
+                    const dateInput = page.locator('input[type="date"]').first();
+
+                    if (await monthSel.isVisible().catch(() => false)) {
+                        // 生日下拉模式
+                        try {
+                            await monthSel.selectOption({index: Number(birthMonth)}).catch(() => monthSel.selectOption(birthMonth));
+                            if (await daySel.isVisible().catch(() => false))
+                                await daySel.selectOption({index: Number(birthDay)}).catch(() => daySel.selectOption(birthDay));
+                            if (await yearSel.isVisible().catch(() => false))
+                                await yearSel.selectOption(birthYear).catch(() => yearSel.selectOption({index: 20}));
+                            ageOk = true;
+                            log(`生日(下拉) ${birthYear}-${birthMonth}-${birthDay}`);
+                        } catch (e) { log(`生日下拉填写异常: ${String(e?.message || e).slice(0, 80)}`); }
+                    } else if (await dateInput.isVisible().catch(() => false)) {
+                        // input[type=date] 模式
+                        try {
+                            await dateInput.fill(`${birthYear}-${birthMonth.padStart(2, "0")}-${birthDay.padStart(2, "0")}`);
+                            ageOk = true;
+                            log(`生日(date input) ${birthYear}-${birthMonth}-${birthDay}`);
+                        } catch (e) { log(`生日 input 填写异常: ${String(e?.message || e).slice(0, 80)}`); }
+                    } else {
+                        // 兜底：查看所有 select，尝试作为生日填写
+                        const selects = await page.locator("select").all();
+                        const visSelects = [];
+                        for (const s of selects) if (await s.isVisible().catch(() => false)) visSelects.push(s);
+                        if (visSelects.length >= 2) {
+                            try {
+                                await visSelects[0].selectOption({index: Number(birthMonth)}).catch(() => {});
+                                if (visSelects.length >= 3) {
+                                    await visSelects[1].selectOption({index: Number(birthDay)}).catch(() => {});
+                                    await visSelects[2].selectOption(birthYear).catch(() => visSelects[2].selectOption({index: 20}));
+                                } else {
+                                    await visSelects[1].selectOption(birthYear).catch(() => visSelects[1].selectOption({index: 20}));
+                                }
+                                ageOk = true;
+                                log(`生日(兜底 select×${visSelects.length}) ${birthYear}-${birthMonth}-${birthDay}`);
+                            } catch { /* */ }
+                        }
+                    }
+                }
+
+                if (!ageOk) {
+                    // 最后兜底：第2个可见 input 当年龄填
                     const inputs = await page.locator("input").all();
                     const vis = [], info = [];
                     for (const el of inputs) {
@@ -257,10 +309,11 @@ export async function registerViaBrowser(email, {password = "", proxyUrl = "", h
                     if (t === 0) log(`资料页可见 input(${vis.length}): ${JSON.stringify(info).slice(0, 260)}`);
                     if (vis.length >= 2) { try { await vis[1].click(); await vis[1].fill(""); await vis[1].pressSequentially(age, {delay: 40}); await vis[1].press("Tab").catch(() => {}); ageOk = true; log("年龄用第2个可见 input 兜底填入"); } catch { /* */ } }
                 }
+
                 filled = nameOk && ageOk;
-                if (!filled) { log(`资料字段未齐(全名=${nameOk} 年龄=${ageOk})，等待渲染重试(${t + 1}/4)…`); await page.waitForTimeout(2500); }
+                if (!filled) { log(`资料字段未齐(全名=${nameOk} 年龄/生日=${ageOk})，等待渲染重试(${t + 1}/4)…`); await page.waitForTimeout(2500); }
             }
-            log(`填资料 name=${name} age=${age}${filled ? "" : "(⚠️未完全填上)"}`);
+            log(`填资料 name=${name} age/birthday=${age}/${birthYear}-${birthMonth}-${birthDay}${filled ? "" : "(⚠️未完全填上)"}`);
             await page.keyboard.press("Enter").catch(() => {});
             await clickContinue(page, log);
         }
