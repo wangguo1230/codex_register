@@ -182,7 +182,7 @@ class Scheduler extends EventEmitter {
     }
 
     state() {
-        return {paused: this.paused, pausedClaude: this.pausedClaude, concurrency: this.concurrency, otpSingle: this.otpSingle, simulateChat: this.simulateChat, smsEnabled: this.smsEnabled, smsLinkTemplate: this.smsLinkTemplate, rtEnabled: this.rtEnabled, smsMaxBind: this.smsMaxBind, regEngine: this.regEngine, bitBrowser: this.bitBrowser, deleteMailboxWithAccount: this.deleteMailboxWithAccount, daily: this.daily, regProxy: this.regProxy, mailProxy: this.mailProxy, claudeProxy: this.claudeProxy, claudeXrayVless: this.claudeXrayVless, regProxyPort: this.regProxyPort, claudeProxyPort: this.claudeProxyPort, mailSeparator: this.mailSeparator, xrayBinPath: this.xrayBinPath || "",
+        return {paused: this.paused, pausedClaude: this.pausedClaude, concurrency: this.concurrency, otpSingle: this.otpSingle, simulateChat: this.simulateChat, smsEnabled: this.smsEnabled, smsLinkTemplate: this.smsLinkTemplate, rtEnabled: this.rtEnabled, smsMaxBind: this.smsMaxBind, regEngine: this.regEngine, bitBrowser: this.bitBrowser, deleteMailboxWithAccount: this.deleteMailboxWithAccount, daily: this.daily, regProxy: this.regProxy, mailProxy: this.mailProxy, claudeProxy: this.claudeProxy, xrayVless: this.xrayVless || "", claudeXrayVless: this.claudeXrayVless, regProxyPort: this.regProxyPort, claudeProxyPort: this.claudeProxyPort, mailSeparator: this.mailSeparator, xrayBinPath: this.xrayBinPath || "",
             pwConcurrency: this.pwConcurrency,
             running: [...this.running.values()].filter((i) => i.domain === "gpt").map((i) => i.id),
             runningClaude: [...this.running.values()].filter((i) => i.domain === "claude").map((i) => i.id)};

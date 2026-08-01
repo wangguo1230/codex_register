@@ -57,7 +57,7 @@ export function ClaudePanel({notify}: {notify?: (m: string) => void}) {
     const allSel = fIds.length > 0 && fIds.every((id) => selected.has(id));
     const toggleAll = () => setSelected(allSel ? new Set() : new Set(fIds));
     const selIds = () => [...selected].filter((id) => filtered.some((a) => a.id === id));
-    const loadState = () => api.state().then((s) => { setPaused(s.state.pausedClaude !== false); setRunningN((s.state.runningClaude || []).length); setClaudeProxy(s.state.claudeProxy || ""); setProxyInput(s.state.claudeProxy || ""); setClaudeXray(s.state.claudeXray || null); }).catch(() => {});
+    const loadState = () => api.state().then((s) => { setPaused(s.state.pausedClaude !== false); setRunningN((s.state.runningClaude || []).length); setClaudeProxy(s.state.claudeProxy || ""); setProxyInput(s.state.claudeProxy || ""); setClaudeXray(s.state.claudeXray || null); if (s.state.claudeXrayVless) setVlessInput(s.state.claudeXrayVless); }).catch(() => {});
     useEffect(() => {
         load(); loadState();
         const off = connectStream((ev, data: any) => {
