@@ -131,7 +131,8 @@ export default function App() {
     const accountsRef = useRef<Account[]>([]);
     accountsRef.current = accounts;
 
-    const notify = (m: string) => { setToast(m); setTimeout(() => setToast(""), 2600); };
+    const toastTimer = useRef<any>(null);
+    const notify = (m: string, ms = 2600) => { if (toastTimer.current) clearTimeout(toastTimer.current); setToast(m); toastTimer.current = setTimeout(() => setToast(""), ms); };
 
     // 初次加载 + SSE
     useEffect(() => {
@@ -562,7 +563,7 @@ export default function App() {
                                     className="px-4 py-2 bg-cyan-600 text-white rounded text-sm font-medium">▶ 启动</button>
                             <button onClick={() => api.stopXray().then((r) => { setXray(r.xray); notify("独立代理已停止"); }).catch((err: any) => notify(err.message))}
                                     className="px-3 py-2 bg-gray-500 text-white rounded text-sm">■ 停止</button>
-                            <button onClick={() => { notify("正在经代理测出口…"); api.xrayProbe().then((r) => notify(r.ok ? `出口 ${r.ip} · chatgpt ${r.chatgpt} ${r.pass ? "✅可用" : "⚠️异常"}` : `❌${r.reason}`)).catch((err: any) => notify(err.message)); }}
+                            <button onClick={() => { notify("正在经代理测出口…", 30000); api.xrayProbe().then((r) => notify(r.ok ? `出口 ${r.ip} · chatgpt ${r.chatgpt} ${r.pass ? "✅可用" : "⚠️异常"}` : `❌${r.reason}`, 8000)).catch((err: any) => notify(err.message, 8000)); }}
                                     className="px-3 py-2 bg-indigo-600 text-white rounded text-sm">测出口</button>
                         </div>
                         <div className="text-xs">
