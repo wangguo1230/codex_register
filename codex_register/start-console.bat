@@ -5,9 +5,10 @@ cd /d "%~dp0"
 
 set PORT=3100
 
-:: 安装依赖（--yes 自动同意远程包提示）
+:: 安装依赖（允许远程包 + 镜像源）
 echo [依赖] 检查并安装后端依赖 ...
-call npm install --yes
+call npm config set fetch-remote-tarball true >nul 2>&1
+call npm install --yes --registry https://registry.npmmirror.com
 
 :: 清理旧进程
 for /f "tokens=5" %%a in ('netstat -ano ^| findstr "LISTENING" ^| findstr ":%PORT% "') do (
