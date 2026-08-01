@@ -1,18 +1,10 @@
 #!/usr/bin/env bash
-# 一键启动 GPT 批量注册 Web 控制台
+# 启动后端 API 服务（前端请单独 cd web && npm run dev）
 set -e
 cd "$(dirname "$0")"
 
-# 首次运行：构建前端
-if [ ! -d web/dist ]; then
-  echo "[首次] 安装并构建前端 ..."
-  (cd web && npm install && npm run build)
-fi
-
 PORT="${PORT:-3100}"
 
-# 先杀后启：干掉所有旧的 server 进程，避免多进程抢端口、请求打到旧进程跑旧代码(改后端不生效的元凶)
-# 注意:npx tsx 会派生多个 node 子进程,只按端口 kill 会漏掉→用 pkill -f 兜底杀全。
 pkill -9 -f "server/index.ts" 2>/dev/null || true
 pkill -9 -f "tsx server" 2>/dev/null || true
 sleep 1
@@ -23,7 +15,8 @@ if [ -n "$OLD_PIDS" ]; then
 fi
 
 echo "============================================================"
-echo "  GPT 批量注册控制台:  http://localhost:${PORT}"
+echo "  后端 API:  http://localhost:${PORT}"
+echo "  前端开发:  cd web && npm run dev"
 echo "  (Ctrl+C 退出)"
 echo "============================================================"
 MAILCOM_HEADLESS=1 exec npx tsx server/index.ts
