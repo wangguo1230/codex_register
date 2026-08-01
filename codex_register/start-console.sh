@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 一键启动：安装依赖 → 构建前端 → 后台起 Vite 热更新 → 前台起后端
+# 一键启动：安装依赖 → 后台起 Vite → 前台起后端
 set -e
 cd "$(dirname "$0")"
 
@@ -9,12 +9,10 @@ PORT="${PORT:-3100}"
 echo "[依赖] 检查并安装后端依赖 ..."
 npm install --yes 2>&1 | tail -1
 
-# 安装前端依赖 + 构建
+# 安装前端依赖
 echo "[依赖] 检查并安装前端依赖 ..."
 cd web
 npm install --yes 2>&1 | tail -1
-echo "[构建] 构建前端 ..."
-npx vite build
 cd ..
 
 # 清理旧进程
@@ -27,15 +25,20 @@ if [ -n "$OLD_PIDS" ]; then
   kill -9 $OLD_PIDS 2>/dev/null || true; sleep 1
 fi
 
+# 删除旧构建产物，避免后端托管过期的静态文件
+rm -rf web/dist
+
 echo "============================================================"
 echo "  后端 API:  http://localhost:${PORT}"
 echo "  前端开发:  http://localhost:5173"
 echo "  (Ctrl+C 退出)"
 echo "============================================================"
 
-# 后台启动前端 Vite 热更新
-MAILCOM_HEADLESS=1 npx --yes vite --host 2>/dev/null &
+# 后台启动前端 Vite
+cd web
+MAILCOM_HEADLESS=1 npx --yes vite --host &
 VITE_PID=$!
+cd ..
 trap "kill $VITE_PID 2>/dev/null" EXIT
 
 # 前台启动后端
