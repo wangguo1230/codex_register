@@ -36,7 +36,7 @@ echo "============================================================"
 
 # 后台启动前端 Vite
 cd web
-MAILCOM_HEADLESS=1 npx --yes vite --host &
+MAILCOM_HEADLESS=1 npx --yes vite &
 VITE_PID=$!
 cd ..
 trap "kill $VITE_PID 2>/dev/null" EXIT
