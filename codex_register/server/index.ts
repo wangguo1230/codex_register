@@ -779,7 +779,7 @@ function runRtWorker(acc, preferPhone) {
         const tmpFile = path.join(tmpDir, `mc-${acc.id}.txt`);
         writeFileSync(tmpFile, `${acc.email}----${acc.password}\n`, "utf8");
         logAcct(acc.id, `[rt] 启动 worker 获取 refresh_token${preferPhone ? `(复用绑定号 +${preferPhone})` : ""}…`);
-        const child = spawn(CHAT_TSX_BIN, ["src/worker-rt.ts"], {
+        const child = spawn(CHAT_TSX_BIN, ["src/worker-rt.ts"], { shell: IS_WIN,
             cwd: CHAT_ROOT,
             env: {
                 ...process.env,
@@ -797,6 +797,7 @@ function runRtWorker(acc, preferPhone) {
         });
         let buf = "";
         let result = null;
+        child.on("error", (e) => { logAcct(acc.id, `[rt] worker 启动失败: ${e?.message || e}`); resolve({ok: false, error: String(e?.message || e)}); });
         child.stdout.on("data", (d) => {
             buf += d.toString();
             let idx;
@@ -843,7 +844,7 @@ function runReloginAtWorker(acc) {
         writeFileSync(tmpFile, `${acc.email}----${acc.password}\n`, "utf8");
         logAcct(acc.id, "[at] 走浏览器登录流程重新获取 at(headed,约1-2分钟)…");
         const child = spawn(CHAT_TSX_BIN, ["src/worker-register-browser.ts"], {
-            cwd: CHAT_ROOT,
+            shell: IS_WIN, cwd: CHAT_ROOT,
             env: {
                 ...process.env,
                 REG_EMAIL: acc.email,
@@ -858,6 +859,7 @@ function runReloginAtWorker(acc) {
             },
         });
         let buf = "", result = null;
+        child.on("error", (e) => logAcct(acc.id, `[relogin-at] worker 启动失败: ${e?.message || e}`));
         child.stdout.on("data", (d) => {
             buf += d.toString(); let idx;
             while ((idx = buf.indexOf("\n")) >= 0) {
@@ -992,7 +994,12 @@ app.post("/api/control/test-rt", async (req, res) => {
 });
 
 // ---------- 测聊天(session 注入 + 真浏览器发一条消息，子进程) ----------
-const CHAT_TSX_BIN = path.resolve(__dirname, "..", "node_modules", ".bin", "tsx");
+const IS_WIN = process.platform === "win32";
+const CHAT_TSX_BIN = (() => {
+    const local = path.resolve(__dirname, "..", "node_modules", ".bin", "tsx" + (IS_WIN ? ".cmd" : ""));
+    if (existsSync(local)) return local;
+    return "tsx";
+})();
 const CHAT_ROOT = path.resolve(__dirname, "..");
 function runChatWorker(acc, message) {
     return new Promise(async (resolve) => {
@@ -1005,11 +1012,12 @@ function runChatWorker(acc, message) {
             return acc.auth_file || "";
         })();
         const child = spawn(CHAT_TSX_BIN, ["src/worker-chat.ts"], {
-            cwd: CHAT_ROOT,
+            shell: IS_WIN, cwd: CHAT_ROOT,
             env: {...process.env, CHAT_AUTH_FILE: chatAuthFile, CHAT_MESSAGE: message || "", PROXY_URL: scheduler.regProxy || ""},
         });
         let buf = "";
         let result = null;
+        child.on("error", (e) => logAcct(acc.id, `[chat] worker 启动失败: ${e?.message || e}`));
         child.stdout.on("data", (d) => {
             buf += d.toString();
             let idx;
@@ -1352,7 +1360,7 @@ function runReloginAtWorkerStandalone(email, password): Promise<{ok: boolean; ac
         broadcast("log", {id: 0, line: `[批量AT] ${email}: 走浏览器登录获取 at…`, ts: Date.now()});
         const mb = await db.getMailboxByEmail?.(email);
         const child = spawn(CHAT_TSX_BIN, ["src/worker-register-browser.ts"], {
-            cwd: CHAT_ROOT,
+            shell: IS_WIN, cwd: CHAT_ROOT,
             env: {
                 ...process.env,
                 REG_EMAIL: email,
@@ -1366,6 +1374,7 @@ function runReloginAtWorkerStandalone(email, password): Promise<{ok: boolean; ac
             },
         });
         let buf = "", result = null;
+        child.on("error", (e) => { broadcast("log", {id: 0, line: `[批量AT] ${email}: worker 启动失败: ${e?.message || e}`, ts: Date.now()}); resolve({ok: false, reason: String(e?.message || e)}); });
         child.stdout.on("data", (d) => {
             buf += d.toString(); let idx;
             while ((idx = buf.indexOf("\n")) >= 0) {
@@ -1446,7 +1455,7 @@ function runRtWorkerStandalone(email, password): Promise<{ok: boolean; rt?: stri
         const mb = await db.getMailboxByEmail?.(email);
         // 用独立脚本(不带 smsBroker),跳过 add-phone
         const child = spawn(CHAT_TSX_BIN, ["scripts/worker-rt-nosms.ts"], {
-            cwd: CHAT_ROOT,
+            shell: IS_WIN, cwd: CHAT_ROOT,
             env: {
                 ...process.env,
                 REG_EMAIL: email,
@@ -1460,6 +1469,7 @@ function runRtWorkerStandalone(email, password): Promise<{ok: boolean; rt?: stri
             },
         });
         let buf = "", result = null;
+        child.on("error", (e) => resolve({ok: false, reason: String(e?.message || e)}));
         child.stdout.on("data", (d) => {
             buf += d.toString(); let idx;
             while ((idx = buf.indexOf("\n")) >= 0) {

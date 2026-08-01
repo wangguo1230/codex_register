@@ -12,7 +12,12 @@ import {resolveEngine} from "./domain/register-engine.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const CODEX_ROOT = path.resolve(__dirname, "..");
-const TSX_BIN = path.resolve(CODEX_ROOT, "node_modules", ".bin", "tsx");
+const IS_WIN = process.platform === "win32";
+const TSX_BIN = (() => {
+    const local = path.resolve(CODEX_ROOT, "node_modules", ".bin", "tsx" + (IS_WIN ? ".cmd" : ""));
+    if (existsSync(local)) return local;
+    return "tsx";
+})();
 const EVENT_PREFIX = "@@EVENT@@";
 const DAILY_FILE = path.resolve(CODEX_ROOT, "data", "daily.json"); // 定时任务配置+统计持久化
 const SETTINGS_FILE = path.resolve(CODEX_ROOT, "data", "settings.json"); // 运行时配置持久化(前端改的开关/代理/上限等)
@@ -214,7 +219,7 @@ class Scheduler extends EventEmitter {
         // 注册知识收敛在引擎:调度器只管进程/并发/事件(通用)。按账号所属域选引擎。
         const engine = resolveEngine(domain);
         const {script, env} = engine.buildSpawn(acc, this, tmpFile);
-        const child = spawn(TSX_BIN, [script], {cwd: CODEX_ROOT, env: {...process.env, ...env}});
+        const child = spawn(TSX_BIN, [script], {cwd: CODEX_ROOT, env: {...process.env, ...env}, shell: IS_WIN});
         const info = {child, tmpFile, gotResult: false, engine, domain, id: acc.id, mailboxId: acc.mailbox_id};
         this.running.set(runId, info);
         if (domain === "claude") this.emit("claude", {stats: await db.claudeStats()});
