@@ -292,11 +292,11 @@ app.post("/api/control/claude-xray", (req, res) => {
     } catch (e: any) { res.status(400).json({error: String(e?.message ?? e)}); }
 });
 app.post("/api/control/claude-xray/stop", (req, res) => { stopXray("claude"); scheduler.claudeXrayVless = ""; scheduler.saveSettings(); res.json({ok: true, xray: xrayStatus("claude")}); });
-// 删除 Claude 账号(keepMailbox 随全局开关:连带删邮箱 / 退回 free 池)
+// 删除 Claude 账号(始终软删邮箱)
 app.delete("/api/claude/accounts/:id", async (req, res) => {
     const id = Number(req.params.id);
     if (scheduler.isRunning(id, "claude")) return res.status(409).json({error: "运行中，无法删除"});
-    await db.deleteClaudeAccount(id, {keepMailbox: !scheduler.deleteMailboxWithAccount});
+    await db.deleteClaudeAccount(id);
     broadcast("claude", {stats: await db.claudeStats()}); broadcast("mailboxes", {stats: await db.mailboxStats()});
     res.json({ok: true});
 });
@@ -313,11 +313,11 @@ app.post("/api/claude/accounts/:id/retry", async (req, res) => {
 });
 // Claude 批次列表(筛选用)
 app.get("/api/claude/batches", async (req, res) => res.json(await db.claudeBatches()));
-// Claude 批量删除(运行中跳过;keepMailbox 随全局开关)
+// Claude 批量删除(运行中跳过;始终软删邮箱)
 app.post("/api/claude/batch-delete", async (req, res) => {
     const ids = Array.isArray(req.body?.ids) ? req.body.ids.map(Number) : [];
     let n = 0, skipped = 0;
-    for (const id of ids) { if (scheduler.isRunning(id, "claude")) { skipped += 1; continue; } try { await db.deleteClaudeAccount(id, {keepMailbox: !scheduler.deleteMailboxWithAccount}); n += 1; } catch { /* ignore */ } }
+    for (const id of ids) { if (scheduler.isRunning(id, "claude")) { skipped += 1; continue; } try { await db.deleteClaudeAccount(id); n += 1; } catch { /* ignore */ } }
     broadcast("claude", {stats: await db.claudeStats()}); broadcast("mailboxes", {stats: await db.mailboxStats()});
     res.json({ok: true, count: n, skipped});
 });
@@ -479,7 +479,7 @@ app.post("/api/accounts/batch-delete", async (req, res) => {
     let n = 0, skipped = 0;
     for (const id of ids) {
         if (scheduler.isRunning(id)) { skipped += 1; continue; } // 运行中不删
-        try { await db.deleteAccount(id, {keepMailbox: !scheduler.deleteMailboxWithAccount}); n += 1; } catch (_) { /* ignore */ }
+        try { await db.deleteAccount(id); n += 1; } catch (_) { /* ignore */ }
     }
     broadcast("snapshot", await db.listAccounts());
     broadcast("stats", await db.stats());
@@ -639,7 +639,7 @@ app.post("/api/tools/mail-check", async (req, res) => {
 app.delete("/api/accounts/:id", async (req, res) => {
     const id = Number(req.params.id);
     if (scheduler.isRunning(id)) return res.status(409).json({error: "运行中，无法删除"});
-    await db.deleteAccount(id, {keepMailbox: !scheduler.deleteMailboxWithAccount});
+    await db.deleteAccount(id);
     broadcast("snapshot", await db.listAccounts());
     broadcast("stats", await db.stats());
     broadcast("mailboxes", {stats: await db.mailboxStats()}); // 邮箱可能退回 free 池 → 刷新邮箱管理
@@ -670,10 +670,9 @@ app.post("/api/control/engine", (req, res) => {
     if (e === "http" || e === "browser") { scheduler.regEngine = e; scheduler.saveSettings(); }
     res.json({ok: true, regEngine: scheduler.regEngine});
 });
-// 删 GPT 账号时是否连带删邮箱(默认删;关=邮箱退回 free 池,保留在邮箱管理可重分配/纯管理)
-app.post("/api/control/delete-mailbox", (req, res) => {
-    if (typeof req.body?.enabled === "boolean") { scheduler.deleteMailboxWithAccount = req.body.enabled; scheduler.saveSettings(); }
-    res.json({ok: true, deleteMailboxWithAccount: scheduler.deleteMailboxWithAccount});
+// delete-mailbox 开关已废弃，所有删除一律软删邮箱
+app.post("/api/control/delete-mailbox", (_req, res) => {
+    res.json({ok: true});
 });
 // 注册成功后是否额外走 codex OAuth 拿可续期 rt(强制 add-phone 接码，有成本)
 app.post("/api/control/rt", (req, res) => {

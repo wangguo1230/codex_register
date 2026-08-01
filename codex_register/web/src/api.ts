@@ -209,8 +209,6 @@ export const api = {
     setRt: (enabled: boolean) => j<{rtEnabled: boolean}>("/api/control/rt", {method: "POST", body: JSON.stringify({enabled})}),
     setBit: (enabled: boolean) => j<{bitBrowser: boolean}>("/api/control/bit", {method: "POST", body: JSON.stringify({enabled})}),
     setEngine: (engine: "http" | "browser") => j<{regEngine: string}>("/api/control/engine", {method: "POST", body: JSON.stringify({engine})}),
-    // 删 GPT 账号时是否连带删邮箱(默认删;关=邮箱退回 free 池保留在邮箱管理)
-    setDeleteMailbox: (enabled: boolean) => j<{deleteMailboxWithAccount: boolean}>("/api/control/delete-mailbox", {method: "POST", body: JSON.stringify({enabled})}),
     setDaily: (cfg: Partial<{enabled: boolean; hour: number; items: {chat: boolean; rt: boolean; at: boolean}}>) => j<{daily: Daily}>("/api/control/daily", {method: "POST", body: JSON.stringify(cfg)}),
     runDaily: () => j<{started: boolean; accounts: number}>("/api/control/daily/run", {method: "POST", body: JSON.stringify({})}),
     setMailSeparator: (separator: string) => j<{mailSeparator: string}>("/api/control/mail-separator", {method: "POST", body: JSON.stringify({separator})}),
@@ -233,7 +231,7 @@ export const api = {
     batchTestRt: (ids: number[], acquire = false) => j<{count: number}>("/api/control/test-rt", {method: "POST", body: JSON.stringify({ids, acquire})}),
     batchTestChat: (ids: number[]) => j<{count: number}>("/api/control/test-chat", {method: "POST", body: JSON.stringify({ids})}),
     retryFailed: () => j("/api/control/retry-failed", {method: "POST"}),
-    state: () => j<{state: {paused: boolean; pausedClaude?: boolean; claudeProxy?: string; claudeXrayVless?: string; claudeXray?: XrayStatus; regProxyPort?: number; claudeProxyPort?: number; runningClaude?: number[]; concurrency: number; otpSingle: boolean; simulateChat: boolean; smsEnabled: boolean; rtEnabled: boolean; bitBrowser?: boolean; deleteMailboxWithAccount?: boolean; smsMaxBind: number; regEngine: string; daily: Daily; xray: XrayStatus; smsLinkTemplate: string; regProxy: string; mailProxy: string; mailSeparator?: string; xrayBinPath?: string; xrayVless?: string; pwConcurrency?: number; running: number[]; batchPw?: {running: boolean; done: number; total: number}}; stats: Stats}>("/api/state"),
+    state: () => j<{state: {paused: boolean; pausedClaude?: boolean; claudeProxy?: string; claudeXrayVless?: string; claudeXray?: XrayStatus; regProxyPort?: number; claudeProxyPort?: number; runningClaude?: number[]; concurrency: number; otpSingle: boolean; simulateChat: boolean; smsEnabled: boolean; rtEnabled: boolean; bitBrowser?: boolean; smsMaxBind: number; regEngine: string; daily: Daily; xray: XrayStatus; smsLinkTemplate: string; regProxy: string; mailProxy: string; mailSeparator?: string; xrayBinPath?: string; xrayVless?: string; pwConcurrency?: number; running: number[]; batchPw?: {running: boolean; done: number; total: number}}; stats: Stats}>("/api/state"),
     // ★统一导出(合并原下载菜单+批量导出)。范围×scope×格式×标记已售出一站式;POST 返回纯文本供 blob 下载。
     //   范围:ids(选中/当前筛选) 或 batch(按批次) 或都不传(全部成功号)。
     exportFull: async (opts: {format: "full" | "at" | "session" | "jsonl" | "csv"; scope?: "all" | "hasRt" | "atOnly"; batch?: string; ids?: number[]; markSold?: boolean}): Promise<string> => {

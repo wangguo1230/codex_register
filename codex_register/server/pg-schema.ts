@@ -197,6 +197,9 @@ export async function ensureSchema() {
         await client.query(`ALTER TABLE claude_accounts ADD COLUMN IF NOT EXISTS instance_id TEXT DEFAULT ''`);
         await client.query(`ALTER TABLE sms_pool ADD COLUMN IF NOT EXISTS claimed_by TEXT DEFAULT ''`);
 
+        // 邮箱软删除
+        await client.query(`ALTER TABLE mailboxes ADD COLUMN IF NOT EXISTS deleted_at BIGINT DEFAULT 0`);
+
         console.log("[pg] Schema 已就绪");
     } finally {
         client.release();

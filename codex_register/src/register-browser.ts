@@ -249,7 +249,20 @@ export async function registerViaBrowser(email, {password = "", proxyUrl = "", h
                 const nameOk = await fillField(page, nameSel, name, log, "全名");
 
                 // 检测页面类型：年龄 input 还是生日(select/date)
-                let ageOk = await fillField(page, ageSel, age, log, "年龄");
+                // type=number + React Aria 受控组件需要逐字符输入，fill() 不触发 React 状态更新
+                let ageOk = false;
+                for (const sel of ageSel) {
+                    try {
+                        const el = typeof sel === "function" ? sel() : page.locator(sel).first();
+                        if (await el.count() && await el.isVisible().catch(() => false)) {
+                            await el.click({timeout: 3000}).catch(() => {});
+                            await el.fill("");
+                            await el.pressSequentially(age, {delay: 50});
+                            await el.press("Tab").catch(() => {});
+                            ageOk = true; break;
+                        }
+                    } catch { /* next */ }
+                }
 
                 if (!ageOk) {
                     // 尝试生日模式：select[name*=month/day/year] 或 input[type=date] 或多个 select

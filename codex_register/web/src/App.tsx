@@ -59,7 +59,6 @@ export default function App() {
     const [smsEnabled, setSmsEnabled] = useState(true);
     const [rtEnabled, setRtEnabled] = useState(false);
     const [bitBrowser, setBitBrowser] = useState(false); // 比特浏览器:每号独立指纹窗口
-    const [delMailbox, setDelMailbox] = useState(true); // 删账号时是否连带删邮箱(关=邮箱退回 free 池)
     const [daily, setDaily] = useState<Daily | null>(null);
     const [showDaily, setShowDaily] = useState(false);
     const [xray, setXray] = useState<XrayStatus | null>(null);
@@ -136,7 +135,7 @@ export default function App() {
 
     // 初次加载 + SSE
     useEffect(() => {
-        api.state().then((s) => { setPaused(s.state.paused); setConcurrency(s.state.concurrency); setOtpSingle(s.state.otpSingle); setChatSim(s.state.simulateChat); setSmsEnabled(s.state.smsEnabled); setRtEnabled(s.state.rtEnabled); setDaily(s.state.daily); setXray(s.state.xray); setRegEngine(s.state.regEngine || "http"); setBitBrowser(!!s.state.bitBrowser); setDelMailbox(s.state.deleteMailboxWithAccount !== false); setSmsLinkTemplate(s.state.smsLinkTemplate || ""); setSmsMaxBind(s.state.smsMaxBind ?? 3); setRegProxy(s.state.regProxy || ""); setMailProxy(s.state.mailProxy || ""); setRegPortInput(String(s.state.regProxyPort ?? 10809)); setClaudePortInput(String(s.state.claudeProxyPort ?? 10810)); setXrayBinPath(s.state.xrayBinPath || ""); if (s.state.xrayVless) setVlessInput(s.state.xrayVless); setStats(s.stats); }).catch(() => {});
+        api.state().then((s) => { setPaused(s.state.paused); setConcurrency(s.state.concurrency); setOtpSingle(s.state.otpSingle); setChatSim(s.state.simulateChat); setSmsEnabled(s.state.smsEnabled); setRtEnabled(s.state.rtEnabled); setDaily(s.state.daily); setXray(s.state.xray); setRegEngine(s.state.regEngine || "http"); setBitBrowser(!!s.state.bitBrowser); setSmsLinkTemplate(s.state.smsLinkTemplate || ""); setSmsMaxBind(s.state.smsMaxBind ?? 3); setRegProxy(s.state.regProxy || ""); setMailProxy(s.state.mailProxy || ""); setRegPortInput(String(s.state.regProxyPort ?? 10809)); setClaudePortInput(String(s.state.claudeProxyPort ?? 10810)); setXrayBinPath(s.state.xrayBinPath || ""); if (s.state.xrayVless) setVlessInput(s.state.xrayVless); setStats(s.stats); }).catch(() => {});
         api.listAccounts().then(setAccounts).catch(() => {});
         // 批次数据来自数据库(筛选/导出用;导入已迁至邮箱管理)
         api.batches().then(setBatches).catch(() => {});
@@ -722,14 +721,10 @@ export default function App() {
                             const ids = selectedIds.size ? [...selectedIds] : filtered.map((a) => a.id);
                             if (!ids.length) { notify("无可删除的账号"); return; }
                             const who = selectedIds.size ? `选中的 ${ids.length} 个` : `当前列表全部 ${ids.length} 个`;
-                            const mbNote = delMailbox ? "邮箱将一并删除" : "邮箱将退回邮箱管理(free 池)";
-                            if (!window.confirm(`确认删除${who}账号？${mbNote}。运行中的会跳过。`)) return;
+                            if (!window.confirm(`确认删除${who}账号？邮箱将一并删除。运行中的会跳过。`)) return;
                             try { const r = await api.batchDelete(ids); setSelectedIds(new Set()); await api.listAccounts().then(setAccounts); notify(`已删除 ${r.count} 个${r.skipped ? `（跳过运行中 ${r.skipped}）` : ""}`); }
                             catch (e: any) { notify(e.message); }
                         }} title="删除选中(或当前列表全部)的号" className="px-2 py-1 bg-red-600 text-white rounded text-xs">🗑 删除选中</button>
-                        <label className="inline-flex items-center gap-1 text-xs text-gray-500 cursor-pointer" title="开=删账号连带删邮箱;关=只删 GPT 业务记录,邮箱退回 free 池保留在邮箱管理,可重新分配/纯管理">
-                            <input type="checkbox" checked={delMailbox} onChange={(e) => { const v = e.target.checked; api.setDeleteMailbox(v).then((r) => { setDelMailbox(r.deleteMailboxWithAccount); notify(r.deleteMailboxWithAccount ? "删账号将连带删邮箱" : "删账号时邮箱退回 free 池(保留在邮箱管理)"); }).catch((err: any) => notify(err.message)); }} />连带删邮箱
-                        </label>
                         {selectedIds.size > 0 && <button onClick={() => setSelectedIds(new Set())} className="text-gray-400 hover:underline text-xs">清空</button>}
                     </div>
                     <div ref={scrollRef} onScroll={(e) => setScrollTop((e.target as HTMLDivElement).scrollTop)} className="flex-1 overflow-auto min-h-0">
@@ -895,7 +890,7 @@ export default function App() {
                                     <button onClick={() => api.getSession(selected.id).then((r) => { navigator.clipboard?.writeText(JSON.stringify(r.session)); notify("session json 已复制"); }).catch((e) => notify(`复制失败: ${e.message}`))} disabled={!selected.auth_file} title={selected.auth_file ? "复制该号 session json(可恢复登录态,同导出 session 格式)" : "无 at 授权文件，没有 session"} className={`px-2.5 py-1 rounded text-xs text-white ${selected.auth_file ? "bg-cyan-600 hover:bg-cyan-700" : "bg-gray-300 cursor-not-allowed"}`}>📋 复制session</button>
                                     {(selected.status === "failed" || selected.status === "success") &&
                                         <button onClick={() => api.retry(selected.id).then(() => notify("已重新排队")).catch((e) => notify(e.message))} className="px-2.5 py-1 bg-indigo-500 hover:bg-indigo-600 text-white rounded text-xs">重跑</button>}
-                                    <button onClick={() => { if (!window.confirm(`删除 ${selected.email}？${delMailbox ? "邮箱将一并删除" : "邮箱将退回邮箱管理(free 池)"}。`)) return; api.remove(selected.id).then(() => { setSelectedId(null); setLogMode("all"); api.listAccounts().then(setAccounts); }).catch((e) => notify(e.message)); }} className="px-2.5 py-1 bg-red-500 hover:bg-red-600 text-white rounded text-xs">删除</button>
+                                    <button onClick={() => { if (!window.confirm(`删除 ${selected.email}？邮箱将一并删除。`)) return; api.remove(selected.id).then(() => { setSelectedId(null); setLogMode("all"); api.listAccounts().then(setAccounts); }).catch((e) => notify(e.message)); }} className="px-2.5 py-1 bg-red-500 hover:bg-red-600 text-white rounded text-xs">删除</button>
                                 </div>
                               </>
                             ))}

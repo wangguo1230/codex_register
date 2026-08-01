@@ -113,19 +113,12 @@ export async function resetAllFailed() {
     await query(`UPDATE gpt_accounts SET status='pending', error='', started_at=NULL, finished_at=NULL WHERE status='failed' AND error NOT LIKE '%account_deactivated%'`);
 }
 
-export async function deleteAccount(id, { keepMailbox = false } = {}) {
+export async function deleteAccount(id) {
     return withTransaction(async (client) => {
         const { rows: [row] } = await client.query(`SELECT mailbox_id FROM gpt_accounts WHERE id=$1`, [id]);
         await client.query(`DELETE FROM logs WHERE account_id=$1`, [id]);
         await client.query(`DELETE FROM gpt_accounts WHERE id=$1`, [id]);
-        if (row) {
-            if (keepMailbox) {
-                await client.query(`UPDATE mailboxes SET usage='free' WHERE id=$1`, [row.mailbox_id]);
-            } else {
-                await client.query(`DELETE FROM mailboxes WHERE id=$1`, [row.mailbox_id]);
-                await client.query(`DELETE FROM mailbox_logs WHERE mailbox_id=$1`, [row.mailbox_id]);
-            }
-        }
+        if (row) await softDeleteMailbox(client, row.mailbox_id);
     });
 }
 
@@ -309,20 +302,27 @@ export async function smsStats() {
     return out;
 }
 
+// ---- 邮箱软删除辅助 ----
+
+async function softDeleteMailbox(client, mailboxId) {
+    if (!mailboxId) return;
+    await client.query(`UPDATE mailboxes SET deleted_at=$1, usage='deleted' WHERE id=$2 AND deleted_at=0`, [Date.now(), mailboxId]);
+}
+
 // ---- 邮箱资源池 ----
 
 export async function listMailboxes(usage?) {
     if (usage) {
-        const { rows } = await query(`SELECT * FROM mailboxes WHERE usage=$1 ORDER BY id`, [usage]);
+        const { rows } = await query(`SELECT * FROM mailboxes WHERE usage=$1 AND deleted_at=0 ORDER BY id`, [usage]);
         return rows;
     }
-    const { rows } = await query(`SELECT * FROM mailboxes ORDER BY id`);
+    const { rows } = await query(`SELECT * FROM mailboxes WHERE deleted_at=0 ORDER BY id`);
     return rows;
 }
 
 export async function mailboxStats() {
     const out = { free: 0, hold: 0, gpt: 0, claude: 0, total: 0 };
-    const { rows } = await query(`SELECT usage, COUNT(*)::int AS n FROM mailboxes GROUP BY usage`);
+    const { rows } = await query(`SELECT usage, COUNT(*)::int AS n FROM mailboxes WHERE deleted_at=0 GROUP BY usage`);
     for (const row of rows) {
         if (out[row.usage] !== undefined) out[row.usage] = row.n;
         out.total += row.n;
@@ -332,7 +332,7 @@ export async function mailboxStats() {
 
 export async function setMailboxUsage(id, usage) {
     if (usage !== "free" && usage !== "hold") return { ok: false, error: "只能在 free/hold 间切换" };
-    const res = await query(`UPDATE mailboxes SET usage=$1 WHERE id=$2 AND usage IN ('free','hold')`, [usage, id]);
+    const res = await query(`UPDATE mailboxes SET usage=$1 WHERE id=$2 AND usage IN ('free','hold') AND deleted_at=0`, [usage, id]);
     return { ok: res.rowCount > 0 };
 }
 
@@ -341,7 +341,7 @@ export async function setMailboxesUsage(ids, usage) {
     let n = 0;
     await withTransaction(async (client) => {
         for (const id of (ids || [])) {
-            const res = await client.query(`UPDATE mailboxes SET usage=$1 WHERE id=$2 AND usage IN ('free','hold')`, [usage, id]);
+            const res = await client.query(`UPDATE mailboxes SET usage=$1 WHERE id=$2 AND usage IN ('free','hold') AND deleted_at=0`, [usage, id]);
             n += res.rowCount;
         }
     });
@@ -349,12 +349,12 @@ export async function setMailboxesUsage(ids, usage) {
 }
 
 export async function getMailbox(id) {
-    const { rows } = await query(`SELECT * FROM mailboxes WHERE id=$1`, [id]);
+    const { rows } = await query(`SELECT * FROM mailboxes WHERE id=$1 AND deleted_at=0`, [id]);
     return rows[0] || undefined;
 }
 
 export async function getMailboxByEmail(email) {
-    const { rows } = await query(`SELECT * FROM mailboxes WHERE email=$1`, [String(email).toLowerCase()]);
+    const { rows } = await query(`SELECT * FROM mailboxes WHERE email=$1 AND deleted_at=0`, [String(email).toLowerCase()]);
     return rows[0] || undefined;
 }
 
@@ -366,11 +366,20 @@ export async function importFreeMailboxes(rows, grp = "", usage = "free", provid
     return withTransaction(async (client) => {
         let inserted = 0;
         for (const r of rows) {
+            const email = r.email.toLowerCase();
             const res = await client.query(
                 `INSERT INTO mailboxes(email,password,provider,usage,grp,created_at) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(email) DO NOTHING`,
-                [r.email.toLowerCase(), r.password, prov, u, g, now]
+                [email, r.password, prov, u, g, now]
             );
-            inserted += res.rowCount;
+            if (res.rowCount) {
+                inserted++;
+            } else {
+                const upd = await client.query(
+                    `UPDATE mailboxes SET deleted_at=0, usage=$1, password=$2, provider=$3, grp=$4 WHERE email=$5 AND deleted_at>0`,
+                    [u, r.password, prov, g, email]
+                );
+                if (upd.rowCount) inserted++;
+            }
         }
         return { inserted, skipped: rows.length - inserted, total: rows.length };
     });
@@ -379,7 +388,7 @@ export async function importFreeMailboxes(rows, grp = "", usage = "free", provid
 export async function allocateMailbox(usage) {
     return withTransaction(async (client) => {
         const { rows: [mb] } = await client.query(
-            `SELECT * FROM mailboxes WHERE usage='free' ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED`
+            `SELECT * FROM mailboxes WHERE usage='free' AND deleted_at=0 ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED`
         );
         if (!mb) return null;
         await client.query(`UPDATE mailboxes SET usage=$1 WHERE id=$2`, [usage, mb.id]);
@@ -396,8 +405,8 @@ export async function allocateMailboxesTo(usage, count, batch = "", sourceGrp = 
         let alloc = 0;
         for (let i = 0; i < n; i++) {
             const pickSql = sourceGrp == null
-                ? `SELECT id, grp FROM mailboxes WHERE usage='free' ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED`
-                : `SELECT id, grp FROM mailboxes WHERE usage='free' AND grp=$1 ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED`;
+                ? `SELECT id, grp FROM mailboxes WHERE usage='free' AND deleted_at=0 ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED`
+                : `SELECT id, grp FROM mailboxes WHERE usage='free' AND deleted_at=0 AND grp=$1 ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED`;
             const pickParams = sourceGrp == null ? [] : [sourceGrp];
             const { rows: [mb] } = await client.query(pickSql, pickParams);
             if (!mb) break;
@@ -424,10 +433,10 @@ export async function allocateMailboxIdsTo(usage, ids, batch = "") {
         let allocated = 0, skipped = 0;
         for (const id of arr) {
             const { rows: [mb] } = await client.query(
-                `SELECT id, grp FROM mailboxes WHERE id=$1 AND usage='free' FOR UPDATE SKIP LOCKED`, [id]
+                `SELECT id, grp FROM mailboxes WHERE id=$1 AND usage='free' AND deleted_at=0 FOR UPDATE SKIP LOCKED`, [id]
             );
             if (!mb) { skipped++; continue; }
-            const res = await client.query(`UPDATE mailboxes SET usage=$1 WHERE id=$2 AND usage='free'`, [usage, mb.id]);
+            const res = await client.query(`UPDATE mailboxes SET usage=$1 WHERE id=$2 AND usage='free' AND deleted_at=0`, [usage, mb.id]);
             if (!res.rowCount) { skipped++; continue; }
             const b = String(batch || mb.grp || "");
             if (usage === "gpt") {
@@ -442,31 +451,25 @@ export async function allocateMailboxIdsTo(usage, ids, batch = "") {
 }
 
 export async function freeMailboxGroups() {
-    const { rows } = await query(`SELECT grp, COUNT(*)::int AS n FROM mailboxes WHERE usage='free' GROUP BY grp ORDER BY grp`);
+    const { rows } = await query(`SELECT grp, COUNT(*)::int AS n FROM mailboxes WHERE usage='free' AND deleted_at=0 GROUP BY grp ORDER BY grp`);
     return rows;
 }
 
 export async function deleteMailbox(id) {
     return withTransaction(async (client) => {
-        const { rows: [g] } = await client.query(`SELECT id FROM gpt_accounts WHERE mailbox_id=$1`, [id]);
-        const { rows: [c] } = await client.query(`SELECT id FROM claude_accounts WHERE mailbox_id=$1`, [id]);
-        if (g || c) return { ok: false, reason: "该邮箱已被业务占用,请从对应业务域删除" };
-        const res = await client.query(`DELETE FROM mailboxes WHERE id=$1`, [id]);
-        return { ok: res.rowCount > 0 };
+        await softDeleteMailbox(client, id);
+        return { ok: true };
     });
 }
 
 export async function batchDeleteMailbox(ids) {
     return withTransaction(async (client) => {
-        let count = 0, skipped = 0;
+        let count = 0;
         for (const id of (ids || [])) {
-            const { rows: [g] } = await client.query(`SELECT id FROM gpt_accounts WHERE mailbox_id=$1`, [id]);
-            const { rows: [c] } = await client.query(`SELECT id FROM claude_accounts WHERE mailbox_id=$1`, [id]);
-            if (g || c) { skipped++; continue; }
-            const res = await client.query(`DELETE FROM mailboxes WHERE id=$1`, [id]);
-            if (res.rowCount) count++;
+            const res = await client.query(`UPDATE mailboxes SET deleted_at=$1, usage='deleted' WHERE id=$2 AND deleted_at=0`, [Date.now(), id]);
+            count += res.rowCount;
         }
-        return { count, skipped };
+        return { count, skipped: 0 };
     });
 }
 
@@ -541,19 +544,12 @@ export async function claudeBatches() {
     return rows;
 }
 
-export async function deleteClaudeAccount(id, { keepMailbox = false } = {}) {
+export async function deleteClaudeAccount(id) {
     return withTransaction(async (client) => {
         const { rows: [row] } = await client.query(`SELECT mailbox_id FROM claude_accounts WHERE id=$1`, [id]);
         await client.query(`DELETE FROM claude_logs WHERE claude_id=$1`, [id]);
         await client.query(`DELETE FROM claude_accounts WHERE id=$1`, [id]);
-        if (row) {
-            if (keepMailbox) {
-                await client.query(`UPDATE mailboxes SET usage='free' WHERE id=$1`, [row.mailbox_id]);
-            } else {
-                await client.query(`DELETE FROM mailboxes WHERE id=$1`, [row.mailbox_id]);
-                await client.query(`DELETE FROM mailbox_logs WHERE mailbox_id=$1`, [row.mailbox_id]);
-            }
-        }
+        if (row) await softDeleteMailbox(client, row.mailbox_id);
     });
 }
 
@@ -697,6 +693,8 @@ export async function removeFromRechargeQueue(ids) {
             const res = await client.query(`DELETE FROM recharge_queue WHERE id=$1`, [id]);
             if (res.rowCount) {
                 await client.query(`UPDATE gpt_accounts SET sold_at=0 WHERE id=$1`, [item.account_id]);
+                const { rows: [gpt] } = await client.query(`SELECT mailbox_id FROM gpt_accounts WHERE id=$1`, [item.account_id]);
+                if (gpt) await softDeleteMailbox(client, gpt.mailbox_id);
                 count++;
             }
         }
