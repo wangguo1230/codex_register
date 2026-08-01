@@ -121,46 +121,54 @@ export async function registerViaBrowser(email, {password = "", proxyUrl = "", h
             catch (e: any) { log(`打开失败(${String(e?.message ?? e).slice(0, 50)})，重试 ${i + 1}/3`); await page.waitForTimeout(3000); }
         }
         if (!opened) throw new Error("多次打开 auth/login 失败(代理/网络不稳，ERR_CONNECTION_CLOSED)");
-        // 等 React hydrate 完成:否则点"继续"会触发浏览器原生 GET 提交(url→?email=、reload 回 login),而非 SPA 进 OTP
-        await page.waitForLoadState("networkidle", {timeout: 12000}).catch(() => {});
-        await page.waitForTimeout(3500);
+        // 填邮箱 + 点继续，降级时重载页面重试(最多 3 轮)
+        const LOGIN_MAX_RETRY = 3;
+        for (let loginAttempt = 0; loginAttempt < LOGIN_MAX_RETRY; loginAttempt++) {
+            // 等 React hydrate 完成:否则点"继续"会触发浏览器原生 GET 提交(url→?email=、reload 回 login),而非 SPA 进 OTP
+            await page.waitForLoadState("networkidle", {timeout: 12000}).catch(() => {});
+            await page.waitForTimeout(3500);
 
-        // 1) 邮箱:【直接逐字 pressSequentially】触发 React onChange,确保 value 落地 + "继续"按钮激活。
-        //    (fill 只设 DOM value、不触发 onChange,React 受控组件重渲染会用 state 清空 → value="",继续按钮一直 disabled)
-        const emailEl = page.locator("#email, input[type='email'], input[name='email']").first();
-        try { await emailEl.waitFor({state: "visible", timeout: 20000}); }
-        catch { throw new Error(`邮箱输入框未出现(可能被 CF 拦，url=${page.url().slice(0, 60)})`); }
-        await emailEl.click();
-        await emailEl.pressSequentially(email, {delay: 30});
-        await page.waitForTimeout(600);
-        if ((await emailEl.inputValue().catch(() => "")).trim().toLowerCase() !== email.toLowerCase()) {
-            await emailEl.fill("");
-            await emailEl.pressSequentially(email, {delay: 60}); // 慢一点重试一次
+            // 1) 邮箱:【直接逐字 pressSequentially】触发 React onChange,确保 value 落地 + "继续"按钮激活。
+            const emailEl = page.locator("#email, input[type='email'], input[name='email']").first();
+            try { await emailEl.waitFor({state: "visible", timeout: 20000}); }
+            catch { throw new Error(`邮箱输入框未出现(可能被 CF 拦，url=${page.url().slice(0, 60)})`); }
+            await emailEl.click();
+            await emailEl.pressSequentially(email, {delay: 30});
             await page.waitForTimeout(600);
-        }
-        log(`填邮箱 ${email}(实际 value=${(await emailEl.inputValue().catch(() => "")).slice(0, 40)})，提交`);
-        if (!await clickContinue(page, log)) {
-            await emailEl.press("Enter").catch(() => {}); // 继续点不到则回车提交(SPA)
-        }
-        // 兜底:若点继续触发了浏览器原生 GET 提交(仍在 login 页、未出现验证码/密码框) → 此时 React 已 hydrate,重填邮箱重点一次(SPA 接管进 OTP)
-        await page.waitForTimeout(2500);
-        if (/auth\/login/.test(page.url()) && !(await page.locator('input[autocomplete="one-time-code"], input[type="password"]').first().isVisible().catch(() => false))) {
-            const el2 = page.locator("#email, input[type='email']").first();
-            if (await el2.isVisible().catch(() => false)) {
-                log("疑似原生 GET 提交(仍在 login)，React 已就绪，重填邮箱重点继续…");
-                await el2.click().catch(() => {});
-                await el2.fill("").catch(() => {});
-                await el2.pressSequentially(email, {delay: 30}).catch(() => {});
-                await page.waitForTimeout(1200);
-                await clickContinue(page, log);
+            if ((await emailEl.inputValue().catch(() => "")).trim().toLowerCase() !== email.toLowerCase()) {
+                await emailEl.fill("");
+                await emailEl.pressSequentially(email, {delay: 60});
+                await page.waitForTimeout(600);
             }
-        }
-        // 兜底重试后仍停在 login 首页(社交登录选项在、无 OTP/密码框)=出口 IP 被 chatgpt 降级成原生表单 → 快速失败(别白等),换 IP 重跑
-        await page.waitForTimeout(2000);
-        if (/auth\/login/.test(page.url())
-            && !(await page.locator('input[autocomplete="one-time-code"], input[type="password"]').first().isVisible().catch(() => false))
-            && /Continue with (Google|Apple|phone)|使用\s*(Google|Apple|电话)|Log in or sign up|登录或注册/i.test((await page.innerText("body").catch(() => "")).replace(/\s+/g, " "))) {
-            throw new Error("出口 IP 被 chatgpt 降级为原生表单(停在登录首页、非 SPA)，此 IP 注册走不通 → 换 IP 重跑");
+            log(`填邮箱 ${email}(实际 value=${(await emailEl.inputValue().catch(() => "")).slice(0, 40)})，提交`);
+            if (!await clickContinue(page, log)) {
+                await emailEl.press("Enter").catch(() => {});
+            }
+            // 兜底:若点继续触发了浏览器原生 GET 提交(仍在 login 页、未出现验证码/密码框) → 此时 React 已 hydrate,重填邮箱重点一次
+            await page.waitForTimeout(2500);
+            if (/auth\/login/.test(page.url()) && !(await page.locator('input[autocomplete="one-time-code"], input[type="password"]').first().isVisible().catch(() => false))) {
+                const el2 = page.locator("#email, input[type='email']").first();
+                if (await el2.isVisible().catch(() => false)) {
+                    log("疑似原生 GET 提交(仍在 login)，React 已就绪，重填邮箱重点继续…");
+                    await el2.click().catch(() => {});
+                    await el2.fill("").catch(() => {});
+                    await el2.pressSequentially(email, {delay: 30}).catch(() => {});
+                    await page.waitForTimeout(1200);
+                    await clickContinue(page, log);
+                }
+            }
+            // 检测是否仍停在降级的登录首页
+            await page.waitForTimeout(2000);
+            const stillOnLogin = /auth\/login/.test(page.url())
+                && !(await page.locator('input[autocomplete="one-time-code"], input[type="password"]').first().isVisible().catch(() => false))
+                && /Continue with (Google|Apple|phone)|使用\s*(Google|Apple|电话)|Log in or sign up|登录或注册/i.test((await page.innerText("body").catch(() => "")).replace(/\s+/g, " "));
+            if (!stillOnLogin) break; // 成功进入下一步
+            if (loginAttempt < LOGIN_MAX_RETRY - 1) {
+                log(`降级为原生表单(第 ${loginAttempt + 1}/${LOGIN_MAX_RETRY} 次)，重载页面重试…`);
+                await page.goto(AUTH_URL, {waitUntil: "domcontentloaded", timeout: 60000}).catch(() => {});
+            } else {
+                throw new Error("出口 IP 被 chatgpt 降级为原生表单(重试 " + LOGIN_MAX_RETRY + " 次仍失败)，此 IP 注册走不通 → 换 IP 重跑");
+            }
         }
 
         // 2) 等下一页出现:验证码框 / 密码框 / 已登录(已注册号密码登录可能免 OTP)。轮询 ~20s,兼容注册/登录/慢渲染。
