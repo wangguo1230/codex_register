@@ -31,13 +31,14 @@ export function MailboxPanel({notify}: {notify?: (m: string) => void}) {
     const [busy, setBusy] = useState(false);
     const [selected, setSelected] = useState<Set<number>>(new Set()); // 多选(批量改密)
     const [batchPw, setBatchPw] = useState<BatchPw>({running: false, done: 0, total: 0, ok: 0});
+    const [pwConc, setPwConc] = useState(1); // 改密并发
     const [detailMb, setDetailMb] = useState<Mailbox | null>(null); // 详情弹窗(日志+收件箱)
 
     const toast = (m: string) => notify?.(m);
     const load = () =>
         api.listMailboxes(usageFilter || undefined).then((r) => { setList(r.list); setStats(r.stats); setGroups(r.groups || []); }).catch(() => {});
     useEffect(() => { load(); /* eslint-disable-next-line */ }, [usageFilter]);
-    useEffect(() => { api.state().then((s) => { if (s.state.mailSeparator) setMailSep(s.state.mailSeparator); }).catch(() => {}); }, []);
+    useEffect(() => { api.state().then((s) => { if (s.state.mailSeparator) setMailSep(s.state.mailSeparator); if (s.state.pwConcurrency) setPwConc(s.state.pwConcurrency); }).catch(() => {}); }, []);
     // 实时刷新(邮箱变化/批量改密进度)
     useEffect(() => {
         const off = connectStream((ev, data) => {
@@ -251,7 +252,12 @@ export function MailboxPanel({notify}: {notify?: (m: string) => void}) {
                             <button onClick={stopBatch} style={{padding: "5px 12px", background: "#dc2626", color: "#fff", border: "none", borderRadius: 6, cursor: "pointer"}}>⏹ 停止</button>
                         </>}
                     {!batchPw.running && selCount > 0 && <button onClick={() => setSelected(new Set())} style={{padding: "5px 10px", fontSize: 13}}>清空选择</button>}
-                    <span style={{fontSize: 11, color: "#9ca3af"}}>批量改密=真登录 mail.com 逐个改随机20位,headed 串行、可停止;失败保留原密码并记录试过的新密码。</span>
+                    <label style={{fontSize: 12, color: "#6b7280", display: "inline-flex", alignItems: "center", gap: 3}}>并发
+                        <input type="number" min={1} max={8} value={pwConc} onChange={(e) => setPwConc(Math.max(1, Math.min(8, Number(e.target.value) || 1)))}
+                               onBlur={() => api.setPwConcurrency(pwConc).catch(() => {})}
+                               style={{width: 42, padding: "2px 4px", border: "1px solid #d1d5db", borderRadius: 6, textAlign: "center", fontSize: 12}} />
+                    </label>
+                    <span style={{fontSize: 11, color: "#9ca3af"}}>改密=真登录 mail.com 改随机20位,headed、可停止;失败保留原密码并记录试过的新密码。</span>
                 </div>
             )}
 

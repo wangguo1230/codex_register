@@ -523,7 +523,7 @@ function startBatchPasswd(items, apply, tag = "批量改密", onDone) {
             await waitRegIdle();
         }
         let done = 0, okc = 0;
-        const conc = 1; // 改密涉及 headed Chrome + 验证登录，串行避免大量浏览器堆积
+        const conc = scheduler.pwConcurrency || 1;
         await runPool(items, async (it) => {
             if (batchPwStop) return;
             const np = randomPassword(20);
@@ -578,6 +578,7 @@ app.post("/api/control/batch-passwd/stop", (req, res) => {
     batchPwStop = true;
     res.json({ok: true});
 });
+app.post("/api/control/pw-concurrency", (req, res) => res.json({ok: true, pwConcurrency: scheduler.setPwConcurrency(req.body?.pwConcurrency)}));
 // 打开一个已登录 chatgpt 的真浏览器(注入该号 at 会话 sessionToken + CF cookie),供人工操作;不关闭,用户关窗口即断开。
 const openedBrowsers = new Map(); // id -> browser(防 GC + 支持重开时关旧的)
 app.post("/api/accounts/:id/open-browser", async (req, res) => {

@@ -17,7 +17,7 @@ const EVENT_PREFIX = "@@EVENT@@";
 const DAILY_FILE = path.resolve(CODEX_ROOT, "data", "daily.json"); // 定时任务配置+统计持久化
 const SETTINGS_FILE = path.resolve(CODEX_ROOT, "data", "settings.json"); // 运行时配置持久化(前端改的开关/代理/上限等)
 // 持久化的运行时配置字段(其余如 paused/running 是运行态不存)
-const SETTINGS_KEYS = ["concurrency", "otpSingle", "simulateChat", "regProxy", "mailProxy", "smsEnabled", "smsLinkTemplate", "rtEnabled", "smsMaxBind", "xrayVless", "regEngine", "bitBrowser", "deleteMailboxWithAccount", "claudeProxy", "claudeXrayVless", "regProxyPort", "claudeProxyPort", "mailSeparator", "rechargeBaseUrl", "rechargeAppId", "rechargeApiKey", "rechargeForwardIp", "rechargeConcurrency", "rechargeInterval", "xrayBinPath"];
+const SETTINGS_KEYS = ["concurrency", "otpSingle", "simulateChat", "regProxy", "mailProxy", "smsEnabled", "smsLinkTemplate", "rtEnabled", "smsMaxBind", "xrayVless", "regEngine", "bitBrowser", "deleteMailboxWithAccount", "claudeProxy", "claudeXrayVless", "regProxyPort", "claudeProxyPort", "mailSeparator", "rechargeBaseUrl", "rechargeAppId", "rechargeApiKey", "rechargeForwardIp", "rechargeConcurrency", "rechargeInterval", "xrayBinPath", "pwConcurrency"];
 
 // 定时任务默认配置(含运行统计)。持久化到 data/daily.json，重启保留。
 const DAILY_DEFAULT = {
@@ -65,6 +65,7 @@ class Scheduler extends EventEmitter {
         this.claudeProxyPort = 10810;
         this.mailSeparator = "----";   // 邮箱----密码 分隔符(导入/校验共用)
         this.xrayBinPath = "";         // xray 二进制路径(前端可配;空=自动探测)
+        this.pwConcurrency = 1;        // 邮箱批量改密并发(headed Chrome,默认串行)
         this.running = new Map();      // runId(`${domain}:${id}`) -> { child, tmpFile, gotResult, domain, id, mailboxId, engine }
         this.maintLock = null; // 浏览器维护互斥锁:null=空闲, string=持有者标识(如 "batch-at-relogin")
         this.tmpDir = mkdtempSync(path.join(os.tmpdir(), "codex-reg-"));
@@ -133,6 +134,12 @@ class Scheduler extends EventEmitter {
         return this.concurrency;
     }
 
+    setPwConcurrency(n) {
+        this.pwConcurrency = Math.max(1, Math.min(8, Number(n) || 1));
+        this.saveSettings();
+        return this.pwConcurrency;
+    }
+
     // ---- 域级控制(GPT/Claude 各自暂停/停止,共用同一进程池) ----
     start() { this.paused = false; this.tick(); }          // GPT 开始
     pause() { this.paused = true; }                          // GPT 软暂停(运行中的跑完)
@@ -176,6 +183,7 @@ class Scheduler extends EventEmitter {
 
     state() {
         return {paused: this.paused, pausedClaude: this.pausedClaude, concurrency: this.concurrency, otpSingle: this.otpSingle, simulateChat: this.simulateChat, smsEnabled: this.smsEnabled, smsLinkTemplate: this.smsLinkTemplate, rtEnabled: this.rtEnabled, smsMaxBind: this.smsMaxBind, regEngine: this.regEngine, bitBrowser: this.bitBrowser, deleteMailboxWithAccount: this.deleteMailboxWithAccount, daily: this.daily, regProxy: this.regProxy, mailProxy: this.mailProxy, claudeProxy: this.claudeProxy, claudeXrayVless: this.claudeXrayVless, regProxyPort: this.regProxyPort, claudeProxyPort: this.claudeProxyPort, mailSeparator: this.mailSeparator, xrayBinPath: this.xrayBinPath || "",
+            pwConcurrency: this.pwConcurrency,
             running: [...this.running.values()].filter((i) => i.domain === "gpt").map((i) => i.id),
             runningClaude: [...this.running.values()].filter((i) => i.domain === "claude").map((i) => i.id)};
     }
