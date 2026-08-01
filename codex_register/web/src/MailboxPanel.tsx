@@ -252,11 +252,6 @@ export function MailboxPanel({notify}: {notify?: (m: string) => void}) {
                             <button onClick={stopBatch} style={{padding: "5px 12px", background: "#dc2626", color: "#fff", border: "none", borderRadius: 6, cursor: "pointer"}}>⏹ 停止</button>
                         </>}
                     {!batchPw.running && selCount > 0 && <button onClick={() => setSelected(new Set())} style={{padding: "5px 10px", fontSize: 13}}>清空选择</button>}
-                    <label style={{fontSize: 12, color: "#6b7280", display: "inline-flex", alignItems: "center", gap: 3}}>并发
-                        <input type="number" min={1} max={8} value={pwConc} onChange={(e) => setPwConc(Math.max(1, Math.min(8, Number(e.target.value) || 1)))}
-                               onBlur={() => api.setPwConcurrency(pwConc).catch(() => {})}
-                               style={{width: 42, padding: "2px 4px", border: "1px solid #d1d5db", borderRadius: 6, textAlign: "center", fontSize: 12}} />
-                    </label>
                     <span style={{fontSize: 11, color: "#9ca3af"}}>改密=真登录 mail.com 改随机20位,headed、可停止;失败保留原密码并记录试过的新密码。</span>
                 </div>
             )}
@@ -275,6 +270,11 @@ export function MailboxPanel({notify}: {notify?: (m: string) => void}) {
                     <option value="fail">改密失败</option>
                 </select>
                 <input value={fEmail} onChange={(e) => setFEmail(e.target.value)} placeholder="邮箱关键词" style={{width: 150, padding: "5px 8px", border: "1px solid #e5e7eb", borderRadius: 8}} />
+                <label style={{fontSize: 12, color: "#6b7280", display: "inline-flex", alignItems: "center", gap: 3, marginLeft: "auto"}}>改密并发
+                    <input type="number" min={1} max={8} value={pwConc} onChange={(e) => setPwConc(Math.max(1, Math.min(8, Number(e.target.value) || 1)))}
+                           onBlur={() => api.setPwConcurrency(pwConc).catch(() => {})}
+                           style={{width: 42, padding: "4px 4px", border: "1px solid #d1d5db", borderRadius: 6, textAlign: "center", fontSize: 12}} />
+                </label>
                 <span style={{color: "#9ca3af", fontSize: 12}}>共 {filtered.length}{selCount ? ` · 已选 ${selCount}` : ""}</span>
             </div>
 
