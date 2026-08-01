@@ -66,6 +66,7 @@ export default function App() {
     const [regPortInput, setRegPortInput] = useState("10809");   // 独立 xray 本地端口(可配置持久化)
     const [claudePortInput, setClaudePortInput] = useState("10810");
     const [showXray, setShowXray] = useState(false);
+    const [xrayBinPath, setXrayBinPath] = useState("");
     const [vlessInput, setVlessInput] = useState("");
     const [smsLinkTemplate, setSmsLinkTemplate] = useState("");
     const [smsMaxBind, setSmsMaxBind] = useState(3);
@@ -134,7 +135,7 @@ export default function App() {
 
     // 初次加载 + SSE
     useEffect(() => {
-        api.state().then((s) => { setPaused(s.state.paused); setConcurrency(s.state.concurrency); setOtpSingle(s.state.otpSingle); setChatSim(s.state.simulateChat); setSmsEnabled(s.state.smsEnabled); setRtEnabled(s.state.rtEnabled); setDaily(s.state.daily); setXray(s.state.xray); setRegEngine(s.state.regEngine || "http"); setBitBrowser(!!s.state.bitBrowser); setDelMailbox(s.state.deleteMailboxWithAccount !== false); setSmsLinkTemplate(s.state.smsLinkTemplate || ""); setSmsMaxBind(s.state.smsMaxBind ?? 3); setRegProxy(s.state.regProxy || ""); setMailProxy(s.state.mailProxy || ""); setRegPortInput(String(s.state.regProxyPort ?? 10809)); setClaudePortInput(String(s.state.claudeProxyPort ?? 10810)); setStats(s.stats); }).catch(() => {});
+        api.state().then((s) => { setPaused(s.state.paused); setConcurrency(s.state.concurrency); setOtpSingle(s.state.otpSingle); setChatSim(s.state.simulateChat); setSmsEnabled(s.state.smsEnabled); setRtEnabled(s.state.rtEnabled); setDaily(s.state.daily); setXray(s.state.xray); setRegEngine(s.state.regEngine || "http"); setBitBrowser(!!s.state.bitBrowser); setDelMailbox(s.state.deleteMailboxWithAccount !== false); setSmsLinkTemplate(s.state.smsLinkTemplate || ""); setSmsMaxBind(s.state.smsMaxBind ?? 3); setRegProxy(s.state.regProxy || ""); setMailProxy(s.state.mailProxy || ""); setRegPortInput(String(s.state.regProxyPort ?? 10809)); setClaudePortInput(String(s.state.claudeProxyPort ?? 10810)); setXrayBinPath(s.state.xrayBinPath || ""); setStats(s.stats); }).catch(() => {});
         api.listAccounts().then(setAccounts).catch(() => {});
         // 批次数据来自数据库(筛选/导出用;导入已迁至邮箱管理)
         api.batches().then(setBatches).catch(() => {});
@@ -545,6 +546,14 @@ export default function App() {
                             <label className="flex items-center gap-1">Claude <input value={claudePortInput} onChange={(e) => setClaudePortInput(e.target.value)} className="w-20 px-1 py-0.5 border rounded font-mono"/></label>
                             <button onClick={() => { const rp = Number(regPortInput), cp = Number(claudePortInput); if (!(rp >= 1024 && rp <= 65535) || !(cp >= 1024 && cp <= 65535)) { notify("端口需为 1024-65535"); return; } if (rp === cp) { notify("两个端口不能相同"); return; } api.setProxyPorts(rp, cp).then((r) => { setRegProxy(r.regProxy || regProxy); notify(`端口已保存 reg=${r.regProxyPort} claude=${r.claudeProxyPort}${r.regProxy ? `，代理→${r.regProxy}` : "（重启或起 vless 后生效）"}`); }).catch((e: any) => notify(e.message)); }}
                                     className="px-2 py-1 bg-cyan-700 text-white rounded">保存端口</button>
+                        </div>
+                        <div className="flex gap-2 items-center flex-wrap text-xs bg-white/70 px-2 py-1.5 rounded border border-cyan-200">
+                            <span className="text-gray-600 font-medium">xray 路径(空=自动探测):</span>
+                            <input value={xrayBinPath} onChange={(e) => setXrayBinPath(e.target.value)}
+                                   placeholder="D:\v2rayN-windows-64\bin\xray\xray.exe"
+                                   className="flex-1 min-w-[320px] px-1 py-0.5 border rounded font-mono"/>
+                            <button onClick={() => { api.setXrayBin(xrayBinPath.trim()).then(() => notify("xray 路径已保存")).catch((e: any) => notify(e.message)); }}
+                                    className="px-2 py-1 bg-cyan-700 text-white rounded">保存路径</button>
                         </div>
                         <div className="flex gap-2 items-start flex-wrap">
                             <textarea value={vlessInput} onChange={(e) => setVlessInput(e.target.value)} placeholder="vless://uuid@host:port?security=reality&pbk=…&sid=…&sni=…&flow=…&type=tcp#name"

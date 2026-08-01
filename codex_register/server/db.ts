@@ -2,30 +2,45 @@
 // PostgreSQL 持久化(从 SQLite 迁移)
 // 所有函数均为 async，调用方需 await。
 import { pool, query, withTransaction } from "./pg.js";
+import os from "node:os";
+
+// 多实例标识：区分不同服务实例，init() 只重置本实例的孤儿任务
+export const instanceId = process.env.INSTANCE_ID || os.hostname();
 
 // 兼容 JOIN：gpt_accounts + mailboxes 拼回原 accounts 形状
-const ACC_COLS = `
+const ACC_COLS_LIST = `
   g.id AS id, m.email AS email, m.password AS password, g.status AS status,
   g.plan AS plan, g.token AS token, g.auth_file AS auth_file, g.error AS error,
   g.started_at AS started_at, g.finished_at AS finished_at, g.created_at AS created_at,
   g.phone AS phone, g.card AS card, g.at_status AS at_status, g.rt_status AS rt_status,
   g.chat_status AS chat_status, g.rt_file AS rt_file, g.dead_at AS dead_at, g.sold_at AS sold_at,
   m.pw_status AS pw_status, m.provider AS provider, g.batch AS batch, g.mailbox_id AS mailbox_id`;
+const ACC_COLS_FULL = `${ACC_COLS_LIST}, g.auth_data, g.rt_data`;
 const ACC_FROM = `FROM gpt_accounts g JOIN mailboxes m ON g.mailbox_id = m.id`;
 
-const CLAUDE_COLS = `c.id, c.mailbox_id, c.status, c.session_key, c.org_id, c.auth_file, c.plan, c.claude_code, c.engine,
+const CLAUDE_COLS_LIST = `c.id, c.mailbox_id, c.status, c.session_key, c.org_id, c.auth_file, c.plan, c.claude_code, c.engine,
            c.batch, c.error, c.dead_at, c.sold_at, c.started_at, c.finished_at, c.created_at,
            m.email, m.password, m.provider, m.pw_status, m.grp`;
+const CLAUDE_COLS_FULL = `${CLAUDE_COLS_LIST}, c.auth_data`;
 
 const MAILBOX_FIELDS = ["email", "password", "pw_status"];
-const GPT_FIELDS = ["status", "plan", "phone", "card", "at_status", "rt_status", "chat_status", "error", "dead_at", "sold_at", "finished_at", "batch", "auth_file", "token", "rt_file", "engine"];
+const GPT_FIELDS = ["status", "plan", "phone", "card", "at_status", "rt_status", "chat_status", "error", "dead_at", "sold_at", "finished_at", "batch", "auth_file", "token", "rt_file", "engine", "auth_data", "rt_data"];
 
 // 启动初始化：重置中断状态（原 SQLite 版在模块加载时同步执行）
 export async function init() {
-    await query(`UPDATE gpt_accounts SET status='pending' WHERE status='running'`);
-    await query(`UPDATE claude_accounts SET status='pending' WHERE status='running'`);
-    await query(`UPDATE sms_pool SET status='free', bound_email='' WHERE status='claimed'`);
-    console.log("[db] 启动初始化完成：running→pending, claimed→free");
+    // 只重置本实例的孤儿任务 + 旧版无标记的遗留数据（instance_id=''）
+    await query(`UPDATE gpt_accounts SET status='pending', instance_id='' WHERE status='running' AND (instance_id=$1 OR instance_id='')`, [instanceId]);
+    await query(`UPDATE claude_accounts SET status='pending', instance_id='' WHERE status='running' AND (instance_id=$1 OR instance_id='')`, [instanceId]);
+    await query(`UPDATE sms_pool SET status='free', bound_email='', claimed_by='' WHERE status='claimed' AND (claimed_by=$1 OR claimed_by='')`, [instanceId]);
+    console.log(`[db] 启动初始化完成 (instance=${instanceId})：本实例 running→pending, claimed→free`);
+}
+
+// 全局清理：重置所有实例的 running/claimed（某台机器断电后手动调用）
+export async function cleanupAllStale() {
+    const r1 = await query(`UPDATE gpt_accounts SET status='pending', instance_id='' WHERE status='running' RETURNING id`);
+    const r2 = await query(`UPDATE claude_accounts SET status='pending', instance_id='' WHERE status='running' RETURNING id`);
+    const r3 = await query(`UPDATE sms_pool SET status='free', bound_email='', claimed_by='' WHERE status='claimed' RETURNING id`);
+    return {gpt: r1.rowCount, claude: r2.rowCount, sms: r3.rowCount};
 }
 
 // ---- GPT 账号（导入 / 读取 / 认领 / 标记） ----
@@ -55,15 +70,15 @@ export async function importAccounts(rows, batch = "", provider = "mailcom") {
 
 export async function listAccounts(status?) {
     if (status) {
-        const { rows } = await query(`SELECT ${ACC_COLS} ${ACC_FROM} WHERE g.status=$1 ORDER BY g.id`, [status]);
+        const { rows } = await query(`SELECT ${ACC_COLS_LIST} ${ACC_FROM} WHERE g.status=$1 ORDER BY g.id`, [status]);
         return rows;
     }
-    const { rows } = await query(`SELECT ${ACC_COLS} ${ACC_FROM} ORDER BY g.id`);
+    const { rows } = await query(`SELECT ${ACC_COLS_LIST} ${ACC_FROM} ORDER BY g.id`);
     return rows;
 }
 
 export async function getAccount(id) {
-    const { rows } = await query(`SELECT ${ACC_COLS} ${ACC_FROM} WHERE g.id=$1`, [id]);
+    const { rows } = await query(`SELECT ${ACC_COLS_FULL} ${ACC_FROM} WHERE g.id=$1`, [id]);
     return rows[0] || undefined;
 }
 
@@ -73,25 +88,25 @@ export async function claimNext() {
             `SELECT id FROM gpt_accounts WHERE status='pending' ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED`
         );
         if (!row) return null;
-        await client.query(`UPDATE gpt_accounts SET status='running', started_at=$1, error='' WHERE id=$2`, [Date.now(), row.id]);
-        const { rows: [full] } = await client.query(`SELECT ${ACC_COLS} ${ACC_FROM} WHERE g.id=$1`, [row.id]);
+        await client.query(`UPDATE gpt_accounts SET status='running', started_at=$1, error='', instance_id=$2 WHERE id=$3`, [Date.now(), instanceId, row.id]);
+        const { rows: [full] } = await client.query(`SELECT ${ACC_COLS_LIST} ${ACC_FROM} WHERE g.id=$1`, [row.id]);
         return full ? { ...full, status: "running" } : null;
     });
 }
 
-export async function markSuccess(id, { token, authFile, plan }) {
-    await query(`UPDATE gpt_accounts SET status='success', token=$1, auth_file=$2, plan=$3, finished_at=$4, error='' WHERE id=$5`,
-        [token || "", authFile || "", plan || "", Date.now(), id]);
+export async function markSuccess(id, { token, authFile, plan, authData }) {
+    await query(`UPDATE gpt_accounts SET status='success', token=$1, auth_file=$2, plan=$3, finished_at=$4, error='', auth_data=$5, instance_id='' WHERE id=$6`,
+        [token || "", authFile || "", plan || "", Date.now(), authData ? JSON.stringify(authData) : null, id]);
 }
 
 export async function markFailed(id, error) {
-    await query(`UPDATE gpt_accounts SET status='failed', error=$1, finished_at=$2 WHERE id=$3`,
+    await query(`UPDATE gpt_accounts SET status='failed', error=$1, finished_at=$2, instance_id='' WHERE id=$3`,
         [String(error || "").slice(0, 2000), Date.now(), id]);
 }
 
 export async function resetToPending(id) {
     await query(`DELETE FROM logs WHERE account_id=$1`, [id]);
-    await query(`UPDATE gpt_accounts SET status='pending', error='', started_at=NULL, finished_at=NULL WHERE id=$1`, [id]);
+    await query(`UPDATE gpt_accounts SET status='pending', error='', started_at=NULL, finished_at=NULL, instance_id='' WHERE id=$1`, [id]);
 }
 
 export async function resetAllFailed() {
@@ -127,7 +142,7 @@ export async function updateAccount(id, fields) {
     await withTransaction(async (client) => {
         if (gKeys.length) {
             const set = gKeys.map((k, i) => `${k}=$${i + 1}`).join(", ");
-            const vals = [...gKeys.map((k) => f[k]), id];
+            const vals = [...gKeys.map((k) => (k === "auth_data" || k === "rt_data") && f[k] && typeof f[k] === "object" ? JSON.stringify(f[k]) : f[k]), id];
             const res = await client.query(`UPDATE gpt_accounts SET ${set} WHERE id=$${gKeys.length + 1}`, vals);
             changes += res.rowCount;
         }
@@ -187,8 +202,24 @@ export async function setAccountCard(id, card) {
     await query(`UPDATE gpt_accounts SET card=$1 WHERE id=$2`, [card || "", id]);
 }
 
-export async function setAccountRtFile(id, rtFile) {
-    await query(`UPDATE gpt_accounts SET rt_file=$1 WHERE id=$2`, [rtFile || "", id]);
+export async function setAccountRtFile(id, rtFile, rtData) {
+    await query(`UPDATE gpt_accounts SET rt_file=$1, rt_data=$2 WHERE id=$3`, [rtFile || "", rtData ? JSON.stringify(rtData) : null, id]);
+}
+
+export async function updateAuthData(id, data) {
+    await query(`UPDATE gpt_accounts SET auth_data=$1 WHERE id=$2`, [data ? JSON.stringify(data) : null, id]);
+}
+export async function updateRtData(id, data) {
+    await query(`UPDATE gpt_accounts SET rt_data=$1 WHERE id=$2`, [data ? JSON.stringify(data) : null, id]);
+}
+
+export async function getAccountAuthData(id) {
+    const { rows } = await query(`SELECT auth_data, rt_data FROM gpt_accounts WHERE id=$1`, [id]);
+    return rows[0] || null;
+}
+export async function getClaudeAuthData(id) {
+    const { rows } = await query(`SELECT auth_data FROM claude_accounts WHERE id=$1`, [id]);
+    return rows[0]?.auth_data || null;
 }
 
 export async function setDeadAt(id, ts) {
@@ -243,7 +274,7 @@ export async function deleteSms(id) {
 }
 
 export async function releaseSms(id) {
-    await query(`UPDATE sms_pool SET status='free', bound_email='' WHERE id=$1`, [id]);
+    await query(`UPDATE sms_pool SET status='free', bound_email='', claimed_by='' WHERE id=$1`, [id]);
 }
 
 export async function markSmsBad(id, email) {
@@ -253,7 +284,7 @@ export async function markSmsBad(id, email) {
 export async function markSmsUsed(id, email) {
     const e = email || "";
     await query(
-        `UPDATE sms_pool SET status='used', bound_email=$1, bind_count=bind_count+1, bind_emails=(CASE WHEN COALESCE(bind_emails,'')='' THEN $1 ELSE bind_emails||','||$1 END) WHERE id=$2`,
+        `UPDATE sms_pool SET status='used', bound_email=$1, claimed_by='', bind_count=bind_count+1, bind_emails=(CASE WHEN COALESCE(bind_emails,'')='' THEN $1 ELSE bind_emails||','||$1 END) WHERE id=$2`,
         [e, id]
     );
 }
@@ -266,7 +297,7 @@ export async function claimSms(email, maxBind = 0) {
             [lim]
         );
         if (!row) return null;
-        await client.query(`UPDATE sms_pool SET status='claimed', bound_email=$1 WHERE id=$2`, [email || "", row.id]);
+        await client.query(`UPDATE sms_pool SET status='claimed', bound_email=$1, claimed_by=$2 WHERE id=$3`, [email || "", instanceId, row.id]);
         return row;
     });
 }
@@ -446,12 +477,12 @@ export async function setMailboxPassword(id, password, pwStatus?) {
 // ---- Claude 域 ----
 
 export async function listClaudeAccounts() {
-    const { rows } = await query(`SELECT ${CLAUDE_COLS} FROM claude_accounts c JOIN mailboxes m ON c.mailbox_id = m.id ORDER BY c.id`);
+    const { rows } = await query(`SELECT ${CLAUDE_COLS_LIST} FROM claude_accounts c JOIN mailboxes m ON c.mailbox_id = m.id ORDER BY c.id`);
     return rows;
 }
 
 export async function getClaudeAccount(id) {
-    const { rows } = await query(`SELECT ${CLAUDE_COLS} FROM claude_accounts c JOIN mailboxes m ON c.mailbox_id = m.id WHERE c.id=$1`, [id]);
+    const { rows } = await query(`SELECT ${CLAUDE_COLS_FULL} FROM claude_accounts c JOIN mailboxes m ON c.mailbox_id = m.id WHERE c.id=$1`, [id]);
     return rows[0] || undefined;
 }
 
@@ -461,23 +492,23 @@ export async function claimNextClaude() {
             `SELECT id FROM claude_accounts WHERE status='pending' ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED`
         );
         if (!row) return null;
-        await client.query(`UPDATE claude_accounts SET status='running', started_at=$1, error='' WHERE id=$2`, [Date.now(), row.id]);
+        await client.query(`UPDATE claude_accounts SET status='running', started_at=$1, error='', instance_id=$2 WHERE id=$3`, [Date.now(), instanceId, row.id]);
         const { rows: [full] } = await client.query(
-            `SELECT ${CLAUDE_COLS} FROM claude_accounts c JOIN mailboxes m ON c.mailbox_id = m.id WHERE c.id=$1`, [row.id]
+            `SELECT ${CLAUDE_COLS_LIST} FROM claude_accounts c JOIN mailboxes m ON c.mailbox_id = m.id WHERE c.id=$1`, [row.id]
         );
         return full ? { ...full, status: "running", domain: "claude" } : null;
     });
 }
 
-export async function markClaudeSuccess(id, { sessionKey, orgId, authFile, plan }) {
+export async function markClaudeSuccess(id, { sessionKey, orgId, authFile, plan, authData }) {
     await query(
-        `UPDATE claude_accounts SET status='success', session_key=$1, org_id=$2, auth_file=$3, plan=$4, finished_at=$5, error='' WHERE id=$6`,
-        [sessionKey || "", orgId || "", authFile || "", plan || "", Date.now(), id]
+        `UPDATE claude_accounts SET status='success', session_key=$1, org_id=$2, auth_file=$3, plan=$4, finished_at=$5, error='', auth_data=$6, instance_id='' WHERE id=$7`,
+        [sessionKey || "", orgId || "", authFile || "", plan || "", Date.now(), authData ? JSON.stringify(authData) : null, id]
     );
 }
 
 export async function markClaudeFailed(id, error) {
-    await query(`UPDATE claude_accounts SET status='failed', error=$1, finished_at=$2 WHERE id=$3`,
+    await query(`UPDATE claude_accounts SET status='failed', error=$1, finished_at=$2, instance_id='' WHERE id=$3`,
         [String(error || "").slice(0, 2000), Date.now(), id]);
 }
 
@@ -488,7 +519,7 @@ export async function setClaudeInfo(id, { plan = "", claudeCode = "", alive = tr
 }
 
 export async function resetClaudeToPending(id) {
-    await query(`UPDATE claude_accounts SET status='pending', error='', started_at=NULL, finished_at=NULL WHERE id=$1`, [id]);
+    await query(`UPDATE claude_accounts SET status='pending', error='', started_at=NULL, finished_at=NULL, instance_id='' WHERE id=$1`, [id]);
 }
 
 export async function setClaudeDeadAt(id, ts) {
@@ -629,11 +660,11 @@ export async function addToRechargeQueue(accountIds, batch = "") {
     return withTransaction(async (client) => {
         let added = 0;
         for (const id of accountIds) {
-            const { rows: [acc] } = await client.query(`SELECT ${ACC_COLS} ${ACC_FROM} WHERE g.id=$1`, [id]);
+            const { rows: [acc] } = await client.query(`SELECT ${ACC_COLS_FULL} ${ACC_FROM} WHERE g.id=$1`, [id]);
             if (!acc) continue;
             const res = await client.query(
-                `INSERT INTO recharge_queue(account_id,email,auth_file,plan,batch,created_at) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(account_id) DO NOTHING`,
-                [acc.id, acc.email, acc.auth_file || "", acc.plan || "", batch, now]
+                `INSERT INTO recharge_queue(account_id,email,auth_file,plan,batch,created_at,auth_data) VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(account_id) DO NOTHING`,
+                [acc.id, acc.email, acc.auth_file || "", acc.plan || "", batch, now, acc.auth_data ? JSON.stringify(acc.auth_data) : null]
             );
             if (res.rowCount) {
                 await client.query(`UPDATE gpt_accounts SET sold_at=$1 WHERE id=$2`, [now, acc.id]);
@@ -700,11 +731,12 @@ export async function resetRechargeQueue(ids) {
             if (item.card_id) {
                 await client.query(`UPDATE recharge_cards SET status='unused', account_id=0, account_email='', updated_at=$1 WHERE id=$2`, [Date.now(), item.card_id]);
             }
-            const { rows: [acc] } = await client.query(`SELECT ${ACC_COLS} ${ACC_FROM} WHERE g.id=$1`, [item.account_id]);
+            const { rows: [acc] } = await client.query(`SELECT ${ACC_COLS_FULL} ${ACC_FROM} WHERE g.id=$1`, [item.account_id]);
             const freshAuthFile = acc?.auth_file || item.auth_file;
+            const freshAuthData = acc?.auth_data || item.auth_data;
             await client.query(
-                `UPDATE recharge_queue SET status='pending', card_id=0, card_code='', task_no='', task_status='', task_message='', error='', auth_file=$1 WHERE id=$2`,
-                [freshAuthFile, id]
+                `UPDATE recharge_queue SET status='pending', card_id=0, card_code='', task_no='', task_status='', task_message='', error='', auth_file=$1, auth_data=$2 WHERE id=$3`,
+                [freshAuthFile, freshAuthData ? JSON.stringify(freshAuthData) : null, id]
             );
         }
     });
@@ -721,7 +753,7 @@ export async function rechargeQueueBatches() {
 }
 
 export async function listRechargeQueueFull(ids?: number[], batch?: string) {
-    let sql = `SELECT rq.*, m.password, g.rt_file, g.auth_file AS gpt_auth_file
+    let sql = `SELECT rq.*, m.password, g.rt_file, g.auth_file AS gpt_auth_file, g.auth_data AS gpt_auth_data, g.rt_data AS gpt_rt_data
                FROM recharge_queue rq
                JOIN gpt_accounts g ON rq.account_id = g.id
                JOIN mailboxes m ON g.mailbox_id = m.id`;

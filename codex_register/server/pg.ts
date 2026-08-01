@@ -1,5 +1,12 @@
 // @ts-nocheck
+import pg from "pg";
 import {Pool, PoolClient} from "pg";
+
+// BIGINT (OID 20) 默认返回字符串 → 转为 number（毫秒时间戳在 Number.MAX_SAFE_INTEGER 范围内）
+pg.types.setTypeParser(20, (val) => {
+    const n = Number(val);
+    return Number.isSafeInteger(n) ? n : val;
+});
 
 const DATABASE_URL = process.env.DATABASE_URL || "postgresql://postgres:123456@192.168.1.126:5432/all_register";
 

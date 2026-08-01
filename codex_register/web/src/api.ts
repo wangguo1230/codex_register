@@ -200,6 +200,7 @@ export const api = {
     setOtp: (single: boolean) => j("/api/control/otp", {method: "POST", body: JSON.stringify({single})}),
     setChat: (simulate: boolean) => j("/api/control/chat", {method: "POST", body: JSON.stringify({simulate})}),
     setProxy: (regProxy: string, mailProxy: string) => j("/api/control/proxy", {method: "POST", body: JSON.stringify({regProxy, mailProxy})}),
+    setXrayBin: (binPath: string) => j<{xrayBinPath: string}>("/api/control/xray-bin", {method: "POST", body: JSON.stringify({binPath})}),
     startXray: (vlessUrl: string) => j<{xray: XrayStatus; regProxy: string}>("/api/control/xray", {method: "POST", body: JSON.stringify({vlessUrl})}),
     stopXray: () => j<{xray: XrayStatus}>("/api/control/xray/stop", {method: "POST"}),
     xrayProbe: () => j<{ok: boolean; ip?: string; chatgpt?: string; pass?: boolean; reason?: string}>("/api/control/xray/probe"),
@@ -231,7 +232,7 @@ export const api = {
     batchTestRt: (ids: number[], acquire = false) => j<{count: number}>("/api/control/test-rt", {method: "POST", body: JSON.stringify({ids, acquire})}),
     batchTestChat: (ids: number[]) => j<{count: number}>("/api/control/test-chat", {method: "POST", body: JSON.stringify({ids})}),
     retryFailed: () => j("/api/control/retry-failed", {method: "POST"}),
-    state: () => j<{state: {paused: boolean; pausedClaude?: boolean; claudeProxy?: string; claudeXrayVless?: string; claudeXray?: XrayStatus; regProxyPort?: number; claudeProxyPort?: number; runningClaude?: number[]; concurrency: number; otpSingle: boolean; simulateChat: boolean; smsEnabled: boolean; rtEnabled: boolean; bitBrowser?: boolean; deleteMailboxWithAccount?: boolean; smsMaxBind: number; regEngine: string; daily: Daily; xray: XrayStatus; smsLinkTemplate: string; regProxy: string; mailProxy: string; mailSeparator?: string; running: number[]; batchPw?: {running: boolean; done: number; total: number}}; stats: Stats}>("/api/state"),
+    state: () => j<{state: {paused: boolean; pausedClaude?: boolean; claudeProxy?: string; claudeXrayVless?: string; claudeXray?: XrayStatus; regProxyPort?: number; claudeProxyPort?: number; runningClaude?: number[]; concurrency: number; otpSingle: boolean; simulateChat: boolean; smsEnabled: boolean; rtEnabled: boolean; bitBrowser?: boolean; deleteMailboxWithAccount?: boolean; smsMaxBind: number; regEngine: string; daily: Daily; xray: XrayStatus; smsLinkTemplate: string; regProxy: string; mailProxy: string; mailSeparator?: string; xrayBinPath?: string; running: number[]; batchPw?: {running: boolean; done: number; total: number}}; stats: Stats}>("/api/state"),
     // ★统一导出(合并原下载菜单+批量导出)。范围×scope×格式×标记已售出一站式;POST 返回纯文本供 blob 下载。
     //   范围:ids(选中/当前筛选) 或 batch(按批次) 或都不传(全部成功号)。
     exportFull: async (opts: {format: "full" | "at" | "session" | "jsonl" | "csv"; scope?: "all" | "hasRt" | "atOnly"; batch?: string; ids?: number[]; markSold?: boolean}): Promise<string> => {

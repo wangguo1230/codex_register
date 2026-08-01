@@ -111,7 +111,9 @@ export async function ensureSchema() {
                 sold_at BIGINT DEFAULT 0,
                 started_at BIGINT,
                 finished_at BIGINT,
-                created_at BIGINT NOT NULL
+                created_at BIGINT NOT NULL,
+                auth_data JSONB,
+                rt_data JSONB
             )
         `);
         await client.query(`CREATE INDEX IF NOT EXISTS idx_gpt_status ON gpt_accounts(status)`);
@@ -134,7 +136,8 @@ export async function ensureSchema() {
                 started_at BIGINT,
                 finished_at BIGINT,
                 created_at BIGINT NOT NULL,
-                claude_code TEXT DEFAULT ''
+                claude_code TEXT DEFAULT '',
+                auth_data JSONB
             )
         `);
         await client.query(`CREATE INDEX IF NOT EXISTS idx_claude_status ON claude_accounts(status)`);
@@ -178,9 +181,21 @@ export async function ensureSchema() {
                 task_message TEXT DEFAULT '',
                 error TEXT DEFAULT '',
                 created_at BIGINT NOT NULL,
-                plan_type TEXT DEFAULT ''
+                plan_type TEXT DEFAULT '',
+                auth_data JSONB
             )
         `);
+
+        // 兼容已有表：追加 JSONB 列（IF NOT EXISTS 避免重复）
+        await client.query(`ALTER TABLE gpt_accounts ADD COLUMN IF NOT EXISTS auth_data JSONB`);
+        await client.query(`ALTER TABLE gpt_accounts ADD COLUMN IF NOT EXISTS rt_data JSONB`);
+        await client.query(`ALTER TABLE claude_accounts ADD COLUMN IF NOT EXISTS auth_data JSONB`);
+        await client.query(`ALTER TABLE recharge_queue ADD COLUMN IF NOT EXISTS auth_data JSONB`);
+
+        // 多实例并行：记录任务归属的实例 ID
+        await client.query(`ALTER TABLE gpt_accounts ADD COLUMN IF NOT EXISTS instance_id TEXT DEFAULT ''`);
+        await client.query(`ALTER TABLE claude_accounts ADD COLUMN IF NOT EXISTS instance_id TEXT DEFAULT ''`);
+        await client.query(`ALTER TABLE sms_pool ADD COLUMN IF NOT EXISTS claimed_by TEXT DEFAULT ''`);
 
         console.log("[pg] Schema 已就绪");
     } finally {

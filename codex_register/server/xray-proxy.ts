@@ -12,21 +12,29 @@ const CODEX_ROOT = path.resolve(__dirname, "..");
 const CFG_DIR = path.resolve(CODEX_ROOT, "..", ".xray-proxy"); // custom-mail/.xray-proxy
 const CFG_FILE = path.join(CFG_DIR, "reg-vless.json");
 
-// 探测 xray 二进制:env XRAY_BIN > 运行中的 xray 进程 > v2rayN 常见路径 > PATH
-function findXrayBin() {
+// 探测 xray 二进制:customPath(前端配置) > env XRAY_BIN > 运行中进程 > 常见路径 > PATH
+function findXrayBin(customPath?: string) {
+    if (customPath && existsSync(customPath)) return customPath;
     if (process.env.XRAY_BIN && existsSync(process.env.XRAY_BIN)) return process.env.XRAY_BIN;
-    try {
-        const line = execSync("ps -eo args= | grep -i '[x]ray run' | head -1", {encoding: "utf8"}).trim();
-        const m = line.match(/^(.*?\/xray)\s+run/i);
-        if (m && existsSync(m[1])) return m[1];
-    } catch { /* ignore */ }
-    const home = process.env.HOME || "";
-    const cands = [
+    const isWin = process.platform === "win32";
+    if (!isWin) {
+        try {
+            const line = execSync("ps -eo args= | grep -i '[x]ray run' | head -1", {encoding: "utf8"}).trim();
+            const m = line.match(/^(.*?\/xray)\s+run/i);
+            if (m && existsSync(m[1])) return m[1];
+        } catch { /* ignore */ }
+    }
+    const home = process.env.HOME || process.env.USERPROFILE || "";
+    const cands = isWin ? [
+        path.join(home, "AppData", "Local", "v2rayN", "bin", "xray", "xray.exe"),
+        path.join(home, "Desktop", "v2rayN-windows-64", "bin", "xray", "xray.exe"),
+        "C:\\Program Files\\v2rayN\\bin\\xray\\xray.exe",
+    ] : [
         `${home}/Library/Application Support/v2rayN/bin/xray/xray`,
         "/opt/homebrew/bin/xray", "/usr/local/bin/xray",
     ];
     for (const c of cands) if (existsSync(c)) return c;
-    return "xray"; // 兜底靠 PATH
+    return isWin ? "xray.exe" : "xray";
 }
 
 /** 解析 vless://uuid@host:port?query#name */
@@ -74,20 +82,26 @@ function inst(name) { if (!INSTANCES[name]) INSTANCES[name] = {proc: null, state
 
 export function xrayStatus(name = "reg") { return {...inst(name).state}; }
 
-/** 起独立 xray(命名实例):解析 vless → config → spawn。opts.name(reg/claude)、opts.localPort。 */
-export function startXray(vlessUrl, opts = {}) {
+/** 起独立 xray(命名实例):解析 vless → config → spawn。opts.name(reg/claude)、opts.localPort、opts.binPath(前端配置路径)。 */
+export function startXray(vlessUrl, opts: {name?: string; localPort?: number; binPath?: string} = {}) {
     const name = opts.name || "reg";
     const localPort = opts.localPort || DEFAULT_PORT[name] || 10809;
-    stopXray(name); // 先停该实例旧的(内存 it.proc)
-    const v = parseVless(vlessUrl); // 解析失败直接抛，路由捕获(放在清理端口前,避免清了端口又没起成)
-    // ★ 再按端口清理【跨 server 重启残留的僵尸 xray】:内存 it.proc 丢失后无法按引用杀,
-    //   多个 xray 抢同一端口 → 内核把连接随机分给不同进程 → 代理行为不确定(时通时断/协议错乱)。
+    stopXray(name);
+    const v = parseVless(vlessUrl);
+    // 按端口清理跨重启残留的僵尸 xray
     try {
-        const pids = execSync(`lsof -ti tcp:${localPort} -sTCP:LISTEN 2>/dev/null || true`).toString().trim().split(/\s+/).filter(Boolean);
-        for (const pid of pids) { try { execSync(`kill -9 ${pid} 2>/dev/null || true`); } catch { /* ignore */ } }
-        if (pids.length) console.log(`[xray] 清理端口 ${localPort} 上 ${pids.length} 个残留进程`);
-    } catch { /* lsof 不可用则跳过 */ }
-    const bin = findXrayBin();
+        if (process.platform === "win32") {
+            const out = execSync(`netstat -ano | findstr "LISTENING" | findstr ":${localPort} "`, {encoding: "utf8"}).trim();
+            const pids = [...new Set(out.split(/\r?\n/).map(l => l.trim().split(/\s+/).pop()).filter(Boolean).filter(p => p !== "0"))];
+            for (const pid of pids) { try { execSync(`taskkill /F /PID ${pid} >nul 2>&1`); } catch { /* ignore */ } }
+            if (pids.length) console.log(`[xray] 清理端口 ${localPort} 上 ${pids.length} 个残留进程`);
+        } else {
+            const pids = execSync(`lsof -ti tcp:${localPort} -sTCP:LISTEN 2>/dev/null || true`).toString().trim().split(/\s+/).filter(Boolean);
+            for (const pid of pids) { try { execSync(`kill -9 ${pid} 2>/dev/null || true`); } catch { /* ignore */ } }
+            if (pids.length) console.log(`[xray] 清理端口 ${localPort} 上 ${pids.length} 个残留进程`);
+        }
+    } catch { /* 命令不可用则跳过 */ }
+    const bin = findXrayBin(opts.binPath);
     mkdirSync(CFG_DIR, {recursive: true});
     const cfgFile = path.join(CFG_DIR, `${name}-vless.json`);
     writeFileSync(cfgFile, JSON.stringify(buildConfig(v, localPort), null, 2), "utf8");

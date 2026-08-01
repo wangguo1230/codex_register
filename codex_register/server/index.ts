@@ -24,6 +24,11 @@ import {queryClaudeInfo, claudeChat} from "../src/claude-api.js";
 import {execSync} from "node:child_process";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+// 凭证读取辅助：DB JSONB 列优先，回退文件读取
+function readJsonFileSafe(p) { try { return p ? JSON.parse(readFileSync(p, "utf8")) : null; } catch { return null; } }
+function getAuthData(acc) { return acc?.auth_data || readJsonFileSafe(acc?.auth_file); }
+function getRtData(acc) { return acc?.rt_data || readJsonFileSafe(acc?.rt_file); }
 const PORT = Number(process.env.PORT || 3100);
 const WEB_DIST = path.resolve(__dirname, "..", "web", "dist");
 
@@ -272,8 +277,8 @@ app.post("/api/control/proxy-ports", (req, res) => {
     if (nextReg === nextClaude) return res.status(400).json({error: "reg 与 claude 端口不能相同"});
     scheduler.regProxyPort = nextReg; scheduler.claudeProxyPort = nextClaude; scheduler.saveSettings();
     // 端口变了→对应 xray 若在跑则用新端口重启(regProxy/claudeProxy 自动跟随 r.port);startXray 只清理"自己这个端口",不碰其他进程
-    try { if (scheduler.xrayVless) { const r = startXray(scheduler.xrayVless, {localPort: scheduler.regProxyPort}); scheduler.regProxy = `socks5://127.0.0.1:${r.port}`; } } catch { /* 起失败保留旧代理 */ }
-    try { if (scheduler.claudeXrayVless) { const r = startXray(scheduler.claudeXrayVless, {name: "claude", localPort: scheduler.claudeProxyPort}); scheduler.claudeProxy = `socks5://127.0.0.1:${r.port}`; } } catch { /* */ }
+    try { if (scheduler.xrayVless) { const r = startXray(scheduler.xrayVless, {localPort: scheduler.regProxyPort, binPath: scheduler.xrayBinPath || undefined}); scheduler.regProxy = `socks5://127.0.0.1:${r.port}`; } } catch { /* 起失败保留旧代理 */ }
+    try { if (scheduler.claudeXrayVless) { const r = startXray(scheduler.claudeXrayVless, {name: "claude", localPort: scheduler.claudeProxyPort, binPath: scheduler.xrayBinPath || undefined}); scheduler.claudeProxy = `socks5://127.0.0.1:${r.port}`; } } catch { /* */ }
     scheduler.saveSettings();
     res.json({ok: true, regProxyPort: scheduler.regProxyPort, claudeProxyPort: scheduler.claudeProxyPort, regProxy: scheduler.regProxy, claudeProxy: scheduler.claudeProxy});
 });
@@ -281,7 +286,7 @@ app.post("/api/control/claude-xray", (req, res) => {
     const vlessUrl = String(req.body?.vlessUrl || "").trim();
     if (!vlessUrl) return res.status(400).json({error: "缺少 vless 链接"});
     try {
-        const r = startXray(vlessUrl, {name: "claude", localPort: scheduler.claudeProxyPort});
+        const r = startXray(vlessUrl, {name: "claude", localPort: scheduler.claudeProxyPort, binPath: scheduler.xrayBinPath || undefined});
         scheduler.claudeXrayVless = vlessUrl; scheduler.claudeProxy = `socks5://127.0.0.1:${r.port}`; scheduler.saveSettings();
         res.json({ok: true, xray: xrayStatus("claude"), claudeProxy: scheduler.claudeProxy});
     } catch (e: any) { res.status(400).json({error: String(e?.message ?? e)}); }
@@ -324,8 +329,8 @@ app.post("/api/claude/export/selected", async (req, res) => {
     if (req.body?.markSold && accs.length) { await db.markClaudeSold(accs.map((a) => a.id)); broadcast("claude", {stats: await db.claudeStats()}); }
     res.type("text/plain").send(text);
 });
-// 读 Claude auth 文件(全 cookie + sessionKey/org)
-function readClaudeAuth(acc) { try { return JSON.parse(readFileSync(acc.auth_file, "utf8")); } catch { return null; } }
+// 读 Claude auth 数据(DB JSONB 优先，回退文件)
+function readClaudeAuth(acc) { return getAuthData(acc); }
 // Claude 域日志(独立表 claude_logs,与邮箱/GPT 日志分开)+ SSE。id=claude_accounts.id
 function logClaude(id, line) { db.appendClaudeLog(id, line).catch(() => {}); broadcast("claudeLog", {id, line, ts: Date.now()}); }
 // Claude 账号操作日志(注册/查订阅/养号)
@@ -333,13 +338,13 @@ app.get("/api/claude/accounts/:id/logs", async (req, res) => res.json(await db.l
 // 查存活 + 订阅/claude_code(比特浏览器注入 sessionKey 过 CF)。后台跑,SSE 推每号结果。ids=claude_account id
 app.post("/api/claude/query", async (req, res) => {
     const ids = Array.isArray(req.body?.ids) ? req.body.ids.map(Number) : [];
-    const accs = (await Promise.all(ids.map((id) => db.getClaudeAccount(id)))).filter((a) => a && a.auth_file);
-    if (!accs.length) return res.json({ok: true, count: 0, msg: "无可查账号(需注册成功且有 auth 文件)"});
+    const accs = (await Promise.all(ids.map((id) => db.getClaudeAccount(id)))).filter((a) => a && (a.auth_data || a.auth_file));
+    if (!accs.length) return res.json({ok: true, count: 0, msg: "无可查账号(需注册成功且有 auth 数据)"});
     res.json({ok: true, count: accs.length});
     (async () => {
         await runPool(accs, async (a) => {
             const auth = readClaudeAuth(a);
-            if (!auth) { await db.setClaudeInfo(a.id, {alive: false}); broadcast("claude", {stats: await db.claudeStats(), result: {id: a.id, email: a.email, alive: false, reason: "无 auth 文件"}}); return; }
+            if (!auth) { await db.setClaudeInfo(a.id, {alive: false}); broadcast("claude", {stats: await db.claudeStats(), result: {id: a.id, email: a.email, alive: false, reason: "无 auth 数据"}}); return; }
             logClaude(a.id, "[订阅] 查存活/套餐(比特浏览器过 CF)…");
             try {
                 const r = await queryClaudeInfo(auth, {proxyUrl: scheduler.claudeProxy || scheduler.regProxy, log: (m) => logClaude(a.id, `[订阅] ${m}`)});
@@ -368,7 +373,7 @@ async function scanOneClaudeDisabled(a) {
     // 2) API 探测(准,慢:比特浏览器过 CF)。需 auth 文件;无则仅凭邮箱无法确证,判存疑不改状态。
     const auth = readClaudeAuth(a);
     if (!auth) {
-        logClaude(a.id, "[禁用检测] 无 auth 文件,邮箱未见禁用 → 存疑(无法 API 探测,不改状态)");
+        logClaude(a.id, "[禁用检测] 无 auth 数据,邮箱未见禁用 → 存疑(无法 API 探测,不改状态)");
         return {id: a.id, email: a.email, alive: null, reason: "邮箱无禁用邮件;无 auth 无法 API 探测", source: "mail-only"};
     }
     logClaude(a.id, "[禁用检测] 邮箱未见禁用 → API 探测存活(比特浏览器过 CF)…");
@@ -424,7 +429,7 @@ app.post("/api/claude/scan-disabled/stop", (req, res) => { scanDisabledStop = tr
 app.post("/api/claude/chat", async (req, res) => {
     const ids = Array.isArray(req.body?.ids) ? req.body.ids.map(Number) : [];
     const message = String(req.body?.message || "").trim();
-    const accs = (await Promise.all(ids.map((id) => db.getClaudeAccount(id)))).filter((a) => a && a.auth_file);
+    const accs = (await Promise.all(ids.map((id) => db.getClaudeAccount(id)))).filter((a) => a && (a.auth_data || a.auth_file));
     if (!accs.length) return res.json({ok: true, count: 0, msg: "无可养号账号"});
     res.json({ok: true, count: accs.length});
     (async () => {
@@ -579,10 +584,8 @@ app.post("/api/accounts/:id/open-browser", async (req, res) => {
     const id = Number(req.params.id);
     const acc = await db.getAccount(id);
     if (!acc) return res.status(404).json({error: "账号不存在"});
-    if (!acc.auth_file || !existsSync(acc.auth_file)) return res.status(400).json({error: "无 at 授权文件(该号可能未注册成功/未拿到 at)"});
-    let rec;
-    try { rec = JSON.parse(readFileSync(acc.auth_file, "utf8")); }
-    catch (e) { return res.status(500).json({error: `读取授权文件失败: ${e?.message || e}`}); }
+    const rec = getAuthData(acc);
+    if (!rec) return res.status(400).json({error: "无 at 授权数据(该号可能未注册成功/未拿到 at)"});
     const sess = rec.session || rec;
     const auth = {sessionToken: sess.sessionToken || "", cookieString: rec.cookie || ""};
     if (!auth.sessionToken && !auth.cookieString) return res.status(400).json({error: "授权文件缺 sessionToken/cookie"});
@@ -691,21 +694,24 @@ app.post("/api/control/bit", async (req, res) => {
 });
 
 // ========== token 测试(at/rt) ==========
-// 从账号 auth 文件解析各类 token
+// 从凭证对象解析各类 token（不再直接读文件）
+function extractTokens(d) {
+    if (!d) return null;
+    const s = (d && d.session) || {};
+    const accessToken = s.accessToken || d.access_token || "";
+    const refreshToken = d.refresh_token || "";
+    let accountId = d.account_id || "";
+    if (!accountId && accessToken) {
+        const c = decodeJwt(accessToken) || {};
+        accountId = (c["https://api.openai.com/auth"] || {}).chatgpt_account_id || "";
+    }
+    if (!accountId && s.account) accountId = s.account.account_id || s.account.id || "";
+    return {accessToken, refreshToken, accountId, raw: d};
+}
+// 兼容：从文件路径读取 token（worker 产出的新文件尚未入 DB 时用）
 function readAuthTokens(authFile) {
-    try {
-        const d = JSON.parse(readFileSync(authFile, "utf8"));
-        const s = (d && d.session) || {};
-        const accessToken = s.accessToken || d.access_token || "";
-        const refreshToken = d.refresh_token || "";
-        let accountId = d.account_id || "";
-        if (!accountId && accessToken) {
-            const c = decodeJwt(accessToken) || {};
-            accountId = (c["https://api.openai.com/auth"] || {}).chatgpt_account_id || "";
-        }
-        if (!accountId && s.account) accountId = s.account.account_id || s.account.id || "";
-        return {accessToken, refreshToken, accountId, raw: d, path: authFile};
-    } catch { return null; }
+    const d = readJsonFileSafe(authFile);
+    return d ? {...extractTokens(d), path: authFile} : null;
 }
 // 等待注册队列排空(running map 清空)。maintLock 设置后 tick 不再认领,等已跑的自然结束。
 function waitRegIdle(): Promise<void> {
@@ -744,7 +750,7 @@ async function reviveIfAlive(id) {
 // at 与 rt 解耦:测 at 只测 at,失效直接走浏览器登录重登,★不用 rt 去续 at。
 async function testOneAt(acc, {relogin = false} = {}) {
     await pushTestStatus(acc.id, "at", "测试中…");
-    const tok = readAuthTokens(acc.auth_file);
+    const tok = extractTokens(getAuthData(acc));
     if (tok && tok.accessToken) {
         const r = await probeAt(tok.accessToken, tok.accountId, buildProxyDispatcher(scheduler.regProxy));
         if (r.ok) { await pushTestStatus(acc.id, "at", "✅有效"); await reviveIfAlive(acc.id); return r; }
@@ -808,7 +814,8 @@ function runRtWorker(acc, preferPhone) {
         child.on("close", async () => {
             try { rmSync(tmpDir, {recursive: true, force: true}); } catch { /* ignore */ }
             if (result && result.status === "success") {
-                await db.setAccountRtFile(acc.id, result.rtFile || "");
+                const rtData = readJsonFileSafe(result.rtFile);
+                await db.setAccountRtFile(acc.id, result.rtFile || "", rtData);
                 if (result.phone) await db.setAccountPhone(acc.id, result.phone);
                 if (result.card) await db.setAccountCard(acc.id, result.card);
                 await pushTestStatus(acc.id, "rt", "✅已获取rt");
@@ -863,7 +870,8 @@ function runReloginAtWorker(acc) {
         child.on("close", async () => {
             try { rmSync(tmpDir, {recursive: true, force: true}); } catch { /* ignore */ }
             if (result && result.status === "success" && result.authFile) {
-                await db.updateAccount(acc.id, {auth_file: result.authFile}); // 更新为新 auth 文件(含新 at)
+                const authData = readJsonFileSafe(result.authFile);
+                await db.updateAccount(acc.id, {auth_file: result.authFile, auth_data: authData});
                 broadcast("snapshot", await db.listAccounts());
                 resolve({ok: true, authFile: result.authFile});
             } else {
@@ -880,7 +888,8 @@ function runReloginAtWorker(acc) {
 // rt 三态：有效→刷新写回；已过期→复用绑定号重新获取；无rt→获取。acquire=false 时不自动获取(批量用，避免误耗接码)。
 async function testOneRt(acc, {updateRt = true, acquire = false} = {}) {
     await pushTestStatus(acc.id, "rt", "测试中…");
-    const tok = readAuthTokens(acc.rt_file || acc.auth_file); // rt 优先在 codex 文件里
+    const rtData = getRtData(acc);
+    const tok = extractTokens(rtData || getAuthData(acc));
     if (tok && tok.refreshToken) {
         let r = await refreshRt(tok.refreshToken, buildProxyDispatcher(scheduler.regProxy));
         if (!r.ok) { // 失败重试一次:过滤网络/代理抖动,两次都失败才算过期(避免抖动误判 dead)
@@ -891,14 +900,15 @@ async function testOneRt(acc, {updateRt = true, acquire = false} = {}) {
         if (r.ok) {
             // 续期只写回【rt 文件本身】(更新 refresh_token/id_token),★绝不碰 at(auth_file 的网页 access_token)。
             // 且只在 rt 有独立 rt_file 时写(rt 若在 auth_file 里则不写,避免充值网页 at)。
-            if (updateRt && r.tokens && tok.raw && acc.rt_file && tok.path === acc.rt_file) {
+            if (updateRt && r.tokens && tok?.raw && rtData) {
                 try {
-                    const rec = tok.raw;
-                    if (r.tokens.access_token) rec.access_token = r.tokens.access_token; // 这是 codex rt 配对的 at(rt 文件内),非网页 at
+                    const rec = {...tok.raw};
+                    if (r.tokens.access_token) rec.access_token = r.tokens.access_token;
                     if (r.tokens.refresh_token) rec.refresh_token = r.tokens.refresh_token;
                     if (r.tokens.id_token) rec.id_token = r.tokens.id_token;
                     rec.last_refresh = new Date().toISOString();
-                    writeFileSync(tok.path, JSON.stringify(rec) + "\n");
+                    await db.updateRtData(acc.id, rec);
+                    if (acc.rt_file) writeFileSync(acc.rt_file, JSON.stringify(rec) + "\n");
                 } catch { /* 写回失败不影响测试结论 */ }
             }
             await pushTestStatus(acc.id, "rt", updateRt ? "✅有效(已续期)" : "✅有效");
@@ -987,9 +997,15 @@ function runChatWorker(acc, message) {
     return new Promise(async (resolve) => {
         await pushTestStatus(acc.id, "chat", "聊天中…");
         broadcast("log", {id: acc.id, line: `[chat] 启动浏览器发消息…`, ts: Date.now()});
+        const authData = getAuthData(acc);
+        let tmpAuthFile = "";
+        const chatAuthFile = (() => {
+            if (authData) { tmpAuthFile = path.join(os.tmpdir(), `chat-auth-${acc.id}-${Date.now()}.json`); writeFileSync(tmpAuthFile, JSON.stringify(authData)); return tmpAuthFile; }
+            return acc.auth_file || "";
+        })();
         const child = spawn(CHAT_TSX_BIN, ["src/worker-chat.ts"], {
             cwd: CHAT_ROOT,
-            env: {...process.env, CHAT_AUTH_FILE: acc.auth_file || "", CHAT_MESSAGE: message || "", PROXY_URL: scheduler.regProxy || ""},
+            env: {...process.env, CHAT_AUTH_FILE: chatAuthFile, CHAT_MESSAGE: message || "", PROXY_URL: scheduler.regProxy || ""},
         });
         let buf = "";
         let result = null;
@@ -1009,11 +1025,12 @@ function runChatWorker(acc, message) {
         });
         child.stderr.on("data", (d) => broadcast("log", {id: acc.id, line: `[chat:err] ${String(d).slice(0, 120)}`, ts: Date.now()}));
         child.on("close", async () => {
+            if (tmpAuthFile) try { rmSync(tmpAuthFile, {force: true}); } catch {}
             const status = result ? (result.ok ? "✅回复成功" : ("❌" + (result.error || "无回复"))) : "❌进程异常退出";
             await pushTestStatus(acc.id, "chat", status);
             resolve(result || {ok: false});
         });
-        child.on("error", async (e) => { await pushTestStatus(acc.id, "chat", "❌启动失败:" + (e?.message ?? e)); resolve({ok: false}); });
+        child.on("error", async (e) => { if (tmpAuthFile) try { rmSync(tmpAuthFile, {force: true}); } catch {} await pushTestStatus(acc.id, "chat", "❌启动失败:" + (e?.message ?? e)); resolve({ok: false}); });
     });
 }
 app.post("/api/accounts/:id/test-chat", async (req, res) => {
@@ -1036,12 +1053,23 @@ app.post("/api/control/proxy", (req, res) => {
 });
 
 // ---------- 独立 vless 代理(起独立 xray，注册代理自动指向本地端口，不碰用户自己的 v2rayN) ----------
+// 全局清理：重置所有实例的 running/claimed 孤儿（某台电脑断电后手动调用）
+app.post("/api/control/cleanup-stale", async (req, res) => {
+    const r = await db.cleanupAllStale();
+    res.json({ok: true, ...r});
+});
+app.post("/api/control/xray-bin", (req, res) => {
+    const p = String(req.body?.binPath ?? "").trim();
+    scheduler.xrayBinPath = p;
+    scheduler.saveSettings();
+    res.json({ok: true, xrayBinPath: p});
+});
 app.post("/api/control/xray", (req, res) => {
     const vlessUrl = String(req.body?.vlessUrl || "").trim();
     if (!vlessUrl) return res.status(400).json({error: "缺少 vless 链接"});
     try {
-        const r = startXray(vlessUrl, {localPort: scheduler.regProxyPort});
-        scheduler.regProxy = `socks5://127.0.0.1:${r.port}`; // 注册代理自动指向独立 xray
+        const r = startXray(vlessUrl, {localPort: scheduler.regProxyPort, binPath: scheduler.xrayBinPath || undefined});
+        scheduler.regProxy = `socks5://127.0.0.1:${r.port}`;
         scheduler.xrayVless = vlessUrl;
         scheduler.saveSettings();
         res.json({ok: true, xray: xrayStatus(), regProxy: scheduler.regProxy});
@@ -1233,21 +1261,22 @@ app.post("/api/control/daily/run", async (req, res) => {
 });
 
 // ---------- 批量下载：导出 session 文件【内容】(非路径)，不含 token 字段 ----------
+// 从凭证对象提取 session 内层(即 /api/auth/session 响应体)
+function extractSession(d) {
+    if (!d || typeof d !== "object") return null;
+    return (d as any).session !== undefined ? (d as any).session : d;
+}
+// 兼容：从文件路径读 session（worker 产出的新文件尚未入 DB 时用）
 function readSession(authFile: string): unknown {
-    try {
-        const d = JSON.parse(readFileSync(authFile, "utf8"));
-        // auth 文件外层包着 {email, session, mailbox, cookie, type...};真正的 ChatGPT 会话是 .session 那层。
-        // 只返回 session 内层(即 /api/auth/session 响应体),剥掉本地包装。无 .session 键则本身即裸 session,原样返回。
-        return d && typeof d === "object" && (d as any).session !== undefined ? (d as any).session : d;
-    } catch { return null; }
+    return extractSession(readJsonFileSafe(authFile));
 }
 // 单号 session json(账号详情「复制session」用)。返回裸 session 对象,与导出 format=session 行内的 json 一致。
 app.get("/api/accounts/:id/session", async (req, res) => {
     const id = Number(req.params.id);
     const a = Number.isInteger(id) ? await db.getAccount(id) : null;
     if (!a) return res.status(404).json({error: "账号不存在"});
-    if (!a.auth_file) return res.status(400).json({error: "该号无 at 授权文件"});
-    const sess = readSession(a.auth_file);
+    if (!a.auth_data && !a.auth_file) return res.status(400).json({error: "该号无 at 授权数据"});
+    const sess = extractSession(getAuthData(a));
     if (!sess) return res.status(400).json({error: "session 文件读取失败"});
     res.json({session: sess});
 });
@@ -1290,9 +1319,9 @@ app.post("/api/tools/batch-refresh-at", async (req, res) => {
                     const atResult = await testOneAt(acc, {relogin: true});
                     if (atResult.ok) {
                         const freshAcc = await db.getAccount(r.accId);
-                        const tok = readAuthTokens(freshAcc?.auth_file);
+                        const tok = extractTokens(getAuthData(freshAcc));
                         r.accessToken = tok?.accessToken || "";
-                        r.sessionJson = freshAcc?.auth_file ? readSession(freshAcc.auth_file) : null;
+                        r.sessionJson = extractSession(getAuthData(freshAcc));
                         r.ok = true; r.reason = "获取成功";
                     } else { r.ok = false; r.reason = atResult.reason || "获取失败"; }
                 } else {
@@ -1395,7 +1424,7 @@ app.post("/api/tools/batch-acquire-rt", (req, res) => {
                     if (re.rtFile) {
                         const allAccs = await db.listAccounts("success");
                         const gptAcc = allAccs.find((a: any) => a.email.toLowerCase() === r.email);
-                        if (gptAcc) { await db.setAccountRtFile(gptAcc.id, re.rtFile); broadcast("log", {id: 0, line: `[批量RT] ${r.email}: rt_file 已同步到 GPT 账号`, ts: Date.now()}); }
+                        if (gptAcc) { const rtData = readJsonFileSafe(re.rtFile); await db.setAccountRtFile(gptAcc.id, re.rtFile, rtData); broadcast("log", {id: 0, line: `[批量RT] ${r.email}: rt 已同步到 GPT 账号`, ts: Date.now()}); }
                     }
                 } else { r.ok = false; r.reason = re.reason || "获取失败"; }
             } catch (e: any) { r.ok = false; r.reason = String(e?.message || e).slice(0, 80); }
@@ -1490,24 +1519,24 @@ app.post("/api/export/full", async (req, res) => {
 
     if (format === "at") {
         const lines = rows.map((r) => {
-            const tok = readAuthTokens(r.auth_file);
+            const tok = extractTokens(getAuthData(r));
             return `${r.email}----${r.password}----${tok?.accessToken || ""}`;
         });
         res.set("Content-Type", "text/plain; charset=utf-8");
         return res.send(lines.join("\n"));
     }
     if (format === "session") {
-        const lines = rows.map((r) => { const sess = readSession(r.auth_file); return `${r.email}----${r.password}----${sess ? JSON.stringify(sess) : ""}`; });
+        const lines = rows.map((r) => { const sess = extractSession(getAuthData(r)); return `${r.email}----${r.password}----${sess ? JSON.stringify(sess) : ""}`; });
         res.set("Content-Type", "text/plain; charset=utf-8");
         return res.send(lines.join("\n"));
     }
     if (format === "jsonl") {
-        const recs = rows.map((r) => ({email: r.email, password: r.password, card: r.card || "", phone: r.phone || "", plan: r.plan, access_token: (readAuthTokens(r.auth_file) || {}).accessToken || ""}));
+        const recs = rows.map((r) => ({email: r.email, password: r.password, card: r.card || "", phone: r.phone || "", plan: r.plan, access_token: (extractTokens(getAuthData(r)) || {}).accessToken || ""}));
         res.set("Content-Type", "application/x-ndjson; charset=utf-8");
         return res.send(recs.map((r) => JSON.stringify(r)).join("\n"));
     }
     const recs = rows.map((r) => {
-        const rt = (readAuthTokens(r.rt_file) || {}).refreshToken || (readAuthTokens(r.auth_file) || {}).refreshToken || "";
+        const rt = (extractTokens(getRtData(r)) || {}).refreshToken || (extractTokens(getAuthData(r)) || {}).refreshToken || "";
         return {email: r.email, mailPw: r.password, gpt: r.auth_file ? gptPw : "", rt, card: r.card || "", hasRt: !!rt};
     });
     if (format === "csv") {
@@ -1738,9 +1767,9 @@ app.post("/api/recharge/submit", async (req, res) => {
 
             try {
                 const freshAcc = await db.getAccount(q.account_id);
-                const authFile = freshAcc?.auth_file || q.auth_file;
-                const session = readSession(authFile);
-                if (!session) throw new Error("session 文件读取失败(path: " + authFile + ")");
+                const authObj = getAuthData(freshAcc) || q.auth_data || readJsonFileSafe(q.auth_file);
+                const session = extractSession(authObj);
+                if (!session) throw new Error("session 数据读取失败(account_id: " + q.account_id + ")");
                 const tokenInput = JSON.stringify(session);
 
                 const valRes = await callRechargeApi("POST", "/redeem-codes/validate", {redeem_code: card.code});
@@ -1913,13 +1942,13 @@ app.post("/api/recharge/queue/export", async (req, res) => {
 
     // full 格式: 先检查是否需要获取 RT，需要则异步执行后通过 SSE 推送结果
     const needRt = rows.filter((r: any) => {
-        const tok = readAuthTokens(r.rt_file || r.gpt_auth_file);
+        const tok = extractTokens(r.gpt_rt_data || r.gpt_auth_data || readJsonFileSafe(r.rt_file) || readJsonFileSafe(r.gpt_auth_file));
         return !tok?.refreshToken;
     });
 
     if (!needRt.length) {
         const text = rows.map((r: any) => {
-            const tok = readAuthTokens(r.rt_file || r.gpt_auth_file);
+            const tok = extractTokens(r.gpt_rt_data || r.gpt_auth_data || readJsonFileSafe(r.rt_file) || readJsonFileSafe(r.gpt_auth_file));
             return `${r.email}${sep}${r.password}${sep}${tok?.refreshToken || ""}`;
         }).join("\n");
         return res.set("Content-Type", "text/plain; charset=utf-8").send(text);
@@ -1945,7 +1974,7 @@ app.post("/api/recharge/queue/export", async (req, res) => {
         // 重新查询最新数据并通过 SSE 推送
         const freshRows = await db.listRechargeQueueFull(ids.length ? ids : undefined, batch || undefined);
         const text = freshRows.map((r: any) => {
-            const tok = readAuthTokens(r.rt_file || r.gpt_auth_file);
+            const tok = extractTokens(r.gpt_rt_data || r.gpt_auth_data || readJsonFileSafe(r.rt_file) || readJsonFileSafe(r.gpt_auth_file));
             return `${r.email}${sep}${r.password}${sep}${tok?.refreshToken || ""}`;
         }).join("\n");
         broadcast("rechargeExportReady", {text});
@@ -1974,13 +2003,13 @@ app.post("/api/recharge/queue/probe-plan", async (req, res) => {
     for (let i = 0; i < targets.length; i++) {
         const q = targets[i];
         const acc = await db.getAccount(q.account_id);
-        const tok = readAuthTokens(acc?.auth_file || q.auth_file);
+        const tok = extractTokens(getAuthData(acc) || q.auth_data || readJsonFileSafe(q.auth_file));
         if (!tok?.accessToken) {
             fail++;
             rechargeLog(`[${i + 1}/${targets.length}] ✗ ${q.email} 无 AT`);
             continue;
         }
-        const rtTok = readAuthTokens(acc?.rt_file || acc?.auth_file || q.auth_file);
+        const rtTok = extractTokens(getRtData(acc) || getAuthData(acc) || q.auth_data || readJsonFileSafe(q.auth_file));
         const r = await probePlan(tok.accessToken, tok.accountId, dispatcher, 12000, rtTok?.refreshToken);
         if (i === 0 && r._debug) {
             rechargeLog(`[调试] endpoint=${r._debug.endpoint}, raw="${r._debug.raw}"`);
@@ -2005,28 +2034,27 @@ if (existsSync(WEB_DIST)) {
 }
 
 setMailProxy(scheduler.mailProxy); // 收件箱初始用邮箱代理(config.mailProxyUrl)
-// 重启自启:若持久化了 vless，自动重新起独立 xray 并把 regProxy 指向它
+// 重启自启:若持久化了 vless，自动重新起独立 xray 并把 regProxy 指向它(失败不阻塞服务启动)
 if (scheduler.xrayVless) {
     try {
-        const r = startXray(scheduler.xrayVless, {localPort: scheduler.regProxyPort});
+        const r = startXray(scheduler.xrayVless, {localPort: scheduler.regProxyPort, binPath: scheduler.xrayBinPath || undefined});
         scheduler.regProxy = `socks5://127.0.0.1:${r.port}`;
         console.log(`[server] 独立 xray 已自启: ${r.node} @ 127.0.0.1:${r.port}`);
     } catch (e: any) {
-        console.warn(`[server] 独立 xray 自启失败: ${e?.message ?? e}`);
+        console.warn(`[server] 独立 xray 自启失败(不影响服务): ${e?.message ?? e}`);
     }
 }
-// Claude 独立 xray 自启(端口 10810)
 if (scheduler.claudeXrayVless) {
     try {
-        const r = startXray(scheduler.claudeXrayVless, {name: "claude", localPort: scheduler.claudeProxyPort});
+        const r = startXray(scheduler.claudeXrayVless, {name: "claude", localPort: scheduler.claudeProxyPort, binPath: scheduler.xrayBinPath || undefined});
         scheduler.claudeProxy = `socks5://127.0.0.1:${r.port}`;
         console.log(`[server] Claude 独立 xray 已自启: ${r.node} @ 127.0.0.1:${r.port}`);
-    } catch (e: any) { console.warn(`[server] Claude xray 自启失败: ${e?.message ?? e}`); }
+    } catch (e: any) { console.warn(`[server] Claude xray 自启失败(不影响服务): ${e?.message ?? e}`); }
 }
 await ensureSchema();
 await initDb();
 await db.init();
 
 app.listen(PORT, () => {
-    console.log(`[server] http://localhost:${PORT}  (前端 ${existsSync(WEB_DIST) ? "已托管" : "未构建, 用 vite dev"})`);
+    console.log(`[server] http://localhost:${PORT}  instance=${db.instanceId}  (前端 ${existsSync(WEB_DIST) ? "已托管" : "未构建, 用 vite dev"})`);
 });

@@ -9,6 +9,9 @@
 //   - ClaudeRegisterEngine:占位,待 Claude 注册机制确定(见 ARCHITECTURE-v2 §8 D1)。
 // 注:邮箱改密是邮箱管理域职责(导入后自动改密/手动/批量),注册流程不越界改邮箱密码(职责归一化)。
 import * as db from "../db.js";
+import {readFileSync} from "node:fs";
+
+function readJsonFile(p) { try { return JSON.parse(readFileSync(p, "utf8")); } catch { return null; } }
 
 /**
  * @typedef {Object} SpawnSpec
@@ -65,8 +68,12 @@ export const GptRegisterEngine = {
      */
     async onResult(runner, id, ev) {
         if (ev.status === "success") {
-            await db.markSuccess(id, {token: ev.token, authFile: ev.authFile, plan: ev.plan});
-            if (ev.rtFile) await db.setAccountRtFile(id, ev.rtFile); // 回写含 rt 的 codex auth 文件路径
+            const authData = ev.authFile ? readJsonFile(ev.authFile) : null;
+            await db.markSuccess(id, {token: ev.token, authFile: ev.authFile, plan: ev.plan, authData});
+            if (ev.rtFile) {
+                const rtData = readJsonFile(ev.rtFile);
+                await db.setAccountRtFile(id, ev.rtFile, rtData);
+            }
             if (ev.phone) await db.setAccountPhone(id, ev.phone);    // 回写绑定的接码手机号
             if (ev.card) await db.setAccountCard(id, ev.card);       // 回写绑定的卡密(导出用)
             // 注册完成即按产出直接标记状态(网页 token 刚生成必有效;rt/养号按实际结果)，无需手动点"测"
@@ -116,7 +123,10 @@ export const ClaudeRegisterEngine = {
     },
     // 注:详细过程日志由 job runner 按域落 mailbox_logs(见 scheduler.logJob),此处不再 runner.log(避免 claude/gpt id 在 logs 表碰撞)。
     async onResult(runner, id, ev) {
-        if (ev.status === "success") await db.markClaudeSuccess(id, {sessionKey: ev.sessionKey, orgId: ev.orgId, authFile: ev.authFile, plan: ev.plan});
+        if (ev.status === "success") {
+            const authData = ev.authFile ? readJsonFile(ev.authFile) : null;
+            await db.markClaudeSuccess(id, {sessionKey: ev.sessionKey, orgId: ev.orgId, authFile: ev.authFile, plan: ev.plan, authData});
+        }
         else await db.markClaudeFailed(id, ev.error);
         runner.emit("claude", {stats: await db.claudeStats()}); // ClaudePanel 刷新
     },
