@@ -52,6 +52,7 @@ export default function App() {
     const [chatSim, setChatSim] = useState(true);
     const [regProxy, setRegProxy] = useState("");
     const [mailProxy, setMailProxy] = useState("");
+    const [mailProxyEnabled, setMailProxyEnabled] = useState(true);
     const [showProxy, setShowProxy] = useState(false);
     const [showSms, setShowSms] = useState(false);
     const [smsText, setSmsText] = useState("");
@@ -77,6 +78,7 @@ export default function App() {
     const [exportFormat, setExportFormat] = useState<"full" | "at" | "session" | "jsonl" | "csv">("full");
     const [exportBatch, setExportBatch] = useState(""); // 范围=按批次时选的批次
     const [batchAssign, setBatchAssign] = useState(""); // 批量设置批次的输入
+    const [quickSelN, setQuickSelN] = useState(100);
     const [exportMarkSold, setExportMarkSold] = useState(false); // 导出时是否标记已售出
     // 批量刷新 AT 弹窗
     const [showRefreshAt, setShowRefreshAt] = useState(false);
@@ -135,7 +137,7 @@ export default function App() {
 
     // 初次加载 + SSE
     useEffect(() => {
-        api.state().then((s) => { setPaused(s.state.paused); setConcurrency(s.state.concurrency); setOtpSingle(s.state.otpSingle); setChatSim(s.state.simulateChat); setSmsEnabled(s.state.smsEnabled); setRtEnabled(s.state.rtEnabled); setDaily(s.state.daily); setXray(s.state.xray); setRegEngine(s.state.regEngine || "http"); setBitBrowser(!!s.state.bitBrowser); setSmsLinkTemplate(s.state.smsLinkTemplate || ""); setSmsMaxBind(s.state.smsMaxBind ?? 3); setRegProxy(s.state.regProxy || ""); setMailProxy(s.state.mailProxy || ""); setRegPortInput(String(s.state.regProxyPort ?? 10809)); setClaudePortInput(String(s.state.claudeProxyPort ?? 10810)); setXrayBinPath(s.state.xrayBinPath || ""); if (s.state.xrayVless) setVlessInput(s.state.xrayVless); setStats(s.stats); }).catch(() => {});
+        api.state().then((s) => { setPaused(s.state.paused); setConcurrency(s.state.concurrency); setOtpSingle(s.state.otpSingle); setChatSim(s.state.simulateChat); setSmsEnabled(s.state.smsEnabled); setRtEnabled(s.state.rtEnabled); setDaily(s.state.daily); setXray(s.state.xray); setRegEngine(s.state.regEngine || "http"); setBitBrowser(!!s.state.bitBrowser); setSmsLinkTemplate(s.state.smsLinkTemplate || ""); setSmsMaxBind(s.state.smsMaxBind ?? 3); setRegProxy(s.state.regProxy || ""); setMailProxy(s.state.mailProxy || ""); setMailProxyEnabled(s.state.mailProxyEnabled !== false); setRegPortInput(String(s.state.regProxyPort ?? 10809)); setClaudePortInput(String(s.state.claudeProxyPort ?? 10810)); setXrayBinPath(s.state.xrayBinPath || ""); if (s.state.xrayVless) setVlessInput(s.state.xrayVless); setStats(s.stats); }).catch(() => {});
         api.listAccounts().then(setAccounts).catch(() => {});
         // 批次数据来自数据库(筛选/导出用;导入已迁至邮箱管理)
         api.batches().then(setBatches).catch(() => {});
@@ -150,7 +152,7 @@ export default function App() {
             if (event === "batchPw") { api.listAccounts().then(setAccounts).catch(() => {}); return; } // 邮箱改密在邮箱管理页;这里仅刷新账号让 gpt 邮箱密码同步
             if (event === "stats") setStats(data);
             else if (event === "snapshot") setAccounts(data);
-            else if (event === "hello") { setStats(data.stats); setPaused(data.state.paused); setConcurrency(data.state.concurrency); setOtpSingle(data.state.otpSingle); setChatSim(data.state.simulateChat); setRegProxy(data.state.regProxy || ""); setMailProxy(data.state.mailProxy || ""); api.listAccounts().then(setAccounts).catch(() => {}); }
+            else if (event === "hello") { setStats(data.stats); setPaused(data.state.paused); setConcurrency(data.state.concurrency); setOtpSingle(data.state.otpSingle); setChatSim(data.state.simulateChat); setRegProxy(data.state.regProxy || ""); setMailProxy(data.state.mailProxy || ""); setMailProxyEnabled(data.state.mailProxyEnabled !== false); api.listAccounts().then(setAccounts).catch(() => {}); }
             else if (event === "status") {
                 setAccounts((prev) => prev.map((a) => (a.id === data.id ? {...a, ...data, status: data.status} : a)));
             } else if (event === "log") {
@@ -616,12 +618,16 @@ export default function App() {
                                    className="w-96 px-2 py-1.5 border rounded text-sm font-mono"/>
                         </div>
                         <div className="flex flex-col">
-                            <label className="text-xs text-gray-500 mb-1">邮箱登录代理(默认空=直连)</label>
+                            <label className="text-xs text-gray-500 mb-1 flex items-center gap-1">
+                                <input type="checkbox" checked={mailProxyEnabled} onChange={(e) => setMailProxyEnabled(e.target.checked)} />
+                                邮箱登录代理{mailProxyEnabled ? "" : "(已关闭)"}
+                            </label>
                             <input value={mailProxy} onChange={(e) => setMailProxy(e.target.value)}
                                    placeholder="留空=直连"
-                                   className="w-72 px-2 py-1.5 border rounded text-sm font-mono"/>
+                                   disabled={!mailProxyEnabled}
+                                   className={`w-72 px-2 py-1.5 border rounded text-sm font-mono ${!mailProxyEnabled ? "opacity-50" : ""}`}/>
                         </div>
-                        <button onClick={() => api.setProxy(regProxy, mailProxy).then(() => notify("代理已保存(影响之后启动的任务)")).catch((e) => notify(e.message))}
+                        <button onClick={() => api.setProxy(regProxy, mailProxy, mailProxyEnabled).then(() => notify("代理已保存(影响之后启动的任务)")).catch((e) => notify(e.message))}
                                 className="px-4 py-2 bg-indigo-600 text-white rounded text-sm font-medium">保存代理</button>
                     </div>
                 )}
@@ -725,6 +731,10 @@ export default function App() {
                             try { const r = await api.batchDelete(ids); setSelectedIds(new Set()); await api.listAccounts().then(setAccounts); notify(`已删除 ${r.count} 个${r.skipped ? `（跳过运行中 ${r.skipped}）` : ""}`); }
                             catch (e: any) { notify(e.message); }
                         }} title="删除选中(或当前列表全部)的号" className="px-2 py-1 bg-red-600 text-white rounded text-xs">🗑 删除选中</button>
+                        <span className="mx-1 text-gray-300">|</span>
+                        <input type="number" min={1} value={quickSelN} onChange={(e) => setQuickSelN(Math.max(1, +e.target.value || 1))} className="w-14 px-1 py-1 border rounded text-xs text-center"/>
+                        <button onClick={() => { const s = new Set<number>(); filtered.slice(0, quickSelN).forEach((a) => s.add(a.id)); setSelectedIds(s); }} className="px-2 py-1 bg-gray-200 rounded text-xs hover:bg-gray-300" title={`选中当前列表前 ${quickSelN} 个`}>选前N</button>
+                        <button onClick={() => { const s = new Set<number>(); filtered.slice(-quickSelN).forEach((a) => s.add(a.id)); setSelectedIds(s); }} className="px-2 py-1 bg-gray-200 rounded text-xs hover:bg-gray-300" title={`选中当前列表后 ${quickSelN} 个`}>选后N</button>
                         {selectedIds.size > 0 && <button onClick={() => setSelectedIds(new Set())} className="text-gray-400 hover:underline text-xs">清空</button>}
                     </div>
                     <div ref={scrollRef} onScroll={(e) => setScrollTop((e.target as HTMLDivElement).scrollTop)} className="flex-1 overflow-auto min-h-0">

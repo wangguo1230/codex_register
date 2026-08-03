@@ -120,7 +120,7 @@ app.post("/api/mailboxes/import", async (req, res) => {
     const result = await db.importFreeMailboxes(rows, String(req.body.grp || "").trim(), usage, String(req.body.provider || "mailcom"));
     broadcast("mailboxes", {stats: await db.mailboxStats()});
     // 导入后自动改密(可选):对刚导入的邮箱(free 或 hold)批量改随机20位(headed 串行,后台跑)
-    if (req.body.autoChangePw && !batchPwRunning && !scheduler.maintLock) {
+    if (req.body.autoChangePw && !batchPwRunning && !pwQueueWorkerRunning && !scheduler.maintLock) {
         const emails = new Set(rows.map((r) => r.email.toLowerCase()));
         const items = (await db.listMailboxes()).filter((m) => emails.has(m.email) && (m.usage === "free" || m.usage === "hold")).map((m) => ({id: m.id, email: m.email, oldPw: m.password}));
         if (items.length) { scheduler.acquireLock("import-auto-pw"); startBatchPasswd(items, mailboxPwApply, "导入后改密"); return res.json({...result, autoChangePw: items.length}); }
@@ -148,7 +148,7 @@ app.post("/api/mailboxes/allocate", async (req, res) => {
         if (!ids.length) return res.status(400).json({error: "未选择邮箱"});
         const changePwFirst = req.body.changePwFirst === true;
         if (changePwFirst) {
-            if (batchPwRunning) return res.status(409).json({error: "已有批量改密在跑,请等待完成或先停止后再用「先改密」分配"});
+            if (batchPwRunning || pwQueueWorkerRunning) return res.status(409).json({error: "已有批量改密在跑,请等待完成或先停止后再用「先改密」分配"});
             if (scheduler.maintLock) return res.status(409).json({error: `有浏览器任务在跑(${scheduler.maintLock}),请等待完成`});
             const mbs = (await Promise.all(ids.map((id) => db.getMailbox(id)))).filter((m) => m && m.usage === "free");
             if (!mbs.length) return res.status(400).json({error: "选中的邮箱都不是待分配(free)状态,无法先改密"});
@@ -506,18 +506,118 @@ app.post("/api/accounts/set-sold", async (req, res) => {
     broadcast("stats", await db.stats());
     res.json({ok: true, count, sold});
 });
-// 批量串行改密(通用引擎):headed 一次一个,后台跑、SSE 进度推送。改密是邮箱能力,GPT/邮箱域共用此引擎。
+// ========== 批量改密引擎(双模式:队列模式 + 直跑模式) ==========
+// 队列模式(batch-change-passwd):任务入 pw_queue 表,各实例 FOR UPDATE SKIP LOCKED 认领,多实例并行。
+// 直跑模式(startBatchPasswd):内存列表驱动,单实例,支持 onDone 回调(changePwFirst / 导入后改密)。
 let batchPwRunning = false, batchPwStop = false;
-const batchPwProg = {running: false, done: 0, total: 0, ok: 0, stopped: false}; // 进度快照(供 /api/state 刷新后恢复)
-// items=[{id,email,oldPw}](oldPw 可为 string|string[] 做自愈候选);apply(item,{ok,np,verified,detail})=写库+广播。
-// onDone(可选):全部跑完(或停止)后回调 {done, ok, stopped},用于"先改密再分配"等链式流程。
+const batchPwProg = {running: false, done: 0, total: 0, ok: 0, stopped: false};
+
+// 邮箱改密结果写库(mailboxes 表)+ 广播
+const mailboxPwApply = async (it, {ok, np, verified, detail}) => {
+    const mb = await db.getMailbox(it.id);
+    if (ok) await db.setMailboxPassword(it.id, np, `✅已改 ${pwStamp()}${verified ? "(验证)" : "?未验证"}`);
+    else await db.setMailboxPassword(it.id, mb?.password ?? "", `❌试过 ${np}·${String(detail).slice(0, 30)}`);
+    broadcast("mailboxes", {stats: await db.mailboxStats()});
+};
+
+// 执行单个改密(队列/直跑共用)
+async function doPwChange(mailboxId, email, oldPw) {
+    const np = randomPassword(20);
+    logMailbox(mailboxId, `[改密] 新密码=${np}`);
+    try {
+        const r = await changeMailcomPassword(email, oldPw, np, (m) => logMailbox(mailboxId, `[改密] ${m}`));
+        const ok = !!r?.ok;
+        await mailboxPwApply({id: mailboxId}, {ok, np, verified: r?.verified, detail: r?.detail || "失败"});
+        logMailbox(mailboxId, ok ? `[改密] 成功` : `[改密] 失败(新密码 ${np} 已记录)`);
+        return {ok, np, detail: r?.detail || ""};
+    } catch (e) {
+        await mailboxPwApply({id: mailboxId}, {ok: false, np, detail: String(e?.message || e)});
+        logMailbox(mailboxId, `[改密] 异常(新密码 ${np} 已记录): ${e?.message || e}`);
+        return {ok: false, np, detail: String(e?.message || e)};
+    }
+}
+
+// ---- 队列模式:pw_queue 表驱动,多实例认领 ----
+let pwQueueWorkerRunning = false, pwQueueStop = false;
+
+async function broadcastPwProgress() {
+    const prog = await db.pwQueueProgress();
+    Object.assign(batchPwProg, {running: pwQueueWorkerRunning || batchPwRunning, done: prog.done, total: prog.total, ok: prog.done, stopped: false});
+    broadcast("batchPw", {...batchPwProg});
+}
+
+async function startPwQueueWorker() {
+    if (pwQueueWorkerRunning) return;
+    pwQueueWorkerRunning = true; pwQueueStop = false;
+    scheduler.acquireLock("batch-pw");
+    await broadcastPwProgress();
+    (async () => {
+        if (scheduler.running.size > 0) {
+            broadcast("log", {id: 0, line: `[队列改密] 等待 ${scheduler.running.size} 个注册任务完成…`, ts: Date.now()});
+            await waitRegIdle();
+        }
+        const conc = scheduler.pwConcurrency || 1;
+        while (!pwQueueStop) {
+            const tasks = await db.claimPwTasks(db.instanceId, conc);
+            if (!tasks.length) break;
+            await runPool(tasks, async (t) => {
+                if (pwQueueStop) return;
+                const r = await doPwChange(t.mailbox_id, t.email, t.old_pw);
+                await db.completePwTask(t.id, r.ok, r.np, r.detail);
+                await broadcastPwProgress();
+            }, conc);
+        }
+        pwQueueWorkerRunning = false;
+        scheduler.releaseLock("batch-pw"); scheduler.tick();
+        await broadcastPwProgress();
+        console.log(`[队列改密] ${pwQueueStop ? "已停止" : "队列处理完毕"}`);
+        pwQueueStop = false;
+    })();
+}
+
+// 定时探测:有 pending 改密任务且本实例空闲 → 自动启动 worker
+setInterval(async () => {
+    if (pwQueueWorkerRunning || batchPwRunning || scheduler.maintLock) return;
+    try {
+        const prog = await db.pwQueueProgress();
+        if (prog.pending > 0) startPwQueueWorker();
+    } catch { /* ignore */ }
+}, 5000);
+
+// 入口:选中邮箱 → 入队 → 启动本实例 worker
+app.post("/api/mailboxes/batch-change-passwd", async (req, res) => {
+    const ids = Array.isArray(req.body?.ids) ? req.body.ids.map(Number) : [];
+    const mbs = (await Promise.all(ids.map((id) => db.getMailbox(id)))).filter(Boolean);
+    if (!mbs.length) return res.json({ok: true, count: 0, msg: "未选择有效邮箱"});
+    const items = mbs.map((m) => ({id: m.id, email: m.email, oldPw: m.password}));
+    await db.addToPwQueue(items);
+    res.json({ok: true, count: items.length});
+    startPwQueueWorker();
+});
+
+// 停止:本实例停 + 删除未认领的 pending 任务(其他实例也不会再捡)
+app.post("/api/control/batch-passwd/stop", async (req, res) => {
+    pwQueueStop = true; batchPwStop = true;
+    const cancelled = await db.cancelPendingPwTasks();
+    res.json({ok: true, cancelled});
+});
+
+// 清理已完成的改密队列
+app.post("/api/control/pw-queue/clear", async (req, res) => {
+    await db.clearPwQueue();
+    await broadcastPwProgress();
+    res.json({ok: true});
+});
+
+app.post("/api/control/pw-concurrency", (req, res) => res.json({ok: true, pwConcurrency: scheduler.setPwConcurrency(req.body?.pwConcurrency)}));
+
+// ---- 直跑模式(changePwFirst / 导入后改密):内存列表,单实例,支持 onDone 回调 ----
 function startBatchPasswd(items, apply, tag = "批量改密", onDone) {
-    const lockOwner = scheduler.maintLock; // 调用点已 acquireLock,记住 owner 用于结束时释放
+    const lockOwner = scheduler.maintLock;
     batchPwRunning = true; batchPwStop = false;
     Object.assign(batchPwProg, {running: true, done: 0, total: items.length, ok: 0, stopped: false});
     broadcast("batchPw", {...batchPwProg});
     (async () => {
-        // 等已跑的注册完成(锁已设,tick 不会认领新的)
         if (scheduler.running.size > 0) {
             broadcast("log", {id: 0, line: `[${tag}] 等待 ${scheduler.running.size} 个注册任务完成…`, ts: Date.now()});
             await waitRegIdle();
@@ -526,15 +626,8 @@ function startBatchPasswd(items, apply, tag = "批量改密", onDone) {
         const conc = scheduler.pwConcurrency || 1;
         await runPool(items, async (it) => {
             if (batchPwStop) return;
-            const np = randomPassword(20);
-            logMailbox(it.id, `[改密] ${tag}(${done + 1}/${items.length}),新密码=${np}`);
-            try {
-                const r = await changeMailcomPassword(it.email, it.oldPw, np, (m) => logMailbox(it.id, `[改密] ${m}`));
-                if (r?.ok) { await apply(it, {ok: true, np, verified: r.verified}); okc += 1; logMailbox(it.id, `[改密] 成功`); }
-                else { await apply(it, {ok: false, np, detail: r?.detail || "失败"}); logMailbox(it.id, `[改密] 失败(新密码 ${np} 已记录)`); }
-            } catch (e) {
-                await apply(it, {ok: false, np, detail: String(e?.message || e)}); logMailbox(it.id, `[改密] 异常(新密码 ${np} 已记录): ${e?.message || e}`);
-            }
+            const r = await doPwChange(it.id, it.email, it.oldPw);
+            if (r.ok) okc++;
             done += 1;
             Object.assign(batchPwProg, {done, ok: okc});
             broadcast("batchPw", {...batchPwProg});
@@ -545,40 +638,9 @@ function startBatchPasswd(items, apply, tag = "批量改密", onDone) {
         broadcast("batchPw", {...batchPwProg});
         console.log(`[${tag}] ${stopped ? "已停止" : "完成"} ${okc}/${items.length} 成功`);
         if (onDone) { try { onDone({done, ok: okc, stopped}); } catch (e) { console.warn(`[${tag}] onDone 异常:`, e?.message ?? e); } }
-        // onDone 里可能已经释放了锁(如 changePwFirst),这里兜底确保释放
         if (lockOwner && scheduler.maintLock === lockOwner) { scheduler.releaseLock(lockOwner); scheduler.tick(); }
     })();
 }
-
-// GPT 域批量改密已移除:所有邮箱改密统一在邮箱管理(POST /api/mailboxes/batch-change-passwd,覆盖 gpt 邮箱)。
-// 邮箱域批量改密(★职责集中:所有邮箱改密统一入口,操作 mailboxes 表,覆盖 free/gpt/claude)。
-// ids=选中的 mailbox id(必填);跳过库里没有的。改后广播 mailboxes 刷新。
-app.post("/api/mailboxes/batch-change-passwd", async (req, res) => {
-    if (batchPwRunning) return res.status(409).json({error: "已有批量改密在跑,请等待完成或先停止"});
-    if (scheduler.maintLock) return res.status(409).json({error: `有浏览器任务在跑(${scheduler.maintLock}),请等待完成`});
-    const ids = Array.isArray(req.body?.ids) ? req.body.ids.map(Number) : [];
-    const mbs = (await Promise.all(ids.map((id) => db.getMailbox(id)))).filter(Boolean);
-    if (!mbs.length) return res.json({ok: true, count: 0, msg: "未选择有效邮箱"});
-    scheduler.acquireLock("batch-pw");
-    res.json({ok: true, count: mbs.length});
-    const items = mbs.map((m) => ({id: m.id, email: m.email, oldPw: m.password}));
-    startBatchPasswd(items, mailboxPwApply, "邮箱批量改密");
-});
-
-// 邮箱改密结果写库(mailboxes 表)+ 广播。批量改密/导入后改密共用(DRY)。失败保留原密码,只记状态。
-const mailboxPwApply = async (it, {ok, np, verified, detail}) => {
-    const mb = await db.getMailbox(it.id);
-    if (ok) await db.setMailboxPassword(it.id, np, `✅已改 ${pwStamp()}${verified ? "(验证)" : "?未验证"}`);
-    else await db.setMailboxPassword(it.id, mb?.password ?? "", `❌试过 ${np}·${String(detail).slice(0, 30)}`);
-    broadcast("mailboxes", {stats: await db.mailboxStats()});
-};
-// 停止批量改密(当前正在改的那个号会跑完,之后不再开始;正在跑的浏览器不强杀)
-app.post("/api/control/batch-passwd/stop", (req, res) => {
-    if (!batchPwRunning) return res.json({ok: true, msg: "当前无批量改密任务"});
-    batchPwStop = true;
-    res.json({ok: true});
-});
-app.post("/api/control/pw-concurrency", (req, res) => res.json({ok: true, pwConcurrency: scheduler.setPwConcurrency(req.body?.pwConcurrency)}));
 // 打开一个已登录 chatgpt 的真浏览器(注入该号 at 会话 sessionToken + CF cookie),供人工操作;不关闭,用户关窗口即断开。
 const openedBrowsers = new Map(); // id -> browser(防 GC + 支持重开时关旧的)
 app.post("/api/accounts/:id/open-browser", async (req, res) => {
@@ -789,8 +851,8 @@ function runRtWorker(acc, preferPhone) {
                 SMS_LINK_TEMPLATE: scheduler.smsLinkTemplate || "",
                 SMS_MAX_BIND: String(scheduler.smsMaxBind ?? 0),
                 RT_PREFER_PHONE: preferPhone || "",
-                PROXY_URL: scheduler.regProxy || "",
-                MAILCOM_PROXY: scheduler.mailProxy || "",
+                PROXY_URL: scheduler.rtProxy || scheduler.regProxy || "",
+                MAILCOM_PROXY: scheduler.mailProxyEnabled !== false ? (scheduler.mailProxy || "") : "",
                 // PG 迁移后 worker 通过 process.env.DATABASE_URL 继承连接
             },
         });
@@ -851,7 +913,7 @@ function runReloginAtWorker(acc) {
                 MAILCOM_TOKENS_FILE: tmpFile, ICLOUD_TOKENS_FILE: tmpFile,
                 MAILCOM_HEADLESS: "1",
                 PROXY_URL: scheduler.regProxy || "",
-                MAILCOM_PROXY: scheduler.mailProxy || "",
+                MAILCOM_PROXY: scheduler.mailProxyEnabled !== false ? (scheduler.mailProxy || "") : "",
                 REG_SIMULATE_CHAT: "", // 不养号
                 REG_TRY_RT: "0",       // 不取 rt,只拿 at
                 // PG 迁移后 worker 通过 process.env.DATABASE_URL 继承连接
@@ -892,12 +954,13 @@ async function testOneRt(acc, {updateRt = true, acquire = false} = {}) {
     await pushTestStatus(acc.id, "rt", "测试中…");
     const rtData = getRtData(acc);
     const tok = extractTokens(rtData || getAuthData(acc));
+    const rtDispatcher = buildProxyDispatcher(scheduler.rtProxy || scheduler.regProxy);
     if (tok && tok.refreshToken) {
-        let r = await refreshRt(tok.refreshToken, buildProxyDispatcher(scheduler.regProxy));
+        let r = await refreshRt(tok.refreshToken, rtDispatcher);
         if (!r.ok) { // 失败重试一次:过滤网络/代理抖动,两次都失败才算过期(避免抖动误判 dead)
             await pushTestStatus(acc.id, "rt", "失败,重试中…");
             await new Promise((s) => setTimeout(s, 2500));
-            r = await refreshRt(tok.refreshToken, buildProxyDispatcher(scheduler.regProxy));
+            r = await refreshRt(tok.refreshToken, rtDispatcher);
         }
         if (r.ok) {
             // 续期只写回【rt 文件本身】(更新 refresh_token/id_token),★绝不碰 at(auth_file 的网页 access_token)。
@@ -1055,9 +1118,11 @@ app.post("/api/control/test-chat", async (req, res) => {
 });
 app.post("/api/control/proxy", (req, res) => {
     if (typeof req.body?.regProxy === "string") scheduler.regProxy = req.body.regProxy.trim();
-    if (typeof req.body?.mailProxy === "string") { scheduler.mailProxy = req.body.mailProxy.trim(); setMailProxy(scheduler.mailProxy); }
+    if (typeof req.body?.mailProxy === "string") scheduler.mailProxy = req.body.mailProxy.trim();
+    if (typeof req.body?.mailProxyEnabled === "boolean") scheduler.mailProxyEnabled = req.body.mailProxyEnabled;
+    setMailProxy(scheduler.mailProxyEnabled !== false ? (scheduler.mailProxy || "") : "");
     scheduler.saveSettings();
-    res.json({ok: true, regProxy: scheduler.regProxy, mailProxy: scheduler.mailProxy});
+    res.json({ok: true, regProxy: scheduler.regProxy, mailProxy: scheduler.mailProxy, mailProxyEnabled: scheduler.mailProxyEnabled !== false});
 });
 
 // ---------- 独立 vless 代理(起独立 xray，注册代理自动指向本地端口，不碰用户自己的 v2rayN) ----------
@@ -1367,7 +1432,7 @@ function runReloginAtWorkerStandalone(email, password): Promise<{ok: boolean; ac
                 MAILCOM_TOKENS_FILE: tmpFile, ICLOUD_TOKENS_FILE: tmpFile,
                 MAILCOM_HEADLESS: "1",
                 PROXY_URL: scheduler.regProxy || "",
-                MAILCOM_PROXY: scheduler.mailProxy || "",
+                MAILCOM_PROXY: scheduler.mailProxyEnabled !== false ? (scheduler.mailProxy || "") : "",
                 REG_SIMULATE_CHAT: "",
                 REG_TRY_RT: "0",
             },
@@ -1462,7 +1527,7 @@ function runRtWorkerStandalone(email, password): Promise<{ok: boolean; rt?: stri
                 MAILCOM_TOKENS_FILE: tmpFile, ICLOUD_TOKENS_FILE: tmpFile,
                 MAILCOM_HEADLESS: "1",
                 PROXY_URL: scheduler.regProxy || "",
-                MAILCOM_PROXY: scheduler.mailProxy || "",
+                MAILCOM_PROXY: scheduler.mailProxyEnabled !== false ? (scheduler.mailProxy || "") : "",
                 // PG 迁移后 worker 通过 process.env.DATABASE_URL 继承连接
                 SMS_LINK_TEMPLATE: scheduler.smsLinkTemplate || "",
             },
@@ -1517,7 +1582,8 @@ app.post("/api/export/full", async (req, res) => {
 
     // 所有范围统一只导「可用」的号:status=success 且未失效(dead_at=0)。
     // 选中/批次里混着的未注册成功/已失效号直接排除(前端弹窗会实时显示导出数与排除数,不会悄悄丢行)。
-    let rows = (await db.listAccounts("success")).filter((r) => !r.dead_at);
+    const needAuth = format === "session" || format === "at";
+    let rows = (await db.listAccounts("success", needAuth)).filter((r) => !r.dead_at);
     if (batch != null) rows = rows.filter((r) => (r.batch || "") === batch);
     if (idSet) rows = rows.filter((r) => idSet.has(r.id));
     if (scope === "hasRt") rows = rows.filter((r) => r.rt_file);
@@ -1612,7 +1678,7 @@ async function rechargeSync() { broadcast("recharge", await db.listRechargeCards
 // 配置
 app.get("/api/recharge/config", (req, res) => {
     const key = scheduler.rechargeApiKey || "";
-    res.json({baseUrl: scheduler.rechargeBaseUrl || "", appId: scheduler.rechargeAppId || "", apiKey: key ? `${key.slice(0, 6)}****${key.slice(-4)}` : "", forwardIp: scheduler.rechargeForwardIp || "", concurrency: scheduler.rechargeConcurrency || 3, interval: scheduler.rechargeInterval || 3, hasKey: !!key});
+    res.json({baseUrl: scheduler.rechargeBaseUrl || "", appId: scheduler.rechargeAppId || "", apiKey: key ? `${key.slice(0, 6)}****${key.slice(-4)}` : "", forwardIp: scheduler.rechargeForwardIp || "", concurrency: scheduler.rechargeConcurrency || 3, interval: scheduler.rechargeInterval || 3, hasKey: !!key, rtProxy: scheduler.rtProxy || "", rtConcurrency: scheduler.rtConcurrency || 4});
 });
 app.post("/api/recharge/config", (req, res) => {
     const b = req.body || {};
@@ -1622,6 +1688,8 @@ app.post("/api/recharge/config", (req, res) => {
     if (typeof b.forwardIp === "string") scheduler.rechargeForwardIp = b.forwardIp.trim();
     if (b.concurrency !== undefined) scheduler.rechargeConcurrency = Math.max(1, Math.min(10, Number(b.concurrency) || 3));
     if (b.interval !== undefined) scheduler.rechargeInterval = Math.max(0, Math.min(60, Number(b.interval) || 3));
+    if (typeof b.rtProxy === "string") scheduler.rtProxy = b.rtProxy.trim();
+    if (b.rtConcurrency !== undefined) scheduler.rtConcurrency = Math.max(1, Math.min(20, Number(b.rtConcurrency) || 4));
     scheduler.saveSettings();
     res.json({ok: true});
 });
@@ -1802,7 +1870,7 @@ app.post("/api/recharge/submit", async (req, res) => {
                 const task = taskRes.task || {};
                 const taskNo = task.task_no || task.receipt_no || "";
 
-                await db.updateQueueItem(q.id, {status: "submitted", task_no: taskNo, task_status: task.status || "queued", task_message: task.message || ""});
+                await db.updateQueueItem(q.id, {status: "submitted", task_no: taskNo, task_status: task.status || "queued", task_message: task.message || "", submitted_at: Date.now()});
                 await db.updateRechargeCard(card.id, {status: "submitted", task_no: taskNo, task_status: task.status || "queued", task_message: task.message || ""});
 
                 submitted++;
@@ -1964,22 +2032,23 @@ app.post("/api/recharge/queue/export", async (req, res) => {
         return res.set("Content-Type", "text/plain; charset=utf-8").send(text);
     }
 
-    // 有账号缺少 RT → 异步获取，完成后 SSE 推送
+    // 有账号缺少 RT → 异步并发获取，完成后 SSE 推送
+    const rtConc = scheduler.rtConcurrency || 4;
     res.json({ok: true, async: true, total: rows.length, needRt: needRt.length});
-    rechargeLog(`导出含RT: ${needRt.length}/${rows.length} 个账号缺少 RT，自动获取中...`);
+    rechargeLog(`导出含RT: ${needRt.length}/${rows.length} 个账号缺少 RT，并发${rtConc}获取中...`);
     (async () => {
-        let ok = 0, fail = 0;
-        for (let i = 0; i < needRt.length; i++) {
-            const r = needRt[i];
+        let ok = 0, fail = 0, done = 0;
+        await runPool(needRt, async (r) => {
+            const idx = ++done;
             const acc = await db.getAccount(r.account_id);
-            if (!acc) { fail++; rechargeLog(`[${i + 1}/${needRt.length}] ✗ ${r.email} 账号不存在`); continue; }
-            rechargeLog(`[${i + 1}/${needRt.length}] 获取 RT: ${r.email}...`);
+            if (!acc) { fail++; rechargeLog(`[${idx}/${needRt.length}] ✗ ${r.email} 账号不存在`); return; }
+            rechargeLog(`[${idx}/${needRt.length}] 获取 RT: ${r.email}...`);
             try {
                 const result = await testOneRt(acc, {acquire: true});
                 if (result.ok) { ok++; rechargeLog(`  ✓ ${r.email}`); }
                 else { fail++; rechargeLog(`  ✗ ${r.email} ${result.reason || "失败"}`); }
             } catch (e: any) { fail++; rechargeLog(`  ✗ ${r.email} ${e?.message || e}`); }
-        }
+        }, rtConc);
         rechargeLog(`RT 获取完成: 成功 ${ok} / 失败 ${fail}`);
         // 重新查询最新数据并通过 SSE 推送
         const freshRows = await db.listRechargeQueueFull(ids.length ? ids : undefined, batch || undefined);
@@ -2043,7 +2112,7 @@ if (existsSync(WEB_DIST)) {
     app.get(/^(?!\/api).*/, (req, res) => { res.set("Cache-Control", "no-cache"); res.sendFile(path.join(WEB_DIST, "index.html")); });
 }
 
-setMailProxy(scheduler.mailProxy); // 收件箱初始用邮箱代理(config.mailProxyUrl)
+setMailProxy(scheduler.mailProxyEnabled !== false ? (scheduler.mailProxy || "") : ""); // 收件箱初始用邮箱代理(受开关控制)
 // 重启自启:若持久化了 vless，自动重新起独立 xray 并把 regProxy 指向它(失败不阻塞服务启动)
 if (scheduler.xrayVless) {
     try {

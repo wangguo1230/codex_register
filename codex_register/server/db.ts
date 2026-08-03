@@ -68,12 +68,13 @@ export async function importAccounts(rows, batch = "", provider = "mailcom") {
     });
 }
 
-export async function listAccounts(status?) {
+export async function listAccounts(status?, full = false) {
+    const cols = full ? ACC_COLS_FULL : ACC_COLS_LIST;
     if (status) {
-        const { rows } = await query(`SELECT ${ACC_COLS_LIST} ${ACC_FROM} WHERE g.status=$1 ORDER BY g.id`, [status]);
+        const { rows } = await query(`SELECT ${cols} ${ACC_FROM} WHERE g.status=$1 ORDER BY g.id`, [status]);
         return rows;
     }
-    const { rows } = await query(`SELECT ${ACC_COLS_LIST} ${ACC_FROM} ORDER BY g.id`);
+    const { rows } = await query(`SELECT ${cols} ${ACC_FROM} ORDER BY g.id`);
     return rows;
 }
 
@@ -692,8 +693,9 @@ export async function removeFromRechargeQueue(ids) {
             if (!item) continue;
             const res = await client.query(`DELETE FROM recharge_queue WHERE id=$1`, [id]);
             if (res.rowCount) {
-                await client.query(`UPDATE gpt_accounts SET sold_at=0 WHERE id=$1`, [item.account_id]);
                 const { rows: [gpt] } = await client.query(`SELECT mailbox_id FROM gpt_accounts WHERE id=$1`, [item.account_id]);
+                await client.query(`DELETE FROM logs WHERE account_id=$1`, [item.account_id]);
+                await client.query(`DELETE FROM gpt_accounts WHERE id=$1`, [item.account_id]);
                 if (gpt) await softDeleteMailbox(client, gpt.mailbox_id);
                 count++;
             }
@@ -711,7 +713,7 @@ export async function setRechargeQueueBatch(ids, batch) {
 }
 
 export async function updateQueueItem(id, fields) {
-    const allowed = ["status", "card_id", "card_code", "task_no", "task_status", "task_message", "error", "batch", "plan_type"];
+    const allowed = ["status", "card_id", "card_code", "task_no", "task_status", "task_message", "error", "batch", "plan_type", "submitted_at"];
     const sets = [], vals = [];
     for (const k of allowed) {
         if (fields[k] !== undefined) { sets.push(`${k}=$${vals.length + 1}`); vals.push(fields[k]); }
@@ -733,7 +735,7 @@ export async function resetRechargeQueue(ids) {
             const freshAuthFile = acc?.auth_file || item.auth_file;
             const freshAuthData = acc?.auth_data || item.auth_data;
             await client.query(
-                `UPDATE recharge_queue SET status='pending', card_id=0, card_code='', task_no='', task_status='', task_message='', error='', auth_file=$1, auth_data=$2 WHERE id=$3`,
+                `UPDATE recharge_queue SET status='pending', card_id=0, card_code='', task_no='', task_status='', task_message='', error='', submitted_at=0, auth_file=$1, auth_data=$2 WHERE id=$3`,
                 [freshAuthFile, freshAuthData ? JSON.stringify(freshAuthData) : null, id]
             );
         }
@@ -769,4 +771,52 @@ export async function listRechargeQueueFull(ids?: number[], batch?: string) {
     sql += ` ORDER BY rq.id`;
     const { rows } = await query(sql, params);
     return rows;
+}
+
+// ========== 改密队列(多实例 FOR UPDATE SKIP LOCKED) ==========
+
+export async function addToPwQueue(items) {
+    const now = Date.now();
+    await withTransaction(async (client) => {
+        for (const it of items) {
+            await client.query(
+                `INSERT INTO pw_queue(mailbox_id, email, old_pw, created_at) VALUES($1,$2,$3,$4)`,
+                [it.id, it.email, it.oldPw, now]
+            );
+        }
+    });
+    return items.length;
+}
+
+export async function claimPwTasks(instId, limit = 1) {
+    return withTransaction(async (client) => {
+        const { rows } = await client.query(
+            `SELECT id, mailbox_id, email, old_pw FROM pw_queue WHERE status='pending' ORDER BY id LIMIT $1 FOR UPDATE SKIP LOCKED`,
+            [limit]
+        );
+        if (!rows.length) return [];
+        const ids = rows.map((r) => r.id);
+        await client.query(`UPDATE pw_queue SET status='running', instance_id=$1 WHERE id = ANY($2)`, [instId, ids]);
+        return rows;
+    });
+}
+
+export async function completePwTask(id, ok, newPw, detail = "") {
+    await query(`UPDATE pw_queue SET status=$1, new_pw=$2, detail=$3 WHERE id=$4`, [ok ? "done" : "error", newPw, detail.slice(0, 500), id]);
+}
+
+export async function pwQueueProgress() {
+    const { rows } = await query(`SELECT status, COUNT(*)::int AS n FROM pw_queue GROUP BY status`);
+    const out = { pending: 0, running: 0, done: 0, error: 0, total: 0 };
+    for (const r of rows) { if (out[r.status] !== undefined) out[r.status] = r.n; out.total += r.n; }
+    return out;
+}
+
+export async function cancelPendingPwTasks() {
+    const { rowCount } = await query(`DELETE FROM pw_queue WHERE status='pending'`);
+    return rowCount || 0;
+}
+
+export async function clearPwQueue() {
+    await query(`DELETE FROM pw_queue`);
 }

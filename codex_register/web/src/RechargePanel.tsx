@@ -29,6 +29,8 @@ export function RechargePanel({notify}: {notify?: (m: string) => void}) {
     const [configIp, setConfigIp] = useState("");
     const [configConcurrency, setConfigConcurrency] = useState(3);
     const [configInterval, setConfigInterval] = useState(3);
+    const [configRtProxy, setConfigRtProxy] = useState("");
+    const [configRtConcurrency, setConfigRtConcurrency] = useState(4);
     const [hasKey, setHasKey] = useState(false);
     const [showConfig, setShowConfig] = useState(false);
     // 弹窗
@@ -51,7 +53,7 @@ export function RechargePanel({notify}: {notify?: (m: string) => void}) {
 
     const loadQueue = () => { api.rechargeQueue().then((r) => { setQueue(r.list); setQStats(r.stats); }).catch(() => {}); api.rechargeQueueBatches().then(setQBatches).catch(() => {}); };
     const loadCards = () => api.rechargeCards().then((r) => { setCards(r.list); setCStats(r.stats); }).catch(() => {});
-    const loadConfig = () => api.rechargeConfig().then((c) => { setConfigBase(c.baseUrl); setConfigAppId(c.appId || ""); setConfigKey(c.apiKey); setConfigIp(c.forwardIp); setConfigConcurrency(c.concurrency || 3); setConfigInterval(c.interval || 3); setHasKey(!!c.hasKey); }).catch(() => {});
+    const loadConfig = () => api.rechargeConfig().then((c) => { setConfigBase(c.baseUrl); setConfigAppId(c.appId || ""); setConfigKey(c.apiKey); setConfigIp(c.forwardIp); setConfigConcurrency(c.concurrency || 3); setConfigInterval(c.interval || 3); setConfigRtProxy(c.rtProxy || ""); setConfigRtConcurrency(c.rtConcurrency || 4); setHasKey(!!c.hasKey); }).catch(() => {});
 
     useEffect(() => {
         loadQueue(); loadCards(); loadConfig();
@@ -93,7 +95,7 @@ export function RechargePanel({notify}: {notify?: (m: string) => void}) {
     const doSaveConfig = async () => {
         setBusy(true);
         try {
-            const body: any = {baseUrl: configBase, appId: configAppId, forwardIp: configIp, concurrency: configConcurrency, interval: configInterval};
+            const body: any = {baseUrl: configBase, appId: configAppId, forwardIp: configIp, concurrency: configConcurrency, interval: configInterval, rtProxy: configRtProxy, rtConcurrency: configRtConcurrency};
             if (configKey && !configKey.includes("****")) body.apiKey = configKey;
             await api.setRechargeConfig(body);
             loadConfig(); toast("配置已保存"); setShowConfig(false);
@@ -169,7 +171,7 @@ export function RechargePanel({notify}: {notify?: (m: string) => void}) {
     const doRemoveFromQueue = async () => {
         const ids = selQIds();
         if (!ids.length) return;
-        if (!confirm(`确认移出 ${ids.length} 个账号?\n对应 GPT 账号将恢复为未售出。`)) return;
+        if (!confirm(`确认移出 ${ids.length} 个账号?\n将同时删除对应 GPT 账号、日志及邮箱。`)) return;
         try {
             await api.removeFromRechargeQueue(ids);
             setQSel(new Set()); loadQueue(); toast(`已移出 ${ids.length} 个`);
@@ -298,6 +300,13 @@ export function RechargePanel({notify}: {notify?: (m: string) => void}) {
                         <label className="block"><span className="text-xs text-gray-500 mb-1 block">提交间隔 (秒)</span>
                             <input type="number" value={configInterval} onChange={(e) => setConfigInterval(Math.max(0, Math.min(60, Number(e.target.value) || 3)))}
                                    min={0} max={60} className="w-full px-2 py-1.5 text-sm border rounded outline-none"/></label>
+                        <label className="block"><span className="text-xs text-gray-500 mb-1 block">RT 代理 (空=用注册代理)</span>
+                            <input value={configRtProxy} onChange={(e) => setConfigRtProxy(e.target.value)}
+                                   placeholder="socks5://... 或留空"
+                                   className="w-full px-2 py-1.5 text-sm border rounded outline-none font-mono"/></label>
+                        <label className="block"><span className="text-xs text-gray-500 mb-1 block">RT 并发数</span>
+                            <input type="number" value={configRtConcurrency} onChange={(e) => setConfigRtConcurrency(Math.max(1, Math.min(20, Number(e.target.value) || 4)))}
+                                   min={1} max={20} className="w-full px-2 py-1.5 text-sm border rounded outline-none"/></label>
                     </div>
                     <div className="flex justify-end">
                         <Btn onClick={doSaveConfig} className="bg-blue-600 text-white border-blue-600 hover:bg-blue-700">保存配置</Btn>
@@ -355,6 +364,7 @@ export function RechargePanel({notify}: {notify?: (m: string) => void}) {
                                 <th className="text-left px-2 py-2 font-medium text-gray-500">批次</th>
                                 <th className="text-left px-2 py-2 font-medium text-gray-500">状态</th>
                                 <th className="text-left px-2 py-2 font-medium text-gray-500">卡密</th>
+                                <th className="text-left px-2 py-2 font-medium text-gray-500">提交时间</th>
                                 <th className="text-left px-2 py-2 font-medium text-gray-500">任务状态</th>
                                 <th className="text-left px-2 py-2 font-medium text-gray-500">消息</th>
                                 <th className="text-left px-2 py-2 font-medium text-gray-500">操作</th>
@@ -374,6 +384,7 @@ export function RechargePanel({notify}: {notify?: (m: string) => void}) {
                                         </span>
                                     </td>
                                     <td className="px-2 py-1.5 font-mono text-gray-500">{q.card_code ? (q.card_code.length > 16 ? q.card_code.slice(0, 8) + "…" : q.card_code) : "—"}</td>
+                                    <td className="px-2 py-1.5 text-gray-500 text-xs whitespace-nowrap">{fmtTime(q.submitted_at)}</td>
                                     <td className="px-2 py-1.5">{q.task_status ? <span style={{color: TASK_COLOR[q.task_status] || "#6b7280"}}>{q.task_status}</span> : "—"}</td>
                                     <td className="px-2 py-1.5 text-gray-500 max-w-[180px] truncate" title={q.task_message || q.error || ""}>
                                         {q.error ? <span className="text-red-500">{q.error}</span> : (q.task_message || "—")}
@@ -390,7 +401,7 @@ export function RechargePanel({notify}: {notify?: (m: string) => void}) {
                                     </td>
                                 </tr>
                             ))}
-                            {!filteredQueue.length && <tr><td colSpan={9} className="text-center py-8 text-gray-400">队列为空，点击「选择账号入队」添加</td></tr>}
+                            {!filteredQueue.length && <tr><td colSpan={10} className="text-center py-8 text-gray-400">队列为空，点击「选择账号入队」添加</td></tr>}
                         </tbody>
                     </table>
                 </div>

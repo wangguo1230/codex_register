@@ -200,6 +200,24 @@ export async function ensureSchema() {
         // 邮箱软删除
         await client.query(`ALTER TABLE mailboxes ADD COLUMN IF NOT EXISTS deleted_at BIGINT DEFAULT 0`);
 
+        // 充值提交时间
+        await client.query(`ALTER TABLE recharge_queue ADD COLUMN IF NOT EXISTS submitted_at BIGINT DEFAULT 0`);
+
+        // 改密队列(多实例 FOR UPDATE SKIP LOCKED)
+        await client.query(`
+            CREATE TABLE IF NOT EXISTS pw_queue (
+                id SERIAL PRIMARY KEY,
+                mailbox_id INTEGER NOT NULL,
+                email TEXT NOT NULL,
+                old_pw TEXT NOT NULL,
+                new_pw TEXT DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'pending',
+                instance_id TEXT DEFAULT '',
+                detail TEXT DEFAULT '',
+                created_at BIGINT NOT NULL
+            )
+        `);
+
         console.log("[pg] Schema 已就绪");
     } finally {
         client.release();
