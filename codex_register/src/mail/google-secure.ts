@@ -464,7 +464,17 @@ export async function runGoogleHardenWithBit(acc, {proxyUrl = "", log = () => {}
         google_state: acc.google_state || {},
         skip,
     };
-    if (straight.swapped) log("  导入字段对调：totp/辅助邮箱已纠正");
+    if (straight.swapped) {
+        log("  导入字段对调：totp/辅助邮箱已纠正");
+        try {
+            const {applyMailboxUpdate} = await import("../../server/db.js");
+            await applyMailboxUpdate(acc.email, {
+                totp_secret: straight.totpSecret,
+                recovery_email: straight.recoveryEmail,
+            });
+            log("  已写回库：密钥和辅助邮箱对调");
+        } catch { /* 跑任务时写回失败不挡登录 */ }
+    }
     if (skip.all) {
         log("[整备] 缺口已齐，不再开窗");
         return {

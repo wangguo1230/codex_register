@@ -81,6 +81,17 @@ export function straightenGoogleCreds(cred: {totpSecret?: string; totp_secret?: 
     return {totpSecret: totp, recoveryEmail: rec, swapped};
 }
 
+/** 导入行落库前纠正 totp/辅助邮箱，避免只在跑任务时内存对调。 */
+export function straightenImportRow(r: {totp_secret?: string; recovery_email?: string} = {}) {
+    const s = straightenGoogleCreds({totpSecret: r.totp_secret, recoveryEmail: r.recovery_email});
+    return {
+        ...r,
+        totp_secret: s.totpSecret,
+        recovery_email: s.recoveryEmail,
+        swapped: s.swapped,
+    };
+}
+
 export function normalizeTotpSecret(raw: string): string {
     const s = String(raw || "").trim();
     if (!s) return "";

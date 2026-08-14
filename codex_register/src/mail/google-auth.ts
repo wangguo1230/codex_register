@@ -1006,8 +1006,33 @@ export async function googleLogin(page, emailOrOpts, password = "", totpSecret =
 function totpInputs(page) {
     return page.locator(
         'input[name="totpPin"]:visible, input[autocomplete="one-time-code"]:visible, '
-        + 'input[id*="totp" i]:visible, input[aria-label*="code" i]:visible',
+        + 'input[id*="totp" i]:visible, input[aria-label*="code" i]:visible, '
+        + 'input[placeholder*="code" i]:visible, input[placeholder*="码" i]:visible',
     );
+}
+
+/** 浏览器「保存密码？」会挡住验证码框。点 Never/No Thanks，不依赖某一种语言当唯一标准。 */
+export async function dismissSavePasswordPrompt(page, write = () => {}) {
+    const named = page.getByRole("button", {name: /never|no thanks|not now|don't save|从不|不了|以后再说|不要保存|ahora no|agora não/i});
+    if (await named.first().isVisible({timeout: 350}).catch(() => false)) {
+        await named.first().click().catch(() => {});
+        write("  关掉保存密码提示");
+        await page.waitForTimeout(300);
+        return true;
+    }
+    const dlg = page.locator('[role="dialog"], [role="alertdialog"]').filter({hasText: /save password|保存密码|guardar contraseña|salvar senha/i}).first();
+    if (await dlg.isVisible({timeout: 250}).catch(() => false)) {
+        const dismiss = dlg.getByRole("button").filter({hasNotText: /^(save|guardar|salvar|保存)$/i}).first();
+        if (await dismiss.isVisible({timeout: 200}).catch(() => false)) {
+            await dismiss.click().catch(() => {});
+            write("  关掉保存密码提示");
+            await page.waitForTimeout(300);
+            return true;
+        }
+        await page.keyboard.press("Escape").catch(() => {});
+        return true;
+    }
+    return false;
 }
 
 async function isRecoveryPromptPage(page) {
@@ -1057,6 +1082,21 @@ async function dismissRecoveryPrompt(page, write = () => {}) {
 
 async function findVisibleTotpBox(page) {
     if (await isRecoveryPromptPage(page)) return null;
+    await dismissSavePasswordPrompt(page).catch(() => {});
+    const dlg = page.locator('[role="dialog"], [role="alertdialog"]').first();
+    if (await dlg.isVisible({timeout: 200}).catch(() => false)) {
+        const inDlg = dlg.locator(
+            'input[name="totpPin"], input[autocomplete="one-time-code"], input[aria-label*="code" i], input[placeholder*="code" i], input[type="tel"], input[inputmode="numeric"]',
+        );
+        const dn = await inDlg.count().catch(() => 0);
+        for (let i = 0; i < dn; i++) {
+            const el = inDlg.nth(i);
+            if (!await el.isVisible({timeout: 200}).catch(() => false)) continue;
+            const typ = String(await el.getAttribute("type").catch(() => "") || "").toLowerCase();
+            if (typ === "password" || typ === "email" || typ === "hidden") continue;
+            return el;
+        }
+    }
     const preferred = totpInputs(page);
     const n = await preferred.count().catch(() => 0);
     for (let i = 0; i < n; i++) {
@@ -1153,6 +1193,7 @@ async function waitTotpOutcome(page, hadWrong, write) {
 /** 逐位输入当前窗验证码。只点当前页 #totpNext。上次的 Wrong code 不能当这次失败。 */
 export async function submitGoogleTotp(page, secret, write = () => {}, attempt = 1) {
     if (await dismissGoogleGlitch(page, write)) return "glitch";
+    await dismissSavePasswordPrompt(page, write).catch(() => {});
     await waitTotpSafeWindow(14);
     const hadWrong = await pageHasWrongTotp(page);
     const code = generateTotp(secret);
@@ -1189,6 +1230,7 @@ export async function googleReauthPassword(page, passwordOrOpts, totpSecret = ""
     for (let i = 0; i < 5; i++) {
         const url = page.url();
         const body = String(await page.innerText("body").catch(() => ""));
+        if (await dismissSavePasswordPrompt(page, write)) continue;
         if (await dismissGoogleGlitch(page, write)) continue;
         if (IMAGE_CAPTCHA_RE.test(body)) {
             write("  二次验证遇到图片验证码，换出口再试");

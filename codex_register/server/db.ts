@@ -74,10 +74,12 @@ export async function importAccounts(rows, batch = "", provider = "mailcom") {
         let inserted = 0;
         for (const r of rows) {
             const email = r.email.toLowerCase();
+            const {straightenImportRow} = await import("../src/mfa.js");
+            const row = straightenImportRow(r);
             const { rows: ins } = await client.query(
                 `INSERT INTO mailboxes(email,password,provider,usage,grp,created_at,recovery_email,totp_secret)
                  VALUES($1,$2,$3,'gpt',$4,$5,$6,$7) ON CONFLICT(email) DO NOTHING RETURNING id`,
-                [email, r.password, prov, grp, now, r.recovery_email || "", r.totp_secret || ""]
+                [email, r.password, prov, grp, now, row.recovery_email || "", row.totp_secret || ""]
             );
             if (!ins.length) continue;
             await insertOrReviveGpt(client, ins[0].id, grp, now);
@@ -444,17 +446,19 @@ export async function importFreeMailboxes(rows, grp = "", usage = "free", provid
         const ids = [];
         for (const r of rows) {
             const email = r.email.toLowerCase();
+            const {straightenImportRow} = await import("../src/mfa.js");
+            const row = straightenImportRow(r);
             const { rows: ins } = await client.query(
                 `INSERT INTO mailboxes(email,password,provider,usage,grp,created_at,recovery_email,totp_secret)
                  VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT(email) DO NOTHING RETURNING id`,
-                [email, r.password, prov, u, g, now, r.recovery_email || "", r.totp_secret || ""]
+                [email, r.password, prov, u, g, now, row.recovery_email || "", row.totp_secret || ""]
             );
             if (ins[0]?.id) {
                 ids.push(ins[0].id);
             } else {
                 const { rows: upd } = await client.query(
                     `UPDATE mailboxes SET deleted_at=0, usage=$1, password=$2, provider=$3, grp=$4, recovery_email=$5, totp_secret=$6 WHERE email=$7 AND deleted_at>0 RETURNING id`,
-                    [u, r.password, prov, g, r.recovery_email || "", r.totp_secret || "", email]
+                    [u, r.password, prov, g, row.recovery_email || "", row.totp_secret || "", email]
                 );
                 if (upd[0]?.id) ids.push(upd[0].id);
             }

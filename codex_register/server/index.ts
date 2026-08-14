@@ -32,6 +32,7 @@ import {changePasswordOnPage, change2faOnPage} from "../src/mail/google-manage.j
 import {runGoogleHardenWithBit, withGoogleBitSession} from "../src/mail/google-secure.js";
 import {mailProxyPool, maskProxyUrl, toProxyImportLine, kookeeySessionOf, probeMailProxy, getMailProxyJump} from "../src/mail/proxy-pool.js";
 import {randomPassword} from "../src/utils.js";
+import {straightenImportRow} from "../src/mfa.js";
 import {openBrowserWithAuth} from "../src/simulate-chat.js";
 import {bitHealth, closeTrackedBitWindows, listAutomationBitWindows, stopAutomationBitWindows} from "../src/bitbrowser.js";
 import {clearMailboxJobStop, isMailboxJobStopped, requestMailboxJobStop} from "../src/mail/mailbox-job-stop.js";
@@ -126,7 +127,8 @@ function parseEmailPasswordLines(text) {
         const email = (parts[0] || "").toLowerCase();
         const password = parts[1] || "";
         if (/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) {
-            rows.push({email, password, totp_secret: parts[2] || "", recovery_email: parts[3] || ""});
+            const straight = straightenImportRow({totp_secret: parts[2] || "", recovery_email: parts[3] || ""});
+            rows.push({email, password, totp_secret: straight.totp_secret, recovery_email: straight.recovery_email});
         }
     }
     return rows;

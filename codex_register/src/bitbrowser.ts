@@ -62,6 +62,7 @@ export async function createBitWindow({proxy = "", name = "reg", remark = "codex
         syncIndexedDb: false,
         syncLocalStorage: false,
         syncHistory: false,
+        credentialsEnableService: true,
     };
     if (proxy) {
         const u = new URL(proxy);
@@ -198,6 +199,8 @@ export async function openBitWindow(id, {extractIp = true} = {}) {
         `--window-size=${t.width},${t.height}`,
         "--lang=en-US",
         "--accept-lang=en-US,en",
+        "--disable-save-password-bubble",
+        "--disable-features=PasswordManagerOnboarding",
     ];
     const d = await bitPost("/browser/open", {id, args, loadExtensions: false, extractIp: extractIp !== false});
     scheduleArrangeBitWindows();
