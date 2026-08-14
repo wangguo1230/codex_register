@@ -7,7 +7,7 @@ import {randomBytes} from "node:crypto";
 import {mkdirSync} from "node:fs";
 import path from "node:path";
 import {generateTotp, waitNextTotpWindow, waitTotpSafeWindow} from "../mfa.js";
-import {ensureGoogleLoggedIn, googleReauthPassword, isVerifyItsYouText, submitGoogleTotp, bounceOffSslOrSid} from "./google-auth.js";
+import {ensureGoogleLoggedIn, googleReauthPassword, isVerifyItsYouText, submitGoogleTotp, bounceOffSslOrSid, preferEnglishGoogleUi} from "./google-auth.js";
 import {launchGoogleBrowser} from "./google-account.js";
 
 const PASSWORD_URL = "https://myaccount.google.com/signinoptions/password?hl=en";
@@ -201,6 +201,7 @@ export async function changePasswordOnPage(page, {
     try { await page.goto(PASSWORD_URL, {waitUntil: "domcontentloaded", timeout: 30000}); } catch { /* ignore */ }
     await bounceOffSslOrSid(page, log);
     await page.waitForTimeout(1500);
+    await preferEnglishGoogleUi(page, log, PASSWORD_URL);
 
     await googleReauthPassword(page, {password, totpSecret, log});
     await bounceOffSslOrSid(page, log);
@@ -345,6 +346,7 @@ export async function change2faOnPage(page, {
     }
     try { await page.goto(TWO_STEP_URL, {waitUntil: "domcontentloaded", timeout: 30000}); } catch { /* ignore */ }
     await page.waitForTimeout(1500);
+    await preferEnglishGoogleUi(page, log, TWO_STEP_URL);
 
     await googleReauthPassword(page, {password, totpSecret, log});
     for (let i = 0; i < 6; i++) {

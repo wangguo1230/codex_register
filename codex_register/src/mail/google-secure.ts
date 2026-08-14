@@ -407,6 +407,8 @@ export async function withGoogleBitSession({proxyUrl = "", name = "gmail", remar
         page.setDefaultTimeout(30000);
         // 登录后 Google 会去 youtube SetSID 同步 Cookie，经跳板常 SSL 掐死。整备不需要 YouTube。
         await page.route(/accounts\.youtube\.com|youtube\.com\/accounts\/SetSID|accounts\.blogger\.com/i, (route) => route.abort()).catch(() => {});
+        const {applyGoogleEnglish} = await import("./google-auth.js");
+        await applyGoogleEnglish(page);
         try {
             return await fn(page);
         } finally {

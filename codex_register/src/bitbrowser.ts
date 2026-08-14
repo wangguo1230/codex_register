@@ -42,7 +42,13 @@ export async function createBitWindow({proxy = "", name = "reg", remark = "codex
         remark,
         proxyMethod: 2,
         proxyType: "noproxy",
-        browserFingerPrint: timeZone ? {timezone: timeZone, timeZone} : {},
+        browserFingerPrint: {
+            ...(timeZone ? {timezone: timeZone, timeZone, isIpCreateTimeZone: false} : {}),
+            isIpCreateLanguage: false,
+            languages: "en-US",
+            isIpCreateDisplayLanguage: false,
+            displayLanguages: "en-US",
+        },
         randomFingerprint: true,
         clearCookiesBeforeLaunch: true,
         clearCacheFilesBeforeLaunch: true,
@@ -62,6 +68,17 @@ export async function createBitWindow({proxy = "", name = "reg", remark = "codex
         if (u.password) body.proxyPassword = decodeURIComponent(u.password);
     }
     const d = await bitPost("/browser/update", body);   // 无 id = 新建
+    if (d?.id) {
+        await bitPost("/browser/update/partial", {
+            ids: [d.id],
+            browserFingerPrint: {
+                isIpCreateLanguage: false,
+                languages: "en-US",
+                isIpCreateDisplayLanguage: false,
+                displayLanguages: "en-US",
+            },
+        }).catch(() => {});
+    }
     return d.id;
 }
 
@@ -154,7 +171,12 @@ export async function openBitWindow(id, {extractIp = true} = {}) {
     const row = Math.floor(idx / t.cols);
     const x = t.startX + col * (t.width + t.spaceX);
     const y = t.startY + row * (t.height + t.spaceY);
-    const args = [`--window-position=${x},${y}`, `--window-size=${t.width},${t.height}`];
+    const args = [
+        `--window-position=${x},${y}`,
+        `--window-size=${t.width},${t.height}`,
+        "--lang=en-US",
+        "--accept-lang=en-US,en",
+    ];
     const d = await bitPost("/browser/open", {id, args, loadExtensions: false, extractIp: extractIp !== false});
     scheduleArrangeBitWindows();
     return {ws: d.ws, http: d.http, driver: d.driver};

@@ -1432,6 +1432,72 @@ function isSslOrSidDead(url, body = "") {
         || /accounts\.youtube\.com|\/accounts\/SetSID/i.test(url);
 }
 
+export function withGoogleHlEn(url) {
+    try {
+        const u = new URL(url);
+        u.searchParams.set("hl", "en");
+        return u.toString();
+    } catch {
+        return url;
+    }
+}
+
+/** 整备只认英文按钮：指纹/请求头/地址都锁 en，不再按地区适配文案。 */
+export async function applyGoogleEnglish(page) {
+    const ctx = page.context();
+    await ctx.setExtraHTTPHeaders({"Accept-Language": "en-US,en;q=0.9"}).catch(() => {});
+    try {
+        const cdp = await ctx.newCDPSession(page);
+        await cdp.send("Emulation.setLocaleOverride", {locale: "en-US"}).catch(() => {});
+        const ua = await page.evaluate(() => navigator.userAgent).catch(() => "");
+        if (ua) {
+            await cdp.send("Emulation.setUserAgentOverride", {
+                userAgent: ua,
+                acceptLanguage: "en-US,en;q=0.9",
+            }).catch(() => {});
+        }
+    } catch { /* ignore */ }
+    await page.addInitScript(() => {
+        try {
+            Object.defineProperty(navigator, "language", {get: () => "en-US"});
+            Object.defineProperty(navigator, "languages", {get: () => ["en-US", "en"]});
+        } catch { /* ignore */ }
+    }).catch(() => {});
+    await page.route(/https:\/\/(accounts|myaccount|gds)\.google\.com\//i, (route) => {
+        try {
+            if (route.request().method() !== "GET") return route.continue();
+            const url = new URL(route.request().url());
+            if (url.searchParams.get("hl") === "en") return route.continue();
+            url.searchParams.set("hl", "en");
+            return route.continue({url: url.toString()});
+        } catch {
+            return route.continue();
+        }
+    }).catch(() => {});
+}
+
+export async function preferEnglishGoogleUi(page, write = () => {}, destUrl = "") {
+    const dest = withGoogleHlEn(destUrl || page.url());
+    const t = String(await page.innerText("body").catch(() => "")).replace(/\s+/g, " ");
+    if (/Authenticator app|Change password|Change authenticator|Two-step verification|App passwords|Security/i.test(t)
+        && !/Kimlik do[gğ]rulay|Autentimisrakenduse|Mudar o app autenticador|Ubah aplikasi pengautentikasi/i.test(t)) {
+        return false;
+    }
+    write("  账号界面不是英文，强制 hl=en");
+    try {
+        await page.goto(
+            `https://www.google.com/setprefs?hl=en&gl=us&continue=${encodeURIComponent(dest)}`,
+            {waitUntil: "domcontentloaded", timeout: 30000},
+        );
+    } catch { /* ignore */ }
+    await page.waitForTimeout(900);
+    if (!/myaccount\.google\.com|accounts\.google\.com/i.test(page.url())) {
+        try { await page.goto(dest, {waitUntil: "domcontentloaded", timeout: 30000}); } catch { /* ignore */ }
+        await page.waitForTimeout(800);
+    }
+    return true;
+}
+
 export async function bounceOffSslOrSid(page, write) {
     const url = String(page.url());
     const body = String(await page.innerText("body").catch(() => ""));
