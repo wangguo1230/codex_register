@@ -37,6 +37,8 @@ export async function bitSessionReady() {
 
 // 创建随机指纹窗口(proxy 可选,格式 socks5://host:port 或 http://user:pass@host:port)。返回窗口 id。
 export async function createBitWindow({proxy = "", name = "reg", remark = "codex-reg", timeZone = ""} = {}) {
+    const screen = await getScreenSize();
+    const tile = tileLayout(plannedTileCount(), screen);
     const body = {
         name: `${String(name || "reg").slice(0, 24)}-${Date.now().toString(36).slice(-5)}`,
         remark,
@@ -48,6 +50,8 @@ export async function createBitWindow({proxy = "", name = "reg", remark = "codex
             languages: "en-US",
             isIpCreateDisplayLanguage: false,
             displayLanguages: "en-US",
+            openWidth: tile.width,
+            openHeight: tile.height,
         },
         randomFingerprint: true,
         clearCookiesBeforeLaunch: true,
@@ -93,48 +97,69 @@ function gridForCount(n) {
 }
 
 let cachedScreen = null;
+let expectedBitTiles = 0;
+
+/** 按本机并发（代理槽）预排，避免第 1 个窗按整屏打开。 */
+export function setExpectedBitTiles(n) {
+    expectedBitTiles = Math.max(0, Math.min(16, Number(n) || 0));
+}
+
+function plannedTileCount() {
+    return Math.max(1, liveBitIds.size || 0, expectedBitTiles || 0);
+}
+
 async function getScreenSize() {
     if (cachedScreen) return cachedScreen;
     try {
+        const {execFile} = await import("node:child_process");
+        const {promisify} = await import("node:util");
+        const execFileAsync = promisify(execFile);
         if (process.platform === "darwin") {
-            const {execFile} = await import("node:child_process");
-            const {promisify} = await import("node:util");
-            const execFileAsync = promisify(execFile);
             const {stdout} = await execFileAsync("osascript", ["-e", 'tell application "Finder" to get bounds of window of desktop']);
             const nums = String(stdout).split(/[^\d]+/).filter(Boolean).map(Number);
             if (nums.length >= 4) cachedScreen = {w: Math.max(800, nums[2] - nums[0]), h: Math.max(600, nums[3] - nums[1])};
         } else if (process.platform === "win32") {
-            const {execFile} = await import("node:child_process");
-            const {promisify} = await import("node:util");
-            const execFileAsync = promisify(execFile);
+            // 必须用工作区逻辑像素。Win32_VideoController 是物理分辨率，150% 缩放下会把每个窗算成接近整屏。
             const {stdout} = await execFileAsync("powershell", [
-                "-NoProfile", "-Command",
-                "$c = Get-CimInstance -ClassName Win32_VideoController | Select-Object -First 1; Write-Output $c.CurrentHorizontalResolution; Write-Output $c.CurrentVerticalResolution",
-            ]);
+                "-NoProfile", "-STA", "-Command",
+                "Add-Type -AssemblyName System.Windows.Forms; $w=[System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea; Write-Output $w.Width; Write-Output $w.Height",
+            ], {timeout: 8000});
             const nums = String(stdout).trim().split(/\s+/).map(Number).filter((n) => n > 200);
             if (nums.length >= 2) cachedScreen = {w: nums[0], h: nums[1]};
         }
-    } catch { /* 拿不到就按 1080p */ }
-    if (!cachedScreen) cachedScreen = {w: 1920, h: 1080};
+    } catch { /* 拿不到就用保守值 */ }
+    if (!cachedScreen) cachedScreen = process.platform === "win32" ? {w: 1366, h: 768} : {w: 1440, h: 900};
+    // 4K 物理值误当成逻辑值时压到常见桌面，避免 2x2 每格还接近 1080p
+    if (cachedScreen.w > 3000 || cachedScreen.h > 1800) {
+        cachedScreen = {w: Math.round(cachedScreen.w / 1.5), h: Math.round(cachedScreen.h / 1.5)};
+    }
     return cachedScreen;
 }
 
 function tileLayout(count, screen) {
     const n = Math.max(1, Number(count) || 1);
     const {cols, rows} = gridForCount(n);
-    const startX = 8;
-    const startY = 8;
-    const spaceX = 8;
-    const spaceY = 8;
-    const chromeH = process.platform === "darwin" ? 28 : 48;
-    const width = Math.max(500, Math.floor((screen.w - startX - (cols - 1) * spaceX) / cols));
-    const height = Math.max(280, Math.floor((screen.h - startY - chromeH - (rows - 1) * spaceY) / rows));
+    const startX = 4;
+    const startY = 4;
+    const spaceX = 6;
+    const spaceY = 6;
+    const taskbar = process.platform === "win32" ? 8 : 24;
+    const availW = Math.max(640, Number(screen.w) - startX);
+    const availH = Math.max(400, Number(screen.h) - startY - taskbar);
+    let width = Math.floor((availW - (cols - 1) * spaceX) / cols);
+    let height = Math.floor((availH - (rows - 1) * spaceY) / rows);
+    width = Math.min(width, availW);
+    height = Math.min(height, availH);
+    if (width * cols + spaceX * (cols - 1) > availW) width = Math.floor((availW - (cols - 1) * spaceX) / cols);
+    if (height * rows + spaceY * (rows - 1) > availH) height = Math.floor((availH - (rows - 1) * spaceY) / rows);
+    width = Math.max(400, width);
+    height = Math.max(240, height);
     return {cols, rows, startX, startY, spaceX, spaceY, width, height};
 }
 
 /** 按当前开着的窗数宫格排开，避免全叠在一起。 */
 export async function arrangeBitWindows(count = 0) {
-    const n = Math.max(1, Number(count) || liveBitIds.size || 1);
+    const n = Math.max(1, Number(count) || plannedTileCount());
     const screen = await getScreenSize();
     const t = tileLayout(n, screen);
     await bitPost("/windowbounds", {
@@ -164,7 +189,7 @@ function scheduleArrangeBitWindows() {
 //   注册即封的高权重原因之一)。因此 worker 不再手动硬编码时区。
 export async function openBitWindow(id, {extractIp = true} = {}) {
     const screen = await getScreenSize();
-    const n = Math.max(1, liveBitIds.size || 1);
+    const n = plannedTileCount();
     const t = tileLayout(n, screen);
     const idx = Math.max(0, liveBitIds.size - 1);
     const col = idx % t.cols;

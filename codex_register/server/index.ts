@@ -668,7 +668,9 @@ async function tickMailJobs() {
             scheduleMailboxJobBroadcast();
             return;
         }
-        const {isBitLoggedOut} = await import("../src/bitbrowser.js");
+        const {isBitLoggedOut, setExpectedBitTiles} = await import("../src/bitbrowser.js");
+        const snap = scheduler.mailProxyPoolSnap();
+        setExpectedBitTiles(Math.max(1, Number(snap.slots) || slots || 4));
         const bitDown = isBitLoggedOut();
         const jobs = await db.claimMailJobs(db.instanceId, slots, bitDown ? "pw" : "");
         if (bitDown && !jobs.length) {
