@@ -242,14 +242,23 @@ export async function changePasswordOnPage(page, {
     }
 
     let clicked = false;
-    for (const kw of CHANGE_PWD_KEYWORDS) {
-        const btn = page.locator(`button:has-text("${kw}")`);
-        if (await btn.first().isVisible({timeout: 2000}).catch(() => false)) {
-            await btn.first().click();
-            clicked = true;
-            log(`[密码] 点击: ${kw}`);
-            await page.waitForTimeout(5000);
-            break;
+    const submit = page.locator('form button[type="submit"], #passwordNext button, #passwordNext, c-wiz form button').last();
+    if (await submit.isVisible({timeout: 1500}).catch(() => false)) {
+        await submit.click().catch(() => submit.click({force: true}));
+        clicked = true;
+        log("[密码] 点了表单提交按钮");
+        await page.waitForTimeout(5000);
+    }
+    if (!clicked) {
+        for (const kw of CHANGE_PWD_KEYWORDS) {
+            const btn = page.locator(`button:has-text("${kw}")`);
+            if (await btn.first().isVisible({timeout: 1200}).catch(() => false)) {
+                await btn.first().click();
+                clicked = true;
+                log(`[密码] 点击: ${kw}`);
+                await page.waitForTimeout(5000);
+                break;
+            }
         }
     }
     if (!clicked) {
@@ -302,25 +311,98 @@ export async function changePasswordOnPage(page, {
     return {ok: true, newPassword: np, verified, detail: String(text).slice(0, 200)};
 }
 
+const STORE_HREF_RE = /play\.google|apps\.apple|itunes\.apple|support\.google|policies\.google|\/TOS|privacy/i;
+
+function hrefLooksAuthAction(href) {
+    const h = String(href || "");
+    if (!h || STORE_HREF_RE.test(h)) return false;
+    return /authenticator|totp|enroll|twosv|two-step-verification/i.test(h);
+}
+
+async function clickVisibleHref(page, pred, log, tag) {
+    const links = page.locator("a[href], [role='link'][href]");
+    const n = await links.count().catch(() => 0);
+    for (let i = 0; i < n; i++) {
+        const a = links.nth(i);
+        if (!await a.isVisible({timeout: 150}).catch(() => false)) continue;
+        const href = String(await a.getAttribute("href").catch(() => "") || "");
+        if (!pred(href)) continue;
+        await a.scrollIntoViewIfNeeded().catch(() => {});
+        await a.click({force: true}).catch(() => a.click());
+        if (log) log(`[2FA] ${tag} href=${href.slice(0, 90)}`);
+        return true;
+    }
+    return false;
+}
+
 async function onAuthenticatorDetail(page) {
     if (/\/authenticator/i.test(page.url())) return true;
-    return page.getByText(/change authenticator app|can't scan it|can’t scan|set up authenticator|更改身份验证器|kimlik do[gğ]rulay|autentimisrakenduse|authenticator uygulamas[ıi]|rakendus authenticator/i).first().isVisible({timeout: 400}).catch(() => false);
+    return page.evaluate(() => {
+        const bad = /play\.google|apps\.apple|support\.google|policies\.google|\/TOS|privacy/i;
+        const vis = (el) => {
+            if (!el || !el.getClientRects().length) return false;
+            const r = el.getBoundingClientRect();
+            return r.width > 6 && r.height > 6;
+        };
+        for (const card of document.querySelectorAll("article, li, [role='listitem'], [role='region'], section, div")) {
+            if ((card.innerText || "").length > 2200) continue;
+            const as = [...card.querySelectorAll("a")].filter((a) => vis(a) && !bad.test(a.href || ""));
+            const btns = [...card.querySelectorAll("button, [role='button']")].filter(vis);
+            if (as.length === 1 && btns.some((b) => ((b.textContent || "").trim().length <= 2))) return true;
+        }
+        return false;
+    }).catch(() => false);
+}
+
+/** 不看文案：卡片里「一条业务链接 + 一个垃圾桶」就是改验证器。 */
+async function clickAuthenticatorChangeByDom(page, log) {
+    if (await clickVisibleHref(page, (h) => hrefLooksAuthAction(h) && /authenticator|totp|enroll/i.test(h) && !/\/two-step-verification\/?(\?|$)/i.test(h), log, "点结构链接")) {
+        return true;
+    }
+    const href = await page.evaluate(() => {
+        const bad = /play\.google|apps\.apple|support\.google|policies\.google|\/TOS|privacy/i;
+        const vis = (el) => {
+            if (!el || !el.getClientRects().length) return false;
+            const r = el.getBoundingClientRect();
+            return r.width > 8 && r.height > 8;
+        };
+        const isTrash = (el) => {
+            const t = (el.textContent || "").replace(/\s+/g, "").trim();
+            const al = `${el.getAttribute("aria-label") || ""} ${el.getAttribute("data-tooltip") || ""}`;
+            if (/delete|remove|trash|sil|hapus|excluir|löschen|supprimer|eliminar|kaldır|eemalda|usuń|删除|移除/i.test(al)) return true;
+            return t.length <= 2 && !!(el.querySelector("svg, img, i"));
+        };
+        for (const card of document.querySelectorAll("article, li, [role='listitem'], [role='region'], section, div")) {
+            if ((card.innerText || "").length > 2200) continue;
+            const links = [...card.querySelectorAll("a, [role='link']")].filter((el) => vis(el) && !bad.test(el.href || el.getAttribute("href") || ""));
+            const trash = [...card.querySelectorAll("button, [role='button']")].filter((el) => vis(el) && isTrash(el));
+            if (!trash.length || !links.length) continue;
+            const action = links.find((el) => !isTrash(el));
+            if (!action) continue;
+            action.setAttribute("data-cm-2fa", "1");
+            return action.getAttribute("href") || action.textContent.trim().slice(0, 40);
+        }
+        return "";
+    }).catch(() => "");
+    if (!href) return false;
+    const marked = page.locator("[data-cm-2fa='1']").first();
+    if (await marked.isVisible({timeout: 800}).catch(() => false)) {
+        await marked.click({force: true}).catch(() => marked.click());
+        log(`[2FA] 点卡片操作链 ${String(href).slice(0, 60)}`);
+        return true;
+    }
+    return false;
 }
 
 async function openAuthenticatorDetail(page, log) {
     if (await onAuthenticatorDetail(page)) return true;
-    const hits = [
-        page.getByRole("link", {name: /^authenticator$/i}),
-        page.getByRole("button", {name: /^authenticator$/i}),
-        page.getByText(/^authenticator$/i),
-        page.locator('[role="link"], a, [role="listitem"], li').filter({hasText: /authenticator/i}).first(),
-    ];
-    for (const loc of hits) {
-        if (await loc.first().isVisible({timeout: 500}).catch(() => false)) {
-            await loc.first().click().catch(async () => loc.first().click({force: true}));
-            log("[2FA] 点开 Authenticator 行");
-            break;
-        }
+    if (await clickVisibleHref(page, (h) => /\/authenticator/i.test(h) && !STORE_HREF_RE.test(h), log, "点开 Authenticator 行")) {
+        /* opened */
+    } else {
+        try {
+            await page.goto("https://myaccount.google.com/two-step-verification/authenticator?hl=en", {waitUntil: "domcontentloaded", timeout: 30000});
+            log("[2FA] 直达 authenticator 页");
+        } catch { /* ignore */ }
     }
     for (let i = 0; i < 16; i++) {
         await page.waitForTimeout(400);
@@ -368,8 +450,15 @@ export async function change2faOnPage(page, {
     const onVerify = isVerifyItsYouText(contentLower);
     let foundAuth = !onVerify && (
         /\/authenticator/i.test(page.url())
+        || await page.locator('a[href*="authenticator"]').first().isVisible({timeout: 400}).catch(() => false)
         || CHANGE_KEYWORDS.some((kw) => contentLower.includes(kw.toLowerCase()))
     );
+
+    if (!foundAuth && !onVerify) {
+        if (await clickVisibleHref(page, (h) => /authenticator/i.test(h) && !STORE_HREF_RE.test(h), log, "总览点 authenticator")) {
+            foundAuth = true;
+        }
+    }
 
     if (!foundAuth && !onVerify) {
         for (let scroll = 0; scroll < 6; scroll++) {
@@ -415,62 +504,10 @@ export async function change2faOnPage(page, {
     }
     log("[2FA] 进入 Authenticator 页面");
 
-    let clickedAction = false;
-    const byRole = page.getByRole("link", {name: CHANGE_AUTH_RE}).first();
-    const byBtn = page.getByRole("button", {name: CHANGE_AUTH_RE}).first();
-    if (await byRole.isVisible({timeout: 800}).catch(() => false)) {
-        await byRole.click({force: true}).catch(() => byRole.click());
-        log(`[2FA] 点了更改链接: ${String(await byRole.innerText().catch(() => "")).slice(0, 50)}`);
-        clickedAction = true;
-    } else if (await byBtn.isVisible({timeout: 400}).catch(() => false)) {
-        await byBtn.click({force: true}).catch(() => byBtn.click());
-        log(`[2FA] 点了更改按钮: ${String(await byBtn.innerText().catch(() => "")).slice(0, 50)}`);
-        clickedAction = true;
-    }
-
+    let clickedAction = await clickAuthenticatorChangeByDom(page, log);
     if (!clickedAction) {
-        const actionText = await page.evaluate(() => {
-            const bad = /play\.google|apps\.apple|support\.google|policies\.google|\/TOS|privacy/i;
-            const want = /chang|de[gğ]i[sş]tir|mutmine|mudar|ubah|cambiar|ändern|[aä]ndra|wijzig|modifier|alterar|ganti|setup|siapkan|configur|设置|更改|更换|modifica|cambia|trocar|substitu|zmie/i;
-            const els = [...document.querySelectorAll('a, button, [role="link"], [role="button"]')];
-            for (const el of els) {
-                if (!el.offsetParent) continue;
-                const txt = (el.textContent || "").replace(/\s+/g, " ").trim();
-                const href = el.getAttribute("href") || "";
-                if (bad.test(href) || bad.test(txt)) continue;
-                if (txt.length < 3 || txt.length > 90) continue;
-                if (want.test(txt)) return txt;
-            }
-            for (const el of els) {
-                if (!el.offsetParent) continue;
-                const txt = (el.textContent || "").replace(/\s+/g, " ").trim();
-                const href = el.getAttribute("href") || "";
-                if (bad.test(href) || bad.test(txt)) continue;
-                if (txt.length < 8 || txt.length > 90) continue;
-                const box = el.closest("li, article, section, [role='listitem'], div");
-                if (!box) continue;
-                const ct = box.textContent || "";
-                if (!/authenticat|autentic|do[gğ]rulay|kimlik|autentim|验证器/i.test(ct)) continue;
-                if (ct.length > 4000) continue;
-                return txt;
-            }
-            return "";
-        });
-        if (actionText) {
-            const target = page.getByText(actionText, {exact: true}).first();
-            if (await target.isVisible({timeout: 2500}).catch(() => false)) {
-                await target.click({force: true}).catch(() => target.click());
-                log(`[2FA] 点击操作链接: ${String(actionText).slice(0, 50)}`);
-                clickedAction = true;
-            }
-        }
-    }
-
-    if (!clickedAction) {
-        if (await clickText(page, CHANGE_KEYWORDS.concat(SETUP_KEYWORDS), 3000)) {
-            clickedAction = true;
-            log("[2FA] 通过关键词找到按钮");
-        }
+        clickedAction = await clickText(page, CHANGE_KEYWORDS.concat(SETUP_KEYWORDS), 2000);
+        if (clickedAction) log("[2FA] 文案兜底点到了更改");
     }
 
     if (!clickedAction) {
