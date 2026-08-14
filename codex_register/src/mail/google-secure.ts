@@ -284,13 +284,14 @@ export async function hardenGoogleAccountOnPage(page, cred, log = () => {}, onCh
     }
 
     const missing = [];
-    if (!cred.totpSecret) missing.push("2FA");
+    if (!out.totpSecret && !cred.totpSecret) missing.push("2FA");
     if (!out.passwordChanged) missing.push("改密");
     if (!out.recoveryCleared && hadRecovery) missing.push("辅助邮箱");
     if (!out.imapPassword) missing.push("IMAP");
-    out.ok = missing.length === 0;
+    out.ok = missing.length === 0 && !out.errors.length;
     out.missing = missing;
-    log(`[邮箱管理] ${out.ok ? "完成" : "未完成: " + missing.join("/")}${out.errors.length ? " · " + out.errors.join("; ").slice(0, 160) : ""}`);
+    const errBrief = out.errors.map((e) => String(e).split("\n")[0].slice(0, 80)).join("；");
+    log(`[邮箱管理] ${out.ok ? "完成" : "未完成: " + (missing.join("/") || "部分步骤失败")}${errBrief ? " · " + errBrief : ""}`);
     return out;
 }
 

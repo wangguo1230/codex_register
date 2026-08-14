@@ -7,7 +7,7 @@ import {randomBytes} from "node:crypto";
 import {mkdirSync} from "node:fs";
 import path from "node:path";
 import {generateTotp, waitNextTotpWindow, waitTotpSafeWindow} from "../mfa.js";
-import {ensureGoogleLoggedIn, googleReauthPassword, isVerifyItsYouText, submitGoogleTotp} from "./google-auth.js";
+import {ensureGoogleLoggedIn, googleReauthPassword, isVerifyItsYouText, submitGoogleTotp, bounceOffSslOrSid} from "./google-auth.js";
 import {launchGoogleBrowser} from "./google-account.js";
 
 const PASSWORD_URL = "https://myaccount.google.com/signinoptions/password?hl=en";
@@ -195,10 +195,13 @@ export async function changePasswordOnPage(page, {
         return {ok: false, newPassword: newPassword || "", detail: "Google 登录失败"};
     }
     try { await page.goto(PASSWORD_URL, {waitUntil: "domcontentloaded", timeout: 30000}); } catch { /* ignore */ }
+    await bounceOffSslOrSid(page, log);
     await page.waitForTimeout(1500);
 
     await googleReauthPassword(page, {password, totpSecret, log});
+    await bounceOffSslOrSid(page, log);
     await page.waitForTimeout(3000);
+    await bounceOffSslOrSid(page, log);
 
     const np = newPassword || generateGooglePassword();
     let pwdInputs = page.locator('input[type="password"]:visible');
@@ -294,6 +297,33 @@ export async function changePasswordOnPage(page, {
     return {ok: true, newPassword: np, verified, detail: String(text).slice(0, 200)};
 }
 
+async function onAuthenticatorDetail(page) {
+    if (/\/authenticator/i.test(page.url())) return true;
+    return page.getByText(/change authenticator app|can't scan it|can’t scan|set up authenticator|更改身份验证器/i).first().isVisible({timeout: 400}).catch(() => false);
+}
+
+async function openAuthenticatorDetail(page, log) {
+    if (await onAuthenticatorDetail(page)) return true;
+    const hits = [
+        page.getByRole("link", {name: /^authenticator$/i}),
+        page.getByRole("button", {name: /^authenticator$/i}),
+        page.getByText(/^authenticator$/i),
+        page.locator('[role="link"], a, [role="listitem"], li').filter({hasText: /authenticator/i}).first(),
+    ];
+    for (const loc of hits) {
+        if (await loc.first().isVisible({timeout: 500}).catch(() => false)) {
+            await loc.first().click().catch(async () => loc.first().click({force: true}));
+            log("[2FA] 点开 Authenticator 行");
+            break;
+        }
+    }
+    for (let i = 0; i < 16; i++) {
+        await page.waitForTimeout(400);
+        if (await onAuthenticatorDetail(page)) return true;
+    }
+    return false;
+}
+
 /** 在已打开的 page 上添加 / 替换 TOTP（对应原 change_2fa）。 */
 export async function change2faOnPage(page, {
     email, password, totpSecret = "", recoveryEmail = "", log = () => {},
@@ -371,19 +401,11 @@ export async function change2faOnPage(page, {
         return {ok: false, error: "未找到 Authenticator 入口"};
     }
 
-    // 等 SPA 内部导航完成（Google 需要 5-10 秒加载详情页）
-    for (let i = 0; i < 5; i++) {
-        await page.waitForTimeout(3000);
-        const url = page.url();
-        const content = await page.innerText("body");
-        if (/authenticator/i.test(url) || (
-            String(content).length > 100 && [
-                "changer", "change", "ubah", "mudar", "更改", "设置",
-                "hanger", "set up", "configurar", "siapkan",
-            ].some((w) => String(content).toLowerCase().includes(w))
-        )) {
-            break;
-        }
+    const opened = await openAuthenticatorDetail(page, log);
+    if (!opened) {
+        log("[2FA] 点了 Authenticator 但还在总览页");
+        await dumpPage(page, "2fa_no_action_btn", log, email);
+        return {ok: false, error: "未进入 Authenticator 详情页"};
     }
     log("[2FA] 进入 Authenticator 页面");
 

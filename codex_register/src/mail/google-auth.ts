@@ -72,7 +72,7 @@ async function safeClick(page, selector, timeout = 3000) {
 async function typeGoogleInput(loc, value, {selectAll = false} = {}) {
     // 跟人一样：点进输入框、打字，不要 blur。Material Next 靠焦点和 input 事件亮起来。
     await loc.click({timeout: 2500}).catch(async () => {
-        await loc.click({force: true});
+        await loc.click({force: true, timeout: 1500});
     });
     const cur = String(await loc.inputValue().catch(() => ""));
     if (cur === String(value)) return;
@@ -144,7 +144,7 @@ async function primePasswordField(page) {
     ];
     for (const loc of hits) {
         if (await loc.isVisible({timeout: 250}).catch(() => false)) {
-            await loc.click({timeout: 1200}).catch(async () => loc.click({force: true}).catch(() => {}));
+            await loc.click({timeout: 1200}).catch(async () => loc.click({force: true, timeout: 800}).catch(() => {}));
             return;
         }
     }
@@ -165,7 +165,7 @@ async function waitForLoginPasswordBox(page, write, ms = 12000) {
             primed = true;
             box = await findLoginPasswordBox(page, {allowSmall: true});
             if (box) {
-                await box.click({force: true}).catch(() => {});
+                await box.click({force: true, timeout: 800}).catch(() => {});
                 await page.waitForTimeout(250);
                 return await findLoginPasswordBox(page) || box;
             }
@@ -960,7 +960,7 @@ async function totpFieldVisible(page) {
 /** 跟人打验证码一样：点框、清空、逐位按键。不用 JS 改 value（Google 当没填）。 */
 async function typeTotpInto(el, code) {
     await el.click({timeout: 2000}).catch(async () => {
-        await el.click({force: true});
+        await el.click({force: true, timeout: 800});
     });
     await el.press("Meta+A").catch(() => {});
     await el.press("Control+A").catch(() => {});
@@ -1331,7 +1331,7 @@ function isSslOrSidDead(url, body = "") {
         || /accounts\.youtube\.com|\/accounts\/SetSID/i.test(url);
 }
 
-async function bounceOffSslOrSid(page, write) {
+export async function bounceOffSslOrSid(page, write) {
     const url = String(page.url());
     const body = String(await page.innerText("body").catch(() => ""));
     if (!isSslOrSidDead(url, body)) return false;
