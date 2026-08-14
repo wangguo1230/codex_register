@@ -719,22 +719,55 @@ app.post("/api/mailboxes/batch-google-harden", async (req, res) => {
 app.post("/api/mailboxes/batch-google-harden/stop", async (req, res) => {
     res.json(await stopAllMailJobs());
 });
-app.post("/api/mailboxes/batch-google-harden/resume", async (req, res) => {
-    const left = await db.listResumableHardenMailboxIds().catch(() => []);
-    if (!left.length) return res.json({ok: true, count: 0, skippedDone: 0, msg: "没有可续跑的整备"});
+async function resumeMailJobs({onlyError = false, ids = null} = {}) {
+    await beginMailQueue();
+    let left = await db.listResumableMailJobs({kinds: ["harden", "pw", "2fa"], onlyError}).catch(() => []);
+    if (Array.isArray(ids) && ids.length) {
+        const want = new Set(ids.map(Number).filter(Number.isInteger));
+        left = left.filter((it) => want.has(it.id));
+    }
+    if (!left.length) return {ok: true, count: 0, skippedDone: 0, msg: onlyError ? "没有失败可重试" : "没有可续跑的任务"};
     const {planHardenSkip} = await import("../src/mail/google-state.js");
-    const ids = [];
+    const harden = [];
+    const pw = [];
+    const twofa = [];
     let skippedDone = 0;
     for (const it of left) {
         const mb = await db.getMailbox(it.id);
-        if (!mb || mb.provider !== "google" || mb.deleted_at > 0) continue;
-        if (planHardenSkip(mb).all) { skippedDone += 1; continue; }
-        ids.push(mb.id);
+        if (!mb || mb.deleted_at > 0) continue;
+        if (it.kind === "harden") {
+            if (mb.provider !== "google") continue;
+            if (planHardenSkip(mb).all) { skippedDone += 1; continue; }
+            harden.push(mb);
+        } else if (it.kind === "pw") pw.push(mb);
+        else if (it.kind === "2fa" && mb.provider === "google") twofa.push(mb);
     }
-    if (!ids.length) return res.json({ok: true, count: 0, skippedDone, msg: "剩下的都已整备齐"});
-    const started = await startBatchGoogleHarden(ids);
-    if (started.error) return res.status(400).json({error: started.error});
-    res.json({...started, skippedDone});
+    let inserted = 0;
+    if (harden.length) {
+        const enq = await db.enqueueMailJobs(harden.map((m) => ({id: m.id, email: m.email})), "harden");
+        inserted += enq.inserted;
+    }
+    if (pw.length) {
+        const enq = await db.enqueueMailJobs(pw.map((m) => ({id: m.id, email: m.email, payload: {oldPw: m.password}})), "pw");
+        inserted += enq.inserted;
+    }
+    if (twofa.length) {
+        const enq = await db.enqueueMailJobs(twofa.map((m) => ({id: m.id, email: m.email})), "2fa");
+        inserted += enq.inserted;
+    }
+    lastMailJobProg = await db.mailJobsProgress();
+    broadcast("batchHarden", {...snapshotMailboxJob(), proxyPool: scheduler.mailProxyPoolSnap()});
+    tickMailJobs().catch(() => {});
+    return {ok: true, queued: true, count: inserted, skippedDone};
+}
+
+app.post("/api/mailboxes/batch-google-harden/resume", async (req, res) => {
+    const ids = Array.isArray(req.body?.ids) ? req.body.ids.map(Number) : null;
+    res.json(await resumeMailJobs({onlyError: false, ids}));
+});
+app.post("/api/mailboxes/jobs/retry-failed", async (req, res) => {
+    const ids = Array.isArray(req.body?.ids) ? req.body.ids.map(Number) : null;
+    res.json(await resumeMailJobs({onlyError: true, ids}));
 });
 app.get("/api/mailboxes/job", async (req, res) => {
     await refreshMailboxJobWindows({listBit: false});

@@ -1299,15 +1299,24 @@ export async function reclaimStaleMailJobs(maxAgeMs = 3 * 60 * 1000) {
 }
 
 export async function listResumableHardenMailboxIds() {
+    return listResumableMailJobs({kinds: ["harden"], onlyError: false});
+}
+
+export async function listResumableMailJobs({kinds = ["harden"], onlyError = false} = {}) {
+    const want = (kinds || ["harden"]).filter(Boolean);
     const {rows} = await query(
-        `SELECT DISTINCT ON (mailbox_id) mailbox_id, email, status, error
+        `SELECT DISTINCT ON (kind, mailbox_id) mailbox_id, email, kind, status, error
          FROM mail_jobs
-         WHERE kind='harden'
-         ORDER BY mailbox_id, id DESC`,
+         WHERE kind = ANY($1)
+         ORDER BY kind, mailbox_id, id DESC`,
+        [want],
     );
     return rows
-        .filter((r) => r.status === "canceled" || r.status === "error")
-        .map((r) => ({id: Number(r.mailbox_id), email: r.email || "", status: r.status, error: r.error || ""}));
+        .filter((r) => onlyError ? r.status === "error" : (r.status === "canceled" || r.status === "error"))
+        .map((r) => ({
+            id: Number(r.mailbox_id), email: r.email || "", kind: r.kind,
+            status: r.status, error: r.error || "",
+        }));
 }
 
 export async function cancelPendingMailJobs(kind = "") {

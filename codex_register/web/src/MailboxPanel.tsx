@@ -393,12 +393,14 @@ export function MailboxPanel({notify}: {notify?: (m: string) => void}) {
         } catch (e: any) { toast(e.message); }
         finally { setStopping(false); }
     };
-    const resumeMailboxJob = async () => {
+    const resumeMailboxJob = async (onlyFailed = false) => {
         try {
-            const r = await api.resumeHardenMailboxGoogle();
+            const ids = selCount > 0 ? [...selected].filter((id) => filtered.some((m) => m.id === id)) : undefined;
+            const r = onlyFailed ? await api.retryFailedMailboxJobs(ids) : await api.resumeHardenMailboxGoogle(ids);
+            const verb = onlyFailed ? "重试失败" : "续跑";
             toast(r.count
-                ? `已续跑 ${r.count} 个未完成${r.skippedDone ? `（${r.skippedDone} 个已齐跳过）` : ""}`
-                : (r.msg || "没有可续跑的"));
+                ? `已${verb} ${r.count} 个${r.skippedDone ? `（${r.skippedDone} 个已齐跳过）` : ""}`
+                : (r.msg || `没有可${verb}的`));
         } catch (e: any) { toast(e.message); }
     };
     const doBatchUsage = async (usage: "free" | "hold") => {
@@ -466,6 +468,18 @@ export function MailboxPanel({notify}: {notify?: (m: string) => void}) {
                 {chip("claude", "Claude", stats.claude)}
                 {chip("deleted", "已删除", stats.deleted)}
                 <div style={{marginLeft: "auto", display: "flex", gap: 12, alignItems: "center"}}>
+                    <button onClick={() => resumeMailboxJob(false)}
+                            style={{padding: "5px 10px", fontSize: 12, border: "1px solid #fdba74", background: "#fff7ed", borderRadius: 8, cursor: "pointer", color: "#c2410c"}}>
+                        继续未完成
+                    </button>
+                    <button onClick={() => resumeMailboxJob(true)}
+                            style={{padding: "5px 10px", fontSize: 12, border: "1px solid #fecaca", background: "#fef2f2", borderRadius: 8, cursor: "pointer", color: "#b91c1c"}}>
+                        重试失败
+                    </button>
+                    <button onClick={stopMailboxJob} disabled={stopping || !jobBusy}
+                            style={{padding: "5px 10px", fontSize: 12, border: "none", background: jobBusy ? "#dc2626" : "#e5e7eb", color: jobBusy ? "#fff" : "#9ca3af", borderRadius: 8, cursor: jobBusy ? "pointer" : "not-allowed"}}>
+                        {stopping ? "停止中" : "停止"}
+                    </button>
                     <button onClick={() => setShowPool((v) => !v)}
                             style={{padding: "5px 10px", fontSize: 12, border: "1px solid #d1d5db", borderRadius: 8, background: showPool ? "#eef2ff" : "#fff", cursor: "pointer", color: "#4338ca"}}>
                         代理池 {poolSnap.total || 0}{poolSnap.leased ? ` · 占用${poolSnap.leased}` : ""}{jumpText.trim() ? " · 链式" : ""}
@@ -555,7 +569,8 @@ export function MailboxPanel({notify}: {notify?: (m: string) => void}) {
                             {metric("成功", lastJob.ok, "#059669")}
                             {metric("失败", lastJob.fail, lastJob.fail ? "#dc2626" : "#9ca3af")}
                             {metric("成功率", `${lastJob.rate}%`, lastJob.rate >= 70 ? "#059669" : "#d97706")}
-                            <button onClick={resumeMailboxJob} style={{marginLeft: "auto", height: 28, padding: "0 12px", background: "#ea580c", color: "#fff", border: "none", borderRadius: 8, fontSize: 12, cursor: "pointer"}}>继续未完成</button>
+                            <button onClick={() => resumeMailboxJob(false)} style={{marginLeft: "auto", height: 28, padding: "0 12px", background: "#ea580c", color: "#fff", border: "none", borderRadius: 8, fontSize: 12, cursor: "pointer"}}>继续未完成</button>
+                            <button onClick={() => resumeMailboxJob(true)} style={{height: 28, padding: "0 12px", background: "#dc2626", color: "#fff", border: "none", borderRadius: 8, fontSize: 12, cursor: "pointer"}}>重试失败</button>
                             <button onClick={() => setLastJob(null)} style={{height: 28, padding: "0 10px", border: "1px solid #e5e7eb", borderRadius: 8, background: "#fff", fontSize: 12, color: "#6b7280", cursor: "pointer"}}>关闭</button>
                         </div>
                     ) : null}

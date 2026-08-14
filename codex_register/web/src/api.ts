@@ -373,8 +373,10 @@ export const api = {
     batchHardenMailboxGoogle: (ids: number[]) =>
         j<{ok: boolean; count: number; concurrency: number; proxies: number}>("/api/mailboxes/batch-google-harden", {method: "POST", body: JSON.stringify({ids})}),
     stopBatchHardenMailboxGoogle: () => j<{ok: boolean; closed?: number}>("/api/mailboxes/batch-google-harden/stop", {method: "POST"}),
-    resumeHardenMailboxGoogle: () =>
-        j<{ok: boolean; count: number; skipped?: number; skippedDone?: number; msg?: string}>("/api/mailboxes/batch-google-harden/resume", {method: "POST"}),
+    resumeHardenMailboxGoogle: (ids?: number[]) =>
+        j<{ok: boolean; count: number; skipped?: number; skippedDone?: number; msg?: string}>("/api/mailboxes/batch-google-harden/resume", {method: "POST", body: JSON.stringify(ids?.length ? {ids} : {})}),
+    retryFailedMailboxJobs: (ids?: number[]) =>
+        j<{ok: boolean; count: number; skippedDone?: number; msg?: string}>("/api/mailboxes/jobs/retry-failed", {method: "POST", body: JSON.stringify(ids?.length ? {ids} : {})}),
     mailboxJob: () => j<{ok: boolean; batchHarden: MailboxJob; batchPw: MailboxJob; job: MailboxJob; instances?: MailFarmInstance[]}>("/api/mailboxes/job"),
     mailProxyPool: () => j<{ok: boolean; urls: string[]; lines?: string[]; jump?: string; total: number; slots: number; leased: number; free: number; items: {url: string; masked: string; leased: boolean; owner: string}[]}>("/api/mailboxes/proxy-pool"),
     setMailProxyPool: (text: string, opts?: {append?: boolean; copies?: number}) =>
