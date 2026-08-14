@@ -88,25 +88,92 @@ async function typeGoogleInput(loc, value, {selectAll = false} = {}) {
     });
 }
 
+const PASSWORD_BOX_SEL = [
+    'input[name="Passwd"]',
+    'input[autocomplete="current-password"]',
+    '#password input',
+    'input[type="password"]',
+    'input[aria-label*="password" i]',
+    'input[aria-label*="contrase" i]',
+    'input[aria-label*="senha" i]',
+    'input[aria-label*="sandi" i]',
+    'input[aria-label*="密码"]',
+].join(", ");
+
 /** 真正给人看的那个密码框。隐藏/1px 的 Passwd 也能被 :visible 命中，填进去 Google 当没填。 */
-async function findLoginPasswordBox(page) {
-    const boxes = page.locator('input[name="Passwd"], input[type="password"]');
+async function findLoginPasswordBox(page, {allowSmall = false} = {}) {
+    const boxes = page.locator(PASSWORD_BOX_SEL);
     const n = await boxes.count().catch(() => 0);
     let best = null;
     let bestW = 0;
+    let fallback = null;
     for (let i = 0; i < n; i++) {
         const el = boxes.nth(i);
-        if (!await el.isVisible({timeout: 200}).catch(() => false)) continue;
         const ac = String(await el.getAttribute("autocomplete").catch(() => "") || "");
         if (/new-password/i.test(ac)) continue;
+        const typ = String(await el.getAttribute("type").catch(() => "") || "").toLowerCase();
+        if (typ === "hidden") continue;
         const box = await el.boundingBox().catch(() => null);
-        if (!box || box.width < 80 || box.height < 16) continue;
+        if (!box) continue;
+        if (!fallback) fallback = el;
+        const visible = await el.isVisible({timeout: 150}).catch(() => false);
+        if (!visible && !allowSmall) continue;
+        if (!allowSmall && (box.width < 40 || box.height < 8)) continue;
         if (box.width > bestW) {
             best = el;
             bestW = box.width;
         }
     }
-    return best;
+    return best || (allowSmall ? fallback : null);
+}
+
+async function dumpPasswordInputs(page, write) {
+    const rows = await page.evaluate(() => [...document.querySelectorAll("input")].slice(0, 12).map((el) => {
+        const r = el.getBoundingClientRect();
+        return `${el.type || "?"} name=${el.name || ""} ac=${el.autocomplete || ""} aria=${(el.getAttribute("aria-label") || "").slice(0, 24)} ${Math.round(r.width)}x${Math.round(r.height)}`;
+    })).catch(() => []);
+    write(`  密码页输入框: ${rows.join(" | ") || "无"}`);
+}
+
+async function primePasswordField(page) {
+    const hits = [
+        page.locator("#password").first(),
+        page.locator('input[name="Passwd"]').first(),
+        page.getByLabel(/password|contrase|senha|sandi|密码/i).first(),
+        page.getByText(/enter (your )?password|ingresa (tu )?contrase|digite (sua )?senha|masukkan sandi|输入密码/i).first(),
+    ];
+    for (const loc of hits) {
+        if (await loc.isVisible({timeout: 250}).catch(() => false)) {
+            await loc.click({timeout: 1200}).catch(async () => loc.click({force: true}).catch(() => {}));
+            return;
+        }
+    }
+    await page.locator(PASSWORD_BOX_SEL).first().click({force: true, timeout: 800}).catch(() => {});
+}
+
+async function waitForLoginPasswordBox(page, write, ms = 12000) {
+    const deadline = Date.now() + ms;
+    let primed = false;
+    while (Date.now() < deadline) {
+        const step = loginStep(page.url());
+        if (step === "totp") return null;
+        if (step !== "password" && step !== "other" && step !== "identifier") return null;
+        let box = await findLoginPasswordBox(page);
+        if (box) return box;
+        if (!primed && step === "password") {
+            await primePasswordField(page);
+            primed = true;
+            box = await findLoginPasswordBox(page, {allowSmall: true});
+            if (box) {
+                await box.click({force: true}).catch(() => {});
+                await page.waitForTimeout(250);
+                return await findLoginPasswordBox(page) || box;
+            }
+        }
+        await page.waitForTimeout(350);
+    }
+    await dumpPasswordInputs(page, write);
+    return findLoginPasswordBox(page, {allowSmall: true});
 }
 
 function emptyPasswordErrorVisible(text) {
@@ -188,14 +255,61 @@ async function clickNext(page, _timeout = 800) {
 }
 
 async function waitLeftIdentifier(page, pwdSoon) {
-    for (let w = 0; w < 25; w++) {
+    for (let w = 0; w < 50; w++) {
         await page.waitForTimeout(400);
         const url = String(page.url());
+        const st = loginStep(url);
+        if (st === "password" || st === "totp") return true;
         if (!/signin\/identifier/i.test(url) && /challenge|rejected|speedbump|signin\/v2|signin\/pwd/i.test(url)) return true;
-        if (await pwdSoon.isVisible({timeout: 200}).catch(() => false)) return true;
+        if (await findLoginPasswordBox(page)) return true;
         if (await totpFieldVisible(page)) return true;
+        if (await pwdSoon.isVisible({timeout: 150}).catch(() => false)) return true;
     }
     return false;
+}
+
+async function dismissGoogleConsent(page, write) {
+    const blob = `${page.url()} ${String(await page.innerText("body").catch(() => "")).slice(0, 1200)}`;
+    if (!/before you continue|we use cookies|value your privacy|consent\.google|gode cookie|Accept all|Reject all/i.test(blob)) {
+        return false;
+    }
+    for (const name of [/accept all/i, /^i agree$/i, /^agree$/i, /reject all/i, /^got it$/i, /^ok$/i]) {
+        const b = page.getByRole("button", {name}).first();
+        if (await b.isVisible({timeout: 350}).catch(() => false)) {
+            await b.click().catch(() => {});
+            write(`  关掉同意页`);
+            await page.waitForTimeout(1200);
+            return true;
+        }
+    }
+    return false;
+}
+
+async function findIdentifierBox(page) {
+    const boxes = page.locator('input[name="identifier"], #identifierId, input[type="email"]');
+    const n = await boxes.count().catch(() => 0);
+    let best = null;
+    let bestW = 0;
+    for (let i = 0; i < n; i++) {
+        const el = boxes.nth(i);
+        if (!await el.isVisible({timeout: 200}).catch(() => false)) continue;
+        const typ = String(await el.getAttribute("type").catch(() => "") || "").toLowerCase();
+        if (typ === "hidden") continue;
+        const box = await el.boundingBox().catch(() => null);
+        if (!box || box.width < 40) continue;
+        if (box.width > bestW) {
+            best = el;
+            bestW = box.width;
+        }
+    }
+    return best;
+}
+
+async function clickIdentifierNext(page) {
+    if (await clickHostNext(page, "#identifierNext")) return "host";
+    const named = page.getByRole("button", {name: /^(next|continue|下一步|继续|siguiente|pr[oó]ximo)$/i}).first();
+    if (await tryClick(named, 2000)) return "role";
+    return "";
 }
 
 async function checkError(page) {
@@ -302,6 +416,7 @@ export async function googleLogin(page, emailOrOpts, password = "", totpSecret =
 
             const url = page.url();
             if (await dismissGoogleGlitch(page, write)) continue;
+            if (await dismissGoogleConsent(page, write)) continue;
             if (await dismissRecoveryPrompt(page, write)) continue;
 
             if (/video-verification|precollection|selfie/i.test(String(url))) {
@@ -325,50 +440,74 @@ export async function googleLogin(page, emailOrOpts, password = "", totpSecret =
             const pwdSoon = page.locator('input[name="Passwd"]:visible').first();
             const pwdVisible = await pwdSoon.isVisible({timeout: 400}).catch(() => false);
             if (step === "identifier" && !pwdVisible && !await totpFieldVisible(page)) {
-                const ei = page.locator('input[name="identifier"], #identifierId').first();
+                const ei = await findIdentifierBox(page) || page.locator('input[name="identifier"], #identifierId').first();
                 if (await ei.isVisible({timeout: 1500}).catch(() => false)) {
                     if (!emailSubmitted) {
-                        await page.waitForTimeout(1500);
+                        for (let i = 0; i < 24 && !await hostNextReady(page, "#identifierNext"); i++) await page.waitForTimeout(250);
+                        await page.waitForTimeout(400);
                         await typeGoogleInput(ei, email);
                         const shown = String(await ei.inputValue().catch(() => ""));
                         if (shown.toLowerCase() !== email.toLowerCase()) {
                             await ei.click().catch(() => {});
                             await ei.fill("").catch(() => {});
-                            await ei.pressSequentially(email, {delay: 40});
+                            await ei.pressSequentially(email, {delay: 45});
                         }
                         emailSubmitted = true;
                         write(`  邮箱已输入: ${email} 框内=${String(await ei.inputValue().catch(() => "")).slice(0, 40)}`);
-                        await page.waitForTimeout(800);
+                        await ei.press("Tab").catch(() => {});
+                        await page.waitForTimeout(600);
                         for (let i = 0; i < 20 && !await hostNextReady(page, "#identifierNext"); i++) await page.waitForTimeout(250);
                     }
-                    if (emailNextClicks >= 2) {
-                        write(`  邮箱页 Next 已点过 ${emailNextClicks} 次仍在 identifier url=${String(page.url()).slice(0, 80)}`);
+                    if (emailNextClicks >= 3) {
+                        const leftover = String(await page.innerText("body").catch(() => "")).replace(/\s+/g, " ").slice(0, 160);
+                        write(`  邮箱页 Next 已点过 ${emailNextClicks} 次仍在 identifier url=${String(page.url()).slice(0, 80)} ${leftover}`);
+                        try {
+                            const {mkdirSync} = await import("node:fs");
+                            const {default: path} = await import("node:path");
+                            const dir = path.resolve(process.cwd(), "captures", "screenshots");
+                            mkdirSync(dir, {recursive: true});
+                            await page.screenshot({path: path.join(dir, `id_stuck_${Date.now()}.png`), fullPage: true});
+                        } catch { /* ignore */ }
                         return false;
                     }
                     emailNextClicks += 1;
+                    let how = "";
                     if (emailNextClicks === 1) {
+                        how = await clickIdentifierNext(page);
+                        if (!how) {
+                            await ei.press("Enter").catch(() => {});
+                            how = "enter";
+                        }
+                    } else if (emailNextClicks === 2) {
+                        await ei.click().catch(() => {});
                         await ei.press("Enter").catch(() => {});
-                        write("  邮箱页在输入框回车");
+                        how = "enter";
                     } else {
-                        const went = await clickHostNext(page, "#identifierNext") || await clickStepNext(page);
-                        write(`  邮箱页点 Next went=${went}`);
+                        how = await clickIdentifierNext(page) || "retry";
                     }
+                    write(`  邮箱页提交 #${emailNextClicks} via=${how || "?"} nextReady=${await hostNextReady(page, "#identifierNext")}`);
                     const left = await waitLeftIdentifier(page, pwdSoon);
                     if (left) await page.waitForTimeout(700);
                     if (!left && !await totpFieldVisible(page)) {
-                        write(`  第 ${emailNextClicks} 次 Next 后仍在邮箱页 url=${String(page.url()).slice(0, 80)}`);
+                        write(`  第 ${emailNextClicks} 次提交后仍在邮箱页 url=${String(page.url()).slice(0, 80)}`);
                     }
                     const e2 = await checkError(page);
                     if (e2) {
                         write(`  邮箱错误: ${e2}`);
                         return false;
                     }
+                    if (loginStep(page.url()) === "password") {
+                        write("  已到密码页，等密码框");
+                        await waitForLoginPasswordBox(page, write, 10000);
+                    }
                     continue;
                 }
             }
 
             // 登录密码：只填真正看得见的大框。隐藏 Passwd 也能 :visible，填了 Google 当没填。
-            const pwdLogin = await findLoginPasswordBox(page);
+            const pwdLogin = loginStep(page.url()) === "password"
+                ? await waitForLoginPasswordBox(page, write, passwordFilled ? 2000 : 8000)
+                : await findLoginPasswordBox(page);
             if (!passwordFilled && pwd && pwdLogin) {
                 await page.waitForTimeout(500);
                 await typeGoogleInput(pwdLogin, pwd, {selectAll: true});
@@ -598,6 +737,12 @@ export async function googleLogin(page, emailOrOpts, password = "", totpSecret =
             if (acted) continue;
 
             // 没有可操作的元素——可能页面还在 loading
+            if (loginStep(page.url()) === "password" && pwd && !passwordFilled) {
+                write("  密码页还没拿到输入框，再等");
+                idleCount = Math.max(0, idleCount - 1);
+                await waitForLoginPasswordBox(page, write, 6000);
+                continue;
+            }
             idleCount += 1;
             if (idleCount >= 3) break;
             await page.waitForTimeout(3000);
@@ -689,7 +834,19 @@ export async function googleLogin(page, emailOrOpts, password = "", totpSecret =
             write("  登录完成");
             return true;
         }
-        if (totp && totpAttempts === 0) {
+        if (loginStep(page.url()) === "password" && !passwordFilled) {
+            write(`  还在密码页，密码没填上 url=${String(page.url()).slice(0, 90)}`);
+            await dumpPasswordInputs(page, write);
+            try {
+                const {mkdirSync} = await import("node:fs");
+                const {default: path} = await import("node:path");
+                const dir = path.resolve(process.cwd(), "captures", "screenshots");
+                mkdirSync(dir, {recursive: true});
+                await page.screenshot({path: path.join(dir, `pwd_no_input_${Date.now()}.png`), fullPage: true});
+            } catch { /* ignore */ }
+            return false;
+        }
+        if (totp && totpAttempts === 0 && loginStep(page.url()) !== "password") {
             write(`  有 2FA 却没填验证码就离开了 url=${String(page.url()).slice(0, 90)}`);
             return false;
         }
@@ -864,7 +1021,7 @@ async function waitTotpOutcome(page, hadWrong, write) {
 /** 逐位输入当前窗验证码。只点当前页 #totpNext。上次的 Wrong code 不能当这次失败。 */
 export async function submitGoogleTotp(page, secret, write = () => {}, attempt = 1) {
     if (await dismissGoogleGlitch(page, write)) return "glitch";
-    await waitTotpSafeWindow(10);
+    await waitTotpSafeWindow(14);
     const hadWrong = await pageHasWrongTotp(page);
     const code = generateTotp(secret);
     if (!code) return "missing";
@@ -1057,6 +1214,7 @@ export async function ensureGoogleLoggedIn(page, targetUrl, creds = {}, log = co
 
     // 等 Google SPA 完成跳转 + 处理可能的二次验证
     for (let waitI = 0; waitI < 5; waitI++) {
+        await bounceOffSslOrSid(page, write);
         await page.waitForTimeout(1500);
         const curUrl = page.url();
         if (/recaptcha|captcha/i.test(curUrl)) {
@@ -1123,9 +1281,24 @@ export async function ensureGoogleLoggedIn(page, targetUrl, creds = {}, log = co
     // 整备/改密/换2FA 都不需要收件箱。目标是账号中心时也不强求 Gmail。
     const needInbox = creds.requireInbox === true;
     if (!needInbox) {
-        const my = await tryOpenMyAccount(page, write);
+        for (let w = 0; w < 8; w++) {
+            await bounceOffSslOrSid(page, write);
+            if (looksLikeAccountHome(page.url(), String(await page.innerText("body").catch(() => "")))) {
+                write(`  登录后已在账号中心 ${String(page.url()).slice(0, 70)}`);
+                return true;
+            }
+            if (loginStep(page.url()) === "totp" && totpSecret) {
+                await submitGoogleTotp(page, totpSecret, write, 1);
+            }
+            await page.waitForTimeout(800);
+        }
+        const my = await tryOpenMyAccount(page, write, totpSecret);
         if (my) {
             write("  账号已登录，整备走账号中心（不依赖 Gmail 收件箱）");
+            return true;
+        }
+        if (looksLikeAccountHome(page.url(), String(await page.innerText("body").catch(() => "")))) {
+            write(`  跳转超时但已在账号中心 ${String(page.url()).slice(0, 70)}`);
             return true;
         }
         write(`  账号中心未确认 url=${String(page.url()).slice(0, 90)}`);
@@ -1152,7 +1325,26 @@ function loginContinueUrl(targetUrl, creds = {}) {
     return "https://mail.google.com/mail/u/0/#inbox";
 }
 
+function isSslOrSidDead(url, body = "") {
+    const blob = `${url} ${body}`;
+    return /chrome-error:|err_ssl|can.?t provide a secure connection|sent an invalid response|ERR_CONNECTION|ERR_TUNNEL|ERR_PROXY/i.test(blob)
+        || /accounts\.youtube\.com|\/accounts\/SetSID/i.test(url);
+}
+
+async function bounceOffSslOrSid(page, write) {
+    const url = String(page.url());
+    const body = String(await page.innerText("body").catch(() => ""));
+    if (!isSslOrSidDead(url, body)) return false;
+    write(`  跨站 SetSID/SSL 被代理掐了，改回账号中心 ${url.slice(0, 70)}`);
+    try {
+        await page.goto("https://myaccount.google.com/security?hl=en", {waitUntil: "domcontentloaded", timeout: 45000});
+    } catch { /* */ }
+    await page.waitForTimeout(1500);
+    return true;
+}
+
 function looksLikeAccountHome(url, body) {
+    if (isSslOrSidDead(url, body)) return false;
     if (/workspace\.google\.com|google\.com\/account\/about|about\/products|myaccount\.google\.com\/intro/i.test(url)) return false;
     if (/accounts\.google\.com/i.test(url)) return false;
     if (/myaccount\.google\.com|gds\.google\.com/i.test(url)) return true;
@@ -1180,7 +1372,7 @@ async function dismissAccountIntro(page, write) {
     return !/myaccount\.google\.com\/intro|accounts\.google\.com\/(v3\/signin\/identifier|ServiceLogin)/i.test(page.url());
 }
 
-async function tryOpenMyAccount(page, write) {
+async function tryOpenMyAccount(page, write, totpSecret = "") {
     const here = String(page.url());
     const hereBody = String(await page.innerText("body").catch(() => ""));
     if (looksLikeAccountHome(here, hereBody)) {
@@ -1191,15 +1383,24 @@ async function tryOpenMyAccount(page, write) {
         write(`  已从介绍页进入 ${String(page.url()).slice(0, 70)}`);
         return true;
     }
+    // 刚登完不要先冲 2FA 设置页，会再要一次验证码。先走普通安全页。
     const targets = [
-        "https://myaccount.google.com/signinoptions/two-step-verification?hl=en",
         "https://myaccount.google.com/security?hl=en",
+        "https://myaccount.google.com/?hl=en",
     ];
     for (const url of targets) {
         try {
-            await page.goto(url, {waitUntil: "domcontentloaded", timeout: 30000});
-        } catch { continue; }
-        await page.waitForTimeout(2000);
+            await page.goto(url, {waitUntil: "domcontentloaded", timeout: 45000});
+        } catch (e) {
+            write(`  打开账号中心超时 ${url.split("?")[0].slice(-24)}: ${String(e?.message || e).slice(0, 60)}`);
+        }
+        await bounceOffSslOrSid(page, write);
+        await page.waitForTimeout(1500);
+        if (loginStep(page.url()) === "totp" && totpSecret) {
+            write("  进账号中心又要验证码，再填一次");
+            await submitGoogleTotp(page, totpSecret, write, 1);
+            await page.waitForTimeout(2000);
+        }
         if (/myaccount\.google\.com\/intro/i.test(page.url())) {
             if (await dismissAccountIntro(page, write)) return true;
             continue;
@@ -1212,7 +1413,7 @@ async function tryOpenMyAccount(page, write) {
         }
         write(`  账号中心未打开 url=${landed.slice(0, 80)}`);
     }
-    return false;
+    return looksLikeAccountHome(page.url(), String(await page.innerText("body").catch(() => "")));
 }
 
 async function recoverGmailInbox(page, write) {

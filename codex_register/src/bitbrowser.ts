@@ -12,7 +12,13 @@ async function bitPost(pathname, body) {
         body: JSON.stringify(body || {}),
     });
     const j = await r.json().catch(() => ({}));
-    if (!j || j.success !== true) throw new Error(`比特API ${pathname} 失败: ${JSON.stringify(j).slice(0, 200)}`);
+    if (!j || j.success !== true) {
+        const msg = JSON.stringify(j).slice(0, 200);
+        if (/频繁|频率|too many|rate/i.test(msg)) markListBackoff(60_000);
+        if (/login out|未登录|please login/i.test(msg)) markBitLoggedOut(true);
+        throw new Error(`比特API ${pathname} 失败: ${msg}`);
+    }
+    if (pathname === "/browser/list" || pathname === "/browser/update") markBitLoggedOut(false);
     return j.data;
 }
 
@@ -20,6 +26,13 @@ async function bitPost(pathname, body) {
 export async function bitHealth() {
     try { const r = await fetch(`${BIT_API}/health`, {method: "POST"}); const j = await r.json(); return j?.success === true; }
     catch { return false; }
+}
+
+/** health 在未登录时仍可能是 true，开窗前再确认会话。 */
+export async function bitSessionReady() {
+    if (!await bitHealth()) return {ok: false, reason: "比特浏览器未启动(127.0.0.1:54345)"};
+    if (isBitLoggedOut()) return {ok: false, reason: "比特已退出登录，请先在客户端重新登录"};
+    return {ok: true};
 }
 
 // 创建随机指纹窗口(proxy 可选,格式 socks5://host:port 或 http://user:pass@host:port)。返回窗口 id。
@@ -76,17 +89,46 @@ export async function listBitWindows({page = 0, pageSize = 100} = {}) {
     return {list: d?.list || [], total: Number(d?.totalNum || 0), page: d?.page, pageSize: d?.pageSize};
 }
 
-export async function listAllBitWindows() {
-    const all = [];
-    let page = 0;
-    const pageSize = 100;
-    while (true) {
-        const {list, total} = await listBitWindows({page, pageSize});
-        all.push(...list);
-        if (!list.length || all.length >= total) break;
-        page += 1;
-    }
-    return all;
+const LIST_MIN_MS = 25_000;
+let listCache = {at: 0, all: []};
+let listInflight = null;
+let listBackoffUntil = 0;
+
+function markListBackoff(ms = 60_000) {
+    listBackoffUntil = Date.now() + Math.max(10_000, ms);
+}
+
+let bitLoggedOutUntil = 0;
+export function markBitLoggedOut(off = true) {
+    bitLoggedOutUntil = off ? Date.now() + 3 * 60 * 1000 : 0;
+}
+export function isBitLoggedOut() {
+    return Date.now() < bitLoggedOutUntil;
+}
+
+export async function listAllBitWindows({force = false} = {}) {
+    const now = Date.now();
+    if (now < listBackoffUntil && listCache.at) return listCache.all;
+    if (!force && listCache.at && now - listCache.at < LIST_MIN_MS) return listCache.all;
+    if (listInflight) return listInflight;
+    listInflight = (async () => {
+        try {
+            const all = [];
+            let page = 0;
+            const pageSize = 100;
+            while (true) {
+                const {list, total} = await listBitWindows({page, pageSize});
+                all.push(...list);
+                if (!list.length || all.length >= total) break;
+                page += 1;
+            }
+            listCache = {at: Date.now(), all};
+            return all;
+        } finally {
+            listInflight = null;
+        }
+    })();
+    return listInflight;
 }
 
 function isOurAutomationWindow(w) {

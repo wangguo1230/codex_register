@@ -511,21 +511,24 @@ export async function change2faOnPage(page, {
     }
 
     let verified = false;
+    const WRONG_RE = /wrong code|incorrect code|c[oó]digo (incorrecto|errado)|code incorrect|验证码有误/i;
     for (let attempt = 1; attempt <= 3; attempt++) {
-        await waitTotpSafeWindow(8);
+        // 经跳板 Verify 要 8–12s，窗口剩 8s 再填会在提交途中过期。
+        await waitTotpSafeWindow(16);
         const code = generateTotp(newSecret);
-        const codeInput = page.locator(
-            'input[type="tel"], input[name*="code"], input[name*="pin"], '
-            + 'input[name="totpPin"], input[type="text"]:visible',
+        const dialog = page.locator('[role="dialog"], [role="alertdialog"]').first();
+        const scoped = (await dialog.isVisible({timeout: 400}).catch(() => false)) ? dialog : page;
+        const codeInput = scoped.locator(
+            'input[name="totpPin"], input[autocomplete="one-time-code"], input[type="tel"], '
+            + 'input[name*="code" i], input[name*="pin" i], input[aria-label*="code" i]',
         );
         let foundInput = null;
         const inputCount = await codeInput.count();
         for (let i = 0; i < inputCount; i++) {
             const inp = codeInput.nth(i);
             if (await inp.isVisible({timeout: 500}).catch(() => false)) {
-                const val = await inp.inputValue().catch(() => "");
                 const atype = (await inp.getAttribute("autocomplete")) || "";
-                if ((!val || val.length <= 8) && !String(atype).includes("search")) {
+                if (!String(atype).includes("search")) {
                     foundInput = inp;
                     break;
                 }
@@ -541,20 +544,35 @@ export async function change2faOnPage(page, {
             continue;
         }
         await foundInput.click({force: true}).catch(() => {});
-        await foundInput.fill("").catch(() => {});
-        await foundInput.pressSequentially(code, {delay: 90}).catch(async () => {
+        await foundInput.press("Meta+A").catch(() => {});
+        await foundInput.press("Control+A").catch(() => {});
+        await foundInput.press("Backspace").catch(() => {});
+        await foundInput.pressSequentially(code, {delay: 80}).catch(async () => {
             await foundInput.fill(code);
         });
         log(`[2FA] 验证码已逐位输入(${attempt}): ${code}`);
-        await page.waitForTimeout(1500);
-        const bodyNow = String(await page.innerText("body").catch(() => ""));
-        if (!/wrong code|incorrect code|código (incorrecto|errado)|code incorrect|验证码有误/i.test(bodyNow)) {
-            await clickVisibleButton(page, VERIFY_KEYWORDS.concat(NEXT_KEYWORDS));
-            await page.waitForTimeout(4000);
+        // Google 满 6 位常自动提交。立刻再点 Verify 会把同一码再送一次 → Wrong code。
+        let after = "";
+        let autoDone = false;
+        for (let w = 0; w < 10; w++) {
+            await page.waitForTimeout(500);
+            after = String(await page.innerText("body").catch(() => ""));
+            if (WRONG_RE.test(after)) break;
+            const stillDialog = await page.getByText(/change authenticator|enter the 6-digit|输入.*6.*位/i).first().isVisible({timeout: 200}).catch(() => false);
+            if (!stillDialog) { autoDone = true; break; }
         }
-        const after = String(await page.innerText("body").catch(() => ""));
-        if (/wrong code|incorrect code|código (incorrecto|errado)|code incorrect|验证码有误/i.test(after)) {
-            log("[2FA] Google 报 Wrong code，等下一窗再点一次");
+        if (WRONG_RE.test(after)) {
+            log("[2FA] Google 报 Wrong code，等下一窗再填（不连点 Verify）");
+            await waitNextTotpWindow();
+            continue;
+        }
+        if (!autoDone) {
+            await clickVisibleButton(page, VERIFY_KEYWORDS);
+            await page.waitForTimeout(3500);
+            after = String(await page.innerText("body").catch(() => ""));
+        }
+        if (WRONG_RE.test(after)) {
+            log("[2FA] Google 报 Wrong code，等下一窗再填");
             await waitNextTotpWindow();
             continue;
         }

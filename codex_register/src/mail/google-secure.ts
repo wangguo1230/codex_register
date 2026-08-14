@@ -296,13 +296,14 @@ export async function hardenGoogleAccountOnPage(page, cred, log = () => {}, onCh
 
 /** 开一个比特指纹窗口（可绑代理），用完关闭并删除。1 代理对应 1 指纹。 */
 export async function withGoogleBitSession({proxyUrl = "", name = "gmail", remark = "gmail-manage", log = () => {}, signal} = {}, fn) {
-    const {bitHealth, createBitWindow, openBitWindow, closeBitWindow, deleteBitWindow, trackBitWindow, untrackBitWindow} = await import("../bitbrowser.js");
+    const {bitSessionReady, createBitWindow, openBitWindow, closeBitWindow, deleteBitWindow, trackBitWindow, untrackBitWindow, isBitLoggedOut} = await import("../bitbrowser.js");
     const {chromium} = await import("playwright-core");
     const {pickLiveMailProxy, maskProxyUrl} = await import("./proxy-pool.js");
     const {isMailboxJobStopped} = await import("./mailbox-job-stop.js");
     const stopped = () => !!(signal?.aborted || isMailboxJobStopped());
     if (stopped()) throw new Error("已停止");
-    if (!await bitHealth()) throw new Error("比特浏览器未启动(127.0.0.1:54345)");
+    const bit = await bitSessionReady();
+    if (!bit.ok) throw new Error(bit.reason);
     let liveProxy = proxyUrl || "";
     let chainClose = () => {};
     let bitProxy = "";
@@ -335,12 +336,20 @@ export async function withGoogleBitSession({proxyUrl = "", name = "gmail", remar
     const stopWatch = setInterval(() => { if (stopped()) dropWindow(); }, 1500);
     try {
         if (stopped()) throw new Error("已停止");
-        bitId = await createBitWindow({
-            proxy: bitProxy || "",
-            name: String(name || "gmail").slice(0, 32),
-            remark: remark || "gmail-manage",
-            timeZone,
-        });
+        try {
+            bitId = await createBitWindow({
+                proxy: bitProxy || "",
+                name: String(name || "gmail").slice(0, 32),
+                remark: remark || "gmail-manage",
+                timeZone,
+            });
+        } catch (e) {
+            const msg = String(e?.message || e);
+            if (/login out|未登录/i.test(msg) || isBitLoggedOut()) {
+                throw new Error("比特已退出登录，请先在客户端重新登录");
+            }
+            throw e;
+        }
         log(`[指纹] 比特窗口 ${bitId}${liveProxy ? " ← " + String(liveProxy).replace(/:[^:@/]+@/, ":***@") : "（无代理）"}${bitProxy && bitProxy !== liveProxy ? " 经跳板" : ""}`);
         trackBitWindow(bitId);
         signal?.addEventListener("abort", onAbort);
@@ -350,6 +359,8 @@ export async function withGoogleBitSession({proxyUrl = "", name = "gmail", remar
         const ctx = browser.contexts()[0] || await browser.newContext();
         const page = ctx.pages()[0] || await ctx.newPage();
         page.setDefaultTimeout(30000);
+        // 登录后 Google 会去 youtube SetSID 同步 Cookie，经跳板常 SSL 掐死。整备不需要 YouTube。
+        await page.route(/accounts\.youtube\.com|youtube\.com\/accounts\/SetSID|accounts\.blogger\.com/i, (route) => route.abort()).catch(() => {});
         try {
             return await fn(page);
         } finally {

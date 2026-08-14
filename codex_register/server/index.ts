@@ -379,9 +379,11 @@ async function runOneGoogleHarden(id, opts = {}) {
         };
     } catch (e: any) {
         const msg = String(e?.message ?? e);
-        const stopped = batchHardenStop || isMailboxJobStopped() || ac.signal.aborted || /已停止/.test(msg);
-        logStep(`[整备] ${stopped ? "已停止" : "异常"}: ${msg}`);
-        return {ok: false, error: stopped ? "已停止" : msg};
+        const closed = /has been closed|Target closed|browser has been closed/i.test(msg);
+        const stopped = batchHardenStop || isMailboxJobStopped() || ac.signal.aborted || (/已停止/.test(msg) && !closed);
+        const err = stopped ? "已停止" : (closed ? "比特窗口被关掉（未登录或被限频踢下线）" : msg);
+        logStep(`[整备] ${stopped ? "已停止" : "异常"}: ${err}`);
+        return {ok: false, error: err};
     } finally {
         hardenAbort.delete(id);
         hardenCurrent.delete(id);
@@ -626,7 +628,13 @@ async function tickMailJobs() {
             scheduleMailboxJobBroadcast();
             return;
         }
-        const jobs = await db.claimMailJobs(db.instanceId, slots, "");
+        const {isBitLoggedOut} = await import("../src/bitbrowser.js");
+        const bitDown = isBitLoggedOut();
+        const jobs = await db.claimMailJobs(db.instanceId, slots, bitDown ? "pw" : "");
+        if (bitDown && !jobs.length) {
+            scheduleMailboxJobBroadcast();
+            return;
+        }
         if (!jobs.length) {
             scheduleMailboxJobBroadcast();
             return;
@@ -642,9 +650,11 @@ async function tickMailJobs() {
     }
 }
 
-async function refreshMailboxJobWindows() {
-    try { lastHardenWindows = await listAutomationBitWindows(); }
-    catch { /* 比特没开就空着 */ }
+async function refreshMailboxJobWindows({listBit = true} = {}) {
+    if (listBit) {
+        try { lastHardenWindows = await listAutomationBitWindows(); }
+        catch { /* 比特没开/限频就沿用上次 */ }
+    }
     try { lastMailJobProg = await db.mailJobsProgress(); }
     catch { /* 表未就绪 */ }
     const open = lastHardenWindows.filter((w) => w.status === 1);
@@ -684,7 +694,7 @@ app.post("/api/mailboxes/batch-google-harden/stop", async (req, res) => {
     res.json(await stopAllMailJobs());
 });
 app.get("/api/mailboxes/job", async (req, res) => {
-    await refreshMailboxJobWindows();
+    await refreshMailboxJobWindows({listBit: false});
     const job = snapshotMailboxJob();
     res.json({ok: true, batchHarden: job, batchPw: job, job, instances: lastMailInstances});
 });
@@ -3558,9 +3568,12 @@ app.listen(PORT, () => {
     db.drainPendingPwQueueToMailJobs().then((n) => {
         if (n) console.log(`[mail-jobs] 已把 ${n} 条旧 pw_queue 迁入 mail_jobs`);
     }).catch((e) => console.warn("[mail-jobs] 迁移 pw_queue 失败:", e?.message || e));
-    refreshMailboxJobWindows().catch(() => {});
+    refreshMailboxJobWindows({listBit: false}).catch(() => {});
     tickMailJobs().catch(() => {});
-    setInterval(() => { refreshMailboxJobWindows().catch(() => {}); }, 3000);
+    setInterval(() => {
+        const busy = lastMailJobProg?.running || lastHardenWindows.some((w) => w.status === 1) || localMailJobIds.size > 0;
+        refreshMailboxJobWindows({listBit: busy}).catch(() => {});
+    }, 30_000);
     setInterval(() => { tickMailJobs().catch(() => {}); }, 2000);
     setInterval(() => { db.heartbeatMailJobs(db.instanceId).catch(() => {}); }, 15000);
     db.listPendingGmailRebinds().then((rows) => {
