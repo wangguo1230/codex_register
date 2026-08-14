@@ -65,15 +65,106 @@ export async function createBitWindow({proxy = "", name = "reg", remark = "codex
     return d.id;
 }
 
+function gridForCount(n) {
+    const count = Math.max(1, Number(n) || 1);
+    if (count <= 1) return {cols: 1, rows: 1};
+    if (count === 2) return {cols: 2, rows: 1};
+    if (count <= 4) return {cols: 2, rows: 2};
+    if (count <= 6) return {cols: 3, rows: 2};
+    if (count <= 9) return {cols: 3, rows: 3};
+    return {cols: 4, rows: Math.ceil(count / 4)};
+}
+
+let cachedScreen = null;
+async function getScreenSize() {
+    if (cachedScreen) return cachedScreen;
+    try {
+        if (process.platform === "darwin") {
+            const {execFile} = await import("node:child_process");
+            const {promisify} = await import("node:util");
+            const execFileAsync = promisify(execFile);
+            const {stdout} = await execFileAsync("osascript", ["-e", 'tell application "Finder" to get bounds of window of desktop']);
+            const nums = String(stdout).split(/[^\d]+/).filter(Boolean).map(Number);
+            if (nums.length >= 4) cachedScreen = {w: Math.max(800, nums[2] - nums[0]), h: Math.max(600, nums[3] - nums[1])};
+        } else if (process.platform === "win32") {
+            const {execFile} = await import("node:child_process");
+            const {promisify} = await import("node:util");
+            const execFileAsync = promisify(execFile);
+            const {stdout} = await execFileAsync("powershell", [
+                "-NoProfile", "-Command",
+                "$c = Get-CimInstance -ClassName Win32_VideoController | Select-Object -First 1; Write-Output $c.CurrentHorizontalResolution; Write-Output $c.CurrentVerticalResolution",
+            ]);
+            const nums = String(stdout).trim().split(/\s+/).map(Number).filter((n) => n > 200);
+            if (nums.length >= 2) cachedScreen = {w: nums[0], h: nums[1]};
+        }
+    } catch { /* 拿不到就按 1080p */ }
+    if (!cachedScreen) cachedScreen = {w: 1920, h: 1080};
+    return cachedScreen;
+}
+
+function tileLayout(count, screen) {
+    const n = Math.max(1, Number(count) || 1);
+    const {cols, rows} = gridForCount(n);
+    const startX = 8;
+    const startY = 8;
+    const spaceX = 8;
+    const spaceY = 8;
+    const chromeH = process.platform === "darwin" ? 28 : 48;
+    const width = Math.max(500, Math.floor((screen.w - startX - (cols - 1) * spaceX) / cols));
+    const height = Math.max(280, Math.floor((screen.h - startY - chromeH - (rows - 1) * spaceY) / rows));
+    return {cols, rows, startX, startY, spaceX, spaceY, width, height};
+}
+
+/** 按当前开着的窗数宫格排开，避免全叠在一起。 */
+export async function arrangeBitWindows(count = 0) {
+    const n = Math.max(1, Number(count) || liveBitIds.size || 1);
+    const screen = await getScreenSize();
+    const t = tileLayout(n, screen);
+    await bitPost("/windowbounds", {
+        type: "box",
+        startX: t.startX,
+        startY: t.startY,
+        width: t.width,
+        height: t.height,
+        col: t.cols,
+        spaceX: t.spaceX,
+        spaceY: t.spaceY,
+        offsetX: 40,
+        offsetY: 40,
+    });
+}
+
+let arrangeTimer = null;
+function scheduleArrangeBitWindows() {
+    clearTimeout(arrangeTimer);
+    arrangeTimer = setTimeout(() => {
+        arrangeBitWindows().catch(() => {});
+    }, 450);
+}
+
 // 打开窗口 → 返回 CDP 端点。data.ws 是 Playwright connectOverCDP 用的 ws:// 端点。
 // extractIp:true = 打开时按代理出口 IP 自动对齐浏览器时区/地理位置(消除"IP地理≠时区≠locale"的风控信号,
 //   注册即封的高权重原因之一)。因此 worker 不再手动硬编码时区。
 export async function openBitWindow(id, {extractIp = true} = {}) {
-    const d = await bitPost("/browser/open", {id, args: [], loadExtensions: false, extractIp: extractIp !== false});
+    const screen = await getScreenSize();
+    const n = Math.max(1, liveBitIds.size || 1);
+    const t = tileLayout(n, screen);
+    const idx = Math.max(0, liveBitIds.size - 1);
+    const col = idx % t.cols;
+    const row = Math.floor(idx / t.cols);
+    const x = t.startX + col * (t.width + t.spaceX);
+    const y = t.startY + row * (t.height + t.spaceY);
+    const args = [`--window-position=${x},${y}`, `--window-size=${t.width},${t.height}`];
+    const d = await bitPost("/browser/open", {id, args, loadExtensions: false, extractIp: extractIp !== false});
+    scheduleArrangeBitWindows();
     return {ws: d.ws, http: d.http, driver: d.driver};
 }
 
-export async function closeBitWindow(id) { try { await bitPost("/browser/close", {id}); } catch { /* ignore */ } }
+export async function closeBitWindow(id) {
+    try { await bitPost("/browser/close", {id}); } catch { /* ignore */ }
+    liveBitIds.delete(id);
+    if (liveBitIds.size) scheduleArrangeBitWindows();
+}
 export async function deleteBitWindow(id) { try { await bitPost("/browser/delete", {id}); } catch { /* ignore */ } }
 
 const liveBitIds = new Set();
