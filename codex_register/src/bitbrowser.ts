@@ -105,7 +105,10 @@ export function setExpectedBitTiles(n) {
 }
 
 function plannedTileCount() {
-    return Math.max(1, liveBitIds.size || 0, expectedBitTiles || 0);
+    const live = liveBitIds.size || 0;
+    // 已经开了几个就按几个排：4 个必须是 2x2。不要用代理槽 5 排成 3x2 留一个大空洞。
+    if (live >= 2) return live;
+    return 4;
 }
 
 async function getScreenSize() {
@@ -115,9 +118,22 @@ async function getScreenSize() {
         const {promisify} = await import("node:util");
         const execFileAsync = promisify(execFile);
         if (process.platform === "darwin") {
-            const {stdout} = await execFileAsync("osascript", ["-e", 'tell application "Finder" to get bounds of window of desktop']);
-            const nums = String(stdout).split(/[^\d]+/).filter(Boolean).map(Number);
-            if (nums.length >= 4) cachedScreen = {w: Math.max(800, nums[2] - nums[0]), h: Math.max(600, nums[3] - nums[1])};
+            try {
+                const {stdout} = await execFileAsync("osascript", [
+                    "-e", "use framework \"AppKit\"",
+                    "-e", "set vf to current application's NSScreen's mainScreen()'s visibleFrame()",
+                    "-e", "set w to (vf's |size|()'s width()) as integer",
+                    "-e", "set h to (vf's |size|()'s height()) as integer",
+                    "-e", "return (w as text) & \" \" & (h as text)",
+                ], {timeout: 8000});
+                const nums = String(stdout).trim().split(/\s+/).map(Number).filter((n) => n > 200);
+                if (nums.length >= 2) cachedScreen = {w: nums[0], h: nums[1]};
+            } catch { /* 再退回 Finder */ }
+            if (!cachedScreen) {
+                const {stdout} = await execFileAsync("osascript", ["-e", 'tell application "Finder" to get bounds of window of desktop']);
+                const nums = String(stdout).split(/[^\d]+/).filter(Boolean).map(Number);
+                if (nums.length >= 4) cachedScreen = {w: Math.max(800, nums[2] - nums[0]), h: Math.max(600, nums[3] - nums[1] - 80)};
+            }
         } else if (process.platform === "win32") {
             // 必须用工作区逻辑像素。Win32_VideoController 是物理分辨率，150% 缩放下会把每个窗算成接近整屏。
             const {stdout} = await execFileAsync("powershell", [
@@ -139,11 +155,11 @@ async function getScreenSize() {
 function tileLayout(count, screen) {
     const n = Math.max(1, Number(count) || 1);
     const {cols, rows} = gridForCount(n);
-    const startX = 4;
-    const startY = 4;
-    const spaceX = 6;
-    const spaceY = 6;
-    const taskbar = process.platform === "win32" ? 8 : 24;
+    const startX = 8;
+    const startY = process.platform === "darwin" ? 28 : 8;
+    const spaceX = 10;
+    const spaceY = 10;
+    const taskbar = process.platform === "darwin" ? 8 : 8;
     const availW = Math.max(640, Number(screen.w) - startX);
     const availH = Math.max(400, Number(screen.h) - startY - taskbar);
     let width = Math.floor((availW - (cols - 1) * spaceX) / cols);
@@ -196,9 +212,12 @@ export async function openBitWindow(id, {extractIp = true} = {}) {
     const row = Math.floor(idx / t.cols);
     const x = t.startX + col * (t.width + t.spaceX);
     const y = t.startY + row * (t.height + t.spaceY);
+    // Chrome --window-size 是内容区，比特标题栏+标签还要再占一截，不扣就会互相叠住。
+    const innerW = Math.max(400, t.width - 16);
+    const innerH = Math.max(240, t.height - (process.platform === "darwin" ? 88 : 80));
     const args = [
         `--window-position=${x},${y}`,
-        `--window-size=${t.width},${t.height}`,
+        `--window-size=${innerW},${innerH}`,
         "--lang=en-US",
         "--accept-lang=en-US,en",
     ];
