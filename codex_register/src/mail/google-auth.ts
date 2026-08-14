@@ -337,6 +337,32 @@ async function waitLeftIdentifier(page, pwdSoon, netWatch) {
     return {left: false};
 }
 
+/** 没有 TOTP 密钥时，从挑战列表里挑非验证器项（优先辅助邮箱，不认单一文案）。 */
+async function pickNonTotpChallenge(page, write) {
+    const rows = page.locator("[data-challengetype]");
+    const n = await rows.count().catch(() => 0);
+    let fallback = null;
+    for (let i = 0; i < n; i++) {
+        const el = rows.nth(i);
+        if (!await el.isVisible({timeout: 180}).catch(() => false)) continue;
+        const typ = String(await el.getAttribute("data-challengetype") || "");
+        const txt = String(await el.innerText().catch(() => "")).replace(/\s+/g, " ");
+        if (/^(6|9)$/i.test(typ) || /authenticat|totp|prompt|验证器/i.test(txt)) continue;
+        if (typ === "12" || /email|correo|e-mail|邮箱|mail/i.test(txt)) {
+            await el.click({force: true}).catch(() => el.click());
+            write(`  改走挑战 ${typ || "email"}`);
+            return true;
+        }
+        if (!fallback) fallback = {el, typ: typ || txt.slice(0, 20)};
+    }
+    if (fallback) {
+        await fallback.el.click({force: true}).catch(() => fallback.el.click());
+        write(`  改走挑战 ${fallback.typ}`);
+        return true;
+    }
+    return false;
+}
+
 async function dismissGoogleConsent(page, write) {
     const blob = `${page.url()} ${String(await page.innerText("body").catch(() => "")).slice(0, 1200)}`;
     if (!/before you continue|we use cookies|value your privacy|consent\.google|gode cookie|Accept all|Reject all/i.test(blob)) {
@@ -769,19 +795,19 @@ export async function googleLogin(page, emailOrOpts, password = "", totpSecret =
                 }
             }
 
-            // 2FA 方式选择页 — 没有输入框但有 Authenticator 可选项
-            let authOption = page.locator(
-                '[data-challengetype], li, [role="link"], [role="button"]',
-            ).filter({hasText: "uthenticat"});
-            if (!await authOption.first().isVisible({timeout: 500}).catch(() => false)) {
-                authOption = page.locator(
-                    '[data-challengetype], li, [role="link"], [role="button"]',
-                ).filter({hasText: "utenticador"});
-            }
-            if (await authOption.first().isVisible({timeout: 1000}).catch(() => false)) {
-                await authOption.first().click();
-                write("  选择 Authenticator 验证方式");
-                await page.waitForTimeout(3000);
+            // 有密钥才点 Authenticator。没密钥再点回去会在验证码页打转。
+            if (totp) {
+                const authOption = page.locator('[data-challengetype], li, [role="link"], [role="button"]').filter({
+                    hasText: /uthenticat|utenticador|验证器/i,
+                }).first();
+                if (await authOption.isVisible({timeout: 700}).catch(() => false)) {
+                    await authOption.click().catch(() => {});
+                    write("  选择 Authenticator 验证方式");
+                    await page.waitForTimeout(3000);
+                    continue;
+                }
+            } else if (await pickNonTotpChallenge(page, write)) {
+                await page.waitForTimeout(2500);
                 continue;
             }
 
