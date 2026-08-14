@@ -71,9 +71,13 @@ async function safeClick(page, selector, timeout = 3000) {
 
 async function typeGoogleInput(loc, value, {selectAll = false} = {}) {
     // 跟人一样：点进输入框、打字，不要 blur。Material Next 靠焦点和 input 事件亮起来。
-    await loc.click({timeout: 2500}).catch(async () => {
-        await loc.click({force: true, timeout: 1500});
-    });
+    // 点不到不能抛：密码页常有隐藏/重复 Passwd，1.5s 超时会把整次登录打成「登录异常」。
+    try {
+        await loc.click({timeout: 2500});
+    } catch {
+        await loc.click({force: true, timeout: 2000}).catch(() => {});
+    }
+    await loc.evaluate((el) => { try { el.focus(); } catch { /* ignore */ } }).catch(() => {});
     const cur = String(await loc.inputValue().catch(() => ""));
     if (cur === String(value)) return;
     // 密码框不要 fill("")：Google 会立刻校验空值，后续输入来不及，页面就报 Enter a password。
@@ -84,7 +88,7 @@ async function typeGoogleInput(loc, value, {selectAll = false} = {}) {
         await loc.fill("").catch(() => {});
     }
     await loc.pressSequentially(String(value), {delay: 28}).catch(async () => {
-        await loc.fill(value);
+        await loc.fill(value).catch(() => {});
     });
 }
 
@@ -102,6 +106,12 @@ const PASSWORD_BOX_SEL = [
 
 /** 真正给人看的那个密码框。隐藏/1px 的 Passwd 也能被 :visible 命中，填进去 Google 当没填。 */
 async function findLoginPasswordBox(page, {allowSmall = false} = {}) {
+    // 优先官方 name=Passwd，避免复合选择器命中第二个不可点的框（日志里的 .nth(1)）。
+    const named = page.locator('input[name="Passwd"]').first();
+    if (await named.isVisible({timeout: 200}).catch(() => false)) {
+        const box = await named.boundingBox().catch(() => null);
+        if (box && (allowSmall || (box.width >= 40 && box.height >= 8))) return named;
+    }
     const boxes = page.locator(PASSWORD_BOX_SEL);
     const n = await boxes.count().catch(() => 0);
     let best = null;
@@ -254,9 +264,28 @@ async function clickNext(page, _timeout = 800) {
     return clickStepNext(page);
 }
 
-async function waitLeftIdentifier(page, pwdSoon) {
-    for (let w = 0; w < 50; w++) {
+async function identifierStillLoading(page) {
+    const t = String(await page.innerText("body").catch(() => "")).replace(/\s+/g, " ").trim();
+    return /^(Loading\b)/i.test(t) || /\bLoading Sign in\b/i.test(t);
+}
+
+async function waitIdentifierUiReady(page, write, ms = 15000) {
+    const deadline = Date.now() + ms;
+    while (Date.now() < deadline) {
+        const loading = await identifierStillLoading(page);
+        const box = await findIdentifierBox(page);
+        const ready = await hostNextReady(page, "#identifierNext");
+        if (!loading && box && ready) return true;
         await page.waitForTimeout(400);
+    }
+    write("  邮箱页仍在 Loading 或 Next 未就绪");
+    return false;
+}
+
+async function waitLeftIdentifier(page, pwdSoon) {
+    // 代理 RTT 常 10s+，原先 20s 会在 Google 还在查邮箱时连点三次 Next。
+    for (let w = 0; w < 90; w++) {
+        await page.waitForTimeout(500);
         const url = String(page.url());
         const st = loginStep(url);
         if (st === "password" || st === "totp") return true;
@@ -264,6 +293,7 @@ async function waitLeftIdentifier(page, pwdSoon) {
         if (await findLoginPasswordBox(page)) return true;
         if (await totpFieldVisible(page)) return true;
         if (await pwdSoon.isVisible({timeout: 150}).catch(() => false)) return true;
+        if (w > 8 && await identifierStillLoading(page)) continue;
     }
     return false;
 }
@@ -401,6 +431,7 @@ export async function googleLogin(page, emailOrOpts, password = "", totpSecret =
         let passwordFilled = false;
         let emailSubmitted = false;
         let emailNextClicks = 0;
+        let identReloaded = false;
         let passwordNextClicks = 0;
         let tryAnotherClicks = 0;
         for (let step = 0; step < 15; step++) {
@@ -443,6 +474,7 @@ export async function googleLogin(page, emailOrOpts, password = "", totpSecret =
                 const ei = await findIdentifierBox(page) || page.locator('input[name="identifier"], #identifierId').first();
                 if (await ei.isVisible({timeout: 1500}).catch(() => false)) {
                     if (!emailSubmitted) {
+                        await waitIdentifierUiReady(page, write, 15000);
                         for (let i = 0; i < 24 && !await hostNextReady(page, "#identifierNext"); i++) await page.waitForTimeout(250);
                         await page.waitForTimeout(400);
                         await typeGoogleInput(ei, email);
@@ -461,6 +493,15 @@ export async function googleLogin(page, emailOrOpts, password = "", totpSecret =
                     if (emailNextClicks >= 3) {
                         const leftover = String(await page.innerText("body").catch(() => "")).replace(/\s+/g, " ").slice(0, 160);
                         write(`  邮箱页 Next 已点过 ${emailNextClicks} 次仍在 identifier url=${String(page.url()).slice(0, 80)} ${leftover}`);
+                        if (!identReloaded) {
+                            identReloaded = true;
+                            emailSubmitted = false;
+                            emailNextClicks = 0;
+                            write("  邮箱页卡住，刷新登录页再试");
+                            await page.reload({waitUntil: "domcontentloaded", timeout: 25000}).catch(() => {});
+                            await waitIdentifierUiReady(page, write, 15000);
+                            continue;
+                        }
                         try {
                             const {mkdirSync} = await import("node:fs");
                             const {default: path} = await import("node:path");
@@ -510,7 +551,15 @@ export async function googleLogin(page, emailOrOpts, password = "", totpSecret =
                 : await findLoginPasswordBox(page);
             if (!passwordFilled && pwd && pwdLogin) {
                 await page.waitForTimeout(500);
-                await typeGoogleInput(pwdLogin, pwd, {selectAll: true});
+                try {
+                    await typeGoogleInput(pwdLogin, pwd, {selectAll: true});
+                } catch (e) {
+                    write(`  密码框点不到，换框再填: ${String(e?.message || e).split("\n")[0]}`);
+                    await dumpPasswordInputs(page, write);
+                    const again = await findLoginPasswordBox(page, {allowSmall: true});
+                    if (!again) continue;
+                    await typeGoogleInput(again, pwd, {selectAll: true});
+                }
                 await page.waitForTimeout(400);
                 let shownPw = String(await pwdLogin.inputValue().catch(() => ""));
                 if (shownPw !== String(pwd)) {
