@@ -31,12 +31,16 @@ const CHANGE_KEYWORDS = [
     "Change authenticator app", "更改身份验证器", "Changer l'application",
     "Cambiar la app del autenticador", "प्रमाणक ऐप्लिकेशन बदलें",
     "Baguhin ang authenticator app",
+    "Kimlik doğrulayıcı uygulaması değiştir", "Autentimisrakenduse muutmine",
+    "Authenticator-App ändern", "Ändra autentiseringsapp", "Wijzig authenticator-app",
+    "Cambia app di autenticazione", "Zmień aplikację uwierzytelniającą",
 ];
 const SETUP_KEYWORDS = [
     "Configurar o app autenticador", "Siapkan pengautentikasi",
     "Set up authenticator", "设置身份验证器", "Configurer l'authentificateur",
     "Configurar el autenticador", "Mag-set up ng authenticator",
 ];
+const CHANGE_AUTH_RE = /change authenticator|set up authenticator|authenticator app|kimlik do[gğ]rulay[ıi]c[ıi].*de[gğ]i[sş]tir|autentimisrakenduse muutmine|mudar o app|ubah aplikasi|changer l.?application|cambiar la app|更改身份验证|设置身份验证|authenticator-app [aä]ndern|[aä]ndra autentiser|wijzig authenticator|cambia app di autentic|zmie[nń] aplikacj|de[gğ]i[sş]tir|muutmine|ändern|modifier|cambiar|alterar|ganti|configur|siapkan|set up|change app|^change$|^更改$|^设置$/i;
 const CANT_SCAN_KEYWORDS = [
     "Can't scan it", "Can’t scan it", "Can't scan", "Can’t scan",
     "Não consegue ler", "Tidak dapat memindai",
@@ -299,7 +303,7 @@ export async function changePasswordOnPage(page, {
 
 async function onAuthenticatorDetail(page) {
     if (/\/authenticator/i.test(page.url())) return true;
-    return page.getByText(/change authenticator app|can't scan it|can’t scan|set up authenticator|更改身份验证器/i).first().isVisible({timeout: 400}).catch(() => false);
+    return page.getByText(/change authenticator app|can't scan it|can’t scan|set up authenticator|更改身份验证器|kimlik do[gğ]rulay|autentimisrakenduse|authenticator uygulamas[ıi]|rakendus authenticator/i).first().isVisible({timeout: 400}).catch(() => false);
 }
 
 async function openAuthenticatorDetail(page, log) {
@@ -410,36 +414,53 @@ export async function change2faOnPage(page, {
     log("[2FA] 进入 Authenticator 页面");
 
     let clickedAction = false;
-    const actionText = await page.evaluate(() => {
-        const all = document.querySelectorAll('section, article, [role="main"], div');
-        for (const container of all) {
-            const ct = (container.textContent || "").toLowerCase();
-            if (!(ct.includes("uthenticat") || ct.includes("utenticador"))) continue;
-            if (container.textContent.length > 600 || container.textContent.length < 30) continue;
-            if (container.closest("nav, footer, header")) continue;
+    const byRole = page.getByRole("link", {name: CHANGE_AUTH_RE}).first();
+    const byBtn = page.getByRole("button", {name: CHANGE_AUTH_RE}).first();
+    if (await byRole.isVisible({timeout: 800}).catch(() => false)) {
+        await byRole.click({force: true}).catch(() => byRole.click());
+        log(`[2FA] 点了更改链接: ${String(await byRole.innerText().catch(() => "")).slice(0, 50)}`);
+        clickedAction = true;
+    } else if (await byBtn.isVisible({timeout: 400}).catch(() => false)) {
+        await byBtn.click({force: true}).catch(() => byBtn.click());
+        log(`[2FA] 点了更改按钮: ${String(await byBtn.innerText().catch(() => "")).slice(0, 50)}`);
+        clickedAction = true;
+    }
 
-            const clickables = container.querySelectorAll('a, button, [role="link"], [role="button"]');
-            const visible = Array.from(clickables).filter((el) => {
-                if (!el.offsetParent) return false;
-                const txt = (el.textContent || "").trim();
-                if (txt.length < 5 || txt.length > 80) return false;
-                const href = el.href || "";
-                if (href.includes("support.google") || href.includes("/TOS")) return false;
-                if (href.includes("play.google.com") || href.includes("apple.com")) return false;
-                return true;
-            });
-            if (visible.length === 0) continue;
-            return visible[visible.length - 1].textContent.trim();
-        }
-        return null;
-    });
-
-    if (actionText) {
-        const target = page.locator(`text="${actionText}"`).first();
-        if (await target.isVisible({timeout: 3000}).catch(() => false)) {
-            await target.click({force: true}).catch(() => target.click());
-            log(`[2FA] 点击操作链接: ${String(actionText).slice(0, 40)}`);
-            clickedAction = true;
+    if (!clickedAction) {
+        const actionText = await page.evaluate(() => {
+            const bad = /play\.google|apps\.apple|support\.google|policies\.google|\/TOS|privacy/i;
+            const want = /chang|de[gğ]i[sş]tir|mutmine|mudar|ubah|cambiar|ändern|[aä]ndra|wijzig|modifier|alterar|ganti|setup|siapkan|configur|设置|更改|更换|modifica|cambia|trocar|substitu|zmie/i;
+            const els = [...document.querySelectorAll('a, button, [role="link"], [role="button"]')];
+            for (const el of els) {
+                if (!el.offsetParent) continue;
+                const txt = (el.textContent || "").replace(/\s+/g, " ").trim();
+                const href = el.getAttribute("href") || "";
+                if (bad.test(href) || bad.test(txt)) continue;
+                if (txt.length < 3 || txt.length > 90) continue;
+                if (want.test(txt)) return txt;
+            }
+            for (const el of els) {
+                if (!el.offsetParent) continue;
+                const txt = (el.textContent || "").replace(/\s+/g, " ").trim();
+                const href = el.getAttribute("href") || "";
+                if (bad.test(href) || bad.test(txt)) continue;
+                if (txt.length < 8 || txt.length > 90) continue;
+                const box = el.closest("li, article, section, [role='listitem'], div");
+                if (!box) continue;
+                const ct = box.textContent || "";
+                if (!/authenticat|autentic|do[gğ]rulay|kimlik|autentim|验证器/i.test(ct)) continue;
+                if (ct.length > 4000) continue;
+                return txt;
+            }
+            return "";
+        });
+        if (actionText) {
+            const target = page.getByText(actionText, {exact: true}).first();
+            if (await target.isVisible({timeout: 2500}).catch(() => false)) {
+                await target.click({force: true}).catch(() => target.click());
+                log(`[2FA] 点击操作链接: ${String(actionText).slice(0, 50)}`);
+                clickedAction = true;
+            }
         }
     }
 
