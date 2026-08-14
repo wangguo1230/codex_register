@@ -124,11 +124,17 @@ export async function createGmailAppPassword(page, {
     return secret;
 }
 
-export async function testGmailImap(email, imapPassword) {
+export async function testGmailImap(email, imapPassword, {proxy = ""} = {}) {
+    const {getMailProxyJump} = await import("./proxy-pool.js");
+    const jump = String(proxy || getMailProxyJump() || "").trim();
     const client = new ImapFlow({
         host: "imap.gmail.com", port: 993, secure: true,
         auth: {user: email, pass: imapPassword},
         logger: false,
+        connectionTimeout: 12_000,
+        greetingTimeout: 10_000,
+        socketTimeout: 15_000,
+        ...(jump ? {proxy: jump} : {}),
     });
     try {
         await client.connect();
@@ -138,8 +144,9 @@ export async function testGmailImap(email, imapPassword) {
         await client.logout().catch(() => {});
         return {ok: true, messages: status?.messages ?? 0};
     } catch (e) {
+        try { await client.close(); } catch { /* */ }
         try { await client.logout(); } catch { /* */ }
-        return {ok: false, error: String(e?.message || e).slice(0, 160)};
+        return {ok: false, error: String(e?.message || e).replace(/\s+/g, " ").slice(0, 160)};
     }
 }
 
@@ -151,9 +158,10 @@ export async function enableGmailFetch(page, {
     const imapPassword = await createGmailAppPassword(page, {password, totpSecret, log});
     const probe = await testGmailImap(email, imapPassword);
     if (!probe.ok) {
-        log(`[取件] 应用密码 IMAP 探活失败: ${probe.error}`);
-        return {ok: false, imapPassword, error: probe.error};
+        // 本机直连/探活失败不否掉已生成的应用密码，否则会空等 90 秒再整单失败。
+        log(`[取件] 应用密码已保存，本机探活未通: ${probe.error}`);
+        return {ok: true, imapPassword, probeOk: false, error: probe.error};
     }
     log(`[取件] IMAP 已通(收件箱 ${probe.messages} 封)`);
-    return {ok: true, imapPassword, messages: probe.messages};
+    return {ok: true, imapPassword, messages: probe.messages, probeOk: true};
 }
