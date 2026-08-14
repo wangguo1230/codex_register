@@ -384,12 +384,16 @@ async function runOneGoogleHarden(id, opts = {}) {
             });
         });
         await applyGoogleHardenResult(id, mb, r);
-        logStep(`[整备] ${r.ok ? "完成" : "部分失败"} ${(r.errors || []).join("; ")}`.slice(0, 200));
+        const miss = (r.missing || []).join("/") || (r.ok ? "" : "部分步骤失败");
+        const errBrief = (r.errors || []).map((e) => String(e).split("\n")[0]).join("；").slice(0, 200);
+        logStep(`[整备] ${r.ok ? "完成" : "部分失败"} 机=${db.instanceId} 缺=${miss || "无"} ${errBrief}`.slice(0, 240));
         broadcast("mailboxes", {stats: await db.mailboxStats(), proxyPool: scheduler.mailProxyPoolSnap()});
         return {
-            ok: !!r.ok, password: r.password, totpSecret: r.totpSecret,
+            ok: !!r.ok, password: r.password, totpSecret: r.totpSecret, totpRotated: !!r.totpRotated,
+            passwordChanged: !!r.passwordChanged, imapPassword: r.imapPassword || "",
             imap: !!r.imapPassword, recoveryCleared: !!r.recoveryCleared,
-            errors: r.errors || [],
+            phoneCleared: !!r.phoneCleared, devicesDone: !!r.devicesDone,
+            missing: r.missing || [], errors: r.errors || [], skipped: !!r.skipped,
         };
     } catch (e: any) {
         const msg = String(e?.message ?? e);
@@ -590,9 +594,14 @@ async function runClaimedMailJob(job) {
             }
         } else {
             const r = await runOneGoogleHarden(job.mailbox_id, {jobId: job.id});
-            const err = (r.errors || [r.error]).filter(Boolean).join("; ");
+            const err = (r.errors || [r.error]).filter(Boolean).map((e) => String(e).split("\n")[0]).join("; ");
             await db.completeMailJob(job.id, !!r.ok, err, {
-                imap: !!r.imap, totp: !!r.totpSecret, password: !!r.password,
+                instanceId: db.instanceId,
+                imap: !!r.imapPassword || !!r.imap, totp: !!r.totpSecret, totpRotated: !!r.totpRotated,
+                password: !!r.passwordChanged, recovery: !!r.recoveryCleared,
+                phone: !!r.phoneCleared, devices: !!r.devicesDone,
+                missing: r.missing || [], errors: (r.errors || []).map((e) => String(e).split("\n")[0].slice(0, 120)),
+                skipped: !!r.skipped,
             });
         }
     } catch (e) {
