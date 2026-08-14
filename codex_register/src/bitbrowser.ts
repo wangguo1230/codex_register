@@ -118,22 +118,10 @@ async function getScreenSize() {
         const {promisify} = await import("node:util");
         const execFileAsync = promisify(execFile);
         if (process.platform === "darwin") {
-            try {
-                const {stdout} = await execFileAsync("osascript", [
-                    "-e", "use framework \"AppKit\"",
-                    "-e", "set vf to current application's NSScreen's mainScreen()'s visibleFrame()",
-                    "-e", "set w to (vf's |size|()'s width()) as integer",
-                    "-e", "set h to (vf's |size|()'s height()) as integer",
-                    "-e", "return (w as text) & \" \" & (h as text)",
-                ], {timeout: 8000});
-                const nums = String(stdout).trim().split(/\s+/).map(Number).filter((n) => n > 200);
-                if (nums.length >= 2) cachedScreen = {w: nums[0], h: nums[1]};
-            } catch { /* 再退回 Finder */ }
-            if (!cachedScreen) {
-                const {stdout} = await execFileAsync("osascript", ["-e", 'tell application "Finder" to get bounds of window of desktop']);
-                const nums = String(stdout).split(/[^\d]+/).filter(Boolean).map(Number);
-                if (nums.length >= 4) cachedScreen = {w: Math.max(800, nums[2] - nums[0]), h: Math.max(600, nums[3] - nums[1] - 80)};
-            }
+            // Finder 桌面 bounds 是逻辑点，接近以前「很大」的 2x2。只扣菜单栏，不再扣 Dock/标题栏。
+            const {stdout} = await execFileAsync("osascript", ["-e", 'tell application "Finder" to get bounds of window of desktop']);
+            const nums = String(stdout).split(/[^\d]+/).filter(Boolean).map(Number);
+            if (nums.length >= 4) cachedScreen = {w: Math.max(800, nums[2] - nums[0]), h: Math.max(600, nums[3] - nums[1] - 26)};
         } else if (process.platform === "win32") {
             // 必须用工作区逻辑像素。Win32_VideoController 是物理分辨率，150% 缩放下会把每个窗算成接近整屏。
             const {stdout} = await execFileAsync("powershell", [
@@ -144,9 +132,9 @@ async function getScreenSize() {
             if (nums.length >= 2) cachedScreen = {w: nums[0], h: nums[1]};
         }
     } catch { /* 拿不到就用保守值 */ }
-    if (!cachedScreen) cachedScreen = process.platform === "win32" ? {w: 1366, h: 768} : {w: 1440, h: 900};
-    // 4K 物理值误当成逻辑值时压到常见桌面，避免 2x2 每格还接近 1080p
-    if (cachedScreen.w > 3000 || cachedScreen.h > 1800) {
+    if (!cachedScreen) cachedScreen = process.platform === "win32" ? {w: 1920, h: 1040} : {w: 1680, h: 1000};
+    // 仅 Windows 物理 4K 误读时压一档；Mac 逻辑点不会到 3000
+    if (process.platform === "win32" && (cachedScreen.w > 3000 || cachedScreen.h > 1800)) {
         cachedScreen = {w: Math.round(cachedScreen.w / 1.5), h: Math.round(cachedScreen.h / 1.5)};
     }
     return cachedScreen;
@@ -155,21 +143,14 @@ async function getScreenSize() {
 function tileLayout(count, screen) {
     const n = Math.max(1, Number(count) || 1);
     const {cols, rows} = gridForCount(n);
-    const startX = 8;
-    const startY = process.platform === "darwin" ? 28 : 8;
-    const spaceX = 10;
-    const spaceY = 10;
-    const taskbar = process.platform === "darwin" ? 8 : 8;
-    const availW = Math.max(640, Number(screen.w) - startX);
-    const availH = Math.max(400, Number(screen.h) - startY - taskbar);
+    const startX = 0;
+    const startY = 0;
+    const spaceX = 4;
+    const spaceY = 4;
+    const availW = Math.max(800, Number(screen.w));
+    const availH = Math.max(500, Number(screen.h));
     let width = Math.floor((availW - (cols - 1) * spaceX) / cols);
     let height = Math.floor((availH - (rows - 1) * spaceY) / rows);
-    width = Math.min(width, availW);
-    height = Math.min(height, availH);
-    if (width * cols + spaceX * (cols - 1) > availW) width = Math.floor((availW - (cols - 1) * spaceX) / cols);
-    if (height * rows + spaceY * (rows - 1) > availH) height = Math.floor((availH - (rows - 1) * spaceY) / rows);
-    width = Math.max(400, width);
-    height = Math.max(240, height);
     return {cols, rows, startX, startY, spaceX, spaceY, width, height};
 }
 
@@ -212,12 +193,9 @@ export async function openBitWindow(id, {extractIp = true} = {}) {
     const row = Math.floor(idx / t.cols);
     const x = t.startX + col * (t.width + t.spaceX);
     const y = t.startY + row * (t.height + t.spaceY);
-    // Chrome --window-size 是内容区，比特标题栏+标签还要再占一截，不扣就会互相叠住。
-    const innerW = Math.max(400, t.width - 16);
-    const innerH = Math.max(240, t.height - (process.platform === "darwin" ? 88 : 80));
     const args = [
         `--window-position=${x},${y}`,
-        `--window-size=${innerW},${innerH}`,
+        `--window-size=${t.width},${t.height}`,
         "--lang=en-US",
         "--accept-lang=en-US,en",
     ];
