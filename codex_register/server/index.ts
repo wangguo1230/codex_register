@@ -314,11 +314,13 @@ async function applyGoogleHardenResult(id, mb, r) {
         recovery_email: r.recoveryCleared ? "" : undefined,
     });
     await db.refreshMailboxGoogleState(id, {
-        login: r.ok || r.password || r.totpSecret ? "ok" : undefined,
-        password: r.password ? "ok" : undefined,
+        login: r.ok || r.password || r.totpSecret || r.imapPassword ? "ok" : undefined,
+        password: r.passwordChanged ? "ok" : undefined,
         totp: r.totpSecret ? "ok" : undefined,
+        totp_rotated: r.totpRotated ? true : undefined,
         recovery: r.recoveryCleared ? "ok" : undefined,
         phone: r.phoneCleared ? "ok" : undefined,
+        devices: r.devicesDone ? "ok" : undefined,
         imap: r.imapPassword ? "ok" : (r.errors || []).some((x) => /IMAP/i.test(String(x))) ? "fail" : undefined,
         last_error: (r.errors || []).filter(Boolean).join("; ").slice(0, 160),
     }).catch(() => {});
@@ -329,6 +331,16 @@ async function runOneGoogleHarden(id, opts = {}) {
     if (!mb) return {ok: false, error: "邮箱不存在"};
     if (mb.provider !== "google") return {ok: false, error: "仅 Gmail 老号可整备"};
     if (batchHardenStop || isMailboxJobStopped()) return {ok: false, error: "已停止"};
+    const {planHardenSkip} = await import("../src/mail/google-state.js");
+    const skip = planHardenSkip(mb);
+    if (skip.all) {
+        logMailbox(id, "[整备] 缺口已齐，不再开窗");
+        return {
+            ok: true, skipped: true, password: mb.password, totpSecret: mb.totp_secret,
+            imapPassword: mb.imap_password, recoveryCleared: true, passwordChanged: true, devicesDone: true,
+        };
+    }
+    logMailbox(id, `[整备] 续跑 ${skip.left.join("/")}`);
     const ac = new AbortController();
     hardenAbort.set(id, ac);
     hardenCurrent.set(id, {id, email: mb.email, lastLine: "开始整备"});
@@ -344,7 +356,7 @@ async function runOneGoogleHarden(id, opts = {}) {
             db.setMailJobLine(opts.jobId, `${mb.email}: ${String(m || "").slice(0, 140)}`).catch(() => {});
         }
     };
-    logStep("[整备] 删手机/辅助邮箱 → 换2FA → 改密 → 登出设备 → IMAP");
+    logStep(`[整备] 续跑 ${skip.left.join(" → ")}`);
     try {
         const r = await withLeasedMailProxy(mb.email, (proxyUrl) => {
             if (batchHardenStop || isMailboxJobStopped() || ac.signal.aborted) throw new Error("已停止");
@@ -353,6 +365,8 @@ async function runOneGoogleHarden(id, opts = {}) {
             return runGoogleHardenWithBit({
                 email: mb.email, password: mb.password,
                 totpSecret: mb.totp_secret || "", recoveryEmail: mb.recovery_email || "",
+                imap_password: mb.imap_password || "", pw_status: mb.pw_status || "",
+                google_state: mb.google_state || {},
             }, {
                 proxyUrl, signal: ac.signal, log: logStep,
                 onCheckpoint: async (patch = {}) => {
@@ -596,7 +610,7 @@ async function reportMailInstance() {
     const snap = scheduler.mailProxyPoolSnap();
     const paused = await db.isMailClaimPaused().catch(() => false);
     await db.upsertMailInstance(db.instanceId, {
-        stopClaim: paused || batchHardenStop,
+        stopClaim: paused || batchHardenStop || isMailboxJobStopped(),
         proxySlots: snap.slots || 0,
         proxyLeased: snap.leased || 0,
         runningJobs: localMailJobIds.size,
@@ -619,7 +633,10 @@ async function tickMailJobs() {
         lastMailJobProg = await db.mailJobsProgress();
         lastMailJobProg.paused = await db.isMailClaimPaused();
         await reportMailInstance();
-        if (batchHardenStop || lastMailJobProg.paused) {
+        if (batchHardenStop || lastMailJobProg.paused || isMailboxJobStopped()) {
+            if (isMailboxJobStopped() && !batchHardenStop && !lastMailJobProg.paused) {
+                console.warn("[mail-jobs] 本机有停止旗标，不再从共池认领（避免把队列领光再标失败）");
+            }
             scheduleMailboxJobBroadcast();
             return;
         }
@@ -692,6 +709,23 @@ app.post("/api/mailboxes/batch-google-harden", async (req, res) => {
 });
 app.post("/api/mailboxes/batch-google-harden/stop", async (req, res) => {
     res.json(await stopAllMailJobs());
+});
+app.post("/api/mailboxes/batch-google-harden/resume", async (req, res) => {
+    const left = await db.listResumableHardenMailboxIds().catch(() => []);
+    if (!left.length) return res.json({ok: true, count: 0, skippedDone: 0, msg: "没有可续跑的整备"});
+    const {planHardenSkip} = await import("../src/mail/google-state.js");
+    const ids = [];
+    let skippedDone = 0;
+    for (const it of left) {
+        const mb = await db.getMailbox(it.id);
+        if (!mb || mb.provider !== "google" || mb.deleted_at > 0) continue;
+        if (planHardenSkip(mb).all) { skippedDone += 1; continue; }
+        ids.push(mb.id);
+    }
+    if (!ids.length) return res.json({ok: true, count: 0, skippedDone, msg: "剩下的都已整备齐"});
+    const started = await startBatchGoogleHarden(ids);
+    if (started.error) return res.status(400).json({error: started.error});
+    res.json({...started, skippedDone});
 });
 app.get("/api/mailboxes/job", async (req, res) => {
     await refreshMailboxJobWindows({listBit: false});

@@ -72,6 +72,7 @@ export function deriveGoogleState(facts = {}, overlay = {}) {
     const prev = facts.google_state && typeof facts.google_state === "object" ? facts.google_state : {};
     const s = {...emptyGoogleState(), ...prev};
 
+    s.totp_rotated = !!(prev.totp_rotated || overlay.totp_rotated);
     s.totp = hasText(facts.totp_secret) ? "ok" : "none";
     s.imap = hasText(facts.imap_password) ? "ok" : (s.imap === "fail" ? "fail" : "none");
     s.recovery = hasText(facts.recovery_email) ? "fail" : "ok";
@@ -98,6 +99,23 @@ export function deriveGoogleState(facts = {}, overlay = {}) {
     s.updated_at = Date.now();
     s.stage = pickStage(s);
     return s;
+}
+
+/** 再跑整备时跳过已经做成的步。换 2FA 只在本轮成功换过才跳（有卖家密钥不算）。 */
+export function planHardenSkip(mb = {}) {
+    const st = mb.google_state && typeof mb.google_state === "object" ? mb.google_state : {};
+    const pwOk = String(mb.pw_status || "").startsWith("✅") || st.password === "ok";
+    const skip = {
+        totp: st.totp_rotated === true,
+        password: pwOk,
+        imap: String(mb.imap_password || "").trim().length > 0,
+        recovery: !String(mb.recovery_email || "").trim() || st.recovery === "ok",
+        phone: st.phone === "ok",
+        devices: st.devices === "ok",
+    };
+    skip.left = ["totp", "password", "devices", "phone", "recovery", "imap"].filter((k) => !skip[k]);
+    skip.all = skip.left.length === 0;
+    return skip;
 }
 
 export function googleStageLabel(stage) {

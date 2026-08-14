@@ -10,12 +10,14 @@ import {change2faOnPage, changePasswordOnPage} from "./google-manage.js";
 import {enableGmailFetch} from "./google-imap.js";
 
 const RECOVERY_EMAIL_URLS = [
-    "https://myaccount.google.com/recovery/email?hl=en",
     "https://myaccount.google.com/signinoptions/rescueemail?hl=en",
+    "https://myaccount.google.com/signinoptions/recoveryoptions?hl=en",
+    "https://myaccount.google.com/security?hl=en",
 ];
 const RECOVERY_PHONE_URLS = [
-    "https://myaccount.google.com/recovery/phone?hl=en",
     "https://myaccount.google.com/signinoptions/rescuephone?hl=en",
+    "https://myaccount.google.com/signinoptions/phone?hl=en",
+    "https://myaccount.google.com/security?hl=en",
 ];
 const DEVICE_URLS = [
     "https://myaccount.google.com/device-activity?hl=en",
@@ -64,15 +66,25 @@ async function bodyHas(page, re) {
     return re.test(String(t || ""));
 }
 
+async function pageLooks404(page) {
+    const blob = `${page.url()} ${String(await page.innerText("body").catch(() => ""))}`;
+    return /404|not found on this server|requested url was not found|that's an error/i.test(blob);
+}
+
 async function gotoReauth(page, url, cred, log) {
     try {
         await page.goto(url, {waitUntil: "domcontentloaded", timeout: 60000});
     } catch { /* ignore */ }
-    await page.waitForTimeout(2500);
+    await page.waitForTimeout(1500);
+    if (await pageLooks404(page)) {
+        log(`[整备] 地址已失效，跳过 ${url.replace("https://myaccount.google.com", "")}`);
+        return false;
+    }
     await googleReauthPassword(page, {
         password: cred.password, totpSecret: cred.totpSecret, log,
     });
     await page.waitForTimeout(2500);
+    return true;
 }
 
 async function alreadyGone(page, kind) {
@@ -89,7 +101,7 @@ async function alreadyGone(page, kind) {
 export async function removeRecoveryPhone(page, cred, log = () => {}) {
     log("[整备] 删除恢复手机号");
     for (const url of RECOVERY_PHONE_URLS) {
-        await gotoReauth(page, url, cred, log);
+        if (!await gotoReauth(page, url, cred, log)) continue;
         if (await alreadyGone(page, "phone")) {
             log("[整备] 本来就没有恢复手机号");
             return {ok: true, skipped: true};
@@ -113,7 +125,7 @@ export async function removeRecoveryPhone(page, cred, log = () => {}) {
 export async function removeRecoveryEmail(page, cred, log = () => {}) {
     log("[整备] 删除辅助邮箱");
     for (const url of RECOVERY_EMAIL_URLS) {
-        await gotoReauth(page, url, cred, log);
+        if (!await gotoReauth(page, url, cred, log)) continue;
         if (await alreadyGone(page, "email")) {
             log("[整备] 本来就没有辅助邮箱");
             return {ok: true, skipped: true};
@@ -155,7 +167,7 @@ export async function signOutOtherDevices(page, cred, log = () => {}) {
     log("[整备] 登出其它设备");
     let signed = 0;
     for (const url of DEVICE_URLS) {
-        await gotoReauth(page, url, cred, log);
+        if (!await gotoReauth(page, url, cred, log)) continue;
         const all = await clickAny(page, [
             "Sign out of all other devices",
             "Sign out of all devices",
@@ -216,41 +228,57 @@ export async function hardenGoogleAccountOnPage(page, cred, log = () => {}, onCh
         errors: [],
     };
 
+    const {planHardenSkip} = await import("./google-state.js");
+    const skip = cred.skip || planHardenSkip(cred);
     const hadRecovery = !!(cred.recoveryEmail || "").trim();
+    const leftLabel = {totp: "换2FA", password: "改密", devices: "踢设备", phone: "删手机", recovery: "删辅助邮箱", imap: "IMAP"};
+    if (skip.left?.length) log(`[邮箱管理] 续跑，只做: ${skip.left.map((k) => leftLabel[k] || k).join("、")}`);
+    else log("[邮箱管理] 缺口已齐");
 
-    log("[邮箱管理 1/5] 更换 Google 2FA");
-    const t = await change2faOnPage(page, {
-        email: cred.email, password: cred.password,
-        totpSecret: cred.totpSecret, recoveryEmail: cred.recoveryEmail, log,
-    }).catch((e) => ({ok: false, error: String(e?.message || e)}));
-    if (t?.ok && t.totpSecret) {
-        cred.totpSecret = t.totpSecret;
-        out.totpSecret = t.totpSecret;
-        log("[邮箱管理] 新 Google TOTP 已生效");
-        await onCheckpoint({totpSecret: t.totpSecret});
+    if (skip.totp) {
+        log("[邮箱管理 1/5] 换 2FA 已做过，跳过");
     } else {
-        out.errors.push(t?.error || "换 2FA 失败");
-        log(`[邮箱管理] 换 2FA 失败: ${t?.error || ""}`);
+        log("[邮箱管理 1/5] 更换 Google 2FA");
+        const t = await change2faOnPage(page, {
+            email: cred.email, password: cred.password,
+            totpSecret: cred.totpSecret, recoveryEmail: cred.recoveryEmail, log,
+        }).catch((e) => ({ok: false, error: String(e?.message || e)}));
+        if (t?.ok && t.totpSecret) {
+            cred.totpSecret = t.totpSecret;
+            out.totpSecret = t.totpSecret;
+            out.totpRotated = true;
+            log("[邮箱管理] 新 Google TOTP 已生效");
+            await onCheckpoint({totpSecret: t.totpSecret});
+        } else {
+            out.errors.push(t?.error || "换 2FA 失败");
+            log(`[邮箱管理] 换 2FA 失败: ${t?.error || ""}`);
+        }
     }
 
-    log("[邮箱管理 2/5] 修改 Google 密码");
-    const pw = await changePasswordOnPage(page, {
-        email: cred.email, password: cred.password,
-        totpSecret: cred.totpSecret, recoveryEmail: cred.recoveryEmail, log,
-    }).catch((e) => ({ok: false, error: String(e?.message || e)}));
-    if (pw?.ok && pw.newPassword) {
-        cred.password = pw.newPassword;
-        out.password = pw.newPassword;
+    if (skip.password) {
+        log("[邮箱管理 2/5] 密码已换过，跳过");
         out.passwordChanged = true;
-        log("[邮箱管理] 新 Google 密码已生效");
-        await onCheckpoint({password: pw.newPassword, passwordChanged: true});
     } else {
-        out.errors.push(pw?.detail || pw?.error || "改密失败");
-        log(`[邮箱管理] 改密失败: ${pw?.detail || pw?.error || ""}`);
+        log("[邮箱管理 2/5] 修改 Google 密码");
+        const pw = await changePasswordOnPage(page, {
+            email: cred.email, password: cred.password,
+            totpSecret: cred.totpSecret, recoveryEmail: cred.recoveryEmail, log,
+        }).catch((e) => ({ok: false, error: String(e?.message || e)}));
+        if (pw?.ok && pw.newPassword) {
+            cred.password = pw.newPassword;
+            out.password = pw.newPassword;
+            out.passwordChanged = true;
+            log("[邮箱管理] 新 Google 密码已生效");
+            await onCheckpoint({password: pw.newPassword, passwordChanged: true});
+        } else {
+            out.errors.push(pw?.detail || pw?.error || "改密失败");
+            log(`[邮箱管理] 改密失败: ${pw?.detail || pw?.error || ""}`);
+        }
     }
 
-    if (process.env.REG_SKIP_DEVICES === "1") {
-        log("[邮箱管理 3/5] 跳过踢设备");
+    if (process.env.REG_SKIP_DEVICES === "1" || skip.devices) {
+        log("[邮箱管理 3/5] 踢设备已做过，跳过");
+        out.devicesDone = true;
     } else {
         log("[邮箱管理 3/5] 踢出其它设备");
         const sess = await signOutOtherDevices(page, cred, log).catch((e) => ({ok: false, error: String(e?.message || e)}));
@@ -259,28 +287,45 @@ export async function hardenGoogleAccountOnPage(page, cred, log = () => {}, onCh
         if (!sess?.ok) out.errors.push(sess?.error || "登出设备失败");
     }
 
-    log("[邮箱管理 4/5] 删除辅助邮箱/恢复手机");
-    const phone = await removeRecoveryPhone(page, cred, log).catch((e) => ({ok: false, error: String(e?.message || e)}));
-    out.phoneCleared = !!phone?.ok;
-    if (!phone?.ok) out.errors.push(phone?.error || "删手机号失败");
+    if (skip.phone) {
+        log("[邮箱管理 4/5] 恢复手机已清，跳过");
+        out.phoneCleared = true;
+    } else {
+        log("[邮箱管理 4/5] 删除恢复手机号");
+        const phone = await removeRecoveryPhone(page, cred, log).catch((e) => ({ok: false, error: String(e?.message || e)}));
+        out.phoneCleared = !!phone?.ok;
+        if (!phone?.ok) out.errors.push(phone?.error || "删手机号失败");
+    }
 
-    const rec = await removeRecoveryEmail(page, cred, log).catch((e) => ({ok: false, error: String(e?.message || e)}));
-    out.recoveryCleared = !!(rec?.ok && !rec?.skipped) || (!hadRecovery && !!rec?.ok);
-    if (rec?.skipped && !hadRecovery) out.recoveryCleared = true;
-    if (out.recoveryCleared) cred.recoveryEmail = "";
-    if (!rec?.ok) out.errors.push(rec?.error || "删辅助邮箱失败");
+    if (skip.recovery) {
+        log("[邮箱管理 4/5] 辅助邮箱已清，跳过");
+        out.recoveryCleared = true;
+        cred.recoveryEmail = "";
+    } else {
+        log("[邮箱管理 4/5] 删除辅助邮箱");
+        const rec = await removeRecoveryEmail(page, cred, log).catch((e) => ({ok: false, error: String(e?.message || e)}));
+        out.recoveryCleared = !!(rec?.ok && !rec?.skipped) || (!hadRecovery && !!rec?.ok);
+        if (rec?.skipped && !hadRecovery) out.recoveryCleared = true;
+        if (out.recoveryCleared) cred.recoveryEmail = "";
+        if (!rec?.ok) out.errors.push(rec?.error || "删辅助邮箱失败");
+    }
 
-    log("[邮箱管理 5/5] 开通 IMAP");
-    try {
-        const fetchR = await enableGmailFetch(page, {
-            email: cred.email, password: cred.password, totpSecret: cred.totpSecret, log,
-        });
-        if (fetchR?.ok && fetchR.imapPassword) {
-            out.imapPassword = fetchR.imapPassword;
-            await onCheckpoint({imapPassword: fetchR.imapPassword});
-        } else out.errors.push(fetchR?.error || "IMAP 开通失败");
-    } catch (e) {
-        out.errors.push(String(e?.message || e));
+    if (skip.imap) {
+        log("[邮箱管理 5/5] IMAP 已通，跳过");
+        out.imapPassword = cred.imapPassword || "";
+    } else {
+        log("[邮箱管理 5/5] 开通 IMAP");
+        try {
+            const fetchR = await enableGmailFetch(page, {
+                email: cred.email, password: cred.password, totpSecret: cred.totpSecret, log,
+            });
+            if (fetchR?.ok && fetchR.imapPassword) {
+                out.imapPassword = fetchR.imapPassword;
+                await onCheckpoint({imapPassword: fetchR.imapPassword});
+            } else out.errors.push(fetchR?.error || "IMAP 开通失败");
+        } catch (e) {
+            out.errors.push(String(e?.message || e));
+        }
     }
 
     const missing = [];
@@ -382,13 +427,26 @@ export async function withGoogleBitSession({proxyUrl = "", name = "gmail", remar
 export async function runGoogleHardenWithBit(acc, {proxyUrl = "", log = () => {}, onCheckpoint = async () => {}, signal} = {}) {
     const {straightenGoogleCreds} = await import("../mfa.js");
     const straight = straightenGoogleCreds(acc);
+    const {planHardenSkip} = await import("./google-state.js");
+    const skip = planHardenSkip(acc);
     const cred = {
         email: acc.email,
         password: acc.password || "",
         totpSecret: straight.totpSecret,
         recoveryEmail: straight.recoveryEmail,
+        imapPassword: acc.imap_password || acc.imapPassword || "",
+        pw_status: acc.pw_status || "",
+        google_state: acc.google_state || {},
+        skip,
     };
     if (straight.swapped) log("  导入字段对调：totp/辅助邮箱已纠正");
+    if (skip.all) {
+        log("[整备] 缺口已齐，不再开窗");
+        return {
+            ok: true, skipped: true, password: cred.password, totpSecret: cred.totpSecret,
+            imapPassword: cred.imapPassword, recoveryCleared: true, passwordChanged: true,
+        };
+    }
     const short = String(acc.email || "").split("@")[0].slice(0, 12);
     return withGoogleBitSession({proxyUrl, name: `harden-${short}`, remark: "gmail-harden", log, signal}, async (page) => {
         const ok = await ensureGoogleLoggedIn(page, "https://myaccount.google.com/security?hl=en", {...cred, requireInbox: false}, log);

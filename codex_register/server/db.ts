@@ -1298,6 +1298,18 @@ export async function reclaimStaleMailJobs(maxAgeMs = 3 * 60 * 1000) {
     return rowCount || 0;
 }
 
+export async function listResumableHardenMailboxIds() {
+    const {rows} = await query(
+        `SELECT DISTINCT ON (mailbox_id) mailbox_id, email, status, error
+         FROM mail_jobs
+         WHERE kind='harden'
+         ORDER BY mailbox_id, id DESC`,
+    );
+    return rows
+        .filter((r) => r.status === "canceled" || r.status === "error")
+        .map((r) => ({id: Number(r.mailbox_id), email: r.email || "", status: r.status, error: r.error || ""}));
+}
+
 export async function cancelPendingMailJobs(kind = "") {
     const now = Date.now();
     const r = kind

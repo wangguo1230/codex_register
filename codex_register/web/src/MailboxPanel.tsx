@@ -393,6 +393,14 @@ export function MailboxPanel({notify}: {notify?: (m: string) => void}) {
         } catch (e: any) { toast(e.message); }
         finally { setStopping(false); }
     };
+    const resumeMailboxJob = async () => {
+        try {
+            const r = await api.resumeHardenMailboxGoogle();
+            toast(r.count
+                ? `已续跑 ${r.count} 个未完成${r.skippedDone ? `（${r.skippedDone} 个已齐跳过）` : ""}`
+                : (r.msg || "没有可续跑的"));
+        } catch (e: any) { toast(e.message); }
+    };
     const doBatchUsage = async (usage: "free" | "hold") => {
         const ids = [...selected].filter((id) => filtered.some((m) => m.id === id));
         if (!ids.length) { toast("请先勾选邮箱"); return; }
@@ -547,7 +555,8 @@ export function MailboxPanel({notify}: {notify?: (m: string) => void}) {
                             {metric("成功", lastJob.ok, "#059669")}
                             {metric("失败", lastJob.fail, lastJob.fail ? "#dc2626" : "#9ca3af")}
                             {metric("成功率", `${lastJob.rate}%`, lastJob.rate >= 70 ? "#059669" : "#d97706")}
-                            <button onClick={() => setLastJob(null)} style={{marginLeft: "auto", height: 28, padding: "0 10px", border: "1px solid #e5e7eb", borderRadius: 8, background: "#fff", fontSize: 12, color: "#6b7280", cursor: "pointer"}}>关闭</button>
+                            <button onClick={resumeMailboxJob} style={{marginLeft: "auto", height: 28, padding: "0 12px", background: "#ea580c", color: "#fff", border: "none", borderRadius: 8, fontSize: 12, cursor: "pointer"}}>继续未完成</button>
+                            <button onClick={() => setLastJob(null)} style={{height: 28, padding: "0 10px", border: "1px solid #e5e7eb", borderRadius: 8, background: "#fff", fontSize: 12, color: "#6b7280", cursor: "pointer"}}>关闭</button>
                         </div>
                     ) : null}
                 </div>
