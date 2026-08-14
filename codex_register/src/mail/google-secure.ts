@@ -239,6 +239,9 @@ export async function hardenGoogleAccountOnPage(page, cred, log = () => {}, onCh
         const s = String(e || fallback || "失败");
         out.errors.push(closed(s) ? "窗口被关" : s.split("\n")[0].slice(0, 160));
     };
+    const pageGone = () => {
+        try { return page.isClosed(); } catch { return true; }
+    };
 
     if (skip.totp) {
         log("[邮箱管理 1/5] 换 2FA 已做过，跳过");
@@ -260,6 +263,13 @@ export async function hardenGoogleAccountOnPage(page, cred, log = () => {}, onCh
         }
     }
 
+    if (pageGone()) {
+        noteErr("窗口被关", "窗口被关");
+        log("[邮箱管理] 窗口已关，后续步骤不再跑");
+        out.ok = false;
+        return out;
+    }
+
     if (skip.password) {
         log("[邮箱管理 2/5] 密码已换过，跳过");
         out.passwordChanged = true;
@@ -279,6 +289,12 @@ export async function hardenGoogleAccountOnPage(page, cred, log = () => {}, onCh
             noteErr(pw?.detail || pw?.error, "改密失败");
             log(`[邮箱管理] 改密失败: ${pw?.detail || pw?.error || ""}`);
         }
+    }
+
+    if (pageGone()) {
+        noteErr("窗口被关", "窗口被关");
+        log("[邮箱管理] 窗口已关，后续步骤不再跑");
+        return out;
     }
 
     if (process.env.REG_SKIP_DEVICES === "1" || skip.devices) {

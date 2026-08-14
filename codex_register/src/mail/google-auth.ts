@@ -714,9 +714,13 @@ export async function googleLogin(page, emailOrOpts, password = "", totpSecret =
                     continue;
                 }
                 write("  TOTP 后仍在验证页，继续处理挑战");
-            } else if (totpAttempts < 3 && !totp && await page.locator('input[name="totpPin"], input[type="tel"]').first().isVisible({timeout: 800}).catch(() => false)) {
-                write("  需要 TOTP 但未提供 secret");
-                return false;
+            } else if (!totp && await totpFieldVisible(page)) {
+                if (tryAnotherClicks < 2) {
+                    write("  验证码页没有可用密钥，改走其它方式");
+                } else {
+                    write("  验证码页没有可用密钥，其它方式也走不通");
+                    return false;
+                }
             }
 
             // 异常活动 / Verify it's you：先点「是我」再走其他方式
@@ -781,8 +785,9 @@ export async function googleLogin(page, emailOrOpts, password = "", totpSecret =
                 continue;
             }
 
-            // 密码页/验证码页底部也有 Try another way，提前点会空提交或打断填码。
-            if (tryAnotherClicks < 1 && step === "other" && !pwdVisible && !await totpFieldVisible(page)) {
+            // 有 TOTP 密钥时别在填码前点其它方式。没有密钥时验证码页也要能切走。
+            const totpShowing = await totpFieldVisible(page);
+            if (tryAnotherClicks < 2 && !pwdVisible && (!totpShowing || !totp)) {
                 let tryBtn = page.locator('[jsname="Njthtb"]');
                 if (!await tryBtn.first().isVisible({timeout: 400}).catch(() => false)) {
                     tryBtn = page.getByText(/try another way|试试其他方式|autre fa[cç]on|cara lain|otra manera|tentar de outra/i).first();
