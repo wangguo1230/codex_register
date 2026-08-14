@@ -234,6 +234,11 @@ export async function hardenGoogleAccountOnPage(page, cred, log = () => {}, onCh
     const leftLabel = {totp: "换2FA", password: "改密", devices: "踢设备", phone: "删手机", recovery: "删辅助邮箱", imap: "IMAP"};
     if (skip.left?.length) log(`[邮箱管理] 续跑，只做: ${skip.left.map((k) => leftLabel[k] || k).join("、")}`);
     else log("[邮箱管理] 缺口已齐");
+    const closed = (e) => /has been closed|Target page|Target closed|Browser has been closed/i.test(String(e || ""));
+    const noteErr = (e, fallback) => {
+        const s = String(e || fallback || "失败");
+        out.errors.push(closed(s) ? "窗口被关" : s.split("\n")[0].slice(0, 160));
+    };
 
     if (skip.totp) {
         log("[邮箱管理 1/5] 换 2FA 已做过，跳过");
@@ -250,7 +255,7 @@ export async function hardenGoogleAccountOnPage(page, cred, log = () => {}, onCh
             log("[邮箱管理] 新 Google TOTP 已生效");
             await onCheckpoint({totpSecret: t.totpSecret});
         } else {
-            out.errors.push(t?.error || "换 2FA 失败");
+            noteErr(t?.error, "换 2FA 失败");
             log(`[邮箱管理] 换 2FA 失败: ${t?.error || ""}`);
         }
     }
@@ -271,7 +276,7 @@ export async function hardenGoogleAccountOnPage(page, cred, log = () => {}, onCh
             log("[邮箱管理] 新 Google 密码已生效");
             await onCheckpoint({password: pw.newPassword, passwordChanged: true});
         } else {
-            out.errors.push(pw?.detail || pw?.error || "改密失败");
+            noteErr(pw?.detail || pw?.error, "改密失败");
             log(`[邮箱管理] 改密失败: ${pw?.detail || pw?.error || ""}`);
         }
     }
@@ -284,7 +289,7 @@ export async function hardenGoogleAccountOnPage(page, cred, log = () => {}, onCh
         const sess = await signOutOtherDevices(page, cred, log).catch((e) => ({ok: false, error: String(e?.message || e)}));
         out.sessionsSignedOut = sess?.signed || 0;
         out.devicesDone = !!sess?.ok;
-        if (!sess?.ok) out.errors.push(sess?.error || "登出设备失败");
+        if (!sess?.ok) noteErr(sess?.error, "登出设备失败");
     }
 
     if (skip.phone) {
@@ -294,7 +299,7 @@ export async function hardenGoogleAccountOnPage(page, cred, log = () => {}, onCh
         log("[邮箱管理 4/5] 删除恢复手机号");
         const phone = await removeRecoveryPhone(page, cred, log).catch((e) => ({ok: false, error: String(e?.message || e)}));
         out.phoneCleared = !!phone?.ok;
-        if (!phone?.ok) out.errors.push(phone?.error || "删手机号失败");
+        if (!phone?.ok) noteErr(phone?.error, "删手机号失败");
     }
 
     if (skip.recovery) {
@@ -307,7 +312,7 @@ export async function hardenGoogleAccountOnPage(page, cred, log = () => {}, onCh
         out.recoveryCleared = !!(rec?.ok && !rec?.skipped) || (!hadRecovery && !!rec?.ok);
         if (rec?.skipped && !hadRecovery) out.recoveryCleared = true;
         if (out.recoveryCleared) cred.recoveryEmail = "";
-        if (!rec?.ok) out.errors.push(rec?.error || "删辅助邮箱失败");
+        if (!rec?.ok) noteErr(rec?.error, "删辅助邮箱失败");
     }
 
     if (skip.imap) {
@@ -322,9 +327,9 @@ export async function hardenGoogleAccountOnPage(page, cred, log = () => {}, onCh
             if (fetchR?.ok && fetchR.imapPassword) {
                 out.imapPassword = fetchR.imapPassword;
                 await onCheckpoint({imapPassword: fetchR.imapPassword});
-            } else out.errors.push(fetchR?.error || "IMAP 开通失败");
+            } else noteErr(fetchR?.error, "IMAP 开通失败");
         } catch (e) {
-            out.errors.push(String(e?.message || e));
+            noteErr(e?.message || e, "IMAP 开通失败");
         }
     }
 

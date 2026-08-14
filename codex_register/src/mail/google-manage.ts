@@ -313,10 +313,22 @@ export async function changePasswordOnPage(page, {
 
 const STORE_HREF_RE = /play\.google|apps\.apple|itunes\.apple|support\.google|policies\.google|\/TOS|privacy/i;
 
-function hrefLooksAuthAction(href) {
+function sameAuthOverview(href, pageUrl) {
+    try {
+        const abs = new URL(href, pageUrl);
+        const cur = new URL(pageUrl);
+        const norm = (p) => String(p || "").replace(/\/+$/, "");
+        if (norm(abs.pathname) === norm(cur.pathname)) return true;
+        if (/\/two-step-verification\/authenticator\/?$/i.test(norm(abs.pathname))) return true;
+    } catch { /* ignore */ }
+    return false;
+}
+
+function hrefLooksAuthAction(href, pageUrl = "") {
     const h = String(href || "");
     if (!h || STORE_HREF_RE.test(h)) return false;
-    return /authenticator|totp|enroll|twosv|two-step-verification/i.test(h);
+    if (sameAuthOverview(h, pageUrl)) return false;
+    return /totp|enroll|change.?auth|signinoptions\/twosv/i.test(h);
 }
 
 async function clickVisibleHref(page, pred, log, tag) {
@@ -354,12 +366,35 @@ async function onAuthenticatorDetail(page) {
     }).catch(() => false);
 }
 
-/** 不看文案：卡片里「一条业务链接 + 一个垃圾桶」就是改验证器。 */
-async function clickAuthenticatorChangeByDom(page, log) {
-    if (await clickVisibleHref(page, (h) => hrefLooksAuthAction(h) && /authenticator|totp|enroll/i.test(h) && !/\/two-step-verification\/?(\?|$)/i.test(h), log, "点结构链接")) {
-        return true;
+async function dismissAccountFlyout(page) {
+    const close = page.locator('[aria-label="Close"], [aria-label="关闭"], [aria-label*="Close" i], [aria-label*="Cerrar" i]').first();
+    if (await close.isVisible({timeout: 250}).catch(() => false)) {
+        await close.click().catch(() => {});
+        await page.waitForTimeout(300);
+        return;
     }
-    const href = await page.evaluate(() => {
+    if (await page.getByText(/Manage your Google Account|管理您的 Google 账号/i).first().isVisible({timeout: 250}).catch(() => false)) {
+        await page.keyboard.press("Escape").catch(() => {});
+        await page.mouse.click(16, 180).catch(() => {});
+    }
+}
+
+async function waitAuthenticatorSetup(page, ms = 9000) {
+    const deadline = Date.now() + ms;
+    while (Date.now() < deadline) {
+        if (await page.locator('[role="dialog"], [role="alertdialog"]').first().isVisible({timeout: 180}).catch(() => false)) return "dialog";
+        if (await page.locator("canvas, img[alt*='QR' i], img[src*='qr']").first().isVisible({timeout: 180}).catch(() => false)) return "qr";
+        const t = String(await page.innerText("body").catch(() => ""));
+        if (/otpauth:\/\//i.test(t) || /can't scan|cannot scan|无法扫描|secret key|setup key|密钥/i.test(t)) return "secret";
+        await page.waitForTimeout(350);
+    }
+    return "";
+}
+
+/** 不看文案：先关账号浮层，再点卡片里垃圾桶旁边那条业务链接。不要点当前页自己的 /authenticator。 */
+async function clickAuthenticatorChangeByDom(page, log) {
+    await dismissAccountFlyout(page);
+    const marked = await page.evaluate(() => {
         const bad = /play\.google|apps\.apple|support\.google|policies\.google|\/TOS|privacy/i;
         const vis = (el) => {
             if (!el || !el.getClientRects().length) return false;
@@ -372,6 +407,7 @@ async function clickAuthenticatorChangeByDom(page, log) {
             if (/delete|remove|trash|sil|hapus|excluir|löschen|supprimer|eliminar|kaldır|eemalda|usuń|删除|移除/i.test(al)) return true;
             return t.length <= 2 && !!(el.querySelector("svg, img, i"));
         };
+        document.querySelectorAll("[data-cm-2fa]").forEach((el) => el.removeAttribute("data-cm-2fa"));
         for (const card of document.querySelectorAll("article, li, [role='listitem'], [role='region'], section, div")) {
             if ((card.innerText || "").length > 2200) continue;
             const links = [...card.querySelectorAll("a, [role='link']")].filter((el) => vis(el) && !bad.test(el.href || el.getAttribute("href") || ""));
@@ -380,15 +416,41 @@ async function clickAuthenticatorChangeByDom(page, log) {
             const action = links.find((el) => !isTrash(el));
             if (!action) continue;
             action.setAttribute("data-cm-2fa", "1");
-            return action.getAttribute("href") || action.textContent.trim().slice(0, 40);
+            return action.textContent.trim().slice(0, 50) || action.getAttribute("href") || "ok";
         }
         return "";
     }).catch(() => "");
-    if (!href) return false;
-    const marked = page.locator("[data-cm-2fa='1']").first();
-    if (await marked.isVisible({timeout: 800}).catch(() => false)) {
-        await marked.click({force: true}).catch(() => marked.click());
-        log(`[2FA] 点卡片操作链 ${String(href).slice(0, 60)}`);
+    if (marked) {
+        const loc = page.locator("[data-cm-2fa='1']").first();
+        if (await loc.isVisible({timeout: 800}).catch(() => false)) {
+            await loc.scrollIntoViewIfNeeded().catch(() => {});
+            await loc.click({force: true}).catch(() => loc.click());
+            log(`[2FA] 点卡片更改链 ${String(marked).slice(0, 50)}`);
+            return true;
+        }
+    }
+    const pageUrl = page.url();
+    if (await clickVisibleHref(page, (h) => hrefLooksAuthAction(h, pageUrl), log, "点结构链接")) return true;
+    return false;
+}
+
+async function clickCantScanByDom(page, log) {
+    const dialog = page.locator('[role="dialog"], [role="alertdialog"]').first();
+    const scope = await dialog.isVisible({timeout: 400}).catch(() => false) ? dialog : page;
+    const links = scope.locator("a[href], button, [role='link'], [role='button']");
+    const n = await links.count().catch(() => 0);
+    for (let i = 0; i < n; i++) {
+        const a = links.nth(i);
+        if (!await a.isVisible({timeout: 120}).catch(() => false)) continue;
+        const href = String(await a.getAttribute("href").catch(() => "") || "");
+        if (STORE_HREF_RE.test(href)) continue;
+        const txt = String(await a.innerText().catch(() => "")).replace(/\s+/g, " ").trim();
+        if (/play store|app store|google play|privacy|terms|help|learn more/i.test(txt)) continue;
+        const box = await a.boundingBox().catch(() => null);
+        if (!box || box.y < 80) continue;
+        if (txt.length > 80) continue;
+        await a.click({force: true}).catch(() => a.click());
+        log(`[2FA] 点无法扫描候选 ${txt.slice(0, 40) || href.slice(0, 40)}`);
         return true;
     }
     return false;
@@ -503,36 +565,35 @@ export async function change2faOnPage(page, {
         return {ok: false, error: "未进入 Authenticator 详情页"};
     }
     log("[2FA] 进入 Authenticator 页面");
+    await dismissAccountFlyout(page);
 
-    let clickedAction = await clickAuthenticatorChangeByDom(page, log);
-    if (!clickedAction) {
-        clickedAction = await clickText(page, CHANGE_KEYWORDS.concat(SETUP_KEYWORDS), 2000);
-        if (clickedAction) log("[2FA] 文案兜底点到了更改");
+    let setup = "";
+    for (let tryChange = 0; tryChange < 3 && !setup; tryChange++) {
+        await dismissAccountFlyout(page);
+        let clickedAction = await clickAuthenticatorChangeByDom(page, log);
+        if (!clickedAction) {
+            clickedAction = !!(await clickText(page, CHANGE_KEYWORDS.concat(SETUP_KEYWORDS), 1500));
+            if (clickedAction) log("[2FA] 文案兜底点到了更改");
+        }
+        if (!clickedAction) break;
+        setup = await waitAuthenticatorSetup(page, 8000);
+        if (!setup) log("[2FA] 点了更改但仍在总览，再点一次");
     }
 
-    if (!clickedAction) {
+    if (!setup && !(await clickAuthenticatorChangeByDom(page, log))) {
         log("[2FA] 未找到更改/设置按钮");
         await dumpPage(page, "2fa_no_action_btn", log, email);
         return {ok: false, error: "未找到更改/设置按钮"};
     }
-    await page.waitForTimeout(5000);
+    if (!setup) setup = await waitAuthenticatorSetup(page, 6000);
 
-    let cantClicked = false;
-    for (const dialogSel of ['[role="dialog"]', '[role="alertdialog"]', '[class*="dialog"]', '[class*="Dialog"]', '[class*="modal"]']) {
-        const dialog = page.locator(dialogSel);
-        if (await dialog.first().isVisible({timeout: 1500}).catch(() => false)) {
-            const dialogLinks = dialog.locator("a");
-            if (await dialogLinks.count() > 0) {
-                await dialogLinks.first().click();
-                cantClicked = true;
-                log("[2FA] 点击 dialog 内链接（无法扫描）");
-                break;
-            }
-        }
+    let cantClicked = setup === "secret";
+    if (!cantClicked && setup === "dialog") {
+        if (await clickCantScanByDom(page, log)) cantClicked = true;
     }
-
     if (!cantClicked) {
         const qrNearby = await page.evaluate(() => {
+            const bad = /play\.google|apps\.apple|support\.google/i;
             const imgs = document.querySelectorAll("img, canvas, svg");
             for (const img of imgs) {
                 const rect = img.getBoundingClientRect();
@@ -541,34 +602,35 @@ export async function change2faOnPage(page, {
                     for (let i = 0; i < 5 && parent; i++) {
                         const links = parent.querySelectorAll("a");
                         for (const a of links) {
-                            if (a.offsetParent && a.textContent.trim().length > 3) {
-                                return a.textContent.trim();
+                            if (!a.getClientRects().length) continue;
+                            if (bad.test(a.href || "")) continue;
+                            if ((a.textContent || "").trim().length > 3) {
+                                a.setAttribute("data-cm-scan", "1");
+                                return true;
                             }
                         }
                         parent = parent.parentElement;
                     }
                 }
             }
-            return null;
-        });
+            return false;
+        }).catch(() => false);
         if (qrNearby) {
-            const target = page.locator(`text="${qrNearby}"`).first();
-            if (await target.isVisible({timeout: 2000}).catch(() => false)) {
-                await target.click();
+            const target = page.locator("[data-cm-scan='1']").first();
+            if (await target.isVisible({timeout: 1500}).catch(() => false)) {
+                await target.click({force: true}).catch(() => target.click());
                 cantClicked = true;
-                log(`[2FA] 点击 QR 附近链接: ${String(qrNearby).slice(0, 30)}`);
+                log("[2FA] 点了 QR 旁链接");
             }
         }
     }
-
-    if (!cantClicked) {
-        if (await clickText(page, CANT_SCAN_KEYWORDS, 3000)) {
-            cantClicked = true;
-            log("[2FA] 通过关键词点击无法扫描");
-        }
+    if (!cantClicked && await clickCantScanByDom(page, log)) cantClicked = true;
+    if (!cantClicked && await clickText(page, CANT_SCAN_KEYWORDS, 2000)) {
+        cantClicked = true;
+        log("[2FA] 通过关键词点击无法扫描");
     }
 
-    if (!cantClicked) {
+    if (!cantClicked && !/otpauth:\/\//i.test(String(await page.innerText("body").catch(() => "")))) {
         log("[2FA] 未找到无法扫描按钮");
         await dumpPage(page, "2fa_no_cant_scan", log, email);
         return {ok: false, error: "未找到无法扫描按钮"};
