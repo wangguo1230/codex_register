@@ -2,7 +2,7 @@
 /**
  * 按需获取 refresh_token(rt) 的 worker —— 由后端 test-rt 在【无 rt / rt 过期】时 spawn。
  * 复用 authLoginHTTP() 走 codex OAuth(client_id=app_EMo... + offline_access)，
- * 完整处理 登录→邮箱OTP(mailcom provider)→add-phone(接码)→选工作区→换 token，
+ * 完整处理 登录→邮箱OTP→2FA(mfa-challenge/TOTP)→add-phone(接码)→选工作区→换 token，
  * 产出含 refresh_token 的 codex auth 文件(auth/<name>.json)。
  *
  * 输入(环境变量)：
@@ -24,7 +24,8 @@ import {createPoolBroker} from "./sms/pool-broker.js";
 
 const EVENT_PREFIX = "@@EVENT@@";
 const email = (process.env.REG_EMAIL || "").trim();
-const password = appConfig.defaultPassword.trim();
+const password = (process.env.GPT_PASSWORD || "").trim() || appConfig.defaultPassword.trim();
+const totpSecret = (process.env.TOTP_SECRET || "").trim();
 const preferPhone = (process.env.RT_PREFER_PHONE || "").trim();
 
 function emit(event) {
@@ -40,31 +41,52 @@ async function main() {
     emit({type: "progress", stage: "rt", message: `开始为 ${email} 获取 refresh_token${preferPhone ? `(复用绑定号 +${preferPhone})` : ""}`});
 
     const deviceProfile = generateRandomDeviceProfile();
-    // 拿 rt 必经 add-phone(手机验证)，必须有接码池;preferPhone 让 rt 过期重取复用同一号。
-    const smsBroker = createPoolBroker({
-        email,
-        linkTemplate: process.env.SMS_LINK_TEMPLATE || "",
-        preferPhone,
-        maxBind: Number(process.env.SMS_MAX_BIND || 0),
-        log: (m) => emit({type: "progress", stage: "phone", message: m}),
-    });
-    const client = new OpenAIClient({email, password, deviceProfile, manualMode: false, smsBroker});
+    let authFile = "";
+    let rt = "";
+    let phone = "";
+    let card = "";
 
-    // authLoginHTTP 走 codex OAuth 全链路，产出 codex auth 文件(含 rt)并回写 lastSavedAuthRecord
-    const result = await client.authLoginHTTP();
-    const rec = client.lastSavedAuthRecord || {};
-    const rt = rec.refresh_token || "";
-    if (!rt) throw new Error("authLoginHTTP 完成但未解析到 refresh_token");
-    emit({type: "progress", stage: "rt", message: `✅ 拿到 refresh_token: ${rt.slice(0, 28)}...  codex文件: ${result.authFile}`});
+    if (totpSecret) {
+        try {
+            emit({type: "progress", stage: "rt", message: "已绑 2FA，先网页登录再会话换 rt（不接码）"});
+            const sessionClient = new OpenAIClient({email, password, totpSecret, deviceProfile, manualMode: false});
+            await sessionClient.authLoginChatGPTHTTP();
+            const sess = await sessionClient.authGetRefreshTokenViaSession(email);
+            const rec = sessionClient.lastSavedAuthRecord || {};
+            rt = rec.refresh_token || sess.refresh_token || "";
+            authFile = sess.authFile || "";
+        } catch (e) {
+            emit({type: "progress", stage: "rt", message: `会话换 rt 失败(${String(e?.message || e).slice(0, 80)})，回退 OAuth+接码`});
+        }
+    }
+
+    if (!rt) {
+        const smsBroker = createPoolBroker({
+            email,
+            linkTemplate: process.env.SMS_LINK_TEMPLATE || "",
+            preferPhone,
+            maxBind: Number(process.env.SMS_MAX_BIND || 0),
+            log: (m) => emit({type: "progress", stage: "phone", message: m}),
+        });
+        const client = new OpenAIClient({email, password, totpSecret, deviceProfile, manualMode: false, smsBroker});
+        const result = await client.authLoginHTTP();
+        const rec = client.lastSavedAuthRecord || {};
+        rt = rec.refresh_token || "";
+        authFile = result.authFile || "";
+        phone = smsBroker.boundPhone || "";
+        card = smsBroker.boundCard || "";
+    }
+    if (!rt) throw new Error("未解析到 refresh_token");
+    emit({type: "progress", stage: "rt", message: `✅ 拿到 refresh_token: ${rt.slice(0, 28)}...  codex文件: ${authFile}`});
 
     emit({
         type: "result",
         status: "success",
         email,
-        rtFile: result.authFile || "",
+        rtFile: authFile,
         rt,
-        phone: smsBroker.boundPhone || "",
-        card: smsBroker.boundCard || "",
+        phone,
+        card,
     });
 }
 

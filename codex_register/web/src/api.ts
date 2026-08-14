@@ -16,7 +16,13 @@ export interface Account {
     dead_at?: number;
     sold_at?: number;
     pw_status?: string; // 邮箱改密状态:''=未改过 / ✅已改 / ❌失败原因
+    gpt_password?: string;
+    totp_secret?: string;
+    mailbox_totp?: string; // 邮箱侧 TOTP(谷歌 2FA)
+    provider?: string;
+    mfa_status?: string;
     batch?: string; // 导入批次名
+    deleted_at?: number; // >0=已删除(GPT 记录软删或邮箱软删联动),仅搜索时带出
     error: string;
     started_at: number | null;
     finished_at: number | null;
@@ -28,12 +34,83 @@ export interface Mailbox {
     id: number;
     email: string;
     password: string;
+    password_prev?: string;
     provider: string;
-    usage: "free" | "hold" | "gpt" | "claude"; // free=待分配 hold=独立(永不被业务分配)
+    usage: "free" | "hold" | "gpt" | "claude" | "deleted"; // free=待分配 hold=独立 gpt/claude=已归属 deleted=已删除
     grp?: string;
     pw_status?: string;
     note?: string;
+    recovery_email?: string;
+    totp_secret?: string;
+    imap_password?: string;
+    deleted_at?: number;
+    sold_at?: number;
+    google_stage?: string;
+    google_state?: {
+        stage?: string;
+        login?: string;
+        login_error?: string;
+        phone?: string;
+        recovery?: string;
+        totp?: string;
+        password?: string;
+        devices?: string;
+        imap?: string;
+        gpt?: string;
+        last_error?: string;
+        updated_at?: number;
+    };
     created_at: number;
+}
+
+export interface MailboxJobWindow {
+    id: string;
+    name: string;
+    remark: string;
+    status: number;
+    createdTime?: string;
+}
+export interface MailboxJobCurrent {
+    id: number;
+    email: string;
+    lastLine: string;
+    instanceId?: string;
+    kind?: string;
+}
+export interface MailFarmInstance {
+    instanceId: string;
+    stopClaim: boolean;
+    proxySlots: number;
+    proxyLeased: number;
+    runningJobs: number;
+    lastSeen: number;
+    free: number;
+}
+export interface MailJobKindStat {
+    pending: number;
+    running: number;
+    done: number;
+    error: number;
+    ok: number;
+}
+export interface MailboxJob {
+    running: boolean;
+    kind?: string;
+    done: number;
+    total: number;
+    ok: number;
+    fail?: number;
+    runningCount?: number;
+    queued?: number;
+    rate?: number;
+    stopped?: boolean;
+    lastLine?: string;
+    current?: MailboxJobCurrent[];
+    windows?: MailboxJobWindow[];
+    byKind?: Record<string, MailJobKindStat>;
+    instances?: MailFarmInstance[];
+    instanceId?: string;
+    source?: string;
 }
 
 export interface Stats {
@@ -95,6 +172,11 @@ export interface RechargeConfig {
     interval: number;
     rtProxy: string;
     rtConcurrency: number;
+    instanceId?: string;
+    rebindGmailAfterPaid?: boolean;
+    rebindAfterPaid?: "off" | "gmail" | "mailcom";
+    gmailFreeImap?: number;
+    mailcomFree?: number;
 }
 
 export interface RechargeCardStats {
@@ -122,8 +204,14 @@ export interface RechargeQueueItem {
     task_message: string;
     error: string;
     plan_type: string;
+    rebind_status?: string;
+    rebind_email?: string;
+    rebind_error?: string;
+    rebind_target?: string;
     created_at: number;
     submitted_at: number;
+    finished_at?: number;
+    instance_id?: string;
 }
 
 export interface RechargeQueueStats {
@@ -178,7 +266,7 @@ export const api = {
     batchDelete: (ids: number[]) => j<{ok: boolean; count: number; skipped: number}>("/api/accounts/batch-delete", {method: "POST", body: JSON.stringify({ids})}),
     // 批量设置售出状态:sold=false 把已售出改回未售出(误标/退回重新上架)
     setSold: (ids: number[], sold: boolean) => j<{ok: boolean; count: number; sold: boolean}>("/api/accounts/set-sold", {method: "POST", body: JSON.stringify({ids, sold})}),
-    listAccounts: () => j<Account[]>("/api/accounts"),
+    listAccounts: (deleted?: boolean) => j<Account[]>(`/api/accounts${deleted ? '?deleted=1' : ''}`),
     getAccount: (id: number) => j<Account>(`/api/accounts/${id}`), // 拉单个账号(点行刷新用,避免整表全量拉)
     logs: (id: number) => j<{id: number; ts: number; line: string}[]>(`/api/accounts/${id}/logs`),
     retry: (id: number) => j(`/api/accounts/${id}/retry`, {method: "POST"}),
@@ -210,6 +298,7 @@ export const api = {
     xrayProbe: () => j<{ok: boolean; ip?: string; chatgpt?: string; pass?: boolean; reason?: string}>("/api/control/xray/probe"),
     setSms: (enabled: boolean) => j("/api/control/sms", {method: "POST", body: JSON.stringify({enabled})}),
     setRt: (enabled: boolean) => j<{rtEnabled: boolean}>("/api/control/rt", {method: "POST", body: JSON.stringify({enabled})}),
+    setMfa: (enabled: boolean) => j<{mfaEnabled: boolean}>("/api/control/mfa", {method: "POST", body: JSON.stringify({enabled})}),
     setBit: (enabled: boolean) => j<{bitBrowser: boolean}>("/api/control/bit", {method: "POST", body: JSON.stringify({enabled})}),
     setEngine: (engine: "http" | "browser") => j<{regEngine: string}>("/api/control/engine", {method: "POST", body: JSON.stringify({engine})}),
     setDaily: (cfg: Partial<{enabled: boolean; hour: number; items: {chat: boolean; rt: boolean; at: boolean}}>) => j<{daily: Daily}>("/api/control/daily", {method: "POST", body: JSON.stringify(cfg)}),
@@ -224,17 +313,20 @@ export const api = {
     batchRefreshAt: (lines: string) => j<{ok: boolean; count: number}>("/api/tools/batch-refresh-at", {method: "POST", body: JSON.stringify({lines})}),
     batchAcquireRt: (lines: string) => j<{ok: boolean; count: number}>("/api/tools/batch-acquire-rt", {method: "POST", body: JSON.stringify({lines})}),
     stopBatchAcquireRt: () => j<{ok: boolean}>("/api/tools/batch-acquire-rt/stop", {method: "POST"}),
+    refreshTokens: (items: {email: string; password: string; rt: string}[]) =>
+        j<{results: {email: string; password?: string; ok: boolean; reason?: string; tokens?: {access_token: string; refresh_token: string; id_token?: string; account_id?: string}}[]}>("/api/tools/refresh-tokens", {method: "POST", body: JSON.stringify({items})}),
     stopBatchRefreshAt: () => j<{ok: boolean}>("/api/tools/batch-refresh-at/stop", {method: "POST"}),
     testAt: (id: number) => j(`/api/accounts/${id}/test-at`, {method: "POST"}),
     testRt: (id: number) => j(`/api/accounts/${id}/test-rt`, {method: "POST"}),
     testChat: (id: number) => j(`/api/accounts/${id}/test-chat`, {method: "POST"}),
+    enrollMfa: (ids: number[]) => j<{ok: boolean; count: number}>("/api/control/enroll-mfa", {method: "POST", body: JSON.stringify({ids})}),
     batchTestAt: (ids: number[], relogin = false) => j<{count: number}>("/api/control/test-at", {method: "POST", body: JSON.stringify({ids, relogin})}),
     stopBatchAt: () => j<{ok: boolean; msg?: string}>("/api/control/test-at/stop", {method: "POST"}),
     // acquire=true:过期/无rt 的号重登获取 rt(走 codex OAuth+接码,有成本);false:只刷新有效 rt、标记失效
     batchTestRt: (ids: number[], acquire = false) => j<{count: number}>("/api/control/test-rt", {method: "POST", body: JSON.stringify({ids, acquire})}),
     batchTestChat: (ids: number[]) => j<{count: number}>("/api/control/test-chat", {method: "POST", body: JSON.stringify({ids})}),
     retryFailed: () => j("/api/control/retry-failed", {method: "POST"}),
-    state: () => j<{state: {paused: boolean; pausedClaude?: boolean; claudeProxy?: string; claudeXrayVless?: string; claudeXray?: XrayStatus; regProxyPort?: number; claudeProxyPort?: number; runningClaude?: number[]; concurrency: number; otpSingle: boolean; simulateChat: boolean; smsEnabled: boolean; rtEnabled: boolean; bitBrowser?: boolean; smsMaxBind: number; regEngine: string; daily: Daily; xray: XrayStatus; smsLinkTemplate: string; regProxy: string; mailProxy: string; mailProxyEnabled?: boolean; mailSeparator?: string; xrayBinPath?: string; xrayVless?: string; pwConcurrency?: number; running: number[]; batchPw?: {running: boolean; done: number; total: number}}; stats: Stats}>("/api/state"),
+    state: () => j<{state: {instanceId?: string; paused: boolean; pausedClaude?: boolean; claudeProxy?: string; claudeXrayVless?: string; claudeXray?: XrayStatus; regProxyPort?: number; claudeProxyPort?: number; runningClaude?: number[]; concurrency: number; otpSingle: boolean; simulateChat: boolean; smsEnabled: boolean; rtEnabled: boolean; mfaEnabled?: boolean; bitBrowser?: boolean; smsMaxBind: number; regEngine: string; daily: Daily; xray: XrayStatus; smsLinkTemplate: string; regProxy: string; mailProxy: string; mailProxyEnabled?: boolean; mailSeparator?: string; xrayBinPath?: string; xrayVless?: string; pwConcurrency?: number; defaultPassword?: string; running: number[]; batchPw?: {running: boolean; done: number; total: number}}; stats: Stats}>("/api/state"),
     // ★统一导出(合并原下载菜单+批量导出)。范围×scope×格式×标记已售出一站式;POST 返回纯文本供 blob 下载。
     //   范围:ids(选中/当前筛选) 或 batch(按批次) 或都不传(全部成功号)。
     exportFull: async (opts: {format: "full" | "at" | "session" | "jsonl" | "csv"; scope?: "all" | "hasRt" | "atOnly"; batch?: string; ids?: number[]; markSold?: boolean}): Promise<string> => {
@@ -244,10 +336,14 @@ export const api = {
     },
     // ---- 邮箱域:资源池(free/gpt/claude 隔离) ----
     listMailboxes: (usage?: string) =>
-        j<{list: Mailbox[]; stats: {free: number; hold: number; gpt: number; claude: number; total: number}; groups: {grp: string; n: number}[]}>(`/api/mailboxes${usage ? `?usage=${usage}` : ""}`),
-    // autoChangePw:导入后自动改随机20位;hold:导入即独立(进 hold,永不被业务分配)
-    importFreeMailboxes: (text: string, defaultPassword?: string, grp?: string, autoChangePw?: boolean, hold?: boolean, provider?: string) =>
-        j<{inserted: number; skipped: number; total: number; autoChangePw?: number}>("/api/mailboxes/import", {method: "POST", body: JSON.stringify({text, defaultPassword, grp, autoChangePw, hold, provider})}),
+        j<{list: Mailbox[]; stats: {free: number; hold: number; gpt: number; claude: number; total: number; deleted: number}; groups: {grp: string; n: number}[]}>(`/api/mailboxes${usage ? `?usage=${usage}` : ""}`),
+    // autoChangePw:导入后自动改随机20位;hold:导入即独立;autoHarden:Gmail 导入后立刻批量整备
+    importFreeMailboxes: (text: string, defaultPassword?: string, grp?: string, autoChangePw?: boolean, hold?: boolean, provider?: string, autoHarden?: boolean) =>
+        j<{inserted: number; skipped: number; total: number; ids?: number[]; emails?: string[]; autoChangePw?: number; autoHarden?: number; hardenError?: string; hardenConcurrency?: number}>(
+            "/api/mailboxes/import", {method: "POST", body: JSON.stringify({text, defaultPassword, grp, autoChangePw, hold, provider, autoHarden: !!autoHarden})}),
+    lookupMailboxes: (emails: string[] | string) =>
+        j<{list: Mailbox[]; queried: string[]; found: string[]; missing: string[]}>(
+            "/api/mailboxes/lookup", {method: "POST", body: JSON.stringify(Array.isArray(emails) ? {emails} : {text: emails})}),
     // 切换邮箱状态 free(待分配) ↔ hold(独立);单个 / 批量
     setMailboxUsage: (id: number, usage: "free" | "hold") => j<{ok: boolean; usage: string}>(`/api/mailboxes/${id}/usage`, {method: "POST", body: JSON.stringify({usage})}),
     setMailboxesUsage: (ids: number[], usage: "free" | "hold") => j<{ok: boolean; count: number}>("/api/mailboxes/usage", {method: "POST", body: JSON.stringify({ids, usage})}),
@@ -268,7 +364,24 @@ export const api = {
     deleteMailbox: (id: number) => j<{ok: boolean; reason?: string}>(`/api/mailboxes/${id}`, {method: "DELETE"}),
     batchDeleteMailbox: (ids: number[]) => j<{ok: boolean; count: number; skipped: number}>("/api/mailboxes/batch-delete", {method: "POST", body: JSON.stringify({ids})}),
     changeMailboxPasswd: (id: number, newPassword?: string) =>
-        j<{ok: boolean; newPassword: string; detail?: string}>(`/api/mailboxes/${id}/change-passwd`, {method: "POST", body: JSON.stringify({newPassword: newPassword || ""})}),
+        j<{ok: boolean; queued?: boolean; newPassword: string; detail?: string; count?: number}>(`/api/mailboxes/${id}/change-passwd`, {method: "POST", body: JSON.stringify({newPassword: newPassword || ""})}),
+    changeMailboxGoogle2fa: (id: number) =>
+        j<{ok: boolean; queued?: boolean; totpSecret?: string; error?: string; count?: number}>(`/api/mailboxes/${id}/google-2fa`, {method: "POST"}),
+    hardenMailboxGoogle: (id: number) =>
+        j<{ok: boolean; queued?: boolean; count?: number; concurrency?: number; proxies?: number; password?: string; totpSecret?: string; imap?: boolean; recoveryCleared?: boolean; errors?: string[]; error?: string}>(
+            `/api/mailboxes/${id}/google-harden`, {method: "POST"}),
+    batchHardenMailboxGoogle: (ids: number[]) =>
+        j<{ok: boolean; count: number; concurrency: number; proxies: number}>("/api/mailboxes/batch-google-harden", {method: "POST", body: JSON.stringify({ids})}),
+    stopBatchHardenMailboxGoogle: () => j<{ok: boolean; closed?: number}>("/api/mailboxes/batch-google-harden/stop", {method: "POST"}),
+    mailboxJob: () => j<{ok: boolean; batchHarden: MailboxJob; batchPw: MailboxJob; job: MailboxJob; instances?: MailFarmInstance[]}>("/api/mailboxes/job"),
+    mailProxyPool: () => j<{ok: boolean; urls: string[]; lines?: string[]; jump?: string; total: number; slots: number; leased: number; free: number; items: {url: string; masked: string; leased: boolean; owner: string}[]}>("/api/mailboxes/proxy-pool"),
+    setMailProxyPool: (text: string, opts?: {append?: boolean; copies?: number}) =>
+        j<{ok: boolean; urls: string[]; lines?: string[]; jump?: string; total: number; slots: number; leased: number; free: number; inserted?: number; skipped?: number}>(
+            "/api/mailboxes/proxy-pool", {method: "POST", body: JSON.stringify({text, append: !!opts?.append, copies: opts?.copies || 1})}),
+    setMailProxyJump: (jump: string) => j<{ok: boolean; jump: string}>("/api/mailboxes/proxy-jump", {method: "POST", body: JSON.stringify({jump})}),
+    testMailProxyJump: (jump?: string) =>
+        j<{ok: boolean; jump?: string; sample?: string; ip?: string; google?: number; ms?: number; reason?: string; error?: string}>(
+            "/api/mailboxes/proxy-jump/test", {method: "POST", body: JSON.stringify({jump: jump || ""})}),
     // ---- Claude 域(架构 v2:与 GPT 对称命名空间 /api/claude/*)。magic-link 注册,比特浏览器+代理过 CF ----
     listClaudeAccounts: () => j<{list: ClaudeAccount[]; stats: Stats}>("/api/claude/accounts"),
     registerClaude: () => j<{ok: boolean}>("/api/claude/register", {method: "POST"}), // 开始(解除 Claude 暂停+tick)
@@ -300,8 +413,8 @@ export const api = {
         return res.text();
     },
     // ---- 充值提交域 ----
-    rechargeConfig: () => j<RechargeConfig & {hasKey: boolean}>("/api/recharge/config"),
-    setRechargeConfig: (cfg: Partial<RechargeConfig>) => j<{ok: boolean}>("/api/recharge/config", {method: "POST", body: JSON.stringify(cfg)}),
+    rechargeConfig: () => j<RechargeConfig & {hasKey: boolean; instanceId?: string}>("/api/recharge/config"),
+    setRechargeConfig: (cfg: Partial<RechargeConfig>) => j<{ok: boolean; rebindGmailAfterPaid?: boolean; rebindAfterPaid?: "off" | "gmail" | "mailcom"; gmailFreeImap?: number; mailcomFree?: number}>("/api/recharge/config", {method: "POST", body: JSON.stringify(cfg)}),
     // 卡密池
     rechargeCards: () => j<{list: RechargeCard[]; stats: RechargeCardStats}>("/api/recharge/cards"),
     importRechargeCards: (text: string, batch?: string) =>
@@ -324,13 +437,27 @@ export const api = {
         j<{ok: boolean}>("/api/recharge/queue/set-batch", {method: "POST", body: JSON.stringify({ids, batch})}),
     resetRechargeQueue: (ids: number[]) =>
         j<{ok: boolean}>("/api/recharge/queue/reset", {method: "POST", body: JSON.stringify({ids})}),
+    rechargeQueueRelogin: (ids: number[]) =>
+        j<{ok: boolean; count: number; claimed?: number; skipped?: number; instanceId?: string}>("/api/recharge/queue/relogin", {method: "POST", body: JSON.stringify({ids})}),
+    // 一条龙:浏览器重登刷新 session → 验卡 → 重置任务 → 用同一张卡密重提(卡密非 unused 则跳过)
+    rechargeQueueReloginSubmit: (ids: number[]) =>
+        j<{ok: boolean; count: number; claimed?: number; skipped?: number; instanceId?: string}>("/api/recharge/queue/relogin-submit", {method: "POST", body: JSON.stringify({ids})}),
+    stopRechargeQueueRelogin: () => j<{ok: boolean}>("/api/recharge/queue/relogin/stop", {method: "POST"}),
+    reclaimCards: (ids: number[]) =>
+        j<{ok: boolean; reclaimed: number; used: number; failed: number}>("/api/recharge/queue/reclaim-cards", {method: "POST", body: JSON.stringify({ids})}),
     // 提交 / 控制
     submitRecharge: (queueIds: number[]) =>
         j<{ok: boolean; paired: number}>("/api/recharge/submit", {method: "POST", body: JSON.stringify({queueIds})}),
     stopRecharge: () => j<{ok: boolean}>("/api/recharge/stop", {method: "POST"}),
     pollRecharge: (ids?: number[]) => j<{ok: boolean; updated: number}>("/api/recharge/poll", {method: "POST", body: JSON.stringify({ids})}),
+    rebindGmail: (ids: number[], target?: "gmail" | "mailcom") =>
+        j<{ok: boolean; queued: number; skipped: {email: string; reason: string}[]; gmailFreeImap?: number; mailcomFree?: number}>("/api/recharge/rebind-gmail", {method: "POST", body: JSON.stringify({ids, target})}),
+    cancelRebindGmail: (ids: number[]) =>
+        j<{ok: boolean; count: number}>("/api/recharge/rebind-gmail/cancel", {method: "POST", body: JSON.stringify({ids})}),
+    rechargeLogs: () => j<{ts: number; line: string}[]>("/api/recharge/logs"),
+    clearRechargeLogs: () => j<{ok: boolean}>("/api/recharge/logs/clear", {method: "POST"}),
     // 导出 / RT 获取
-    exportRechargeQueue: async (opts: {ids?: number[]; batch?: string; format: "account" | "full"}): Promise<{text?: string; async?: boolean; needRt?: number}> => {
+    exportRechargeQueue: async (opts: {ids?: number[]; batch?: string; format: "account" | "full" | "card" | "session"}): Promise<{text?: string; async?: boolean; needRt?: number}> => {
         const res = await fetch("/api/recharge/queue/export", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(opts)});
         if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || `HTTP ${res.status}`);
         const ct = res.headers.get("content-type") || "";
@@ -345,7 +472,7 @@ export type StreamHandler = (event: string, data: any) => void;
 
 export function connectStream(onEvent: StreamHandler): () => void {
     const es = new EventSource("/api/stream");
-    for (const name of ["hello", "log", "status", "stats", "snapshot", "sms", "daily", "mailboxes", "mbLog", "claude", "claudeLog", "claudeScan", "batchAt", "batchPw", "refreshAt", "batchRtAcquire", "recharge", "rechargeLog", "rechargeQueue"]) {
+    for (const name of ["hello", "log", "status", "stats", "snapshot", "sms", "daily", "mailboxes", "mbLog", "claude", "claudeLog", "claudeScan", "batchAt", "batchPw", "batchHarden", "refreshAt", "batchRtAcquire", "recharge", "rechargeLog", "rechargeQueue", "rechargeExportReady"]) {
         es.addEventListener(name, (e: MessageEvent) => {
             try { onEvent(name, JSON.parse(e.data)); } catch { /* ignore */ }
         });

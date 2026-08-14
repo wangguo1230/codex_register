@@ -18,6 +18,7 @@ import {
     AUTH_EMAIL_OTP_SEND_URL,
     AUTH_EMAIL_OTP_VALIDATE_URL,
     AUTH_OAUTH_TOKEN_URLS,
+    AUTH_MFA_VALIDATE_URLS,
     AUTH_PASSWORD_VERIFY_URL,
     AUTH_REGISTER_URL,
     AUTH_WORKSPACE_SELECT_URL,
@@ -27,6 +28,7 @@ import {
     DEFAULT_USER_AGENT,
 } from "./constants.js";
 import {getEmailAddress, getEmailVerificationCode, getMailboxCredential, MAILBOX_CONFIG} from "./mailbox.js";
+import {generateTotpCandidates, isMfaContinueUrl} from "./mfa.js";
 import {ensureNextAuthCsrf, buildAuthRecord} from "./email-reg/index.js";
 import {fetchSentinelToken} from "./sentinel.js";
 import { pkceCodeChallenge, randomUrlSafeString } from "./utils.js";
@@ -139,6 +141,9 @@ interface ContinueResponse {
         backstack_behavior?: string;
         payload?: {
             url?: string;
+            factor_id?: string;
+            factors?: Array<{id?: string; factor_type?: string; type?: string}>;
+            mfa_factors?: Array<{id?: string; factor_type?: string; type?: string}>;
         };
     };
 }
@@ -215,6 +220,14 @@ export interface OpenAIClientOptions {
     fetchAddEmailOtp?: () => Promise<string>;
     /** 验证码单封模式：跳过主动 sendEmailOtp，只用创建账号时自动发的那封(默认 false=发两封更稳) */
     otpSingle?: boolean;
+    /** 已绑定的 TOTP secret。有则登录优先走验证器，不再先收邮箱。 */
+    totpSecret?: string;
+}
+
+interface MfaFactor {
+    id?: string;
+    factor_type?: string;
+    type?: string;
 }
 
 export class OpenAIClient {
@@ -239,12 +252,15 @@ export class OpenAIClient {
     readonly bindEmail: string;
     readonly fetchAddEmailOtp?: () => Promise<string>;
     readonly otpSingle: boolean;
+    readonly totpSecret: string;
+    lastMfaFactorId = "";
 
     constructor(options: OpenAIClientOptions) {
         this.smsBroker = options.smsBroker;
         this.bindEmail = options.bindEmail?.trim() ?? "";
         this.fetchAddEmailOtp = options.fetchAddEmailOtp;
         this.otpSingle = options.otpSingle ?? false;
+        this.totpSecret = String(options.totpSecret || "").trim();
         this.email = options.email?.trim() ?? "";
         this.password = options.password;
         this.deviceProfile = options.deviceProfile
@@ -319,16 +335,7 @@ export class OpenAIClient {
         }
 
         this.logProgress(2, totalSteps, "提交登录用户名");
-        let continueURL = await this.authorizeContinue();
-        if (continueURL === `${AUTH_BASE_URL}/log-in/password`) {
-            this.logProgress(3, totalSteps, "提交登录密码");
-            continueURL = await this.passwordVerify();
-        }
-
-        if (continueURL === `${AUTH_BASE_URL}/email-verification`) {
-            this.logProgress(4, totalSteps, "提交邮箱验证码");
-            continueURL = await this.emailOtpValidate();
-        }
+        let continueURL = await this.continueLoginSteps(await this.authorizeContinue());
 
         if (continueURL === `${AUTH_BASE_URL}/add-phone`) {
             throw new Error("CPA 登录触发 add-phone 流程，当前不支持");
@@ -352,7 +359,7 @@ export class OpenAIClient {
                 }
                 const code = await this.fetchAddEmailOtp();
                 if (!code) throw new Error("add-email OTP 未提供");
-                continueURL = await this.emailOtpValidate(code);
+                continueURL = await this.continueLoginSteps(await this.emailOtpValidate(code));
             }
             if (continueURL === `${AUTH_BASE_URL}/sign-in-with-chatgpt/codex/consent`) {
                 continueURL = await this.selectWorkspace(continueURL);
@@ -373,7 +380,14 @@ export class OpenAIClient {
             return startURL;
         }
         let currentURL = startURL;
+        let didMfa = false;
         for (let hop = 0; hop < 10; hop++) {
+            if (isMfaContinueUrl(currentURL) && !didMfa) {
+                didMfa = true;
+                if (!this.totpSecret) throw new Error(`OAuth 停在 2FA 页但无 totp_secret: ${currentURL.slice(0, 80)}`);
+                currentURL = await this.totpValidate(currentURL);
+                continue;
+            }
             const response = await this.fetch(currentURL, {
                 method: "GET",
                 redirect: "manual",
@@ -394,6 +408,10 @@ export class OpenAIClient {
             }
             if (response.url.startsWith(DEFAULT_REDIRECT_URI)) {
                 return response.url;
+            }
+            if (isMfaContinueUrl(response.url) && !didMfa) {
+                currentURL = response.url;
+                continue;
             }
             throw new Error(`OAuth跳转未到达 localhost callback: status=${response.status} url=${response.url}`);
         }
@@ -447,16 +465,7 @@ export class OpenAIClient {
         }
 
         this.logProgress(2, totalSteps, "提交登录邮箱");
-        let continueURL = await this.authorizeContinue();
-        if (continueURL === `${AUTH_BASE_URL}/log-in/password`) {
-            this.logProgress(3, totalSteps, "提交登录密码");
-            continueURL = await this.passwordVerify();
-        }
-
-        if (continueURL === `${AUTH_BASE_URL}/email-verification`) {
-            this.logProgress(4, totalSteps, "提交邮箱验证码");
-            continueURL = await this.emailOtpValidate();
-        }
+        let continueURL = await this.continueLoginSteps(await this.authorizeContinue());
 
         if (continueURL === `${AUTH_BASE_URL}/add-phone`) {
             // 复用 resolveAddPhone:含 markAsUsed/markAsSucceed(把号回写为 used + bind_count/bind_emails/boundPhone)、
@@ -485,7 +494,7 @@ export class OpenAIClient {
                 }
                 const code = await this.fetchAddEmailOtp();
                 if (!code) throw new Error("add-email OTP 未提供");
-                continueURL = await this.emailOtpValidate(code);
+                continueURL = await this.continueLoginSteps(await this.emailOtpValidate(code));
             }
         }
 
@@ -500,6 +509,30 @@ export class OpenAIClient {
         const authPath = await this.saveAuthRecord(authRecord);
         result.authFile = authPath;
         return result;
+    }
+
+    /** ChatGPT 网页登录(纯协议):boot session → 邮箱/密码/TOTP → callback → /api/auth/session。给重登拿 AT 用,不走浏览器。 */
+    async authLoginChatGPTHTTP(): Promise<{authFile: string; token: string}> {
+        this.logProgress(1, 5, "打开 ChatGPT 会话");
+        await this.bootChatGPTSession();
+        this.logProgress(2, 5, "打开登录授权页");
+        await this.openSignupPage(this.email);
+        this.logProgress(3, 5, "提交登录邮箱");
+        let continueURL = await this.continueLoginSteps(await this.authorizeContinue());
+        if (continueURL === `${AUTH_BASE_URL}/about-you`) {
+            this.logProgress(4, 5, "填写基础资料");
+            continueURL = await this.completeAboutYou();
+        }
+        if (continueURL.startsWith(`${CHATGPT_BASE_URL}/api/auth/callback/openai`)) {
+            this.logProgress(4, 5, "完成登录回调");
+            await this.finishChatGPTRegistration(continueURL);
+        } else if (!/^https:\/\/chatgpt\.com\/?($|\?|#)/.test(continueURL) && continueURL !== `${CHATGPT_BASE_URL}/`) {
+            throw new Error(`登录未到达 ChatGPT 回调(url=${String(continueURL).slice(0, 80)})`);
+        }
+        this.logProgress(5, 5, "读取 session");
+        const token = await this.getChatGPTAccessToken();
+        const authFile = await this.saveChatGPTAccessToken(token);
+        return {authFile, token};
     }
 
     async authRegisterHTTP(): Promise<string> {
@@ -540,10 +573,8 @@ export class OpenAIClient {
             }
         }
 
-        if (continueURL === `${AUTH_BASE_URL}/email-verification`) {
-            totalSteps += 1;
-            this.logProgress(step++, totalSteps, "提交邮箱验证码");
-            continueURL = await this.emailOtpValidate();
+        if (continueURL === `${AUTH_BASE_URL}/email-verification` || isMfaContinueUrl(continueURL) || /\/log-in\/password/i.test(continueURL)) {
+            continueURL = await this.continueLoginSteps(continueURL);
         }
 
         // [按需] 邮箱验证后 OpenAI 若要求手机验证(add-phone)，用接码池过验证并自动换号；
@@ -682,10 +713,8 @@ export class OpenAIClient {
             }
         }
 
-        if (continueURL === `${AUTH_BASE_URL}/email-verification`) {
-            totalSteps += 1;
-            this.logProgress(step++, totalSteps, "提交邮箱验证码");
-            continueURL = await this.emailOtpValidate();
+        if (continueURL === `${AUTH_BASE_URL}/email-verification` || isMfaContinueUrl(continueURL) || /\/log-in\/password/i.test(continueURL)) {
+            continueURL = await this.continueLoginSteps(continueURL);
         }
 
         if (continueURL === `${AUTH_BASE_URL}/add-phone`) {
@@ -994,7 +1023,95 @@ export class OpenAIClient {
             );
         }
         const payload = (await response.json()) as ContinueResponse;
+        this.rememberMfaContext(payload);
         return payload.continue_url;
+    }
+
+    /** 密码 / 邮箱 OTP / TOTP 状态机(纯协议)。OpenAI 先给哪一步就走哪一步,2FA 在邮箱码之后也会接上。 */
+    private async continueLoginSteps(continueURL: string): Promise<string> {
+        let didPassword = false;
+        let didEmail = false;
+        let didTotp = false;
+        for (let i = 0; i < 8; i++) {
+            const url = String(continueURL || "");
+            if (!url) return url;
+            if (url.startsWith(DEFAULT_REDIRECT_URI)) return url;
+            if (url.startsWith(`${CHATGPT_BASE_URL}/api/auth/callback`)) return url;
+            if (/\/(sign-in-with-chatgpt\/codex\/consent|add-phone|add-email|about-you|choose-an-account)(\/|$|\?)/i.test(url)) return url;
+
+            if (/\/(log-in|create-account)\/password/i.test(url) && !didPassword) {
+                didPassword = true;
+                this.logProgress("pwd", 0, "提交登录密码");
+                continueURL = /create-account/i.test(url) ? await this.registerPassword() : await this.passwordVerify();
+                continue;
+            }
+            if (isMfaContinueUrl(url) && !didTotp) {
+                didTotp = true;
+                if (!this.totpSecret) {
+                    if (didEmail) throw new Error(`邮箱验证后出现 2FA 页但无 totp_secret (url=${url.slice(0, 80)})`);
+                    this.logProgress("mfa", 0, "无 TOTP secret,回退邮箱验证");
+                    continueURL = `${AUTH_BASE_URL}/email-verification`;
+                    continue;
+                }
+                this.logProgress("mfa", 0, `邮箱码之后进入 2FA，提交 TOTP`);
+                try {
+                    continueURL = await this.totpValidate(url);
+                } catch (e: any) {
+                    if (didEmail) throw e;
+                    this.logProgress("mfa", 0, `TOTP 失败,回退邮箱: ${String(e?.message || e).slice(0, 80)}`);
+                    continueURL = `${AUTH_BASE_URL}/email-verification`;
+                }
+                continue;
+            }
+            if (/email-verification/i.test(url) && !didEmail) {
+                didEmail = true;
+                this.logProgress("otp", 0, "提交邮箱验证码");
+                continueURL = await this.emailOtpValidate();
+                continue;
+            }
+            return continueURL;
+        }
+        return continueURL;
+    }
+
+    private rememberMfaContext(payload: ContinueResponse | null | undefined, fallbackUrl = "") {
+        const p = payload?.page?.payload;
+        const url = payload?.continue_url || p?.url || fallbackUrl || "";
+        const fromUrl = String(url).match(/mfa-challenge\/([^/?#]+)/i)?.[1] || "";
+        const factors = p?.mfa_factors || p?.factors || [];
+        const totp = factors.find((f) => /totp|authenticator/i.test(String(f?.factor_type || f?.type || "")));
+        this.lastMfaFactorId = totp?.id || p?.factor_id || fromUrl || this.lastMfaFactorId || "";
+        return url;
+    }
+
+    async totpValidate(refererUrl = ""): Promise<string> {
+        if (!this.totpSecret) throw new Error("需要 TOTP 但未提供 totpSecret");
+        const referer = refererUrl || `${AUTH_BASE_URL}/mfa-challenge`;
+        const factorId = String(refererUrl || "").match(/mfa-challenge\/([^/?#]+)/i)?.[1] || this.lastMfaFactorId || "";
+        const codes = generateTotpCandidates(this.totpSecret);
+        const sentinelToken = await this.fetchSentinelToken("mfa_validate").catch(() => "");
+        let lastErr = "TOTP 提交失败";
+        const verifyUrl = `${AUTH_BASE_URL}/api/accounts/mfa/verify`;
+        for (const code of codes) {
+            const bodies: Record<string, string>[] = [];
+            if (factorId) bodies.push({id: factorId, type: "totp", code});
+            bodies.push({type: "totp", code});
+            if (factorId) bodies.push({id: factorId, type: "totp", code, mfa_request_id: factorId});
+            for (const body of bodies) {
+                const response = await this.postJSON(verifyUrl, body, {referer, sentinelToken});
+                if (response.ok) {
+                    const payload = (await response.json()) as ContinueResponse;
+                    const next = this.rememberMfaContext(payload) || payload.continue_url || payload.page?.payload?.url || "";
+                    this.logProgress("mfa", 0, `2FA 已通过 → ${String(next).slice(0, 70)}`);
+                    return next;
+                }
+                const err = await this.formatErrorResponse(response);
+                lastErr = `/api/accounts/mfa/verify ${err}`;
+                this.logProgress("mfa", 0, `TOTP 提交失败(${body.id ? "id+type" : "type"}): ${err.slice(0, 120)}`);
+                if (/incorrect|invalid_code|invalid_otp/i.test(err)) break;
+            }
+        }
+        throw new Error(`TotpValidate失败: ${lastErr}`);
     }
 
     async emailOtpValidate(externalCode?: string, excludeCode = "", depth = 0): Promise<string> {
@@ -1179,7 +1296,23 @@ export class OpenAIClient {
 
     async followOAuthRedirects(startURL: string): Promise<AuthLoginResult> {
         let currentURL = startURL;
+        let didMfa = false;
         for (let hop = 0; hop < 10; hop++) {
+            if (String(currentURL || "").startsWith(DEFAULT_REDIRECT_URI)) {
+                return this.extractAuthResult(currentURL);
+            }
+            if (isMfaContinueUrl(currentURL) && !didMfa) {
+                didMfa = true;
+                if (!this.totpSecret) throw new Error(`OAuth 停在 2FA 页但无 totp_secret: ${currentURL.slice(0, 80)}`);
+                this.logProgress("mfa", 0, "OAuth 跳转到 2FA，提交 TOTP");
+                currentURL = await this.totpValidate(currentURL);
+                continue;
+            }
+            if (/\/sign-in-with-chatgpt\/codex\/consent/i.test(currentURL)) {
+                this.logProgress("oauth", 0, "OAuth 停在同意页，选择工作区");
+                currentURL = await this.selectWorkspace(currentURL);
+                continue;
+            }
             const response = await this.fetch(currentURL, {
                 method: "GET",
                 redirect: "manual",
@@ -1216,6 +1349,10 @@ export class OpenAIClient {
             if (response.url.startsWith(DEFAULT_REDIRECT_URI)) {
                 return this.extractAuthResult(response.url);
             }
+            if (isMfaContinueUrl(response.url) && !didMfa) {
+                currentURL = response.url;
+                continue;
+            }
 
             throw new Error(
                 `OAuth跳转未到达callback: status=${response.status} url=${response.url}`,
@@ -1244,7 +1381,8 @@ export class OpenAIClient {
             | "authorize_continue"
             | "password_verify"
             | "username_password_create"
-            | "oauth_create_account",
+            | "oauth_create_account"
+            | "mfa_validate",
     ): Promise<string> {
         return fetchSentinelToken({
             flow,

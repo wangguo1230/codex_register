@@ -40,6 +40,8 @@ mailcom_调研记录.md
 
 # ===== 临时/草稿输出(历史会话的 grep dump,非源码) =====
 codex_register/_*.txt
+codex_register/scripts/_*.txt
+codex_register/captures/
 
 # ===== 编辑器 / 系统 =====
 .vscode/

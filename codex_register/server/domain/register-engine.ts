@@ -37,17 +37,23 @@ export const GptRegisterEngine = {
      * @returns {SpawnSpec}
      */
     buildSpawn(acc, cfg, tmpFile) {
-        const script = cfg.regEngine === "browser" ? "src/worker-register-browser.ts" : "src/worker-register.ts";
+        const provider = acc.provider || (/@(gmail|googlemail)\.com$/i.test(acc.email || "") ? "google" : "mailcom");
+        const isGoogle = provider === "google";
+        // Gmail 老号强制浏览器+比特，HTTP 引擎没有整备/收信能力
+        const script = (cfg.regEngine === "browser" || isGoogle) ? "src/worker-register-browser.ts" : "src/worker-register.ts";
         const env = {
             REG_EMAIL: acc.email,
             REG_PASSWORD: acc.password,
-            MAIL_PROVIDER: acc.provider || "mailcom",
+            MAIL_PROVIDER: provider,
             MAILCOM_TOKENS_FILE: tmpFile,
             ICLOUD_TOKENS_FILE: tmpFile,
-            MAILCOM_HEADLESS: "1",
+            MAILCOM_HEADLESS: isGoogle ? "0" : "1",
+            GOOGLE_HEADED: "1",
             REG_OTP_SINGLE: cfg.otpSingle ? "1" : "0",
             REG_SIMULATE_CHAT: cfg.simulateChat ? "1" : "0",
             REG_TRY_RT: cfg.rtEnabled ? "1" : "0",
+            GPT_PASSWORD: acc.gpt_password || "",
+            REG_TRY_MFA: cfg.mfaEnabled !== false ? "1" : "0",
             // 拿 rt 走 codex OAuth 强制 add-phone，必须有接码池 → rt 开启时强制启用 SMS
             REG_SMS: (cfg.smsEnabled || cfg.rtEnabled) ? "1" : "0",
             SMS_LINK_TEMPLATE: cfg.smsLinkTemplate || "",
@@ -55,7 +61,13 @@ export const GptRegisterEngine = {
             // PG 迁移后 worker 通过 process.env.DATABASE_URL 继承连接(无需 REG_DB_PATH)
             PROXY_URL: cfg.regProxy || "",
             MAILCOM_PROXY: cfg.mailProxy || "",
-            BITBROWSER: cfg.bitBrowser ? "1" : "", // 比特浏览器:每号独立指纹窗口(仅浏览器引擎有效)
+            BITBROWSER: (cfg.bitBrowser || isGoogle) ? "1" : "", // Gmail 老号强制比特窗口
+            REG_GOOGLE_PREP: isGoogle ? "1" : "0",
+            // Gmail：先邮箱管理(2FA/改密/踢设备/删辅助/IMAP)，做完才注册 GPT
+            REG_GOOGLE_HARDEN: isGoogle ? "1" : "0",
+            REG_SKIP_DEVICES: isGoogle ? "0" : "1",
+            REG_GOOGLE_CHANGE_PW: isGoogle && cfg.googleChangePw ? "1" : "0",
+            REG_GOOGLE_CHANGE_2FA: isGoogle && cfg.googleChange2fa ? "1" : "0",
         };
         return {script, env};
     },
@@ -76,6 +88,9 @@ export const GptRegisterEngine = {
             }
             if (ev.phone) await db.setAccountPhone(id, ev.phone);    // 回写绑定的接码手机号
             if (ev.card) await db.setAccountCard(id, ev.card);       // 回写绑定的卡密(导出用)
+            if (ev.gptPassword) await db.updateAccount(id, {gpt_password: ev.gptPassword});
+            if (ev.totpSecret) await db.updateAccount(id, {totp_secret: ev.totpSecret, mfa_status: "✅已绑"});
+            else if (ev.mfaStatus) await db.updateAccount(id, {mfa_status: ev.mfaStatus});
             // 注册完成即按产出直接标记状态(网页 token 刚生成必有效;rt/养号按实际结果)，无需手动点"测"
             await db.setTestStatus(id, "at", ev.token ? "✅有效" : "无at");
             if (ev.rtFile) await db.setTestStatus(id, "rt", "✅有效");
@@ -83,17 +98,34 @@ export const GptRegisterEngine = {
             if (ev.chatOk === true) await db.setTestStatus(id, "chat", "✅回复成功");
             else if (ev.chatOk === false) await db.setTestStatus(id, "chat", "❌未回复");
             runner.emit("sms", {stats: await db.smsStats()}); // 接码池状态变化 → 前端刷新
-            runner.log(id, `✅ 注册成功 plan=${ev.plan || "?"}`);
+            runner.log(id, `✅ 注册成功 plan=${ev.plan || "?"}${ev.mfaStatus ? ` 2FA=${ev.mfaStatus}` : ""}`);
+            const acc = await db.getAccount(id);
+            if (acc?.email) await db.refreshMailboxGoogleState(acc.email, {gpt: "ok", login: "ok"}).catch(() => {});
         } else {
             await db.markFailed(id, ev.error);
             runner.log(id, `❌ 失败: ${ev.error}`);
+            const acc = await db.getAccount(id);
+            const err = String(ev.error || "");
+            const overlay = {gpt: "fail", last_error: err.slice(0, 160)};
+            if (/Wrong password|密码错误/i.test(err)) { overlay.login = "fail"; overlay.login_error = "wrong_password"; }
+            else if (/doritos|插页/i.test(err)) { overlay.login = "fail"; overlay.login_error = "interstitial_doritos"; }
+            else if (/reCAPTCHA|图片验证|人机/i.test(err)) { overlay.login = "fail"; overlay.login_error = "captcha"; }
+            else if (/ERR_SSL|SSL/i.test(err)) { overlay.login = "fail"; overlay.login_error = "ssl"; }
+            else if (/security verification|not a bot|Cloudflare|Ray ID/i.test(err)) { overlay.login_error = "cf"; overlay.last_error = "Cloudflare 拦截"; }
+            if (acc?.email) await db.refreshMailboxGoogleState(acc.email, overlay).catch(() => {});
         }
         runner.emit("status", {id, status: ev.status, ...(await db.getAccount(id))});
         runner.emit("stats", await db.stats());
     },
 
-    /** worker 没发 result 事件就退出 = 异常,判失败。 */
-    async onAbnormalExit(runner, id, code) {
+    /** worker 没发 result 事件就退出 = 异常。本实例主动停止则退回 pending,供其他实例认领。 */
+    async onAbnormalExit(runner, id, code, info) {
+        if (info?.releasing) {
+            await db.releaseGptIfRunning(id);
+            runner.log(id, `↩ 本实例已停止,任务退回队列供其他实例认领`);
+            runner.emit("status", {id, status: "pending", ...(await db.getAccount(id))});
+            return;
+        }
         await db.markFailed(id, `worker 异常退出 code=${code}`);
         runner.log(id, `❌ worker 异常退出 code=${code}`);
         runner.emit("status", {id, status: "failed", ...(await db.getAccount(id))});
@@ -130,7 +162,12 @@ export const ClaudeRegisterEngine = {
         else await db.markClaudeFailed(id, ev.error);
         runner.emit("claude", {stats: await db.claudeStats()}); // ClaudePanel 刷新
     },
-    async onAbnormalExit(runner, id, code) {
+    async onAbnormalExit(runner, id, code, info) {
+        if (info?.releasing) {
+            await db.releaseClaudeIfRunning(id);
+            runner.emit("claude", {stats: await db.claudeStats()});
+            return;
+        }
         await db.markClaudeFailed(id, `worker 异常退出 code=${code}`);
         runner.emit("claude", {stats: await db.claudeStats()});
     },

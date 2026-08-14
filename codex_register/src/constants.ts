@@ -8,6 +8,12 @@ export const AUTH_AUTHORIZE_CONTINUE_URL =
 export const AUTH_PASSWORD_VERIFY_URL =
   "https://auth.openai.com/api/accounts/password/verify";
 
+export const AUTH_MFA_VALIDATE_URLS = [
+  "https://auth.openai.com/api/accounts/mfa/validate",
+  "https://auth.openai.com/api/accounts/totp/validate",
+  "https://auth.openai.com/api/accounts/mfa/verify",
+] as const;
+
 export const AUTH_EMAIL_OTP_VALIDATE_URL =
   "https://auth.openai.com/api/accounts/email-otp/validate";
 

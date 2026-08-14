@@ -34,12 +34,29 @@ echo "  前端开发:  http://localhost:5173"
 echo "  (Ctrl+C 退出)"
 echo "============================================================"
 
-# 后台启动前端 Vite
+# 先起后端，等 3100 通了再开 Vite，避免页面先请求空数据
+MAILCOM_HEADLESS=1 npx tsx server/index.ts &
+SERVER_PID=$!
+cleanup() {
+  kill "$SERVER_PID" "$VITE_PID" 2>/dev/null || true
+}
+trap cleanup EXIT INT TERM
+
+echo "[等待] 后端 http://localhost:${PORT} ..."
+for i in $(seq 1 40); do
+  if curl -sf -o /dev/null --connect-timeout 1 "http://127.0.0.1:${PORT}/api/batches"; then
+    echo "[就绪] 后端已监听"
+    break
+  fi
+  if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+    echo "[错误] 后端进程退出，看上面日志"
+    exit 1
+  fi
+  sleep 0.5
+done
+
 cd web
 MAILCOM_HEADLESS=1 npx --yes vite &
 VITE_PID=$!
 cd ..
-trap "kill $VITE_PID 2>/dev/null" EXIT
-
-# 前台启动后端
-MAILCOM_HEADLESS=1 exec npx tsx server/index.ts
+wait "$SERVER_PID"

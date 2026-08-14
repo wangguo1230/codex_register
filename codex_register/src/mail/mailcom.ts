@@ -4,7 +4,8 @@
  * 再用同一浏览器会话(context.request 带全部 cookie)主动调 maillist/正文接口取验证码。
  *
  * 这条链路已在 Python(mailcom_client.py)完整验证：
- *   登录(复刻录制) → 截获 mail_mailbox Bearer → POST maillist.mail.com/Mailbox/Mail 列表
+ *   登录 → 只要 mail_mailbox_r 票(LPS 的 ppc_permission_r 打 maillist 会 403)
+ *   → 没有则用 oauthbridge passport 换票 → POST maillist.mail.com/Mailbox/Mail
  *   → POST mailcom.mailbody-ui.de/Mail/<id>/Body/html(form access_token) 取正文 → 提 6 位码
  *
  * 邮箱池文件(每行 `email----password`)：
@@ -39,10 +40,17 @@ const POLL_ATTEMPTS = Number(process.env.MAILCOM_POLL_ATTEMPTS || 24);
 const POLL_INTERVAL_MS = Number(process.env.MAILCOM_POLL_INTERVAL_MS || 5000);
 
 const MAILLIST_BASE = "https://maillist.mail.com/Mailbox/Mail";
+const MAILBOX_OAUTH = {
+    url: "https://oauthbridge.navigator-lxa.mail.com/navigator/oauth2/token",
+    clientId: "mailcom_webmailermaillist_passport_live",
+    clientSecret: "*******",
+    scope: "mail_mailbox_r",
+    grant: "urn:mam:oauth:grant-type:spa",
+};
 const COMMON_HDR = {
     origin: "https://webmailer.mail.com",
     referer: "https://webmailer.mail.com/",
-    "x-ui-app": "mailcom.webmailer.mail-list/6.0.0",
+    "x-ui-app": "mailcom.webmailer.mail-list/6.6.3",
 };
 const LIST_HDR = {
     ...COMMON_HDR,
@@ -87,12 +95,97 @@ function loadPool() {
     return pool;
 }
 
+export function rememberMailcomPassword(email, password) {
+    const key = normalizeEmail(email);
+    if (key && password) passwordByEmail.set(key, String(password));
+}
+
 function resolvePassword(email) {
     const key = normalizeEmail(email);
     if (passwordByEmail.has(key)) return passwordByEmail.get(key);
     loadPool();
     if (passwordByEmail.has(key)) return passwordByEmail.get(key);
     throw new Error(`mail.com 邮箱池中找不到密码: ${email}`);
+}
+
+function decodeJwtPayload(auth) {
+    const token = String(auth || "").replace(/^bearer\s+/i, "").trim();
+    const part = token.split(".")[1];
+    if (!part) return null;
+    try {
+        const pad = part.replace(/-/g, "+").replace(/_/g, "/");
+        return JSON.parse(Buffer.from(pad, "base64").toString("utf8"));
+    } catch { return null; }
+}
+
+function authScope(auth) {
+    return String(decodeJwtPayload(auth)?.scope || "");
+}
+
+function isMailboxAuth(auth) {
+    return /mail_mailbox/i.test(authScope(auth));
+}
+
+function extractNavsid(page, extra = "") {
+    const from = `${page?.url?.() || ""} ${extra}`;
+    return (from.match(/[?&](?:sid|navsid)=([0-9a-f]{32,})/i) || [])[1]
+        || "";
+}
+
+async function readNavsid(page) {
+    const urlSid = extractNavsid(page);
+    if (urlSid) return urlSid;
+    return page.evaluate(() => {
+        try { return sessionStorage.getItem("mam.navsid") || ""; } catch { return ""; }
+    }).catch(() => "") || "";
+}
+
+async function mintMailboxToken(session, navsid) {
+    if (!navsid) return "";
+    const url = `${MAILBOX_OAUTH.url}?sid=${encodeURIComponent(navsid)}`;
+    const basic = Buffer.from(`${MAILBOX_OAUTH.clientId}:${MAILBOX_OAUTH.clientSecret}`).toString("base64");
+    const headers = {
+        "content-type": "application/x-www-form-urlencoded",
+        authorization: `Basic ${basic}`,
+        "x-ui-app": COMMON_HDR["x-ui-app"],
+        origin: COMMON_HDR.origin,
+        referer: COMMON_HDR.referer,
+    };
+    const body = `grant_type=${MAILBOX_OAUTH.grant}&scope=${MAILBOX_OAUTH.scope}`;
+    const tryParse = (status, text) => {
+        if (status >= 400) {
+            console.warn(`[mailcom] mint mailbox token HTTP ${status} ${String(text).slice(0, 120)}`);
+            return "";
+        }
+        try {
+            const data = JSON.parse(text);
+            if (data?.access_token && /mail_mailbox/i.test(String(data.scope || MAILBOX_OAUTH.scope))) {
+                return `Bearer ${data.access_token}`;
+            }
+            console.warn(`[mailcom] mint token 无 mailbox scope: ${String(data?.scope || "").slice(0, 80)}`);
+        } catch (e) {
+            console.warn(`[mailcom] mint token 解析失败: ${String(e?.message || e).slice(0, 80)}`);
+        }
+        return "";
+    };
+    try {
+        const res = await session.context.request.post(url, {headers, data: body});
+        const minted = tryParse(res.status(), await res.text());
+        if (minted) return minted;
+    } catch (e) {
+        console.warn(`[mailcom] mint token context.request: ${String(e?.message || e).slice(0, 80)}`);
+    }
+    if (!session.page) return "";
+    try {
+        const inPage = await session.page.evaluate(async ({url, headers, body}) => {
+            const res = await fetch(url, {method: "POST", credentials: "include", headers, body});
+            return {status: res.status, text: await res.text()};
+        }, {url, headers, body});
+        return tryParse(inPage.status, inPage.text);
+    } catch (e) {
+        console.warn(`[mailcom] mint token in-page: ${String(e?.message || e).slice(0, 80)}`);
+        return "";
+    }
 }
 
 function htmlToText(s) {
@@ -122,7 +215,46 @@ function htmlToReadable(s) {
     return t.split("\n").map((l) => l.replace(/[ \t]+/g, " ").trim()).join("\n").replace(/\n{3,}/g, "\n\n").trim();
 }
 
+async function clickIfVisible(root, sel, timeout = 800) {
+    try {
+        const el = root.locator(sel).first();
+        if (await el.isVisible({timeout}).catch(() => false)) {
+            await el.click({force: true, timeout: 2000}).catch(() => {});
+            return true;
+        }
+    } catch { /* ignore */ }
+    return false;
+}
+
+async function dismissCookieBanners(page) {
+    const names = [/Accept all/i, /Accept All/i, /Agree/i, /I agree/i, /Continue to Mail/i, /Allow all/i, /Alle akzeptieren/i];
+    const sels = [
+        "#onetrust-accept-btn-handler",
+        "#accept-all",
+        "button#accept",
+        '[id*="accept-all" i]',
+        '[data-testid*="accept" i]',
+        "button[mode='primary']",
+    ];
+    const roots = [page, ...page.frames()];
+    for (const root of roots) {
+        for (const sel of sels) {
+            if (await clickIfVisible(root, sel, 400)) return;
+        }
+        for (const name of names) {
+            try {
+                const btn = root.getByRole("button", {name}).first();
+                if (await btn.isVisible({timeout: 400}).catch(() => false)) {
+                    await btn.click({force: true, timeout: 2000}).catch(() => {});
+                    return;
+                }
+            } catch { /* ignore */ }
+        }
+    }
+}
+
 async function dismissPopups(page) {
+    await dismissCookieBanners(page);
     // 通用弹窗关闭：推广/升级/安全提醒/引导等遮罩层
     for (const sel of [
         'button[aria-label="Close"]', 'button[aria-label="close"]',
@@ -138,7 +270,7 @@ async function dismissPopups(page) {
             const el = page.locator(sel).first();
             if (await el.isVisible({timeout: 300}).catch(() => false)) {
                 await el.click({timeout: 2000}).catch(() => {});
-                await page.waitForTimeout(500);
+                await page.waitForTimeout(400);
             }
         } catch { /* ignore */ }
     }
@@ -146,9 +278,41 @@ async function dismissPopups(page) {
     for (const name of [/Not now/i, /Later/i, /Skip/i, /No thanks/i, /Maybe later/i, /Remind me later/i]) {
         try {
             const btn = page.getByRole("button", {name});
-            if (await btn.count()) { await btn.first().click({timeout: 2000}).catch(() => {}); await page.waitForTimeout(500); break; }
+            if (await btn.count()) { await btn.first().click({timeout: 2000}).catch(() => {}); await page.waitForTimeout(400); break; }
         } catch { /* ignore */ }
     }
+}
+
+async function openMailcomLoginForm(page) {
+    const emailBox = page.locator("#login-email, input[name='username'], input[placeholder='Email address']").first();
+    if (await emailBox.isVisible({timeout: 1200}).catch(() => false)) return emailBox;
+
+    await dismissPopups(page);
+    for (const sel of [
+        "#login-button",
+        "button#login-button",
+        "a#login-button",
+        ".login-button",
+        "a[href*='login']",
+        "button:has-text('Log in')",
+        "a:has-text('Log in')",
+        "button:has-text('Login')",
+        "a:has-text('Login')",
+        "[data-testid='login']",
+    ]) {
+        if (await clickIfVisible(page, sel, 700)) {
+            await page.waitForTimeout(700);
+            if (await emailBox.isVisible({timeout: 1500}).catch(() => false)) return emailBox;
+        }
+    }
+
+    if (!(await emailBox.isVisible({timeout: 400}).catch(() => false))) {
+        await page.goto("https://www.mail.com/login/", {waitUntil: "domcontentloaded", timeout: 30000}).catch(() => {});
+        await page.waitForTimeout(1500);
+        await dismissPopups(page);
+    }
+    if (await emailBox.isVisible({timeout: 4000}).catch(() => false)) return emailBox;
+    return emailBox;
 }
 
 async function loginMailcom(email, password, opts = {}) {
@@ -166,17 +330,40 @@ async function loginMailcom(email, password, opts = {}) {
             locale: "en-US",
             timezoneId: "America/New_York",
         });
-        const session = {browser, context, page: null, bearer: null};
+        const session = {browser, context, page: null, bearer: null, lastList: null};
         const page = await context.newPage();
         session.page = page;
-        page.on("request", (req) => {
-            if (session.bearer) return;
-            if (req.url().includes("maillist.mail.com/Mailbox/Mail")) {
-                const a = req.headers()["authorization"];
-                if (a && a.toLowerCase().startsWith("bearer ")) {
-                    session.bearer = a;
-                    console.log(`[mailcom] 截获 Bearer: ${a.slice(0, 32)}...`);
+        const grabBearer = (auth, url = "") => {
+            if (!auth || !String(auth).toLowerCase().startsWith("bearer ")) return;
+            const mailbox = isMailboxAuth(auth) || /maillist\.mail\.com/i.test(url);
+            if (!mailbox) {
+                if (!session.ignoredOtherBearer) {
+                    session.ignoredOtherBearer = true;
+                    console.log(`[mailcom] 忽略非 mailbox Bearer scope=${authScope(auth) || "?"} ${String(url).slice(0, 70)}`);
                 }
+                return;
+            }
+            if (session.bearer && isMailboxAuth(session.bearer)) return;
+            session.bearer = auth;
+            console.log(`[mailcom] 截获 mailbox Bearer scope=${authScope(auth) || "maillist"} ${String(url).slice(0, 70)}`);
+        };
+        page.on("request", (req) => {
+            if (/mail\.com|1and1|webmailer|maillist/i.test(req.url())) {
+                grabBearer(req.headers()?.authorization || req.headers()?.Authorization, req.url());
+            }
+        });
+        page.on("response", async (res) => {
+            const url = res.url();
+            if (/oauth2\/token/i.test(url) && res.ok()) {
+                try {
+                    const data = await res.json();
+                    if (data?.access_token && /mail_mailbox/i.test(String(data.scope || ""))) {
+                        grabBearer(`Bearer ${data.access_token}`, url);
+                    }
+                } catch { /* not json */ }
+            }
+            if (/maillist\.mail\.com\/Mailbox\/Mail/i.test(url) && res.ok()) {
+                try { session.lastList = parseMailListPayload(await res.json()); } catch { /* ignore */ }
             }
         });
         page.setDefaultTimeout(20000);
@@ -198,24 +385,41 @@ async function loginMailcom(email, password, opts = {}) {
         }
         await dismissPopups(page);
 
-        // 登录表单(复刻录制)
+        // 登录表单：先关 cookie/弹窗，再展开下拉（#login-email 常在 DOM 里但 display:none）
         if (!page.url().includes("navigator-lxa")) {
-            try {
-                await page.click("#login-button", {timeout: 10000});
-                await page.waitForTimeout(1000);
-            } catch { /* 已展开/无需 */ }
-            await page.fill("#login-email", email, {timeout: 15000});
-            await page.fill("#login-password", password);
+            const emailBox = await openMailcomLoginForm(page);
+            const filled = await emailBox.fill(email, {force: true, timeout: 8000}).then(() => true).catch(() => false);
+            if (!filled) {
+                await page.goto("https://www.mail.com/int/en/login/", {waitUntil: "domcontentloaded", timeout: 30000}).catch(() => {});
+                await page.waitForTimeout(1200);
+                await dismissPopups(page);
+                const again = page.locator("#login-email, input[name='username'], input[type='email'], input[placeholder*='mail' i]").first();
+                await again.fill(email, {force: true, timeout: 8000});
+            }
+            const pwdBox = page.locator("#login-password, input[name='password'], input[type='password']").first();
+            await pwdBox.fill(password, {force: true, timeout: 8000}).catch(async () => {
+                await page.locator("input[type='password']").first().fill(password, {force: true, timeout: 8000});
+            });
             let submitted = false;
-            for (const sel of ["#header-login-box span", "#header-login-box button"]) {
+            for (const sel of [
+                "#header-login-box button[type='submit']",
+                "#header-login-box button",
+                "#header-login-box span",
+                "button[type='submit']",
+                "button:has-text('Log in')",
+                "button:has-text('Login')",
+            ]) {
                 try {
-                    await page.click(sel, {timeout: 5000});
-                    submitted = true;
-                    break;
+                    const b = page.locator(sel).first();
+                    if (await b.isVisible({timeout: 800}).catch(() => false)) {
+                        await b.click({timeout: 4000});
+                        submitted = true;
+                        break;
+                    }
                 } catch { /* try next */ }
             }
-            if (!submitted && (await page.locator("#login-password").count())) {
-                try { await page.press("#login-password", "Enter"); } catch { /* ignore */ }
+            if (!submitted) {
+                await pwdBox.press("Enter").catch(() => page.keyboard.press("Enter").catch(() => {}));
             }
         }
         try {
@@ -227,7 +431,7 @@ async function loginMailcom(email, password, opts = {}) {
             throw new Error(`mail.com 账密无效或账号已停用(登录被拒, 跳转 logout): ${email}`);
         }
 
-        // 等收件箱自动加载、截获 Bearer(风控页面提前跳出,不白等 30s)
+        // 等 webmailer 自己去换 mail_mailbox_r。先到的几乎一定是 LPS 的 ppc_permission_r，那个票打 maillist 会 403。
         for (let i = 0; i < 30 && !session.bearer; i += 1) {
             await page.waitForTimeout(1000);
             if (i === 3 || i === 10) await dismissPopups(page);
@@ -235,9 +439,25 @@ async function loginMailcom(email, password, opts = {}) {
                 const body = await page.innerText("body").catch(() => "");
                 if (/blocked your account|irregular activity|contact.*support/i.test(body)) break;
             }
+            if (i === 8 || i === 18) {
+                const navsid = await readNavsid(page);
+                if (navsid) {
+                    const minted = await mintMailboxToken(session, navsid);
+                    if (minted) {
+                        session.bearer = minted;
+                        console.log(`[mailcom] oauthbridge 换到 mailbox token sid=${navsid.slice(0, 8)}…`);
+                        break;
+                    }
+                }
+            }
+        }
+        if (session.bearer) {
+            await page.goto("https://3c.mail.com/", {waitUntil: "domcontentloaded", timeout: 45000}).catch(() => {});
+            await page.waitForTimeout(2500);
+            await dismissPopups(page);
         }
         if (!session.bearer) {
-            let reason = "登录后未截获 Bearer(账号可能需二次验证或网络异常)";
+            let reason = "登录后未拿到 mail_mailbox 票(截到 LPS 票打 maillist 会 403)";
             try {
                 const body = await page.innerText("body").catch(() => "");
                 if (/blocked your account|irregular activity|contact.*support|precautionary measure/i.test(body)) {
@@ -422,20 +642,8 @@ export async function verifyMailcomLogin(email, password, log = (m) => {}) {
     }
 }
 
-async function fetchList(session, folder = "INBOX", offset = 0, amount = 50) {
-    const res = await session.context.request.post(MAILLIST_BASE, {
-        params: {folderTypeOrId: folder, offset: String(offset),
-            amount: String(amount), orderBy: "INTERNALDATE DESC"},
-        headers: {...LIST_HDR, authorization: session.bearer},
-        data: JSON.stringify(LIST_BODY),
-    });
-    if (res.status() === 401) return "EXPIRED";
-    if (!res.ok()) {
-        console.warn(`[mailcom] maillist HTTP ${res.status()}`);
-        return null;
-    }
-    const data = await res.json();
-    return (data.mailListElements || []).map((el) => {
+function parseMailListPayload(data) {
+    return (data?.mailListElements || []).map((el) => {
         const raw = el.rawData || el;
         const mh = raw.mailHeader || {};
         const at = raw.attribute || {};
@@ -447,6 +655,81 @@ async function fetchList(session, folder = "INBOX", offset = 0, amount = 50) {
             timestamp: mh.date || at.internalDate || 0,
         };
     });
+}
+
+async function fetchList(session, folder = "INBOX", offset = 0, amount = 50) {
+    if (!session.bearer || !isMailboxAuth(session.bearer)) {
+        const navsid = session.page ? await readNavsid(session.page) : "";
+        if (navsid) {
+            const minted = await mintMailboxToken(session, navsid);
+            if (minted) session.bearer = minted;
+        }
+    }
+    if (!session.bearer) return session.lastList || null;
+    const url = `${MAILLIST_BASE}?folderTypeOrId=${encodeURIComponent(folder)}&offset=${offset}&amount=${amount}&orderBy=${encodeURIComponent("INTERNALDATE DESC")}`;
+    const headers = {...LIST_HDR, authorization: session.bearer};
+    const payload = JSON.stringify(LIST_BODY);
+    const frames = session.page ? session.page.frames().filter((f) => /webmailer\.mail\.com|3c\.mail\.com|navigator-lxa/i.test(f.url())) : [];
+    for (const frame of frames) {
+        try {
+            const inPage = await frame.evaluate(async ({url, headers, body}) => {
+                const res = await fetch(url, {method: "POST", headers, body, credentials: "include"});
+                return {status: res.status, text: await res.text()};
+            }, {url, headers, body: payload});
+            if (inPage.status === 401) return "EXPIRED";
+            if (inPage.status >= 200 && inPage.status < 300) {
+                try { return parseMailListPayload(JSON.parse(inPage.text)); } catch { return null; }
+            }
+            console.warn(`[mailcom] maillist(in-page ${new URL(frame.url()).host}) HTTP ${inPage.status} ${String(inPage.text).slice(0, 80)}`);
+        } catch (e) {
+            console.warn(`[mailcom] maillist(in-page) ${String(e?.message || e).slice(0, 80)}`);
+        }
+    }
+    const res = await session.context.request.post(MAILLIST_BASE, {
+        params: {folderTypeOrId: folder, offset: String(offset),
+            amount: String(amount), orderBy: "INTERNALDATE DESC"},
+        headers,
+        data: payload,
+    });
+    if (res.status() === 401) return "EXPIRED";
+    if (!res.ok()) {
+        const text = await res.text().catch(() => "");
+        console.warn(`[mailcom] maillist HTTP ${res.status()} scope=${authScope(session.bearer) || "?"} ${text.slice(0, 160)}`);
+        return session.lastList || null;
+    }
+    return parseMailListPayload(await res.json());
+}
+
+async function scrapeInboxOtp(session, email, excludeCode = "") {
+    const page = session.page;
+    if (!page) return "";
+    try {
+        if (!/webmailer|3c\.|navigator-lxa/i.test(page.url())) {
+            await page.goto("https://3c.mail.com/", {waitUntil: "domcontentloaded", timeout: 30000}).catch(() => {});
+            await page.waitForTimeout(2000);
+        }
+        const text = String(await page.innerText("body").catch(() => ""));
+        const found = findLatestVerificationMail(
+            [{subject: "inbox", from: "openai", content: text, timestamp: Date.now(), recipient: [email]}],
+            {targetEmail: email},
+        );
+        if (found?.verificationCode && found.verificationCode !== excludeCode) return found.verificationCode;
+        const rows = page.locator("[data-test-id], .list-item, tr, [role='row'], [class*='mail']").filter({hasText: /openai|chatgpt|verification|verify/i});
+        const n = Math.min(await rows.count().catch(() => 0), 6);
+        for (let i = 0; i < n; i++) {
+            await rows.nth(i).click({timeout: 2000}).catch(() => {});
+            await page.waitForTimeout(800);
+            const body = String(await page.innerText("body").catch(() => ""));
+            const hit = findLatestVerificationMail(
+                [{subject: "opened", from: "openai", content: body, timestamp: Date.now(), recipient: [email]}],
+                {targetEmail: email},
+            );
+            if (hit?.verificationCode && hit.verificationCode !== excludeCode) return hit.verificationCode;
+        }
+    } catch (e) {
+        console.warn(`[mailcom] scrapeInbox ${String(e?.message || e).slice(0, 80)}`);
+    }
+    return "";
 }
 
 async function fetchBody(session, mailId) {
@@ -483,6 +766,10 @@ export function createMailcomProvider() {
             const minTimestampMs = options?.minTimestampMs || 0;
             const excludeCode = options?.excludeCode || ""; // 排除的旧码(重复注册/上次验证失败的残留码),跳过等新邮件
             const session = await ensureSession(email);
+            if (session.page && !/3c\.|webmailer/i.test(session.page.url())) {
+                await session.page.goto("https://3c.mail.com/", {waitUntil: "domcontentloaded", timeout: 30000}).catch(() => {});
+                await session.page.waitForTimeout(2000);
+            }
 
             for (let attempt = 1; attempt <= POLL_ATTEMPTS; attempt += 1) {
                 console.log(`[mailcom] pollOtp attempt=${attempt}/${POLL_ATTEMPTS} email=${email}`);
@@ -523,6 +810,12 @@ export function createMailcomProvider() {
                                 console.log(`[mailcom] OTP=${found.verificationCode} subject="${(found.subject || "").slice(0, 60)}"`);
                                 return found.verificationCode;
                             }
+                        }
+                    } else {
+                        const scraped = await scrapeInboxOtp(session, email, excludeCode);
+                        if (scraped) {
+                            console.log(`[mailcom] 网页收件箱 OTP=${scraped}`);
+                            return scraped;
                         }
                     }
                 } catch (err) {

@@ -1,5 +1,6 @@
 // @ts-nocheck
 import {pool} from "./pg.js";
+import {appConfig} from "../src/config.js";
 
 export async function ensureSchema() {
     const client = await pool.connect();
@@ -112,6 +113,7 @@ export async function ensureSchema() {
                 started_at BIGINT,
                 finished_at BIGINT,
                 created_at BIGINT NOT NULL,
+                deleted_at BIGINT DEFAULT 0,
                 auth_data JSONB,
                 rt_data JSONB
             )
@@ -199,9 +201,42 @@ export async function ensureSchema() {
 
         // 邮箱软删除
         await client.query(`ALTER TABLE mailboxes ADD COLUMN IF NOT EXISTS deleted_at BIGINT DEFAULT 0`);
+        // GPT 账号软删除:删号只打标记,记录/日志保留,可按邮箱回查
+        await client.query(`ALTER TABLE gpt_accounts ADD COLUMN IF NOT EXISTS deleted_at BIGINT DEFAULT 0`);
+        // Gmail 老号:辅助邮箱 + Google 自身 TOTP(收 ChatGPT 码/改密/换 2FA 用)
+        await client.query(`ALTER TABLE mailboxes ADD COLUMN IF NOT EXISTS recovery_email TEXT DEFAULT ''`);
+        await client.query(`ALTER TABLE mailboxes ADD COLUMN IF NOT EXISTS totp_secret TEXT DEFAULT ''`);
+        await client.query(`ALTER TABLE mailboxes ADD COLUMN IF NOT EXISTS imap_password TEXT DEFAULT ''`);
+        await client.query(`ALTER TABLE mailboxes ADD COLUMN IF NOT EXISTS google_state JSONB DEFAULT '{}'::jsonb`);
+        await client.query(`ALTER TABLE mailboxes ADD COLUMN IF NOT EXISTS google_stage TEXT DEFAULT ''`);
+        await client.query(`ALTER TABLE mailboxes ADD COLUMN IF NOT EXISTS sold_at BIGINT DEFAULT 0`);
+        await client.query(`ALTER TABLE mailboxes ADD COLUMN IF NOT EXISTS password_prev TEXT DEFAULT ''`);
+        await client.query(`CREATE INDEX IF NOT EXISTS idx_mailboxes_google_stage ON mailboxes(google_stage)`);
 
-        // 充值提交时间
+        // 充值提交时间 + 多实例认领(谁点的谁跑)
         await client.query(`ALTER TABLE recharge_queue ADD COLUMN IF NOT EXISTS submitted_at BIGINT DEFAULT 0`);
+        await client.query(`ALTER TABLE recharge_queue ADD COLUMN IF NOT EXISTS finished_at BIGINT DEFAULT 0`);
+        await client.query(`ALTER TABLE recharge_queue ADD COLUMN IF NOT EXISTS instance_id TEXT DEFAULT ''`);
+        await client.query(`ALTER TABLE recharge_queue ADD COLUMN IF NOT EXISTS rebind_status TEXT DEFAULT ''`);
+        await client.query(`ALTER TABLE recharge_queue ADD COLUMN IF NOT EXISTS rebind_email TEXT DEFAULT ''`);
+        await client.query(`ALTER TABLE recharge_queue ADD COLUMN IF NOT EXISTS rebind_error TEXT DEFAULT ''`);
+        await client.query(`ALTER TABLE recharge_queue ADD COLUMN IF NOT EXISTS rebind_target TEXT DEFAULT ''`);
+
+        // ChatGPT 登录凭证(与邮箱密码分离):每号独立密码 + TOTP
+        await client.query(`ALTER TABLE gpt_accounts ADD COLUMN IF NOT EXISTS gpt_password TEXT DEFAULT ''`);
+        await client.query(`ALTER TABLE gpt_accounts ADD COLUMN IF NOT EXISTS totp_secret TEXT DEFAULT ''`);
+        await client.query(`ALTER TABLE gpt_accounts ADD COLUMN IF NOT EXISTS mfa_status TEXT DEFAULT ''`);
+
+        // 已碰过的旧号空密码回填默认密码(未启动过的 pending 仍留给 spawn 生成随机密码)
+        const defaultPw = String(appConfig.defaultPassword || "").trim();
+        if (defaultPw) {
+            await client.query(
+                `UPDATE gpt_accounts SET gpt_password=$1
+                 WHERE COALESCE(gpt_password,'')=''
+                   AND (COALESCE(auth_file,'')<>'' OR COALESCE(token,'')<>'' OR COALESCE(error,'')<>'' OR started_at IS NOT NULL)`,
+                [defaultPw]
+            );
+        }
 
         // 改密队列(多实例 FOR UPDATE SKIP LOCKED)
         await client.query(`
@@ -215,6 +250,53 @@ export async function ensureSchema() {
                 instance_id TEXT DEFAULT '',
                 detail TEXT DEFAULT '',
                 created_at BIGINT NOT NULL
+            )
+        `);
+
+        // 邮箱任务共享队列：各实例用本机代理认领，任务本身跨机
+        await client.query(`
+            CREATE TABLE IF NOT EXISTS mail_jobs (
+                id SERIAL PRIMARY KEY,
+                kind TEXT NOT NULL DEFAULT 'harden',
+                mailbox_id INTEGER NOT NULL,
+                email TEXT NOT NULL DEFAULT '',
+                batch_id TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'pending',
+                instance_id TEXT DEFAULT '',
+                last_line TEXT DEFAULT '',
+                error TEXT DEFAULT '',
+                ok BOOLEAN DEFAULT FALSE,
+                result JSONB,
+                created_at BIGINT NOT NULL,
+                claimed_at BIGINT DEFAULT 0,
+                heartbeat_at BIGINT DEFAULT 0,
+                finished_at BIGINT DEFAULT 0
+            )
+        `);
+        await client.query(`ALTER TABLE mail_jobs ADD COLUMN IF NOT EXISTS payload JSONB`);
+        await client.query(`CREATE INDEX IF NOT EXISTS idx_mail_jobs_status ON mail_jobs(status, kind)`);
+        await client.query(`CREATE INDEX IF NOT EXISTS idx_mail_jobs_batch ON mail_jobs(batch_id)`);
+        await client.query(`
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_mail_jobs_active
+            ON mail_jobs(kind, mailbox_id)
+            WHERE status IN ('pending', 'running')
+        `);
+        await client.query(`
+            CREATE TABLE IF NOT EXISTS mail_control (
+                id INTEGER PRIMARY KEY DEFAULT 1,
+                claim_paused BOOLEAN NOT NULL DEFAULT FALSE,
+                updated_at BIGINT DEFAULT 0
+            )
+        `);
+        await client.query(`INSERT INTO mail_control(id, claim_paused, updated_at) VALUES(1, FALSE, 0) ON CONFLICT (id) DO NOTHING`);
+        await client.query(`
+            CREATE TABLE IF NOT EXISTS mail_instances (
+                instance_id TEXT PRIMARY KEY,
+                stop_claim BOOLEAN NOT NULL DEFAULT FALSE,
+                proxy_slots INTEGER DEFAULT 0,
+                proxy_leased INTEGER DEFAULT 0,
+                running_jobs INTEGER DEFAULT 0,
+                last_seen BIGINT NOT NULL DEFAULT 0
             )
         `);
 

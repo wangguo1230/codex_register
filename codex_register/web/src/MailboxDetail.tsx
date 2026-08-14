@@ -23,7 +23,7 @@ export function MailboxDetail({mailbox, onClose}: {mailbox: Mailbox; onClose: ()
     const [bodyLoading, setBodyLoading] = useState<string | null>(null);
     const [copied, setCopied] = useState(false);
     const copyPw = () => { try { navigator.clipboard?.writeText(mailbox.password); } catch { /* */ } setCopied(true); setTimeout(() => setCopied(false), 1500); };
-    const usageLabel = mailbox.usage === "free" ? "独立/未归属" : mailbox.usage.toUpperCase();
+    const usageLabel = mailbox.usage === "deleted" ? "已删除" : mailbox.usage === "free" ? "独立/未归属" : mailbox.usage.toUpperCase();
 
     const loadLogs = () => api.mailboxLogs(mailbox.id).then(setLogs).catch(() => {});
     // 载入该邮箱日志 + 订阅 mbLog 实时追加(仅本邮箱)
@@ -75,10 +75,50 @@ export function MailboxDetail({mailbox, onClose}: {mailbox: Mailbox; onClose: ()
                         {mailbox.password || "—"}
                         {mailbox.password && <button onClick={copyPw} className="text-indigo-600 hover:underline shrink-0">{copied ? "✓ 已复制" : "复制"}</button>}
                     </span>
+                    {mailbox.provider === "google" || mailbox.totp_secret ? <>
+                        <span className="text-gray-400">Google 2FA</span>
+                        <span className="font-mono text-gray-800 break-all">{mailbox.totp_secret || "—"}</span>
+                        <span className="text-gray-400">辅助邮箱</span>
+                        <span className="font-mono text-gray-800 break-all">{mailbox.recovery_email || "已删除"}</span>
+                        <span className="text-gray-400">IMAP</span>
+                        <span className="font-mono text-gray-800">{mailbox.imap_password ? "已开通应用专用密码" : "未开通"}</span>
+                        <span className="text-gray-400">管理阶段</span>
+                        <span className="text-gray-800">
+                            {mailbox.google_stage === "gpt_ok" ? "已注册 GPT"
+                                : mailbox.google_stage === "ready" ? "可取件"
+                                : mailbox.google_stage === "blocked" ? "卡住"
+                                : mailbox.google_stage === "partial" ? "整备未齐"
+                                : mailbox.google_stage === "login_fail" ? "登不上"
+                                : mailbox.google_stage === "login_ok" ? "能登录"
+                                : mailbox.google_stage === "imported" ? "刚导入"
+                                : "未记录"}
+                            {mailbox.google_state?.last_error ? ` · ${mailbox.google_state.last_error}` : ""}
+                        </span>
+                    </> : null}
                     <span className="text-gray-400">归属</span>
-                    <span className="text-gray-700">{usageLabel}{mailbox.grp ? ` · 分组 ${mailbox.grp}` : ""}</span>
+                    <span className="text-gray-700">{usageLabel}{mailbox.sold_at ? " · 已售" : ""}{mailbox.grp ? ` · 分组 ${mailbox.grp}` : ""}</span>
                     <span className="text-gray-400">改密状态</span>
                     <span className={(mailbox.pw_status || "").startsWith("✅") ? "text-emerald-600" : (mailbox.pw_status || "").startsWith("❌") ? "text-red-500" : "text-gray-500"}>{mailbox.pw_status || "未改过"}</span>
+                    {mailbox.provider === "google" && mailbox.google_state ? <>
+                        <span className="text-gray-400">缺口</span>
+                        <span className="text-gray-700 flex flex-wrap gap-1">
+                            {([
+                                ["login", "登录"],
+                                ["phone", "手机"],
+                                ["recovery", "辅助邮箱"],
+                                ["totp", "2FA"],
+                                ["password", "密码"],
+                                ["devices", "设备"],
+                                ["imap", "IMAP"],
+                                ["gpt", "GPT"],
+                            ] as const).map(([k, lab]) => {
+                                const v = (mailbox.google_state as any)?.[k];
+                                const color = v === "ok" ? "#059669" : v === "fail" ? "#dc2626" : "#9ca3af";
+                                const mark = v === "ok" ? "✓" : v === "fail" ? "✗" : "·";
+                                return <span key={k} style={{color}}>{mark}{lab}</span>;
+                            })}
+                        </span>
+                    </> : null}
                     <span className="text-gray-400">Provider</span>
                     <span className="text-gray-700">{mailbox.provider}{mailbox.created_at ? ` · 创建 ${new Date(mailbox.created_at).toLocaleString()}` : ""}</span>
                 </div>

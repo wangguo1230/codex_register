@@ -1,14 +1,16 @@
 // @ts-nocheck
 // 并发调度器：worker 子进程池，支持并发数配置 / 暂停 / 恢复 / 重跑
 import {EventEmitter} from "node:events";
-import {spawn} from "node:child_process";
+import {spawn, execSync} from "node:child_process";
 import {writeFileSync, rmSync, mkdtempSync, readFileSync, existsSync} from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import {fileURLToPath} from "node:url";
 import * as db from "./db.js";
 import {appConfig} from "../src/config.js";
+import {randomPassword} from "../src/utils.js";
 import {resolveEngine} from "./domain/register-engine.js";
+import {mailProxyPool, expandProxyImport, toProxyImportLine, setMailProxyJump} from "../src/mail/proxy-pool.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const CODEX_ROOT = path.resolve(__dirname, "..");
@@ -22,7 +24,7 @@ const EVENT_PREFIX = "@@EVENT@@";
 const DAILY_FILE = path.resolve(CODEX_ROOT, "data", "daily.json"); // 定时任务配置+统计持久化
 const SETTINGS_FILE = path.resolve(CODEX_ROOT, "data", "settings.json"); // 运行时配置持久化(前端改的开关/代理/上限等)
 // 持久化的运行时配置字段(其余如 paused/running 是运行态不存)
-const SETTINGS_KEYS = ["concurrency", "otpSingle", "simulateChat", "regProxy", "mailProxy", "mailProxyEnabled", "smsEnabled", "smsLinkTemplate", "rtEnabled", "smsMaxBind", "xrayVless", "regEngine", "bitBrowser", "claudeProxy", "claudeXrayVless", "regProxyPort", "claudeProxyPort", "mailSeparator", "rechargeBaseUrl", "rechargeAppId", "rechargeApiKey", "rechargeForwardIp", "rechargeConcurrency", "rechargeInterval", "xrayBinPath", "pwConcurrency", "rtProxy", "rtConcurrency"];
+const SETTINGS_KEYS = ["concurrency", "otpSingle", "simulateChat", "regProxy", "mailProxy", "mailProxyEnabled", "smsEnabled", "smsLinkTemplate", "rtEnabled", "smsMaxBind", "xrayVless", "regEngine", "bitBrowser", "claudeProxy", "claudeXrayVless", "regProxyPort", "claudeProxyPort", "mailSeparator", "rechargeBaseUrl", "rechargeAppId", "rechargeApiKey", "rechargeForwardIp", "rechargeConcurrency", "rechargeInterval", "xrayBinPath", "pwConcurrency", "rtProxy", "rtConcurrency", "mfaEnabled", "rebindGmailAfterPaid", "rebindAfterPaid", "mailProxyPool", "mailProxyJump"];
 
 // 定时任务默认配置(含运行统计)。持久化到 data/daily.json，重启保留。
 const DAILY_DEFAULT = {
@@ -50,6 +52,7 @@ class Scheduler extends EventEmitter {
         this.smsEnabled = true;        // 注册若要求手机验证(add-phone)时启用接码池，不要求则不影响
         this.smsLinkTemplate = appConfig.smsLinkTemplate; // 接码收码链接模板(key/project 通用，phone 动态替换)
         this.rtEnabled = false;        // 注册成功后是否额外走 codex OAuth 拿可续期 rt(强制 add-phone，接码有成本，默认关)
+        this.mfaEnabled = true;        // 注册成功后绑 TOTP,后续登录走密码+验证器,少靠邮箱
         this.smsMaxBind = 3;           // 每个接码号最多绑定几个账号(0=不限，直到被 OpenAI 拒)
         this.xrayVless = "";           // 独立注册代理的 vless 链接(启用则 index 起独立 xray 并把 regProxy 指向它)
         this.regEngine = "http";       // 注册引擎:http(sentinel HTTP 模拟) / browser(真 Chrome 过 CF)
@@ -72,13 +75,23 @@ class Scheduler extends EventEmitter {
         this.mailSeparator = "----";   // 邮箱----密码 分隔符(导入/校验共用)
         this.xrayBinPath = "";         // xray 二进制路径(前端可配;空=自动探测)
         this.pwConcurrency = 1;        // 邮箱批量改密并发(headed Chrome,默认串行)
-        this.rtProxy = "";             // RT 刷新/获取代理(空=回退 regProxy)
+        this.rtProxy = "";             // 充值页代理:重登过 CF + RT 刷新/获取(空=回退 regProxy)
         this.rtConcurrency = 4;        // 导出含RT时并发获取数
+        this.rebindAfterPaid = "gmail";   // 充值平台回 paid 后换绑目标: off | gmail | mailcom
+        this.rebindGmailAfterPaid = true; // 兼容旧配置(true=gmail)
+        this.mailProxyPool = [];          // 邮箱整备/换2FA/改密代理池(一行一个,1代理=1指纹)
+        this.mailProxyJump = "";          // 跳板：本机先走它再连代理池网关(直连 kookeey 不通时用)
         this.running = new Map();      // runId(`${domain}:${id}`) -> { child, tmpFile, gotResult, domain, id, mailboxId, engine }
         this.maintLock = null; // 浏览器维护互斥锁:null=空闲, string=持有者标识(如 "batch-at-relogin")
+        this.releasingGpt = false;     // 本实例停止 GPT:被杀 worker 退回 pending,供其他实例认领
+        this.releasingClaude = false;
         this.tmpDir = mkdtempSync(path.join(os.tmpdir(), "codex-reg-"));
         this.daily = this.loadDaily(); // 定时任务配置+统计(持久化)
         this.loadSettings();           // 覆盖上面默认值为上次持久化的运行时配置
+        mailProxyPool.setUrls(this.mailProxyPool || []);
+        setMailProxyJump(this.mailProxyJump || "");
+        // 多实例:其他实例退回的 pending 不会触发本机事件,空闲时靠这轮询接着认领
+        setInterval(() => { if (!this.paused || !this.pausedClaude) this.tick(); }, 3000);
     }
 
     // ---- 运行时配置持久化(data/settings.json) ----
@@ -87,8 +100,22 @@ class Scheduler extends EventEmitter {
             if (existsSync(SETTINGS_FILE)) {
                 const s = JSON.parse(readFileSync(SETTINGS_FILE, "utf8"));
                 for (const k of SETTINGS_KEYS) if (s[k] !== undefined) this[k] = s[k];
+                if (Array.isArray(s.mailProxyPool)) this.mailProxyPool = s.mailProxyPool;
+                if (s.mailProxyJump === undefined) this.mailProxyJump = this.detectMailProxyJump();
+                this.normalizeRebindAfterPaid();
+            } else {
+                this.mailProxyJump = this.detectMailProxyJump();
             }
         } catch { /* 损坏则保留默认 */ }
+    }
+    normalizeRebindAfterPaid() {
+        const v = String(this.rebindAfterPaid || "");
+        if (v === "off" || v === "gmail" || v === "mailcom") {
+            this.rebindGmailAfterPaid = v === "gmail";
+            return;
+        }
+        this.rebindAfterPaid = this.rebindGmailAfterPaid === false ? "off" : "gmail";
+        this.rebindGmailAfterPaid = this.rebindAfterPaid === "gmail";
     }
     saveSettings() {
         try {
@@ -148,17 +175,63 @@ class Scheduler extends EventEmitter {
         return this.pwConcurrency;
     }
 
+    setMailProxyPool(textOrList, {append = false, copies = 1} = {}) {
+        const incoming = Array.isArray(textOrList)
+            ? expandProxyImport(textOrList.join("\n"), copies)
+            : expandProxyImport(String(textOrList || ""), copies);
+        const prev = Array.isArray(this.mailProxyPool) ? this.mailProxyPool.slice() : [];
+        const prevSet = new Set(prev);
+        const inserted = incoming.filter((u) => !prevSet.has(u));
+        const skipped = incoming.length - inserted.length;
+        const urls = append ? [...prev, ...inserted] : incoming;
+        this.mailProxyPool = urls;
+        mailProxyPool.setUrls(urls);
+        this.saveSettings();
+        return {
+            ...this.mailProxyPoolSnap(),
+            inserted: append ? inserted.length : incoming.length,
+            skipped: append ? skipped : 0,
+            lines: urls.map(toProxyImportLine),
+        };
+    }
+
+    mailProxyFallback() {
+        if (this.mailProxyEnabled !== false && this.mailProxy) return this.mailProxy;
+        return this.regProxy || "";
+    }
+
+    mailProxyPoolSnap() {
+        return mailProxyPool.snapshot(this.mailProxyFallback());
+    }
+
+    detectMailProxyJump() {
+        try {
+            execSync("lsof -tiTCP:10808 -sTCP:LISTEN", {stdio: "ignore"});
+            return "socks5://127.0.0.1:10808";
+        } catch { /* 系统代理没开 */ }
+        return this.regProxy || "";
+    }
+
+    setMailProxyJump(url) {
+        this.mailProxyJump = String(url || "").trim();
+        setMailProxyJump(this.mailProxyJump);
+        this.saveSettings();
+        return this.mailProxyJump;
+    }
+
     // ---- 域级控制(GPT/Claude 各自暂停/停止,共用同一进程池) ----
-    start() { this.paused = false; this.tick(); }          // GPT 开始
-    pause() { this.paused = true; }                          // GPT 软暂停(运行中的跑完)
-    stopAll() { this.paused = true; this.killDomain("gpt"); } // GPT 停止(暂停+杀 gpt worker)
-    startClaude() { this.pausedClaude = false; this.tick(); } // Claude 开始
-    pauseClaude() { this.pausedClaude = true; }               // Claude 软暂停
-    stopClaude() { this.pausedClaude = true; this.killDomain("claude"); } // Claude 停止
-    // 杀某域正在跑的 worker(其余域不受影响)
+    start() { this.paused = false; this.tick(); }
+    pause() { this.paused = true; }
+    stopAll() { this.paused = true; this.killDomain("gpt"); }
+    startClaude() { this.pausedClaude = false; this.tick(); }
+    pauseClaude() { this.pausedClaude = true; }
+    stopClaude() { this.pausedClaude = true; this.killDomain("claude"); }
     killDomain(domain) {
         for (const info of this.running.values()) {
-            if (info.domain === domain) { try { info.child.kill("SIGTERM"); } catch { /* ignore */ } }
+            if (info.domain === domain) {
+                info.releasing = true;
+                try { info.child.kill("SIGTERM"); } catch { /* ignore */ }
+            }
         }
     }
 
@@ -190,13 +263,18 @@ class Scheduler extends EventEmitter {
     }
 
     state() {
-        return {paused: this.paused, pausedClaude: this.pausedClaude, concurrency: this.concurrency, otpSingle: this.otpSingle, simulateChat: this.simulateChat, smsEnabled: this.smsEnabled, smsLinkTemplate: this.smsLinkTemplate, rtEnabled: this.rtEnabled, smsMaxBind: this.smsMaxBind, regEngine: this.regEngine, bitBrowser: this.bitBrowser, daily: this.daily, regProxy: this.regProxy, mailProxy: this.mailProxy, mailProxyEnabled: this.mailProxyEnabled !== false, claudeProxy: this.claudeProxy, xrayVless: this.xrayVless || "", claudeXrayVless: this.claudeXrayVless, regProxyPort: this.regProxyPort, claudeProxyPort: this.claudeProxyPort, mailSeparator: this.mailSeparator, xrayBinPath: this.xrayBinPath || "",
-            pwConcurrency: this.pwConcurrency, rtProxy: this.rtProxy || "", rtConcurrency: this.rtConcurrency,
+        return {instanceId: db.instanceId, paused: this.paused, pausedClaude: this.pausedClaude, concurrency: this.concurrency, otpSingle: this.otpSingle, simulateChat: this.simulateChat, smsEnabled: this.smsEnabled, smsLinkTemplate: this.smsLinkTemplate, rtEnabled: this.rtEnabled, mfaEnabled: this.mfaEnabled !== false, smsMaxBind: this.smsMaxBind, regEngine: this.regEngine, bitBrowser: this.bitBrowser, daily: this.daily, regProxy: this.regProxy, mailProxy: this.mailProxy, mailProxyEnabled: this.mailProxyEnabled !== false, claudeProxy: this.claudeProxy, xrayVless: this.xrayVless || "", claudeXrayVless: this.claudeXrayVless, regProxyPort: this.regProxyPort, claudeProxyPort: this.claudeProxyPort, mailSeparator: this.mailSeparator, xrayBinPath: this.xrayBinPath || "",
+            pwConcurrency: this.pwConcurrency, rtProxy: this.rtProxy || "", rtConcurrency: this.rtConcurrency, defaultPassword: String(appConfig.defaultPassword || "").trim(),
+            mailProxyPool: this.mailProxyPool || [], mailProxyPoolLines: (this.mailProxyPool || []).map(toProxyImportLine), mailProxyPoolSnap: this.mailProxyPoolSnap(),
+            mailProxyJump: this.mailProxyJump || "",
             running: [...this.running.values()].filter((i) => i.domain === "gpt").map((i) => i.id),
             runningClaude: [...this.running.values()].filter((i) => i.domain === "claude").map((i) => i.id)};
     }
 
     async tick() {
+        if (this.ticking) return;
+        this.ticking = true;
+        try {
         if (this.paused && this.pausedClaude) return; // 两域都暂停才完全不认领
         if (this.maintLock) return; // 浏览器维护任务在跑(重登at/获取rt),暂停注册
         // 浏览器引擎跑真 Chrome(headed，重)，硬上限 4，避免开一堆窗口卡机；用户并发设更小则用更小
@@ -210,20 +288,29 @@ class Scheduler extends EventEmitter {
             this.spawnWorker(acc);
         }
         this.emit("stats", await db.stats());
+        } finally { this.ticking = false; }
     }
 
     // running Map 键=复合 runId(`${domain}:${id}`),避免 gpt/claude 各自自增 id 重叠碰撞。
     async spawnWorker(acc) {
         const domain = acc.domain || "gpt";
+        if (domain === "gpt" && !acc.gpt_password) {
+            const touched = !!(acc.auth_file || acc.token || acc.error || acc.started_at);
+            const pw = touched ? String(appConfig.defaultPassword || "").trim() : randomPassword(16);
+            if (pw) {
+                await db.updateAccount(acc.id, {gpt_password: pw});
+                acc.gpt_password = pw;
+            }
+        }
         const runId = `${domain}:${acc.id}`;
         const tmpFile = path.join(this.tmpDir, `mc-${domain}-${acc.id}.txt`);
-        writeFileSync(tmpFile, `${acc.email}----${acc.password}\n`, "utf8");
+        writeFileSync(tmpFile, [acc.email, acc.password, acc.mailbox_totp || "", acc.recovery_email || "", acc.mailbox_imap || ""].join("----") + "\n", "utf8");
 
         // 注册知识收敛在引擎:调度器只管进程/并发/事件(通用)。按账号所属域选引擎。
         const engine = resolveEngine(domain);
         const {script, env} = engine.buildSpawn(acc, this, tmpFile);
         const child = spawn(TSX_BIN, [script], {cwd: CODEX_ROOT, env: {...process.env, ...env}, shell: IS_WIN});
-        const info = {child, tmpFile, gotResult: false, engine, domain, id: acc.id, mailboxId: acc.mailbox_id};
+        const info = {child, tmpFile, gotResult: false, engine, domain, id: acc.id, mailboxId: acc.mailbox_id, releasing: false};
         this.running.set(runId, info);
         if (domain === "claude") this.emit("claude", {stats: await db.claudeStats()});
         else { this.emit("status", {id: acc.id, status: "running"}); this.emit("stats", await db.stats()); }
@@ -252,6 +339,14 @@ class Scheduler extends EventEmitter {
             let ev;
             try { ev = JSON.parse(line.slice(EVENT_PREFIX.length)); } catch { return; }
             if (ev.type === "result") { info.gotResult = true; await info.engine.onResult(this, info.id, ev); }
+            else if (ev.type === "mailbox_update") {
+                await db.applyMailboxUpdate(ev.email || "", {
+                    password: ev.password, totp_secret: ev.totp_secret,
+                    imap_password: ev.imap_password, recovery_email: ev.recovery_email,
+                }).catch(() => {});
+                if (ev.message) this.logJob(info, ev.message);
+                else this.logJob(info, `邮箱凭证已更新${ev.imap_password ? "(应用专用密码)" : ""}`);
+            }
             else if (ev.message) this.logJob(info, ev.message);
         } else {
             this.logJob(info, line);
@@ -276,7 +371,7 @@ class Scheduler extends EventEmitter {
         if (info) {
             try { rmSync(info.tmpFile, {force: true}); } catch { /* ignore */ }
             // 没收到结果事件就退出 = 异常,交由引擎按域解释
-            if (!info.gotResult) await info.engine.onAbnormalExit(this, info.id, code);
+            if (!info.gotResult) await info.engine.onAbnormalExit(this, info.id, code, info);
         }
         this.emit("stats", await db.stats());
         this.tick(); // 释放槽位，继续下一个

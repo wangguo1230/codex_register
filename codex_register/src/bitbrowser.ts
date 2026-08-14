@@ -23,12 +23,22 @@ export async function bitHealth() {
 }
 
 // 创建随机指纹窗口(proxy 可选,格式 socks5://host:port 或 http://user:pass@host:port)。返回窗口 id。
-export async function createBitWindow({proxy = "", name = "reg", remark = "codex-reg"} = {}) {
+export async function createBitWindow({proxy = "", name = "reg", remark = "codex-reg", timeZone = ""} = {}) {
     const body = {
-        name, remark,
-        proxyMethod: 2,             // 2=自定义代理
-        proxyType: "noproxy",       // 无代理时
-        browserFingerPrint: {},     // 空对象=所有指纹随机(每号不同设备)
+        name: `${String(name || "reg").slice(0, 24)}-${Date.now().toString(36).slice(-5)}`,
+        remark,
+        proxyMethod: 2,
+        proxyType: "noproxy",
+        browserFingerPrint: timeZone ? {timezone: timeZone, timeZone} : {},
+        randomFingerprint: true,
+        clearCookiesBeforeLaunch: true,
+        clearCacheFilesBeforeLaunch: true,
+        syncCookies: false,
+        syncTabs: false,
+        syncAuthorization: false,
+        syncIndexedDb: false,
+        syncLocalStorage: false,
+        syncHistory: false,
     };
     if (proxy) {
         const u = new URL(proxy);
@@ -45,10 +55,111 @@ export async function createBitWindow({proxy = "", name = "reg", remark = "codex
 // 打开窗口 → 返回 CDP 端点。data.ws 是 Playwright connectOverCDP 用的 ws:// 端点。
 // extractIp:true = 打开时按代理出口 IP 自动对齐浏览器时区/地理位置(消除"IP地理≠时区≠locale"的风控信号,
 //   注册即封的高权重原因之一)。因此 worker 不再手动硬编码时区。
-export async function openBitWindow(id) {
-    const d = await bitPost("/browser/open", {id, args: [], loadExtensions: false, extractIp: true});
+export async function openBitWindow(id, {extractIp = true} = {}) {
+    const d = await bitPost("/browser/open", {id, args: [], loadExtensions: false, extractIp: extractIp !== false});
     return {ws: d.ws, http: d.http, driver: d.driver};
 }
 
 export async function closeBitWindow(id) { try { await bitPost("/browser/close", {id}); } catch { /* ignore */ } }
 export async function deleteBitWindow(id) { try { await bitPost("/browser/delete", {id}); } catch { /* ignore */ } }
+
+const liveBitIds = new Set();
+const STALE_NAME_RE = /^(harden-|totp-|probe-|gmail-|recharge|pw-|2fa-)/i;
+const STALE_REMARKS = new Set(["gmail-harden", "gmail-manage", "gmail-gpt", "gmail-pw", "gmail-2fa"]);
+
+export function trackBitWindow(id) { if (id) liveBitIds.add(id); }
+export function untrackBitWindow(id) { liveBitIds.delete(id); }
+export function liveBitWindowIds() { return [...liveBitIds]; }
+
+export async function listBitWindows({page = 0, pageSize = 100} = {}) {
+    const d = await bitPost("/browser/list", {page, pageSize});
+    return {list: d?.list || [], total: Number(d?.totalNum || 0), page: d?.page, pageSize: d?.pageSize};
+}
+
+export async function listAllBitWindows() {
+    const all = [];
+    let page = 0;
+    const pageSize = 100;
+    while (true) {
+        const {list, total} = await listBitWindows({page, pageSize});
+        all.push(...list);
+        if (!list.length || all.length >= total) break;
+        page += 1;
+    }
+    return all;
+}
+
+function isOurAutomationWindow(w) {
+    const name = String(w?.name || "");
+    const remark = String(w?.remark || "");
+    return STALE_NAME_RE.test(name) || STALE_REMARKS.has(remark);
+}
+
+export async function listAutomationBitWindows() {
+    const all = await listAllBitWindows();
+    return all.filter(isOurAutomationWindow).map((w) => ({
+        id: w.id,
+        name: w.name || "",
+        remark: w.remark || "",
+        status: Number(w.status) || 0,
+        createdTime: w.createdTime || "",
+    }));
+}
+
+/** 停任务：关掉本进程登记的窗，再清自动化残留（含外部脚本开的窗）。 */
+export async function stopAutomationBitWindows({includeClosed = true, log = () => {}} = {}) {
+    const n1 = await closeTrackedBitWindows();
+    const n2 = await sweepStaleBitWindows({keepIds: [], includeClosed, log});
+    return n1 + n2;
+}
+
+/** 关掉并删除本进程登记的窗口（给 SIGINT/SIGTERM 用）。 */
+export async function closeTrackedBitWindows() {
+    const ids = [...liveBitIds];
+    for (const id of ids) {
+        await closeBitWindow(id);
+        await deleteBitWindow(id);
+        liveBitIds.delete(id);
+    }
+    return ids.length;
+}
+
+/**
+ * 清掉自动化留下的比特指纹。keepIds / 当前登记的 live 窗口会留下。
+ * includeClosed: 连已关但没删的配置也删掉（占会员额度）。
+ */
+export async function sweepStaleBitWindows({keepIds = [], includeClosed = true, log = () => {}} = {}) {
+    const keep = new Set([...keepIds, ...liveBitIds].filter(Boolean));
+    let windows = [];
+    try { windows = await listAllBitWindows(); }
+    catch (e) {
+        log(`[指纹] 列举失败: ${e?.message || e}`);
+        return 0;
+    }
+    const stale = windows.filter((w) => {
+        if (!w?.id || keep.has(w.id)) return false;
+        if (!includeClosed && Number(w.status) === 0) return false;
+        return isOurAutomationWindow(w);
+    });
+    let n = 0;
+    for (const w of stale) {
+        if (Number(w.status) === 1) await closeBitWindow(w.id);
+        await deleteBitWindow(w.id);
+        n += 1;
+        log(`[指纹] 清残留 ${w.name || w.id} status=${w.status}`);
+    }
+    return n;
+}
+
+let bitSignalsInstalled = false;
+export function installBitCleanupSignals() {
+    if (bitSignalsInstalled) return;
+    bitSignalsInstalled = true;
+    const onSignal = (sig) => {
+        closeTrackedBitWindows()
+            .catch(() => {})
+            .finally(() => process.exit(sig === "SIGINT" ? 130 : 143));
+    };
+    process.on("SIGINT", () => onSignal("SIGINT"));
+    process.on("SIGTERM", () => onSignal("SIGTERM"));
+}

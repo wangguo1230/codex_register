@@ -3,6 +3,7 @@ import {api, connectStream, type Account, type Stats, type Daily, type XrayStatu
 import {MailboxPanel} from "./MailboxPanel";
 import {ClaudePanel} from "./ClaudePanel";
 import {RechargePanel} from "./RechargePanel";
+import {generateTotp, totpRemain} from "./totp";
 
 const STATUS_STYLE: Record<string, string> = {
     pending: "bg-gray-200 text-gray-700",
@@ -40,11 +41,46 @@ function fmtDuration(startAt?: number | null, endAt?: number | null): string {
     const s = Math.round((endAt - startAt) / 1000);
     return s < 60 ? `${s}秒` : `${Math.floor(s / 60)}分${pad(s % 60)}秒`;
 }
-// 前端生成随机密码:20位 大写(去OI)+小写(去l)+数字(去01),保证各类≥1
+function accountGptPw(a: {gpt_password?: string}, fallback = "") {
+    return String(a.gpt_password || fallback || "").trim();
+}
+function isGoogleMailbox(a: {provider?: string; email?: string}) {
+    return a.provider === "google" || /@(gmail|googlemail)\.com$/i.test(a.email || "");
+}
+function exportableAccount(a: Account) {
+    if (isGoogleMailbox(a) && String(a.gpt_password || "").trim()) return true;
+    return a.status === "success" && !a.dead_at;
+}
+
+function TotpLive({secret}: {secret: string}) {
+    const [code, setCode] = useState("");
+    const [left, setLeft] = useState(30);
+    useEffect(() => {
+        let stop = false;
+        const tick = async () => {
+            if (stop) return;
+            setCode(await generateTotp(secret));
+            setLeft(totpRemain());
+        };
+        tick();
+        const t = setInterval(tick, 1000);
+        return () => { stop = true; clearInterval(t); };
+    }, [secret]);
+    if (!code) return null;
+    return (
+        <span className="inline-flex items-center gap-1.5">
+            <span className="font-mono text-base tracking-widest text-emerald-700 select-all">{code}</span>
+            <span className="text-[11px] text-gray-400">{left}s</span>
+            <button type="button" className="text-[11px] text-indigo-600 hover:underline" onClick={() => navigator.clipboard?.writeText(code)}>复制码</button>
+        </span>
+    );
+}
+
 export default function App() {
     const [accounts, setAccounts] = useState<Account[]>([]);
     const [stats, setStats] = useState<Stats>({pending: 0, running: 0, success: 0, failed: 0, total: 0});
     const [paused, setPaused] = useState(true);
+    const [instanceId, setInstanceId] = useState("");
     const [concurrency, setConcurrency] = useState(2);
     const [regEngine, setRegEngine] = useState<string>("http");
     const [expDays, setExpDays] = useState(10); // 过期阈值:注册满 N 天视为过期(网页 token 约 10 天)
@@ -59,6 +95,7 @@ export default function App() {
     const [smsData, setSmsData] = useState<{list: any[]; stats: {free: number; used: number; bad: number; claimed: number; total: number}}>({list: [], stats: {free: 0, used: 0, bad: 0, claimed: 0, total: 0}});
     const [smsEnabled, setSmsEnabled] = useState(true);
     const [rtEnabled, setRtEnabled] = useState(false);
+    const [mfaEnabled, setMfaEnabled] = useState(true);
     const [bitBrowser, setBitBrowser] = useState(false); // 比特浏览器:每号独立指纹窗口
     const [daily, setDaily] = useState<Daily | null>(null);
     const [showDaily, setShowDaily] = useState(false);
@@ -88,7 +125,7 @@ export default function App() {
     // 批量获取 RT 弹窗
     const [showAcquireRt, setShowAcquireRt] = useState(false);
     const [acquireRtInput, setAcquireRtInput] = useState("");
-    const [acquireRtResults, setAcquireRtResults] = useState<{email: string; password?: string; rt?: string; accessToken?: string; ok: boolean; reason?: string; status: "pending"|"done"}[]>([]);
+    const [acquireRtResults, setAcquireRtResults] = useState<{email: string; password?: string; rt?: string; accessToken?: string; ok: boolean; reason?: string; status: "pending"|"running"|"done"}[]>([]);
     const [acquireRtRunning, setAcquireRtRunning] = useState(false);
     // 「从邮箱选号」弹窗:从待分配(free)邮箱勾选 → 设批次 → 可选先改密 → 分配进 GPT 注册队列
     const [showPicker, setShowPicker] = useState(false);
@@ -105,6 +142,8 @@ export default function App() {
     const [statusFilter, setStatusFilter] = useState<"all" | "pending" | "running" | "success" | "failed">("all");
     const [facets, setFacets] = useState<Set<string>>(new Set()); // 选中的 facet key 集合,空=不额外收窄
     const [soldFilter, setSoldFilter] = useState<"all" | "sold" | "unsold">("all"); // 第三层:售出(全部/未售/已售)
+    const [showDeleted, setShowDeleted] = useState(false); // 查看已删除邮箱的GPT账号
+    const [delAccounts, setDelAccounts] = useState<Account[]>([]); // 已删除账号:搜索时惰性加载,让按邮箱回查能命中软删数据
     const toggleFacet = (k: string) => setFacets((prev) => { const s = new Set(prev); s.has(k) ? s.delete(k) : s.add(k); return s; });
     const [search, setSearch] = useState(""); // 邮箱名搜索
     const [selectedId, setSelectedId] = useState<number | null>(null);
@@ -115,12 +154,14 @@ export default function App() {
     const [logMode, setLogMode] = useState<"all" | "single">("all");
     const [panelOpen, setPanelOpen] = useState(true); // 右侧抽屉是否展开(收起则表格占满)
     const [domain, setDomain] = useState<"gpt" | "mailbox" | "claude" | "recharge">("gpt"); // 顶层业务域:GPT注册 / 邮箱管理 / Claude注册 / 充值提交
+    const [mailJobOn, setMailJobOn] = useState(false);
     const [dark, setDark] = useState<boolean>(() => (localStorage.getItem("theme") ?? "dark") === "dark"); // 默认暗色
     useEffect(() => { document.documentElement.classList.toggle("dark", dark); localStorage.setItem("theme", dark ? "dark" : "light"); }, [dark]);
     const [editMode, setEditMode] = useState(false); // 详情抽屉是否处于编辑记录态
     const [editForm, setEditForm] = useState<Record<string, any>>({});
     const [infoOpen, setInfoOpen] = useState(true); // 详情抽屉的账户信息区是否展开(收起给日志/收件箱更多空间)
     const [batchAt, setBatchAt] = useState<{running: boolean; done: number; total: number}>({running: false, done: 0, total: 0});
+    const [defaultGptPw, setDefaultGptPw] = useState("");
     // 虚拟滚动:大数据量只渲染可视区行(固定行高),避免几千行 DOM 卡顿
     const scrollRef = useRef<HTMLDivElement>(null);
     const [scrollTop, setScrollTop] = useState(0);
@@ -131,13 +172,16 @@ export default function App() {
     selectedIdRef.current = selectedId;
     const accountsRef = useRef<Account[]>([]);
     accountsRef.current = accounts;
+    const showDeletedRef = useRef(false);
+    showDeletedRef.current = showDeleted;
+    const delLoadedRef = useRef(false); // 已删除列表是否已加载(删号后置回 false 触发重取)
 
     const toastTimer = useRef<any>(null);
     const notify = (m: string, ms = 2600) => { if (toastTimer.current) clearTimeout(toastTimer.current); setToast(m); toastTimer.current = setTimeout(() => setToast(""), ms); };
 
     // 初次加载 + SSE
     useEffect(() => {
-        api.state().then((s) => { setPaused(s.state.paused); setConcurrency(s.state.concurrency); setOtpSingle(s.state.otpSingle); setChatSim(s.state.simulateChat); setSmsEnabled(s.state.smsEnabled); setRtEnabled(s.state.rtEnabled); setDaily(s.state.daily); setXray(s.state.xray); setRegEngine(s.state.regEngine || "http"); setBitBrowser(!!s.state.bitBrowser); setSmsLinkTemplate(s.state.smsLinkTemplate || ""); setSmsMaxBind(s.state.smsMaxBind ?? 3); setRegProxy(s.state.regProxy || ""); setMailProxy(s.state.mailProxy || ""); setMailProxyEnabled(s.state.mailProxyEnabled !== false); setRegPortInput(String(s.state.regProxyPort ?? 10809)); setClaudePortInput(String(s.state.claudeProxyPort ?? 10810)); setXrayBinPath(s.state.xrayBinPath || ""); if (s.state.xrayVless) setVlessInput(s.state.xrayVless); setStats(s.stats); }).catch(() => {});
+        api.state().then((s) => { setPaused(s.state.paused); setInstanceId(s.state.instanceId || ""); setConcurrency(s.state.concurrency); setOtpSingle(s.state.otpSingle); setChatSim(s.state.simulateChat); setSmsEnabled(s.state.smsEnabled); setRtEnabled(s.state.rtEnabled); setMfaEnabled(s.state.mfaEnabled !== false); setDaily(s.state.daily); setXray(s.state.xray); setRegEngine(s.state.regEngine || "http"); setBitBrowser(!!s.state.bitBrowser); setSmsLinkTemplate(s.state.smsLinkTemplate || ""); setSmsMaxBind(s.state.smsMaxBind ?? 3); setRegProxy(s.state.regProxy || ""); setMailProxy(s.state.mailProxy || ""); setMailProxyEnabled(s.state.mailProxyEnabled !== false); setRegPortInput(String(s.state.regProxyPort ?? 10809)); setClaudePortInput(String(s.state.claudeProxyPort ?? 10810)); setXrayBinPath(s.state.xrayBinPath || ""); if (s.state.xrayVless) setVlessInput(s.state.xrayVless); if (s.state.defaultPassword) setDefaultGptPw(s.state.defaultPassword); setStats(s.stats); }).catch(() => {});
         api.listAccounts().then(setAccounts).catch(() => {});
         // 批次数据来自数据库(筛选/导出用;导入已迁至邮箱管理)
         api.batches().then(setBatches).catch(() => {});
@@ -146,15 +190,36 @@ export default function App() {
         const disconnect = connectStream((event, data) => {
             if (event === "sms") { api.listSms().then(setSmsData).catch(() => {}); return; }
             if (event === "daily") { setDaily(data); return; }
-            if (event === "batchAt") { setBatchAt(data); if (!data.running) api.listAccounts().then(setAccounts).catch(() => {}); return; }
+            if (event === "batchAt") { setBatchAt(data); if (!data.running && !showDeletedRef.current) api.listAccounts().then(setAccounts).catch(() => {}); return; }
             if (event === "refreshAt") { setRefreshAtResults(data.results.map((r: any) => ({...r, status: r.status || "done"}))); if (data.done) setRefreshAtRunning(false); return; }
             if (event === "batchRtAcquire") { setAcquireRtResults(data.results.map((r: any) => ({...r, status: r.status || "done"}))); if (data.done) setAcquireRtRunning(false); return; }
-            if (event === "batchPw") { api.listAccounts().then(setAccounts).catch(() => {}); return; } // 邮箱改密在邮箱管理页;这里仅刷新账号让 gpt 邮箱密码同步
+            if (event === "batchPw") {
+                setMailJobOn((on) => !!data?.running || on);
+                if (!showDeletedRef.current) api.listAccounts().then(setAccounts).catch(() => {});
+                return;
+            }
+            if (event === "batchHarden") {
+                const open = (data?.windows || []).some((w: any) => w.status === 1);
+                setMailJobOn(!!data?.running || open);
+                return;
+            }
             if (event === "stats") setStats(data);
-            else if (event === "snapshot") setAccounts(data);
-            else if (event === "hello") { setStats(data.stats); setPaused(data.state.paused); setConcurrency(data.state.concurrency); setOtpSingle(data.state.otpSingle); setChatSim(data.state.simulateChat); setRegProxy(data.state.regProxy || ""); setMailProxy(data.state.mailProxy || ""); setMailProxyEnabled(data.state.mailProxyEnabled !== false); api.listAccounts().then(setAccounts).catch(() => {}); }
+            else if (event === "snapshot") { if (!showDeletedRef.current) setAccounts(data); }
+            else if (event === "hello") {
+                setStats(data.stats); setPaused(data.state.paused); setConcurrency(data.state.concurrency); setOtpSingle(data.state.otpSingle); setChatSim(data.state.simulateChat); setRegProxy(data.state.regProxy || ""); setMailProxy(data.state.mailProxy || ""); setMailProxyEnabled(data.state.mailProxyEnabled !== false);
+                if (data.state?.mfaEnabled !== undefined) setMfaEnabled(data.state.mfaEnabled !== false);
+                if (data.state?.defaultPassword) setDefaultGptPw(data.state.defaultPassword);
+                const bh = data.state?.batchHarden;
+                const open = (bh?.windows || []).some((w: any) => w.status === 1);
+                setMailJobOn(!!bh?.running || !!data.state?.batchPw?.running || open);
+                if (!showDeletedRef.current) api.listAccounts().then(setAccounts).catch(() => {});
+            }
             else if (event === "status") {
-                setAccounts((prev) => prev.map((a) => (a.id === data.id ? {...a, ...data, status: data.status} : a)));
+                setAccounts((prev) => {
+                    const exists = prev.some((a) => a.id === data.id);
+                    if (exists) return prev.map((a) => (a.id === data.id ? {...a, ...data, status: data.status} : a));
+                    return [...prev, data];
+                });
             } else if (event === "log") {
                 const email = accountsRef.current.find((a) => a.id === data.id)?.email || `#${data.id}`;
                 setAllLogs((prev) => [...prev.slice(-1200), {id: data.id, email, ts: data.ts, line: data.line}]);
@@ -165,6 +230,18 @@ export default function App() {
         });
         return disconnect;
     }, []);
+
+    // 切换「已删除」视图时重新拉取账号列表
+    useEffect(() => { api.listAccounts(showDeleted).then(setAccounts).catch(() => {}); }, [showDeleted]);
+
+    // 默认视图下一旦开始搜索,顺带拉一次已删除账号并入候选:删号是软删,邮箱仍能搜出历史数据
+    useEffect(() => {
+        if (showDeleted || !search.trim() || delLoadedRef.current) return;
+        delLoadedRef.current = true;
+        api.listAccounts(true).then(setDelAccounts).catch(() => { delLoadedRef.current = false; });
+    }, [search, showDeleted]);
+    // 删号后作废缓存:下次搜索重新拉,新删的号才搜得到
+    const invalidateDeleted = () => { delLoadedRef.current = false; setDelAccounts([]); };
 
     // 选中账号 → 拉历史日志
     useEffect(() => {
@@ -195,6 +272,8 @@ export default function App() {
         expired: {group: "age", label: "过期", pred: (a: Account) => isExpired(a)},
         noPw: {group: "pw", label: "未改密", pred: (a: Account) => succ(a) && !String(a.pw_status || "").includes("✅")},
         pwFail: {group: "pw", label: "改密失败", pred: (a: Account) => succ(a) && String(a.pw_status || "").includes("❌")},
+        mfaOk: {group: "2fa", label: "已绑2FA", pred: (a: Account) => succ(a) && /✅/.test(a.mfa_status || "")},
+        mfaNo: {group: "2fa", label: "未绑2FA", pred: (a: Account) => succ(a) && !/✅/.test(a.mfa_status || "")},
         deactivated: {group: "misc", label: "已停用", pred: (a: Account) => /account_deactivated/i.test(a.error || "")},
     }), [expDays]);
     type FacetKey = keyof typeof FACET_DEFS;
@@ -210,15 +289,20 @@ export default function App() {
         return list.filter((a) => [...byGroup.values()].every((preds) => preds.some((p) => p(a))));
     };
     const filtered = useMemo(() => {
-        let list = statusFilter === "all" ? accounts : accounts.filter((a) => a.status === statusFilter); // ①注册状态
+        const qs = search.trim().toLowerCase().split(/[\s,;|]+/).filter(Boolean);
+        // 搜索时把已删除账号并入候选(默认视图本身不含它们),其余筛选口径与正常号一致,已删除的排在末尾
+        const base = qs.length && !showDeleted ? [...accounts, ...delAccounts] : accounts;
+        let list = statusFilter === "all" ? base : base.filter((a) => a.status === statusFilter); // ①注册状态
         list = applyFacets(list, facets); // ②质量 facet(跨组 AND、组内 OR)
-        const q = search.trim().toLowerCase();
-        if (q) list = list.filter((a) => a.email.toLowerCase().includes(q)); // 邮箱名搜索
+        if (qs.length) list = list.filter((a) => { const e = a.email.toLowerCase(); return qs.some((q) => e.includes(q)); });
         if (batchFilter) list = list.filter((a) => (a.batch || "") === batchFilter); // 批次筛选
         if (soldFilter === "sold") list = list.filter((a) => a.sold_at);        // ③售出:仅已售
         else if (soldFilter === "unsold") list = list.filter((a) => !a.sold_at); // ③售出:仅未售
         return list;
-    }, [accounts, statusFilter, facets, FACET_DEFS, expDays, search, batchFilter, soldFilter]);
+    }, [accounts, delAccounts, showDeleted, statusFilter, facets, FACET_DEFS, expDays, search, batchFilter, soldFilter]);
+    // 批量操作/导出的作用域:剔除搜索带出的已删除号,避免误跑/误导出
+    const actionable = useMemo(() => (showDeleted ? filtered : filtered.filter((a) => !a.deleted_at)), [filtered, showDeleted]);
+    const delHits = filtered.length - actionable.length;
     // facet 计数:在【当前注册状态】的基数上算(不受其他 facet 影响,数字稳定可预测)。售出单列。
     const statusBase = useMemo(() => statusFilter === "all" ? accounts : accounts.filter((a) => a.status === statusFilter), [accounts, statusFilter]);
     const facetCnt = useMemo(() => {
@@ -237,7 +321,7 @@ export default function App() {
         const done = success + failed;
         return {total: list.length, success, failed, busy, dead, rate: done ? Math.round((success / done) * 100) : 0};
     }, [accounts, batchFilter]);
-    const selected = accounts.find((a) => a.id === selectedId) || null;
+    const selected = accounts.find((a) => a.id === selectedId) || delAccounts.find((a) => a.id === selectedId) || null;
     // 虚拟滚动可视区:只渲染 [vStart, vEnd) 行,上下用占位撑起总高度
     const ROW_H = 41;
     const vTotal = filtered.length;
@@ -258,6 +342,7 @@ export default function App() {
             phone: a.phone || "", card: a.card || "", at_status: a.at_status || "",
             rt_status: a.rt_status || "", chat_status: a.chat_status || "", error: a.error || "",
             batch: a.batch || "", dead: !!a.dead_at, sold: !!a.sold_at,
+            gpt_password: a.gpt_password || "", totp_secret: a.totp_secret || "", mfa_status: a.mfa_status || "",
         });
         setEditMode(true); setInfoOpen(true);
     }
@@ -328,22 +413,22 @@ export default function App() {
         } catch (e: any) { notify("分配失败: " + e.message); }
     }
 
-    // 导出弹窗实时条数预估(与服务端口径一致:任何范围都只导「可用」号=success 且未失效;排除数明示,不悄悄丢行)
+    // 导出弹窗实时条数预估(与服务端口径一致:success 未失效 + 有 GPT 密码的谷歌号全部导出)
     const {exportCount, exportSkipped} = useMemo(() => {
         let list = exportRange === "selected" ? accounts.filter((a) => selectedIds.has(a.id))
-            : exportRange === "filtered" ? filtered
+            : exportRange === "filtered" ? actionable
             : exportRange === "batch" ? accounts.filter((a) => !!exportBatch && (a.batch || "") === exportBatch)
             : accounts;
         if (exportScope === "hasRt") list = list.filter((a) => a.rt_file);
         else if (exportScope === "atOnly") list = list.filter((a) => !a.rt_file);
-        const usable = list.filter((a) => a.status === "success" && !a.dead_at);
+        const usable = list.filter(exportableAccount);
         return {exportCount: usable.length, exportSkipped: list.length - usable.length};
-    }, [accounts, filtered, selectedIds, exportRange, exportBatch, exportScope]);
+    }, [accounts, actionable, selectedIds, exportRange, exportBatch, exportScope]);
     async function doExportFull() {
         // 范围 → ids/batch:选中/当前筛选传 ids;按批次传 batch;全部都不传。ids/batch 显式范围服务端不限状态全导。
         let ids: number[] | undefined, batch: string | undefined;
         if (exportRange === "selected") { ids = [...selectedIds]; if (!ids.length) { notify("未选中任何账号"); return; } }
-        else if (exportRange === "filtered") { ids = filtered.map((a) => a.id); if (!ids.length) { notify("当前筛选无账号"); return; } }
+        else if (exportRange === "filtered") { ids = actionable.map((a) => a.id); if (!ids.length) { notify("当前筛选无账号"); return; } }
         else if (exportRange === "batch") { if (!exportBatch) { notify("请选择批次"); return; } batch = exportBatch; }
         if (!exportCount) { notify("该范围没有可导出的账号"); return; }
         if (exportMarkSold && !window.confirm(`导出并把这 ${exportCount} 个号标记为【已售出】？`)) return;
@@ -358,7 +443,7 @@ export default function App() {
         } catch (e: any) { notify("导出失败: " + e.message); }
     }
     async function setBatchForSelected() {
-        const ids = selectedIds.size ? [...selectedIds] : filtered.map((a) => a.id);
+        const ids = selectedIds.size ? [...selectedIds] : actionable.map((a) => a.id);
         if (!ids.length) { notify("无可设置的账号"); return; }
         const b = batchAssign.trim();
         if (!window.confirm(`给 ${selectedIds.size ? "选中" : "当前列表"} ${ids.length} 个号设置批次「${b || "(清空批次)"}」？`)) return;
@@ -418,7 +503,7 @@ export default function App() {
             <nav className="bg-white border-b px-6 py-2 flex items-center gap-2 shadow-sm">
                 <span className="text-sm font-bold text-gray-700 mr-3">🗂 多域账号系统</span>
                 <DomainTab active={domain === "gpt"} onClick={() => setDomain("gpt")}>⚡ GPT 注册</DomainTab>
-                <DomainTab active={domain === "mailbox"} onClick={() => setDomain("mailbox")}>📮 邮箱管理</DomainTab>
+                <DomainTab active={domain === "mailbox"} onClick={() => setDomain("mailbox")}>📮 邮箱管理{mailJobOn ? <span className="ml-1 text-amber-500">●</span> : null}</DomainTab>
                 <DomainTab active={domain === "claude"} onClick={() => setDomain("claude")}>🧠 Claude 注册</DomainTab>
                 <DomainTab active={domain === "recharge"} onClick={() => setDomain("recharge")}>💳 充值提交</DomainTab>
             </nav>
@@ -429,17 +514,23 @@ export default function App() {
             {/* 顶栏 */}
             <header className="bg-white border-b px-6 py-3 flex items-center gap-4 flex-wrap shadow-sm">
                 <h1 className="text-lg font-bold">⚡ GPT 批量注册控制台</h1>
+                {instanceId && <span className="text-xs text-gray-400 font-mono" title="本机实例。多机可共跑同一队列；停止/关本机只退回本机任务">本机 {instanceId}</span>}
                 <div className="flex flex-col gap-1.5">
                     {/* 第①层:注册状态(互斥单选)。右侧「清除筛选」在选了 facet/售出时出现 */}
                     <div className="flex items-center gap-1.5 flex-wrap">
-                        <StatusTab label="全部" n={stats.total} active={statusFilter === "all"} onClick={() => setStatusFilter("all")}/>
-                        <StatusTab label="等待" n={stats.pending} active={statusFilter === "pending"} onClick={() => setStatusFilter("pending")}/>
-                        <StatusTab label="运行" n={stats.running} active={statusFilter === "running"} onClick={() => setStatusFilter("running")}/>
-                        <StatusTab label="成功" n={stats.success} tone="ok" active={statusFilter === "success"} onClick={() => setStatusFilter("success")}/>
-                        <StatusTab label="失败" n={stats.failed} tone="bad" active={statusFilter === "failed"} onClick={() => setStatusFilter("failed")}/>
+                        <StatusTab label="全部" n={stats.total} active={statusFilter === "all" && !showDeleted} onClick={() => { setShowDeleted(false); setStatusFilter("all"); }}/>
+                        <StatusTab label="等待" n={stats.pending} active={statusFilter === "pending" && !showDeleted} onClick={() => { setShowDeleted(false); setStatusFilter("pending"); }}/>
+                        <StatusTab label="运行" n={stats.running} active={statusFilter === "running" && !showDeleted} onClick={() => { setShowDeleted(false); setStatusFilter("running"); }}/>
+                        <StatusTab label="成功" n={stats.success} tone="ok" active={statusFilter === "success" && !showDeleted} onClick={() => { setShowDeleted(false); setStatusFilter("success"); }}/>
+                        <StatusTab label="失败" n={stats.failed} tone="bad" active={statusFilter === "failed" && !showDeleted} onClick={() => { setShowDeleted(false); setStatusFilter("failed"); }}/>
+                        <span className="text-gray-300 mx-0.5">|</span>
+                        <button onClick={() => { const next = !showDeleted; setShowDeleted(next); if (next) { setStatusFilter("all"); setFacets(new Set()); setSoldFilter("all"); } }}
+                            className={`px-3 py-1 rounded-md text-sm border transition ${showDeleted ? 'bg-gray-500 text-white border-gray-500' : 'bg-white text-gray-400 border-gray-200 hover:bg-gray-50'}`}>
+                            已删除
+                        </button>
                         <div className="relative ml-1">
-                            <input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="🔍 搜索邮箱名"
-                                   className="w-44 pl-2 pr-6 py-1 border rounded-lg text-sm"/>
+                            <input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="🔍 搜索邮箱(空格分隔多个)"
+                                   className="w-52 pl-2 pr-6 py-1 border rounded-lg text-sm"/>
                             {search && <button onClick={() => setSearch("")} title="清除" className="absolute right-1.5 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-600 text-sm">✕</button>}
                         </div>
                         {batches.length > 0 &&
@@ -465,6 +556,7 @@ export default function App() {
                             </span>
                         </FacetGroup>
                         <FacetGroup name="改密"><FacetChip fkey="noPw" label="未改"/><FacetChip fkey="pwFail" label="失败"/></FacetGroup>
+                        <FacetGroup name="2FA"><FacetChip fkey="mfaOk" label="已绑"/><FacetChip fkey="mfaNo" label="未绑"/></FacetGroup>
                         <FacetGroup name="停用"><FacetChip fkey="deactivated" label="已停用"/></FacetGroup>
                         <span className="inline-flex items-center rounded-md border border-gray-200 overflow-hidden text-xs ml-0.5">
                             <span className="px-1.5 text-gray-400">售出</span>
@@ -508,10 +600,16 @@ export default function App() {
                             className={`px-2.5 py-1.5 rounded-lg text-sm border ${chatSim ? "bg-green-50 text-green-700 border-green-200" : "bg-gray-100 text-gray-600 border-gray-200"}`}>
                         {chatSim ? "开" : "关"}
                     </button>
+                    <label className="text-sm text-gray-500 ml-1">2FA</label>
+                    <button onClick={() => { const v = !mfaEnabled; setMfaEnabled(v); api.setMfa(v).then(() => notify(v ? "已开启:注册成功后自动绑 TOTP" : "已关闭注册后自动绑 2FA")).catch((e) => { setMfaEnabled(!v); notify(e.message); }); }}
+                            title="开=注册拿到 AT 后立刻绑 TOTP 并入库密钥；关=注册不绑，老号仍可用「批量绑2FA」"
+                            className={`px-2.5 py-1.5 rounded-lg text-sm border ${mfaEnabled ? "bg-green-50 text-green-700 border-green-200" : "bg-gray-100 text-gray-600 border-gray-200"}`}>
+                        {mfaEnabled ? "开" : "关"}
+                    </button>
                     {paused
                         ? <button onClick={start} className="px-4 py-1.5 bg-green-600 text-white rounded-lg text-sm font-medium hover:bg-green-700">▶ 开始</button>
                         : <button onClick={pause} className="px-4 py-1.5 bg-amber-500 text-white rounded-lg text-sm font-medium hover:bg-amber-600">⏸ 暂停</button>}
-                    <button onClick={ctrl(api.stop, "已停止全部运行中任务")} className="px-3 py-1.5 bg-red-500 text-white rounded-lg text-sm hover:bg-red-600">⏹ 停止</button>
+                    <button onClick={ctrl(api.stop, "已停止本实例注册，未完成任务退回队列（其他实例可接着跑）")} className="px-3 py-1.5 bg-red-500 text-white rounded-lg text-sm hover:bg-red-600" title="只停本机。正在跑的号退回等待，其他实例会认领">⏹ 停止</button>
                     <button onClick={ctrl(api.retryFailed, "已把失败项重置为等待")} className="px-3 py-1.5 bg-gray-200 rounded-lg text-sm hover:bg-gray-300">↻ 重试失败</button>
                     <button onClick={() => { setShowProxy(true); notify("代理设置已在下方展开"); }} className="px-3 py-1.5 bg-gray-200 rounded-lg text-sm hover:bg-gray-300">⚙ 代理</button>
                     {/* 从待分配邮箱选号 → 设批次 → 可选先改密 → 进注册队列(补邮箱管理按数量盲分、无法设批次的缺口) */}
@@ -651,6 +749,10 @@ export default function App() {
                                 <input type="checkbox" checked={rtEnabled} onChange={(e) => { setRtEnabled(e.target.checked); api.setRt(e.target.checked).then(() => notify(e.target.checked ? "已开启:注册后取 rt(每号消耗接码)" : "已关闭注册后取 rt")).catch((err: any) => notify(err.message)); }} />
                                 <span className="text-purple-700">注册后取 rt(可续期·耗接码)</span>
                             </label>
+                            <label className="inline-flex items-center gap-1 cursor-pointer text-sm" title="注册拿到 AT 后立刻绑 TOTP，密钥写入本号">
+                                <input type="checkbox" checked={mfaEnabled} onChange={(e) => { setMfaEnabled(e.target.checked); api.setMfa(e.target.checked).then(() => notify(e.target.checked ? "已开启:注册后自动绑 2FA" : "已关闭注册后自动绑 2FA")).catch((err: any) => { setMfaEnabled(!e.target.checked); notify(err.message); }); }} />
+                                <span className="text-emerald-700">注册后自动绑 2FA</span>
+                            </label>
                             <input value={smsLinkTemplate} onChange={(e) => setSmsLinkTemplate(e.target.value)}
                                    placeholder="接码链接模板 https://eccaptcha.com/api/GetVerifyCode?key=你的KEY&phone={phone}&project=45"
                                    className="flex-1 min-w-[280px] px-2 py-1 border rounded text-xs font-mono"/>
@@ -698,17 +800,18 @@ export default function App() {
             <div className="flex-1 flex min-h-0">
                 <div className="flex-1 flex flex-col min-h-0">
                     <div className="flex items-center gap-2 px-4 py-2 border-b bg-gray-50 text-sm flex-wrap shrink-0">
-                        <span className="text-gray-500">共 <b className="text-gray-700">{filtered.length}</b> 条{selectedIds.size > 0 ? <> · 已选 <b className="text-indigo-600">{selectedIds.size}</b> 个</> : "（未选则对当前列表全部执行）"}</span>
-                        <button onClick={() => api.batchTestAt(selectedIds.size ? [...selectedIds] : filtered.map((a) => a.id)).then((r) => notify(`批量测 at：${r.count} 个`)).catch((e) => notify(e.message))} className="px-2 py-1 bg-blue-600 text-white rounded text-xs">批量测 at</button>
+                        <span className="text-gray-500">共 <b className="text-gray-700">{filtered.length}</b> 条{delHits > 0 ? <>（含已删除 <b className="text-gray-500">{delHits}</b> 条，只读）</> : null}{selectedIds.size > 0 ? <> · 已选 <b className="text-indigo-600">{selectedIds.size}</b> 个</> : "（未选则对当前列表全部执行）"}</span>
+                        <button onClick={() => api.batchTestAt(selectedIds.size ? [...selectedIds] : actionable.map((a) => a.id)).then((r) => notify(`批量测 at：${r.count} 个`)).catch((e) => notify(e.message))} className="px-2 py-1 bg-blue-600 text-white rounded text-xs">批量测 at</button>
                         {batchAt.running
                             ? <button onClick={() => api.stopBatchAt().then(() => notify("已请求停止(当前号跑完即停)")).catch((e) => notify(e.message))} className="px-2 py-1 bg-red-600 text-white rounded text-xs animate-pulse">⏹ 停止重登 {batchAt.done}/{batchAt.total}</button>
-                            : <button onClick={() => { const ids = selectedIds.size ? [...selectedIds] : filtered.map((a) => a.id); if (!ids.length) { notify("无账号"); return; } if (!window.confirm(`对 ${ids.length} 个号【串行】测 at，失效的走浏览器登录重新获取(一次一个、每个约1-2分钟、可停止)。开始？`)) return; api.batchTestAt(ids, true).then((r) => notify(`已开始串行重登 ${r.count} 个`)).catch((e) => notify(e.message)); }} title="批量测 at,失效的号串行(一次一个)走浏览器登录重新获取 at" className="px-2 py-1 bg-blue-700 text-white rounded text-xs">批量重登at(串行)</button>}
-                        <button onClick={() => api.batchTestRt(selectedIds.size ? [...selectedIds] : filtered.map((a) => a.id)).then((r) => notify(`批量测 rt：${r.count} 个(只刷新有效的)`)).catch((e) => notify(e.message))} title="只刷新有效 rt、标记失效的;不重登、不耗接码" className="px-2 py-1 bg-teal-600 text-white rounded text-xs">批量测 rt</button>
-                        <button onClick={() => { const ids = selectedIds.size ? [...selectedIds] : filtered.map((a) => a.id); if (!ids.length) { notify("无账号"); return; } if (!window.confirm(`对 ${ids.length} 个号批量测 rt，过期/无rt 的会【重登获取 rt】(走 codex OAuth + add-phone 接码，每号消耗一个接码号、有成本、较慢)。开始？`)) return; api.batchTestRt(ids, true).then((r) => notify(`已开始批量重取 rt ${r.count} 个(过期/无rt 会重登获取)`)).catch((e) => notify(e.message)); }} title="过期/无rt 的号重登获取 rt(codex OAuth+接码,有成本)" className="px-2 py-1 bg-teal-700 text-white rounded text-xs">批量重取rt(耗接码)</button>
-                        <button onClick={() => api.batchTestChat(selectedIds.size ? [...selectedIds] : filtered.map((a) => a.id)).then((r) => notify(`批量测聊天：${r.count} 个（逐个开浏览器）`)).catch((e) => notify(e.message))} className="px-2 py-1 bg-fuchsia-600 text-white rounded text-xs">批量测聊天</button>
+                            : <button onClick={() => { const ids = selectedIds.size ? [...selectedIds] : actionable.map((a) => a.id); if (!ids.length) { notify("无账号"); return; } if (!window.confirm(`对 ${ids.length} 个号【串行】测 at，失效的走浏览器登录重新获取(一次一个、每个约1-2分钟、可停止)。开始？`)) return; api.batchTestAt(ids, true).then((r) => notify(`已开始串行重登 ${r.count} 个`)).catch((e) => notify(e.message)); }} title="批量测 at,失效的号串行(一次一个)走浏览器登录重新获取 at" className="px-2 py-1 bg-blue-700 text-white rounded text-xs">批量重登at(串行)</button>}
+                        <button onClick={() => api.batchTestRt(selectedIds.size ? [...selectedIds] : actionable.map((a) => a.id)).then((r) => notify(`批量测 rt：${r.count} 个(只刷新有效的)`)).catch((e) => notify(e.message))} title="只刷新有效 rt、标记失效的;不重登、不耗接码" className="px-2 py-1 bg-teal-600 text-white rounded text-xs">批量测 rt</button>
+                        <button onClick={() => { const ids = selectedIds.size ? [...selectedIds] : actionable.map((a) => a.id); if (!ids.length) { notify("无账号"); return; } if (!window.confirm(`对 ${ids.length} 个号批量测 rt，过期/无rt 的会【重登获取 rt】(走 codex OAuth + add-phone 接码，每号消耗一个接码号、有成本、较慢)。开始？`)) return; api.batchTestRt(ids, true).then((r) => notify(`已开始批量重取 rt ${r.count} 个(过期/无rt 会重登获取)`)).catch((e) => notify(e.message)); }} title="过期/无rt 的号重登获取 rt(codex OAuth+接码,有成本)" className="px-2 py-1 bg-teal-700 text-white rounded text-xs">批量重取rt(耗接码)</button>
+                        <button onClick={() => api.batchTestChat(selectedIds.size ? [...selectedIds] : actionable.map((a) => a.id)).then((r) => notify(`批量测聊天：${r.count} 个（逐个开浏览器）`)).catch((e) => notify(e.message))} className="px-2 py-1 bg-fuchsia-600 text-white rounded text-xs">批量测聊天</button>
+                        <button onClick={() => { const ids = selectedIds.size ? [...selectedIds] : actionable.map((a) => a.id); if (!ids.length) { notify("无账号"); return; } api.enrollMfa(ids).then((r) => notify(`开始绑 2FA ${r.count} 个(需有效 AT)`)).catch((e) => notify(e.message)); }} title="用现有 AT 绑定 TOTP，之后重登走密码+验证器" className="px-2 py-1 bg-emerald-700 text-white rounded text-xs">批量绑2FA</button>
                         {/* 已售出改回未售出:误标/退回重新上架。只对已售出的号生效 */}
                         <button onClick={async () => {
-                            const pool = selectedIds.size ? filtered.filter((a) => selectedIds.has(a.id)) : filtered;
+                            const pool = selectedIds.size ? actionable.filter((a) => selectedIds.has(a.id)) : actionable;
                             const ids = pool.filter((a) => a.sold_at).map((a) => a.id);
                             if (!ids.length) { notify("选中(或当前列表)里没有已售出的账号"); return; }
                             if (!window.confirm(`把 ${ids.length} 个已售出账号改回【未售出】？(重新参与保活)`)) return;
@@ -724,17 +827,17 @@ export default function App() {
                         <datalist id="batch-list">{batches.map((b) => <option key={b.name} value={b.name}/>)}</datalist>
                         <button onClick={setBatchForSelected} title="给选中(或当前列表全部)的号设置批次名,便于分组筛选/导出" className="px-2 py-1 bg-cyan-600 text-white rounded text-xs">设置批次</button>
                         <button onClick={async () => {
-                            const ids = selectedIds.size ? [...selectedIds] : filtered.map((a) => a.id);
+                            const ids = selectedIds.size ? [...selectedIds] : actionable.map((a) => a.id);
                             if (!ids.length) { notify("无可删除的账号"); return; }
                             const who = selectedIds.size ? `选中的 ${ids.length} 个` : `当前列表全部 ${ids.length} 个`;
                             if (!window.confirm(`确认删除${who}账号？邮箱将一并删除。运行中的会跳过。`)) return;
-                            try { const r = await api.batchDelete(ids); setSelectedIds(new Set()); await api.listAccounts().then(setAccounts); notify(`已删除 ${r.count} 个${r.skipped ? `（跳过运行中 ${r.skipped}）` : ""}`); }
+                            try { const r = await api.batchDelete(ids); setSelectedIds(new Set()); invalidateDeleted(); await api.listAccounts(showDeleted).then(setAccounts); notify(`已删除 ${r.count} 个${r.skipped ? `（跳过运行中 ${r.skipped}）` : ""}`); }
                             catch (e: any) { notify(e.message); }
                         }} title="删除选中(或当前列表全部)的号" className="px-2 py-1 bg-red-600 text-white rounded text-xs">🗑 删除选中</button>
                         <span className="mx-1 text-gray-300">|</span>
                         <input type="number" min={1} value={quickSelN} onChange={(e) => setQuickSelN(Math.max(1, +e.target.value || 1))} className="w-14 px-1 py-1 border rounded text-xs text-center"/>
-                        <button onClick={() => { const s = new Set<number>(); filtered.slice(0, quickSelN).forEach((a) => s.add(a.id)); setSelectedIds(s); }} className="px-2 py-1 bg-gray-200 rounded text-xs hover:bg-gray-300" title={`选中当前列表前 ${quickSelN} 个`}>选前N</button>
-                        <button onClick={() => { const s = new Set<number>(); filtered.slice(-quickSelN).forEach((a) => s.add(a.id)); setSelectedIds(s); }} className="px-2 py-1 bg-gray-200 rounded text-xs hover:bg-gray-300" title={`选中当前列表后 ${quickSelN} 个`}>选后N</button>
+                        <button onClick={() => { const s = new Set<number>(); actionable.slice(0, quickSelN).forEach((a) => s.add(a.id)); setSelectedIds(s); }} className="px-2 py-1 bg-gray-200 rounded text-xs hover:bg-gray-300" title={`选中当前列表前 ${quickSelN} 个`}>选前N</button>
+                        <button onClick={() => { const s = new Set<number>(); actionable.slice(-quickSelN).forEach((a) => s.add(a.id)); setSelectedIds(s); }} className="px-2 py-1 bg-gray-200 rounded text-xs hover:bg-gray-300" title={`选中当前列表后 ${quickSelN} 个`}>选后N</button>
                         {selectedIds.size > 0 && <button onClick={() => setSelectedIds(new Set())} className="text-gray-400 hover:underline text-xs">清空</button>}
                     </div>
                     <div ref={scrollRef} onScroll={(e) => setScrollTop((e.target as HTMLDivElement).scrollTop)} className="flex-1 overflow-auto min-h-0">
@@ -742,29 +845,44 @@ export default function App() {
                         <thead className="bg-gray-100 text-gray-500 sticky top-0 z-10">
                         <tr>
                             <th className="px-2 py-2"><input type="checkbox" title="全选当前列表"
-                                checked={filtered.length > 0 && filtered.every((a) => selectedIds.has(a.id))}
-                                onChange={(e) => setSelectedIds((prev) => { const s = new Set(prev); filtered.forEach((a) => e.target.checked ? s.add(a.id) : s.delete(a.id)); return s; })}/></th>
+                                checked={actionable.length > 0 && actionable.every((a) => selectedIds.has(a.id))}
+                                onChange={(e) => setSelectedIds((prev) => { const s = new Set(prev); actionable.forEach((a) => e.target.checked ? s.add(a.id) : s.delete(a.id)); return s; })}/></th>
                             <th className="text-left px-4 py-2 font-medium">#</th>
                             <th className="text-left px-4 py-2 font-medium">邮箱</th>
+                            <th className="text-left px-4 py-2 font-medium" title="ChatGPT 登录密码(空则用系统默认)">GPT密码</th>
                             <th className="text-left px-4 py-2 font-medium">状态</th>
                             <th className="text-left px-4 py-2 font-medium">套餐</th>
+                            <th className="text-left px-4 py-2 font-medium" title="ChatGPT TOTP 绑定状态">2FA</th>
                             <th className="text-left px-4 py-2 font-medium">注册时间/存活</th>
                             <th className="text-left px-4 py-2 font-medium" title="at / rt / 聊天 概览，点行看详情可测试">令牌</th>
                         </tr>
                         </thead>
                         <tbody>
-                        {vTopPad > 0 && <tr style={{height: vTopPad}}><td colSpan={7} className="p-0"/></tr>}
+                        {vTopPad > 0 && <tr style={{height: vTopPad}}><td colSpan={9} className="p-0"/></tr>}
                         {vRows.map((a, idx) => { const i = vStart + idx; return (
                             <tr key={a.id} style={{height: ROW_H}}
-                                onClick={() => { setSelectedId(a.id); setLogMode("single"); setPanelOpen(true); setEditMode(false); api.getAccount(a.id).then((r) => setAccounts((prev) => prev.map((x) => (x.id === a.id ? r : x)))).catch(() => {}); }}
-                                className={`border-b cursor-pointer hover:bg-indigo-50 ${selectedId === a.id ? "bg-indigo-100" : ""}`}>
+                                onClick={() => { setSelectedId(a.id); setLogMode("single"); setPanelOpen(true); setEditMode(false); api.getAccount(a.id).then((r) => { const upd = (prev: Account[]) => prev.map((x) => (x.id === a.id ? r : x)); a.deleted_at && !showDeleted ? setDelAccounts(upd) : setAccounts(upd); }).catch(() => {}); }}
+                                className={`border-b cursor-pointer hover:bg-indigo-50 ${selectedId === a.id ? "bg-indigo-100" : ""} ${a.deleted_at && !showDeleted ? "opacity-60" : ""}`}>
                                 <td className="px-2 py-2" onClick={(e) => e.stopPropagation()}>
-                                    <input type="checkbox" checked={selectedIds.has(a.id)} onChange={() => toggleSel(a.id)}/>
+                                    {/* 搜索带出的已删除号只读:不参与批量操作 */}
+                                    <input type="checkbox" disabled={!!a.deleted_at && !showDeleted} checked={selectedIds.has(a.id)} onChange={() => toggleSel(a.id)}/>
                                 </td>
                                 <td className="px-4 py-2 text-gray-400" title={`账号ID ${a.id}`}>{i + 1}</td>
                                 <td className="px-4 py-2 font-mono">
                                     {a.email}
                                     {a.sold_at ? <span className="ml-1 px-1 rounded bg-amber-100 text-amber-700 text-xs">已售</span> : null}
+                                    {a.deleted_at && !showDeleted ? <span className="ml-1 px-1 rounded bg-gray-200 text-gray-500 text-xs" title={`已删除 ${fmtDateTime(a.deleted_at)}`}>已删除</span> : null}
+                                </td>
+                                <td className="px-4 py-2 font-mono text-xs select-all" title={a.gpt_password ? "本号独立 GPT 密码" : (defaultGptPw ? "库中为空,登录用系统默认密码" : "无 GPT 密码")}
+                                    onClick={(e) => {
+                                        const pw = accountGptPw(a, defaultGptPw);
+                                        if (!pw) return;
+                                        e.stopPropagation();
+                                        navigator.clipboard?.writeText(pw);
+                                        notify("GPT密码已复制");
+                                    }}>
+                                    {accountGptPw(a, defaultGptPw) || <span className="text-gray-300">—</span>}
+                                    {!a.gpt_password && defaultGptPw ? <span className="ml-1 text-[10px] text-gray-400">默认</span> : null}
                                 </td>
                                 <td className="px-4 py-2">
                                     <span className={`px-2 py-0.5 rounded text-xs font-medium ${STATUS_STYLE[a.status]}`}>{STATUS_LABEL[a.status]}</span>
@@ -773,6 +891,13 @@ export default function App() {
                                         : a.status === "failed" && a.error ? <span className="ml-2 text-xs text-red-400" title={a.error}>{a.error.slice(0, 20)}…</span> : null}
                                 </td>
                                 <td className="px-4 py-2">{a.plan && <span className="px-2 py-0.5 bg-purple-100 text-purple-700 rounded text-xs">{a.plan}</span>}</td>
+                                <td className="px-4 py-2 whitespace-nowrap" title={a.mfa_status || "未绑"}>
+                                    {/✅/.test(a.mfa_status || "")
+                                        ? <span className="px-1.5 py-0.5 rounded bg-emerald-100 text-emerald-700 text-xs">已绑</span>
+                                        : /❌|⚠/.test(a.mfa_status || "")
+                                            ? <span className="px-1.5 py-0.5 rounded bg-amber-100 text-amber-700 text-xs">{(a.mfa_status || "").slice(0, 8)}</span>
+                                            : <span className="text-gray-300 text-xs">未绑</span>}
+                                </td>
                                 <td className="px-4 py-2 text-xs whitespace-nowrap" title={a.finished_at ? `注册完成 ${fmtDateTime(a.finished_at)}${a.dead_at ? ` · 失效 ${fmtDateTime(a.dead_at)}` : ""}` : "未成功"}>
                                     {a.status === "success"
                                         ? <span className="text-gray-500">
@@ -792,9 +917,9 @@ export default function App() {
                                 </td>
                             </tr>
                         ); })}
-                        {vBotPad > 0 && <tr style={{height: vBotPad}}><td colSpan={7} className="p-0"/></tr>}
+                        {vBotPad > 0 && <tr style={{height: vBotPad}}><td colSpan={9} className="p-0"/></tr>}
                         {filtered.length === 0 && (
-                            <tr><td colSpan={7} className="px-4 py-10 text-center text-gray-400">暂无数据。请到「📮 邮箱管理」导入独立邮箱并分配给 GPT，即可在此注册。</td></tr>
+                            <tr><td colSpan={9} className="px-4 py-10 text-center text-gray-400">暂无数据。请到「📮 邮箱管理」导入独立邮箱并分配给 GPT，即可在此注册。</td></tr>
                         )}
                         </tbody>
                     </table>
@@ -837,7 +962,7 @@ export default function App() {
                             {infoOpen && (editMode ? (
                                 /* —— 编辑记录(改本地库全字段) —— */
                                 <div className="px-4 py-3 border-b space-y-2 text-sm shrink-0 overflow-auto" onClick={(e) => e.stopPropagation()}>
-                                    {([["email", "邮箱"], ["password", "密码(明文)"], ["batch", "批次"], ["plan", "套餐"], ["phone", "手机"], ["card", "卡密"], ["at_status", "at状态"], ["rt_status", "rt状态"], ["chat_status", "聊天状态"]] as const).map(([k, label]) => (
+                                    {([["email", "邮箱"], ["password", "密码(明文)"], ["gpt_password", "GPT密码"], ["totp_secret", "2FA密钥"], ["mfa_status", "2FA状态"], ["batch", "批次"], ["plan", "套餐"], ["phone", "手机"], ["card", "卡密"], ["at_status", "at状态"], ["rt_status", "rt状态"], ["chat_status", "聊天状态"]] as const).map(([k, label]) => (
                                         <label key={k} className="flex items-center gap-2">
                                             <span className="w-16 text-gray-400 shrink-0 text-xs">{label}</span>
                                             <input value={editForm[k] ?? ""} onChange={ef(k)} className="flex-1 px-2 py-1 border rounded text-xs font-mono"/>
@@ -865,9 +990,32 @@ export default function App() {
                             ) : (
                               <>
                                 {/* 全字段展示(密码明文) */}
-                                <div className="px-4 py-3 border-b text-sm grid grid-cols-[4rem_1fr] gap-x-3 gap-y-1.5 shrink-0" onClick={(e) => e.stopPropagation()}>
+                                <div className="px-4 py-3 border-b text-sm grid grid-cols-[5.5rem_1fr] gap-x-3 gap-y-1.5 shrink-0" onClick={(e) => e.stopPropagation()}>
                                     <span className="text-gray-400">ID</span><span className="text-gray-600">{selected.id}</span>
-                                    <span className="text-gray-400">密码</span><span className="font-mono text-xs break-all text-gray-700 select-text cursor-text">{selected.password}</span>
+                                    <span className="text-gray-400">邮箱密码</span>
+                                    <span className="font-mono text-xs break-all text-gray-700 select-text cursor-text">
+                                        {selected.password || "—"}
+                                        {selected.password ? <button type="button" className="ml-2 text-[11px] text-indigo-600 hover:underline" onClick={() => { navigator.clipboard?.writeText(selected.password || ""); notify("邮箱密码已复制"); }}>复制</button> : null}
+                                    </span>
+                                    <span className="text-gray-400">GPT密码</span>
+                                    <span className="font-mono text-xs break-all text-gray-700 select-text cursor-text">
+                                        {accountGptPw(selected, defaultGptPw) || "—"}
+                                        {!selected.gpt_password && defaultGptPw ? <span className="ml-1 text-[10px] text-gray-400">默认</span> : null}
+                                        {accountGptPw(selected, defaultGptPw) ? <button type="button" className="ml-2 text-[11px] text-indigo-600 hover:underline" onClick={() => { navigator.clipboard?.writeText(accountGptPw(selected, defaultGptPw)); notify("GPT密码已复制"); }}>复制</button> : null}
+                                    </span>
+                                    <span className="text-gray-400">2FA</span>
+                                    <span className="min-w-0">
+                                        <span className={`text-xs ${/✅/.test(selected.mfa_status || "") ? "text-green-600" : /❌/.test(selected.mfa_status || "") ? "text-red-500" : "text-gray-400"}`}>{selected.mfa_status || "未绑"}</span>
+                                        {selected.totp_secret ? (
+                                            <span className="block mt-0.5 space-y-0.5">
+                                                <span className="font-mono text-[11px] break-all text-gray-700 select-all">{selected.totp_secret}</span>
+                                                <button type="button" className="ml-2 text-[11px] text-indigo-600 hover:underline" onClick={() => { navigator.clipboard?.writeText(selected.totp_secret || ""); notify("2FA 密钥已复制"); }}>复制密钥</button>
+                                                <span className="block"><TotpLive secret={selected.totp_secret}/></span>
+                                            </span>
+                                        ) : (
+                                            <button type="button" className="ml-2 text-[11px] text-emerald-700 hover:underline" onClick={() => api.enrollMfa([selected.id]).then((r) => notify(`开始绑 2FA ${r.count} 个(需有效 AT)`)).catch((e) => notify(e.message))}>去绑定</button>
+                                        )}
+                                    </span>
                                     <span className="text-gray-400">改密</span><span className={`text-xs ${String(selected.pw_status || "").includes("✅") ? "text-green-600" : String(selected.pw_status || "").includes("❌") ? "text-red-500" : "text-gray-400"}`} title={selected.pw_status || "未改过邮箱密码"}>{selected.pw_status || "未改过"}</span>
                                     <span className="text-gray-400">套餐</span><span>{selected.plan ? <span className="px-2 py-0.5 bg-purple-100 text-purple-700 rounded text-xs">{selected.plan}</span> : "—"}</span>
                                     <span className="text-gray-400">批次</span><span className="text-xs text-gray-600">{selected.batch ? <span className="px-2 py-0.5 bg-cyan-100 text-cyan-700 rounded">{selected.batch}</span> : "—"}</span>
@@ -898,9 +1046,14 @@ export default function App() {
                                     <button onClick={() => startEdit(selected)} title="编辑本地库记录(全字段,不动真邮箱)" className="px-2.5 py-1 bg-slate-600 hover:bg-slate-700 text-white rounded text-xs">✏️ 编辑</button>
                                     <button onClick={() => doOpenBrowser(selected)} disabled={!selected.auth_file} title={selected.auth_file ? "注入 at 打开已登录的 chatgpt 浏览器" : "无 at 授权文件，不能打开"} className={`px-2.5 py-1 rounded text-xs text-white ${selected.auth_file ? "bg-emerald-600 hover:bg-emerald-700" : "bg-gray-300 cursor-not-allowed"}`}>🌐 打开浏览器</button>
                                     <button onClick={() => api.getSession(selected.id).then((r) => { navigator.clipboard?.writeText(JSON.stringify(r.session)); notify("session json 已复制"); }).catch((e) => notify(`复制失败: ${e.message}`))} disabled={!selected.auth_file} title={selected.auth_file ? "复制该号 session json(可恢复登录态,同导出 session 格式)" : "无 at 授权文件，没有 session"} className={`px-2.5 py-1 rounded text-xs text-white ${selected.auth_file ? "bg-cyan-600 hover:bg-cyan-700" : "bg-gray-300 cursor-not-allowed"}`}>📋 复制session</button>
+                                    {/* 已删除的号只读:重跑/再删无意义(调度器不认领软删记录),留查看+导出凭证的能力 */}
+                                    {selected.deleted_at
+                                        ? <span className="px-2 py-1 rounded bg-gray-200 text-gray-500 text-xs" title={`已删除 ${fmtDateTime(selected.deleted_at)}`}>已删除（只读）</span>
+                                        : <>
                                     {(selected.status === "failed" || selected.status === "success") &&
                                         <button onClick={() => api.retry(selected.id).then(() => notify("已重新排队")).catch((e) => notify(e.message))} className="px-2.5 py-1 bg-indigo-500 hover:bg-indigo-600 text-white rounded text-xs">重跑</button>}
-                                    <button onClick={() => { if (!window.confirm(`删除 ${selected.email}？邮箱将一并删除。`)) return; api.remove(selected.id).then(() => { setSelectedId(null); setLogMode("all"); api.listAccounts().then(setAccounts); }).catch((e) => notify(e.message)); }} className="px-2.5 py-1 bg-red-500 hover:bg-red-600 text-white rounded text-xs">删除</button>
+                                    <button onClick={() => { if (!window.confirm(`删除 ${selected.email}？邮箱将一并删除。`)) return; api.remove(selected.id).then(() => { setSelectedId(null); setLogMode("all"); invalidateDeleted(); api.listAccounts(showDeleted).then(setAccounts); }).catch((e) => notify(e.message)); }} className="px-2.5 py-1 bg-red-500 hover:bg-red-600 text-white rounded text-xs">删除</button>
+                                          </>}
                                 </div>
                               </>
                             ))}
@@ -940,8 +1093,8 @@ export default function App() {
                         <div className="px-5 py-4 space-y-3 text-sm">
                             <label className="flex items-center gap-2"><span className="w-14 text-gray-400 shrink-0">范围</span>
                                 <select value={exportRange} onChange={(e) => setExportRange(e.target.value as any)} className="flex-1 px-2 py-1.5 border rounded">
-                                    <option value="all">全部可用号(成功且未失效)</option>
-                                    <option value="filtered">当前筛选({filtered.length})</option>
+                                    <option value="all">全部(可用号 + 有GPT密码的谷歌号)</option>
+                                    <option value="filtered">当前筛选({actionable.length})</option>
                                     <option value="selected">选中的号({selectedIds.size})</option>
                                     <option value="batch">按批次…</option>
                                 </select>
@@ -962,7 +1115,7 @@ export default function App() {
                             </label>
                             <label className="flex items-center gap-2"><span className="w-14 text-gray-400 shrink-0">格式</span>
                                 <select value={exportFormat} onChange={(e) => setExportFormat(e.target.value as any)} className="flex-1 px-2 py-1.5 border rounded">
-                                    <option value="full">账号(带rt:邮箱--邮箱密码--GPT密码--rt--卡密;只有at:邮箱--邮箱密码)</option>
+                                    <option value="full">账号(邮箱----邮箱密码----邮箱2FA[----GPT密码----GPT2FA----rt])</option>
                                     <option value="at">账号+AT(邮箱--邮箱密码--accessToken)</option>
                                     <option value="session">session(邮箱--邮箱密码--session json)</option>
                                     <option value="jsonl">JSONL(含 accessToken)</option>
@@ -1020,7 +1173,7 @@ export default function App() {
                                                     <tr key={i} className="border-t">
                                                         <td className="px-2 py-1 text-gray-400">{i + 1}</td>
                                                         <td className="px-2 py-1 font-mono">{r.email}</td>
-                                                        <td className="px-2 py-1">{r.status === "pending" ? <span className="text-blue-500">⏳ 等待</span> : r.ok ? <span className="text-green-600">✅ {r.reason}</span> : <span className="text-red-500">❌ {r.reason}</span>}</td>
+                                                        <td className="px-2 py-1">{r.status === "pending" ? <span className="text-gray-400">未开始</span> : r.status === "running" ? <span className="text-amber-600">进行中 {r.reason || ""}</span> : r.ok ? <span className="text-green-600">✅ {r.reason}</span> : <span className="text-red-500">❌ {r.reason}</span>}</td>
                                                     </tr>
                                                 ))}
                                             </tbody>
@@ -1067,17 +1220,16 @@ export default function App() {
                             <button onClick={() => !acquireRtRunning && setShowAcquireRt(false)} disabled={acquireRtRunning} className="text-gray-400 hover:text-gray-700 text-lg leading-none disabled:opacity-40">✕</button>
                         </div>
                         <div className="px-5 py-4 space-y-3 text-sm overflow-auto">
-                            <div className="text-xs text-gray-500">每行 <span className="font-mono">邮箱----密码</span>，走 codex OAuth 登录获取 refresh_token。</div>
-                            <textarea value={acquireRtInput} onChange={(e) => setAcquireRtInput(e.target.value)} placeholder={"a@mail.com----password1\nb@mail.com----password2"} disabled={acquireRtRunning}
+                            <div className="text-xs text-gray-500">每行 <span className="font-mono">邮箱----密码</span> 或 <span className="font-mono">邮箱:密码</span>，走 codex OAuth 登录获取 refresh_token。</div>
+                            <textarea value={acquireRtInput} onChange={(e) => setAcquireRtInput(e.target.value)} placeholder={"a@mail.com----password1\nb@mail.com:password2"} disabled={acquireRtRunning}
                                       className="w-full h-24 px-2 py-1.5 border rounded text-xs font-mono resize-y disabled:bg-gray-50"/>
                             <div className="flex items-center gap-3">
                                 <button onClick={async () => {
-                                    const sep = "----";
                                     const lines = acquireRtInput.split("\n").map(l => l.trim()).filter(Boolean);
-                                    const emails = lines.map(l => l.split(sep)[0].trim().toLowerCase()).filter(Boolean);
+                                    const emails = lines.map(l => l.split(/----| |\t|:|;|,|\|/)[0].trim().toLowerCase()).filter(Boolean);
                                     if (!emails.length) { notify("请粘贴邮箱----密码列表"); return; }
                                     setAcquireRtRunning(true);
-                                    setAcquireRtResults(emails.map(e => ({email: e, ok: false, status: "pending" as const})));
+                                    setAcquireRtResults(emails.map((e, i) => ({email: e, ok: false, status: i === 0 ? "running" as const : "pending" as const, reason: i === 0 ? "已提交，正在登录…" : ""})));
                                     try { await api.batchAcquireRt(acquireRtInput); } catch (e: any) { notify("请求失败: " + e.message); setAcquireRtRunning(false); }
                                 }} disabled={acquireRtRunning} className={`px-4 py-1.5 rounded text-sm font-medium text-white ${acquireRtRunning ? "bg-gray-400 cursor-not-allowed" : "bg-amber-600 hover:bg-amber-700"}`}>
                                     {acquireRtRunning ? "获取中(OAuth登录)…" : "▶ 开始获取"}
@@ -1095,7 +1247,7 @@ export default function App() {
                                                     <tr key={i} className="border-t">
                                                         <td className="px-2 py-1 text-gray-400">{i + 1}</td>
                                                         <td className="px-2 py-1 font-mono">{r.email}</td>
-                                                        <td className="px-2 py-1">{r.status === "pending" ? <span className="text-blue-500">⏳ 等待</span> : r.ok ? <span className="text-green-600">✅ {r.reason}</span> : <span className="text-red-500">❌ {r.reason}</span>}</td>
+                                                        <td className="px-2 py-1">{r.status === "pending" ? <span className="text-gray-400">未开始</span> : r.status === "running" ? <span className="text-amber-600">进行中 {r.reason || ""}</span> : r.ok ? <span className="text-green-600">✅ {r.reason}</span> : <span className="text-red-500">❌ {r.reason}</span>}</td>
                                                     </tr>
                                                 ))}
                                             </tbody>

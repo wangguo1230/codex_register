@@ -19,13 +19,15 @@ import {OpenAIClient} from "./openai.js";
 import {appConfig} from "./config.js";
 import {simulateChat} from "./simulate-chat.js";
 import {createPoolBroker} from "./sms/pool-broker.js";
+import {enrollTotp} from "./mfa.js";
+import {decodeJwt} from "./token-check.js";
 import {readFile} from "node:fs/promises";
 
 const EVENT_PREFIX = "@@EVENT@@";
 const email = (process.env.REG_EMAIL || "").trim();
-// ChatGPT 账号密码：用统一的 config.defaultPassword(OpenAI 要求≥12位)。
+// ChatGPT 账号密码：调度器按号生成经 GPT_PASSWORD 传入；空则回退 defaultPassword。
 // 邮箱密码(池文件里的 email----password)只用于登录 mail.com 收码，两者不能混用！
-const password = appConfig.defaultPassword.trim();
+const password = (process.env.GPT_PASSWORD || "").trim() || appConfig.defaultPassword.trim();
 // 养号聊天随机消息(每个号发不同的话，更像真人)
 const CHAT_MESSAGES = [
     "hello, how are you?", "what can you do?", "tell me a fun fact",
@@ -46,6 +48,7 @@ async function getTokenWithFallback(client, deviceProfile) {
         const reauth = new OpenAIClient({
             email: client.email,
             password,
+            totpSecret: process.env.TOTP_SECRET || "",
             deviceProfile: deviceProfile ?? generateRandomDeviceProfile(),
             manualMode: false,
         });
@@ -86,6 +89,17 @@ async function main() {
     const token = await getTokenWithFallback(client, deviceProfile);
     const authFile = await client.saveChatGPTAccessToken(token);
 
+    let totpSecret = "";
+    let mfaStatus = "";
+    if (process.env.REG_TRY_MFA === "1") {
+        emit({type: "progress", stage: "mfa", message: "注册后绑定 TOTP…"});
+        const accountId = decodeJwt(token)?.["https://api.openai.com/auth"]?.chatgpt_account_id || "";
+        const mfa = await enrollTotp(token, {accountId, proxyUrl: process.env.PROXY_URL || ""});
+        if (mfa.ok && mfa.secret) { totpSecret = mfa.secret; mfaStatus = "✅已绑"; emit({type: "progress", stage: "mfa", message: "TOTP 已绑定"}); }
+        else if (mfa.ok && mfa.already) { mfaStatus = "⚠已有2FA缺密钥"; emit({type: "progress", stage: "mfa", message: "该号已有 2FA 但本次未拿到 secret"}); }
+        else { mfaStatus = "❌" + (mfa.reason || "绑定失败"); emit({type: "progress", stage: "mfa", message: "TOTP 绑定失败: " + (mfa.reason || "")}); }
+    }
+
     // [追加·不影响原流程] 注册成功后额外走一次 codex OAuth(client_id=app_EMo... + offline_access)拿可续期 refresh_token。
     // authLoginHTTP 会完整处理 登录/邮箱OTP/add-phone(smsBroker)/选工作区 → 产出含 rt 的 codex auth 文件。
     // rt 依赖手机验证(接码有成本)，失败仅记录、不影响已拿到的网页 token 结果。
@@ -96,7 +110,7 @@ async function main() {
             emit({type: "progress", stage: "rt", message: "走 codex OAuth 获取 refresh_token(重新登录→add-phone 接码) ..."});
             // 关键:不复用注册后的 client——它带登录态，authorize 会跳 /choose-an-account 死路(authLoginHTTP 不处理该页)。
             // 新建干净 client(无 session)走正常登录路径(/log-in→密码→邮箱OTP→add-phone→换 rt)，与 worker-rt 一致。
-            const rtClient = new OpenAIClient({email, password, deviceProfile: generateRandomDeviceProfile(), manualMode: false, smsBroker});
+            const rtClient = new OpenAIClient({email, password, totpSecret, deviceProfile: generateRandomDeviceProfile(), manualMode: false, smsBroker});
             const rtResult = await rtClient.authLoginHTTP();
             rtFile = rtResult.authFile || "";
             const rt = (rtClient as any).lastSavedAuthRecord?.refresh_token || "";
@@ -137,7 +151,7 @@ async function main() {
         plan = payload?.["https://api.openai.com/auth"]?.chatgpt_plan_type ?? "";
     } catch { /* ignore */ }
 
-    emit({type: "result", status: "success", email: client.email, password, token, authFile, rtFile, chatOk, plan, phone: smsBroker?.boundPhone || "", card: smsBroker?.boundCard || ""});
+    emit({type: "result", status: "success", email: client.email, password, gptPassword: password, totpSecret, mfaStatus, token, authFile, rtFile, chatOk, plan, phone: smsBroker?.boundPhone || "", card: smsBroker?.boundCard || ""});
 }
 
 main()

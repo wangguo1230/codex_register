@@ -12,6 +12,7 @@ interface FindVerificationMailOptions<T> {
     targetEmail?: string;
     candidateMatcher?: (mail: T) => boolean;
     rememberLastCode?: boolean;
+    excludeCode?: string;
 }
 
 const lastVerificationCodeByEmail = new Map<string, string>();
@@ -40,7 +41,12 @@ function normalizeTextForCodeMatching(text: string): string {
 
 function normalizeSixDigitCode(value: string | undefined): string {
     const digitsOnly = String(value ?? "").replace(/\D/g, "");
-    return digitsOnly.length === 6 ? digitsOnly : "";
+    if (digitsOnly.length !== 6) return "";
+    // 邮件日期 202608 / 202614 都会混进来，年份开头一律不当验证码
+    const y = Number(digitsOnly.slice(0, 4));
+    if (y >= 2020 && y <= 2035) return "";
+    if (digitsOnly === "000000" || /^0{4,}/.test(digitsOnly)) return "";
+    return digitsOnly;
 }
 
 function extractVerificationCode(text: string): string {
@@ -62,9 +68,11 @@ function extractVerificationCode(text: string): string {
         }
     }
 
-    const directMatch = raw.match(/\b(\d{6})\b/);
-    if (directMatch?.[1]) {
-        return directMatch[1];
+    // 全部 6 位数字都过年份过滤；旧逻辑直接 return 第一个 \d{6}，会把 202608/202613 当验证码
+    const tokens = raw.match(/\b\d{6}\b/g) || [];
+    for (const token of tokens) {
+        const code = normalizeSixDigitCode(token);
+        if (code) return code;
     }
 
     return normalizeSixDigitCode(
@@ -120,6 +128,9 @@ export function findLatestVerificationMail<T extends VerificationMailCandidate>(
         }
 
         if (previousCode && verificationCode === previousCode) {
+            continue;
+        }
+        if (options.excludeCode && verificationCode === String(options.excludeCode)) {
             continue;
         }
 

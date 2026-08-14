@@ -1,0 +1,386 @@
+// @ts-nocheck
+/**
+ * Gmail 老号安全整备：拆掉卖家找回入口，再换钥匙。
+ * 顺序：删恢复手机 → 删辅助邮箱 → 换 TOTP → 改密 → 登出其它设备 → 开 IMAP。
+ */
+import {mkdirSync} from "node:fs";
+import path from "node:path";
+import {ensureGoogleLoggedIn, googleReauthPassword} from "./google-auth.js";
+import {change2faOnPage, changePasswordOnPage} from "./google-manage.js";
+import {enableGmailFetch} from "./google-imap.js";
+
+const RECOVERY_EMAIL_URLS = [
+    "https://myaccount.google.com/recovery/email?hl=en",
+    "https://myaccount.google.com/signinoptions/rescueemail?hl=en",
+];
+const RECOVERY_PHONE_URLS = [
+    "https://myaccount.google.com/recovery/phone?hl=en",
+    "https://myaccount.google.com/signinoptions/rescuephone?hl=en",
+];
+const DEVICE_URLS = [
+    "https://myaccount.google.com/device-activity?hl=en",
+    "https://gds.google.com/web/home?hl=en",
+];
+
+const REMOVE_WORDS = [
+    "Remove", "Delete", "删除", "移除", "Remove phone", "Remove email",
+    "Delete phone", "Delete email", "Hapus", "Remover", "Supprimer", "Quitar",
+];
+const CONFIRM_WORDS = [
+    "Remove", "Delete", "Confirm", "Yes", "Continue", "OK",
+    "删除", "移除", "确认", "确定", "继续", "是",
+];
+const SIGNOUT_WORDS = [
+    "Sign out", "Sign out of all other devices", "Sign out of all devices",
+    "登出", "退出", "退出其它设备", "退出其他设备", "Sign out of other sessions",
+];
+
+async function dump(page, name, log) {
+    try {
+        const dir = path.resolve(process.cwd(), "captures", "screenshots");
+        mkdirSync(dir, {recursive: true});
+        await page.screenshot({path: path.join(dir, `${name}_${Date.now()}.png`)});
+    } catch { /* ignore */ }
+}
+
+async function clickAny(page, keywords, timeout = 2500) {
+    for (const kw of keywords) {
+        const btn = page.getByRole("button", {name: new RegExp(`^\\s*${kw}\\s*$`, "i")}).first();
+        if (await btn.isVisible({timeout: 700}).catch(() => false)) {
+            await btn.click().catch(() => {});
+            return kw;
+        }
+        const loc = page.locator(`button:has-text("${kw}"), [role="button"]:has-text("${kw}"), a:has-text("${kw}")`).first();
+        if (await loc.isVisible({timeout: 700}).catch(() => false)) {
+            await loc.click().catch(() => {});
+            return kw;
+        }
+    }
+    return "";
+}
+
+async function bodyHas(page, re) {
+    const t = await page.innerText("body").catch(() => "");
+    return re.test(String(t || ""));
+}
+
+async function gotoReauth(page, url, cred, log) {
+    try {
+        await page.goto(url, {waitUntil: "domcontentloaded", timeout: 60000});
+    } catch { /* ignore */ }
+    await page.waitForTimeout(2500);
+    await googleReauthPassword(page, {
+        password: cred.password, totpSecret: cred.totpSecret, log,
+    });
+    await page.waitForTimeout(2500);
+}
+
+async function alreadyGone(page, kind) {
+    const hasCard = await page.locator(kind === "email" ? "text=/Your recovery email/i" : "text=/Your recovery phone/i")
+        .first().isVisible({timeout: 1200}).catch(() => false);
+    if (hasCard) return false;
+    const add = page.getByRole("button", {
+        name: kind === "email" ? /add( a)? recovery email/i : /add recovery phone/i,
+    }).or(page.getByText(kind === "email" ? /Add( a)? recovery email/i : /Add recovery phone/i));
+    return add.first().isVisible({timeout: 1500}).catch(() => false);
+}
+
+/** 删除恢复手机号。没有则 ok=true。 */
+export async function removeRecoveryPhone(page, cred, log = () => {}) {
+    log("[整备] 删除恢复手机号");
+    for (const url of RECOVERY_PHONE_URLS) {
+        await gotoReauth(page, url, cred, log);
+        if (await alreadyGone(page, "phone")) {
+            log("[整备] 本来就没有恢复手机号");
+            return {ok: true, skipped: true};
+        }
+        const hit = await clickAny(page, REMOVE_WORDS, 3000);
+        if (!hit) continue;
+        await page.waitForTimeout(1500);
+        await clickAny(page, CONFIRM_WORDS, 2500);
+        await page.waitForTimeout(2500);
+        if (await alreadyGone(page, "phone") || await bodyHas(page, /removed|deleted|已删除|已移除/i)) {
+            log("[整备] 恢复手机号已删除");
+            return {ok: true};
+        }
+    }
+    await dump(page, "secure_phone", log);
+    log("[整备] 未找到恢复手机号删除入口(可能本来就没有)");
+    return {ok: true, skipped: true};
+}
+
+/** 删除辅助/恢复邮箱。没有则 ok=true。 */
+export async function removeRecoveryEmail(page, cred, log = () => {}) {
+    log("[整备] 删除辅助邮箱");
+    for (const url of RECOVERY_EMAIL_URLS) {
+        await gotoReauth(page, url, cred, log);
+        if (await alreadyGone(page, "email")) {
+            log("[整备] 本来就没有辅助邮箱");
+            return {ok: true, skipped: true};
+        }
+        // 新版 UI：卡片右侧是铅笔 + 垃圾桶图标，没有 “Delete” 文案
+        const trash = page.locator(
+            '[aria-label*="Delete" i], [aria-label*="Remove" i], [aria-label*="删除"], [data-tooltip*="Delete" i], [data-tooltip*="Remove" i]',
+        ).first();
+        if (await trash.isVisible({timeout: 2000}).catch(() => false)) {
+            await trash.click();
+        } else {
+            const card = page.locator("text=/Your recovery email/i").locator("xpath=ancestor::*[.//button][1]");
+            const iconBtns = card.locator("button");
+            const n = await iconBtns.count().catch(() => 0);
+            if (n >= 2) await iconBtns.nth(n - 1).click().catch(() => {});
+            else if (!await clickAny(page, REMOVE_WORDS, 3000)) {
+                const edit = await clickAny(page, ["Edit", "编辑", "Change", "更改"], 2000);
+                if (edit) {
+                    await page.waitForTimeout(1500);
+                    await clickAny(page, REMOVE_WORDS, 2500);
+                }
+            }
+        }
+        await page.waitForTimeout(1200);
+        await clickAny(page, CONFIRM_WORDS, 2500);
+        await page.waitForTimeout(2500);
+        if (await alreadyGone(page, "email") || await bodyHas(page, /removed|deleted|已删除|已移除/i)) {
+            log("[整备] 辅助邮箱已删除");
+            return {ok: true};
+        }
+    }
+    await dump(page, "secure_email", log);
+    log("[整备] 未能确认辅助邮箱已删除");
+    return {ok: false, error: "未能删除辅助邮箱"};
+}
+
+/** 登出其它设备，保留当前比特窗口。 */
+export async function signOutOtherDevices(page, cred, log = () => {}) {
+    log("[整备] 登出其它设备");
+    let signed = 0;
+    for (const url of DEVICE_URLS) {
+        await gotoReauth(page, url, cred, log);
+        const all = await clickAny(page, [
+            "Sign out of all other devices",
+            "Sign out of all devices",
+            "退出其它设备",
+            "退出其他设备",
+            "Sign out of other sessions",
+        ], 3000);
+        if (all) {
+            await page.waitForTimeout(1000);
+            await clickAny(page, CONFIRM_WORDS.concat(["Sign out", "登出"]), 2500);
+            await page.waitForTimeout(2000);
+            log("[整备] 已点退出其它设备");
+            return {ok: true, signed: -1};
+        }
+
+        // 逐个设备卡片点 Sign out（跳过 This device / 当前设备）
+        const buttons = page.locator('button, [role="button"], a');
+        const n = Math.min(await buttons.count().catch(() => 0), 40);
+        for (let i = 0; i < n; i++) {
+            const b = buttons.nth(i);
+            if (!await b.isVisible().catch(() => false)) continue;
+            const txt = ((await b.innerText().catch(() => "")) || "").replace(/\s+/g, " ").trim();
+            if (!/sign out|登出|退出/i.test(txt)) continue;
+            if (/this device|当前设备|this computer/i.test(txt)) continue;
+            const parent = await b.evaluate((el) => (el.closest("li,article,section,div") || el).textContent || "").catch(() => "");
+            if (/this device|当前设备|you're using|正在使用/i.test(parent) && /this device|当前/i.test(parent)) continue;
+            await b.click().catch(() => {});
+            await page.waitForTimeout(800);
+            await clickAny(page, CONFIRM_WORDS.concat(["Sign out", "登出"]), 1500);
+            signed += 1;
+            await page.waitForTimeout(800);
+        }
+        if (signed) {
+            log(`[整备] 已登出 ${signed} 个其它设备`);
+            return {ok: true, signed};
+        }
+    }
+    await dump(page, "secure_devices", log);
+    log("[整备] 未见其它设备可登出(可能只有当前窗口)");
+    return {ok: true, signed: 0, skipped: true};
+}
+
+/**
+ * 完整整备。cred 会被就地更新为新密码 / 新 TOTP。
+ */
+export async function hardenGoogleAccountOnPage(page, cred, log = () => {}, onCheckpoint = async () => {}) {
+    const out = {
+        ok: true,
+        password: "",
+        totpSecret: "",
+        recoveryCleared: false,
+        phoneCleared: false,
+        sessionsSignedOut: 0,
+        devicesDone: false,
+        passwordChanged: false,
+        imapPassword: "",
+        missing: [],
+        errors: [],
+    };
+
+    const hadRecovery = !!(cred.recoveryEmail || "").trim();
+
+    log("[邮箱管理 1/5] 更换 Google 2FA");
+    const t = await change2faOnPage(page, {
+        email: cred.email, password: cred.password,
+        totpSecret: cred.totpSecret, recoveryEmail: cred.recoveryEmail, log,
+    }).catch((e) => ({ok: false, error: String(e?.message || e)}));
+    if (t?.ok && t.totpSecret) {
+        cred.totpSecret = t.totpSecret;
+        out.totpSecret = t.totpSecret;
+        log("[邮箱管理] 新 Google TOTP 已生效");
+        await onCheckpoint({totpSecret: t.totpSecret});
+    } else {
+        out.errors.push(t?.error || "换 2FA 失败");
+        log(`[邮箱管理] 换 2FA 失败: ${t?.error || ""}`);
+    }
+
+    log("[邮箱管理 2/5] 修改 Google 密码");
+    const pw = await changePasswordOnPage(page, {
+        email: cred.email, password: cred.password,
+        totpSecret: cred.totpSecret, recoveryEmail: cred.recoveryEmail, log,
+    }).catch((e) => ({ok: false, error: String(e?.message || e)}));
+    if (pw?.ok && pw.newPassword) {
+        cred.password = pw.newPassword;
+        out.password = pw.newPassword;
+        out.passwordChanged = true;
+        log("[邮箱管理] 新 Google 密码已生效");
+        await onCheckpoint({password: pw.newPassword, passwordChanged: true});
+    } else {
+        out.errors.push(pw?.detail || pw?.error || "改密失败");
+        log(`[邮箱管理] 改密失败: ${pw?.detail || pw?.error || ""}`);
+    }
+
+    if (process.env.REG_SKIP_DEVICES === "1") {
+        log("[邮箱管理 3/5] 跳过踢设备");
+    } else {
+        log("[邮箱管理 3/5] 踢出其它设备");
+        const sess = await signOutOtherDevices(page, cred, log).catch((e) => ({ok: false, error: String(e?.message || e)}));
+        out.sessionsSignedOut = sess?.signed || 0;
+        out.devicesDone = !!sess?.ok;
+        if (!sess?.ok) out.errors.push(sess?.error || "登出设备失败");
+    }
+
+    log("[邮箱管理 4/5] 删除辅助邮箱/恢复手机");
+    const phone = await removeRecoveryPhone(page, cred, log).catch((e) => ({ok: false, error: String(e?.message || e)}));
+    out.phoneCleared = !!phone?.ok;
+    if (!phone?.ok) out.errors.push(phone?.error || "删手机号失败");
+
+    const rec = await removeRecoveryEmail(page, cred, log).catch((e) => ({ok: false, error: String(e?.message || e)}));
+    out.recoveryCleared = !!(rec?.ok && !rec?.skipped) || (!hadRecovery && !!rec?.ok);
+    if (rec?.skipped && !hadRecovery) out.recoveryCleared = true;
+    if (out.recoveryCleared) cred.recoveryEmail = "";
+    if (!rec?.ok) out.errors.push(rec?.error || "删辅助邮箱失败");
+
+    log("[邮箱管理 5/5] 开通 IMAP");
+    try {
+        const fetchR = await enableGmailFetch(page, {
+            email: cred.email, password: cred.password, totpSecret: cred.totpSecret, log,
+        });
+        if (fetchR?.ok && fetchR.imapPassword) {
+            out.imapPassword = fetchR.imapPassword;
+            await onCheckpoint({imapPassword: fetchR.imapPassword});
+        } else out.errors.push(fetchR?.error || "IMAP 开通失败");
+    } catch (e) {
+        out.errors.push(String(e?.message || e));
+    }
+
+    const missing = [];
+    if (!cred.totpSecret) missing.push("2FA");
+    if (!out.passwordChanged) missing.push("改密");
+    if (!out.recoveryCleared && hadRecovery) missing.push("辅助邮箱");
+    if (!out.imapPassword) missing.push("IMAP");
+    out.ok = missing.length === 0;
+    out.missing = missing;
+    log(`[邮箱管理] ${out.ok ? "完成" : "未完成: " + missing.join("/")}${out.errors.length ? " · " + out.errors.join("; ").slice(0, 160) : ""}`);
+    return out;
+}
+
+/** 开一个比特指纹窗口（可绑代理），用完关闭并删除。1 代理对应 1 指纹。 */
+export async function withGoogleBitSession({proxyUrl = "", name = "gmail", remark = "gmail-manage", log = () => {}, signal} = {}, fn) {
+    const {bitHealth, createBitWindow, openBitWindow, closeBitWindow, deleteBitWindow, trackBitWindow, untrackBitWindow} = await import("../bitbrowser.js");
+    const {chromium} = await import("playwright-core");
+    const {pickLiveMailProxy, maskProxyUrl} = await import("./proxy-pool.js");
+    const {isMailboxJobStopped} = await import("./mailbox-job-stop.js");
+    const stopped = () => !!(signal?.aborted || isMailboxJobStopped());
+    if (stopped()) throw new Error("已停止");
+    if (!await bitHealth()) throw new Error("比特浏览器未启动(127.0.0.1:54345)");
+    let liveProxy = proxyUrl || "";
+    let chainClose = () => {};
+    let bitProxy = "";
+    let extractIp = true;
+    let timeZone = "";
+    if (liveProxy) {
+        if (stopped()) throw new Error("已停止");
+        log("[网络] 先测代理出口 / Google");
+        const picked = await pickLiveMailProxy(liveProxy, {tries: 3, log: (m) => log(`[网络] ${m}`)});
+        if (!picked.ok) throw new Error(`代理不通，先别登 Google: ${picked.probe.reason || "未知"}`);
+        liveProxy = picked.url;
+        log(`[网络] 通 出口 ${picked.probe.ip} Google=${picked.probe.google} ${picked.probe.ms}ms ${maskProxyUrl(liveProxy)}`);
+        const {getMailProxyJump} = await import("./proxy-pool.js");
+        const jump = getMailProxyJump();
+        if (jump) {
+            const {wrapExitThroughJump, timezoneFromExitUrl} = await import("./proxy-chain.js");
+            const wrapped = await wrapExitThroughJump(liveProxy, jump);
+            chainClose = wrapped.close;
+            bitProxy = wrapped.url;
+            extractIp = false;
+            timeZone = timezoneFromExitUrl(liveProxy);
+            log(`[网络] 链式 跳板→${wrapped.destHost}:${wrapped.destPort} 本机转发 :${wrapped.localPort}${timeZone ? " tz=" + timeZone : ""}`);
+        } else {
+            bitProxy = liveProxy;
+        }
+    }
+    let bitId = "";
+    const dropWindow = () => { if (bitId) closeBitWindow(bitId); };
+    const onAbort = () => dropWindow();
+    const stopWatch = setInterval(() => { if (stopped()) dropWindow(); }, 1500);
+    try {
+        if (stopped()) throw new Error("已停止");
+        bitId = await createBitWindow({
+            proxy: bitProxy || "",
+            name: String(name || "gmail").slice(0, 32),
+            remark: remark || "gmail-manage",
+            timeZone,
+        });
+        log(`[指纹] 比特窗口 ${bitId}${liveProxy ? " ← " + String(liveProxy).replace(/:[^:@/]+@/, ":***@") : "（无代理）"}${bitProxy && bitProxy !== liveProxy ? " 经跳板" : ""}`);
+        trackBitWindow(bitId);
+        signal?.addEventListener("abort", onAbort);
+        const {ws} = await openBitWindow(bitId, {extractIp});
+        if (stopped()) throw new Error("已停止");
+        const browser = await chromium.connectOverCDP(ws);
+        const ctx = browser.contexts()[0] || await browser.newContext();
+        const page = ctx.pages()[0] || await ctx.newPage();
+        page.setDefaultTimeout(30000);
+        try {
+            return await fn(page);
+        } finally {
+            untrackBitWindow(bitId);
+        }
+    } finally {
+        clearInterval(stopWatch);
+        try { signal?.removeEventListener("abort", onAbort); } catch { /* */ }
+        if (bitId) {
+            await closeBitWindow(bitId);
+            await deleteBitWindow(bitId);
+        }
+        try { chainClose(); } catch { /* */ }
+    }
+}
+
+/** 开比特窗口跑完整整备（邮箱面板 / 独立脚本用）。 */
+export async function runGoogleHardenWithBit(acc, {proxyUrl = "", log = () => {}, onCheckpoint = async () => {}, signal} = {}) {
+    const {straightenGoogleCreds} = await import("../mfa.js");
+    const straight = straightenGoogleCreds(acc);
+    const cred = {
+        email: acc.email,
+        password: acc.password || "",
+        totpSecret: straight.totpSecret,
+        recoveryEmail: straight.recoveryEmail,
+    };
+    if (straight.swapped) log("  导入字段对调：totp/辅助邮箱已纠正");
+    const short = String(acc.email || "").split("@")[0].slice(0, 12);
+    return withGoogleBitSession({proxyUrl, name: `harden-${short}`, remark: "gmail-harden", log, signal}, async (page) => {
+        const ok = await ensureGoogleLoggedIn(page, "https://myaccount.google.com/security?hl=en", {...cred, requireInbox: false}, log);
+        if (!ok) return {ok: false, error: "Gmail 登录失败", errors: ["登录失败"]};
+        return await hardenGoogleAccountOnPage(page, cred, log, onCheckpoint);
+    });
+}

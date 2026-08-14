@@ -7,7 +7,8 @@ import {appConfig} from "../src/config.js";
 
 const EVENT_PREFIX = "@@EVENT@@";
 const email = (process.env.REG_EMAIL || "").trim();
-const password = appConfig.defaultPassword.trim();
+const password = (process.env.GPT_PASSWORD || "").trim() || appConfig.defaultPassword.trim();
+const totpSecret = (process.env.TOTP_SECRET || "").trim();
 
 function emit(event) {
     process.stdout.write(EVENT_PREFIX + JSON.stringify(event) + "\n");
@@ -19,23 +20,35 @@ async function main() {
         process.exit(1);
         return;
     }
-    emit({type: "progress", stage: "rt", message: `开始为 ${email} 获取 refresh_token(无接码模式)…`});
+    emit({type: "progress", stage: "rt", message: `开始为 ${email} 获取 refresh_token(无接码${totpSecret ? "+2FA会话" : ""})…`});
 
     const deviceProfile = generateRandomDeviceProfile();
-    // 不传 smsBroker → add-phone 不会被处理,Pro 号不触发则无影响
-    const client = new OpenAIClient({email, password, deviceProfile, manualMode: false});
+    const client = new OpenAIClient({email, password, totpSecret, deviceProfile, manualMode: false});
 
-    const result = await client.authLoginHTTP();
-    const rec = client.lastSavedAuthRecord || {};
-    const rt = rec.refresh_token || "";
-    if (!rt) throw new Error("authLoginHTTP 完成但未解析到 refresh_token");
-    emit({type: "progress", stage: "rt", message: `✅ 拿到 refresh_token: ${rt.slice(0, 28)}...  codex文件: ${result.authFile}`});
+    let authFile = "";
+    let rt = "";
+    emit({type: "progress", stage: "rt", message: totpSecret ? "已绑 2FA，先网页登录再会话换 rt" : "先 ChatGPT 登录再会话换 rt（不接码）"});
+    try {
+        await client.authLoginChatGPTHTTP();
+        const sess = await client.authGetRefreshTokenViaSession(email);
+        const rec = client.lastSavedAuthRecord || {};
+        rt = rec.refresh_token || sess.refresh_token || "";
+        authFile = sess.authFile || "";
+    } catch (e) {
+        emit({type: "progress", stage: "rt", message: `会话换 rt 失败(${String(e?.message || e).slice(0, 80)})，回退 OAuth`});
+        const result = await client.authLoginHTTP();
+        const rec = client.lastSavedAuthRecord || {};
+        rt = rec.refresh_token || "";
+        authFile = result.authFile || "";
+    }
+    if (!rt) throw new Error("未解析到 refresh_token");
+    emit({type: "progress", stage: "rt", message: `✅ 拿到 refresh_token: ${rt.slice(0, 28)}...  codex文件: ${authFile}`});
 
     emit({
         type: "result",
         status: "success",
         email,
-        rtFile: result.authFile || "",
+        rtFile: authFile,
         rt,
         phone: "",
         card: "",
