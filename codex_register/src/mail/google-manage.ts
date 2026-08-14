@@ -379,21 +379,65 @@ async function dismissAccountFlyout(page) {
     }
 }
 
+async function isAccountPickerDialog(page) {
+    const dlg = page.locator('[role="dialog"], [role="alertdialog"]').first();
+    if (!await dlg.isVisible({timeout: 150}).catch(() => false)) return false;
+    const t = String(await dlg.innerText().catch(() => ""));
+    return /Manage your Google Account|Add account|Sign out|管理您的 Google 账号|添加账号|退出账号/i.test(t);
+}
+
 async function waitAuthenticatorSetup(page, ms = 9000) {
     const deadline = Date.now() + ms;
     while (Date.now() < deadline) {
-        if (await page.locator('[role="dialog"], [role="alertdialog"]').first().isVisible({timeout: 180}).catch(() => false)) return "dialog";
+        if (await isAccountPickerDialog(page)) {
+            await dismissAccountFlyout(page);
+            await page.waitForTimeout(250);
+            continue;
+        }
         if (await page.locator("canvas, img[alt*='QR' i], img[src*='qr']").first().isVisible({timeout: 180}).catch(() => false)) return "qr";
         const t = String(await page.innerText("body").catch(() => ""));
-        if (/otpauth:\/\//i.test(t) || /can't scan|cannot scan|无法扫描|secret key|setup key|密钥/i.test(t)) return "secret";
+        if (/otpauth:\/\//i.test(t) || /secret key|setup key|密钥|can't scan it|cannot scan|无法扫描/i.test(t)) return "secret";
+        const dlg = page.locator('[role="dialog"], [role="alertdialog"]').first();
+        if (await dlg.isVisible({timeout: 180}).catch(() => false)) {
+            const dt = String(await dlg.innerText().catch(() => ""));
+            if (/change authenticator|replace|next|continue|更改|替换|下一步/i.test(dt) && !/Manage your Google Account/i.test(dt)) return "confirm";
+        }
         await page.waitForTimeout(350);
     }
     return "";
 }
 
+async function clickDialogNext(page, log) {
+    const dlg = page.locator('[role="dialog"], [role="alertdialog"]').first();
+    if (!await dlg.isVisible({timeout: 400}).catch(() => false)) return false;
+    const btn = dlg.getByRole("button", {name: /^(next|continue|replace|change|ok|下一步|继续|更换|确定)$/i}).last();
+    if (await btn.isVisible({timeout: 600}).catch(() => false)) {
+        await btn.click({force: true}).catch(() => btn.click());
+        log("[2FA] 点了确认框 Next");
+        return true;
+    }
+    const any = dlg.locator("button").last();
+    if (await any.isVisible({timeout: 400}).catch(() => false)) {
+        const txt = String(await any.innerText().catch(() => ""));
+        if (!/cancel|close|取消|关闭/i.test(txt)) {
+            await any.click({force: true}).catch(() => any.click());
+            log(`[2FA] 点了确认框按钮 ${txt.slice(0, 30)}`);
+            return true;
+        }
+    }
+    return false;
+}
+
 /** 不看文案：先关账号浮层，再点卡片里垃圾桶旁边那条业务链接。不要点当前页自己的 /authenticator。 */
 async function clickAuthenticatorChangeByDom(page, log) {
     await dismissAccountFlyout(page);
+    const named = page.getByRole("link", {name: /change authenticator|set up authenticator|更改身份验证|设置身份验证/i}).first();
+    if (await named.isVisible({timeout: 500}).catch(() => false)) {
+        await named.scrollIntoViewIfNeeded().catch(() => {});
+        await named.click({force: true}).catch(() => named.click());
+        log("[2FA] 点了 Change authenticator app");
+        return true;
+    }
     const marked = await page.evaluate(() => {
         const bad = /play\.google|apps\.apple|support\.google|policies\.google|\/TOS|privacy/i;
         const vis = (el) => {
@@ -435,7 +479,23 @@ async function clickAuthenticatorChangeByDom(page, log) {
 }
 
 async function clickCantScanByDom(page, log) {
+    const named = page.getByRole("button", {name: /can.?t scan|cannot scan|无法扫描/i}).first();
+    const namedLink = page.getByRole("link", {name: /can.?t scan|cannot scan|无法扫描/i}).first();
+    if (await named.isVisible({timeout: 400}).catch(() => false)) {
+        await named.click({force: true}).catch(() => named.click());
+        log("[2FA] 点了 Can't scan 按钮");
+        return true;
+    }
+    if (await namedLink.isVisible({timeout: 300}).catch(() => false)) {
+        await namedLink.click({force: true}).catch(() => namedLink.click());
+        log("[2FA] 点了 Can't scan 链接");
+        return true;
+    }
     const dialog = page.locator('[role="dialog"], [role="alertdialog"]').first();
+    if (await isAccountPickerDialog(page)) {
+        await dismissAccountFlyout(page);
+        return false;
+    }
     const scope = await dialog.isVisible({timeout: 400}).catch(() => false) ? dialog : page;
     const links = scope.locator("a[href], button, [role='link'], [role='button']");
     const n = await links.count().catch(() => 0);
@@ -577,7 +637,12 @@ export async function change2faOnPage(page, {
         }
         if (!clickedAction) break;
         setup = await waitAuthenticatorSetup(page, 8000);
-        if (!setup) log("[2FA] 点了更改但仍在总览，再点一次");
+        if (setup === "confirm") {
+            await clickDialogNext(page, log);
+            setup = await waitAuthenticatorSetup(page, 8000);
+        }
+        if (!setup || setup === "confirm") log("[2FA] 点了更改但仍在总览，再点一次");
+        if (setup === "confirm") setup = "";
     }
 
     if (!setup && !(await clickAuthenticatorChangeByDom(page, log))) {
