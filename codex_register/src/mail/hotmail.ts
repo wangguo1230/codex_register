@@ -461,7 +461,11 @@ async function listFolderMessagesViaImap(account, folderId) {
         },
         logger: false,
         emitLogs: false,
+        connectionTimeout: 12_000,
+        greetingTimeout: 10_000,
+        socketTimeout: 15_000,
     });
+    client.on("error", () => {});
 
     const messages = [];
     try {

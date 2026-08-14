@@ -117,7 +117,12 @@ async function tryImapOtp(cred, {minTimestampMs = 0, excludeCode = ""} = {}) {
         secure: true,
         auth: {user: cred.email, pass: cred.imapPassword || cred.password},
         logger: false,
+        emitLogs: false,
+        connectionTimeout: 12_000,
+        greetingTimeout: 10_000,
+        socketTimeout: 15_000,
     });
+    client.on("error", () => {});
     try {
         await client.connect();
         const lock = await client.getMailboxLock("INBOX");

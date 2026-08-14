@@ -124,18 +124,23 @@ export async function createGmailAppPassword(page, {
     return secret;
 }
 
-export async function testGmailImap(email, imapPassword, {proxy = ""} = {}) {
-    const {getMailProxyJump} = await import("./proxy-pool.js");
-    const jump = String(proxy || getMailProxyJump() || "").trim();
-    const client = new ImapFlow({
+function attachImapErrorSink(client) {
+    // ImapFlow 的 TLS 错误走 EventEmitter；不 listen 会 Unhandled 'error' 把整进程打死。
+    client.on("error", () => {});
+    return client;
+}
+
+async function probeImapOnce(email, imapPassword, via = "") {
+    const client = attachImapErrorSink(new ImapFlow({
         host: "imap.gmail.com", port: 993, secure: true,
         auth: {user: email, pass: imapPassword},
         logger: false,
+        emitLogs: false,
         connectionTimeout: 12_000,
         greetingTimeout: 10_000,
         socketTimeout: 15_000,
-        ...(jump ? {proxy: jump} : {}),
-    });
+        ...(via ? {proxy: via} : {}),
+    }));
     try {
         await client.connect();
         const lock = await client.getMailboxLock("INBOX");
@@ -144,10 +149,23 @@ export async function testGmailImap(email, imapPassword, {proxy = ""} = {}) {
         await client.logout().catch(() => {});
         return {ok: true, messages: status?.messages ?? 0};
     } catch (e) {
-        try { await client.close(); } catch { /* */ }
+        try { client.close(); } catch { /* */ }
         try { await client.logout(); } catch { /* */ }
         return {ok: false, error: String(e?.message || e).replace(/\s+/g, " ").slice(0, 160)};
     }
+}
+
+export async function testGmailImap(email, imapPassword, {proxy = ""} = {}) {
+    const {getMailProxyJump} = await import("./proxy-pool.js");
+    const jump = String(proxy || getMailProxyJump() || "").trim();
+    const direct = await probeImapOnce(email, imapPassword, "");
+    if (direct.ok) return direct;
+    if (!jump) return direct;
+    if (/ERR_SSL|bad record mac|decryption failed|ECONNREFUSED/i.test(direct.error || "")) {
+        // 直连 TLS 已经烂了，再套跳板更容易坏 MAC；应用密码照样保留。
+        return direct;
+    }
+    return probeImapOnce(email, imapPassword, jump);
 }
 
 /** 开 IMAP + 生成应用专用密码，并立刻用 IMAP 探活。 */

@@ -1,6 +1,20 @@
 // @ts-nocheck
 // 后端服务：REST(导入/控制/下载) + SSE(实时日志/状态/统计) + 静态托管前端
 import express from "express";
+
+function isImapTlsCrash(err) {
+    const s = `${err?.code || ""} ${err?.reason || ""} ${err?.message || ""} ${err?.stack || ""}`;
+    return /ERR_SSL_DECRYPTION_FAILED_OR_BAD_RECORD_MAC|bad record mac|tls_get_more_records|ImapFlow/i.test(s)
+        && /SSL|TLS|imap/i.test(s);
+}
+process.on("uncaughtException", (err) => {
+    if (isImapTlsCrash(err)) {
+        console.warn("[imap] TLS 记录损坏，已忽略（不退出进程）:", err?.message || err);
+        return;
+    }
+    console.error(err);
+    process.exit(1);
+});
 import cors from "cors";
 import {existsSync, readFileSync, writeFileSync, mkdtempSync, rmSync} from "node:fs";
 import os from "node:os";
