@@ -15,7 +15,7 @@ async function bitPost(pathname, body) {
     if (!j || j.success !== true) {
         const msg = JSON.stringify(j).slice(0, 200);
         if (/频繁|频率|too many|rate/i.test(msg)) markListBackoff(60_000);
-        if (/login out|未登录|please login/i.test(msg)) markBitLoggedOut(true);
+        if (/login out|未登录|please login|token 失效|检查登录状态/i.test(msg)) markBitLoggedOut(true);
         throw new Error(`比特API ${pathname} 失败: ${msg}`);
     }
     if (pathname === "/browser/list" || pathname === "/browser/update") markBitLoggedOut(false);
