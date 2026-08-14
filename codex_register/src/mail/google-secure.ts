@@ -354,10 +354,12 @@ export async function hardenGoogleAccountOnPage(page, cred, log = () => {}, onCh
     if (!out.passwordChanged) missing.push("改密");
     if (!out.recoveryCleared && hadRecovery) missing.push("辅助邮箱");
     if (!out.imapPassword) missing.push("IMAP");
-    out.ok = missing.length === 0 && !out.errors.length;
     out.missing = missing;
-    const errBrief = out.errors.map((e) => String(e).split("\n")[0].slice(0, 80)).join("；");
-    log(`[邮箱管理] ${out.ok ? "完成" : "未完成: " + (missing.join("/") || "部分步骤失败")}${errBrief ? " · " + errBrief : ""}`);
+    // 能用就算成功：我们的密码 + 应用专用密码。换2FA/踢设备失败记缺口，不把整单打成 0 成功。
+    out.ok = !missing.includes("改密") && !missing.includes("IMAP");
+    const errBrief = out.errors.filter((e) => e !== "窗口被关").map((e) => String(e).split("\n")[0].slice(0, 80)).join("；");
+    const title = out.ok ? (missing.length ? "可用" : "完成") : ("未完成: " + (missing.join("/") || "部分步骤失败"));
+    log(`[邮箱管理] ${title}${errBrief ? " · " + errBrief : ""}`);
     return out;
 }
 
