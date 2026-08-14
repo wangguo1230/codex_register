@@ -282,20 +282,59 @@ async function waitIdentifierUiReady(page, write, ms = 15000) {
     return false;
 }
 
-async function waitLeftIdentifier(page, pwdSoon) {
+const NET_DROP_RE = /ERR_CONNECTION_CLOSED|ERR_CONNECTION_RESET|ERR_CONNECTION_ABORTED|ERR_CONNECTION_REFUSED|ERR_EMPTY_RESPONSE|ERR_TIMED_OUT|ERR_TUNNEL|ERR_SSL|ERR_PROXY|ERR_SOCKET_NOT_CONNECTED|ERR_NETWORK_CHANGED|ERR_INTERNET_DISCONNECTED/i;
+
+function attachGoogleNetWatch(page) {
+    const fails = [];
+    const onFail = (req) => {
+        const err = String(req.failure()?.errorText || "");
+        if (!NET_DROP_RE.test(err)) return;
+        const url = String(req.url() || "");
+        if (!/accounts\.google\.com|googleapis\.com|gstatic\.com\/accounts|play\.google\.com|batchexecute|identifier|signin/i.test(url)) return;
+        fails.push({url: url.slice(0, 140), err, at: Date.now()});
+    };
+    page.on("requestfailed", onFail);
+    return {
+        recent(ms = 12000) {
+            const cut = Date.now() - ms;
+            return fails.filter((f) => f.at >= cut);
+        },
+        detach() { page.off("requestfailed", onFail); },
+    };
+}
+
+function identifierEntryUrl(page) {
+    let cont = "https://myaccount.google.com/security?hl=en";
+    try {
+        const u = new URL(page.url());
+        cont = u.searchParams.get("continue") || cont;
+    } catch { /* keep default */ }
+    return `https://accounts.google.com/ServiceLogin?hl=en&continue=${encodeURIComponent(cont)}`;
+}
+
+async function hardReloadIdentifier(page, write) {
+    write("  连接被掐，整页重开登录入口");
+    await page.goto(identifierEntryUrl(page), {waitUntil: "domcontentloaded", timeout: 30000}).catch(() => {});
+    await page.waitForTimeout(1200);
+    await waitIdentifierUiReady(page, write, 15000);
+}
+
+async function waitLeftIdentifier(page, pwdSoon, netWatch) {
     // 代理 RTT 常 10s+，原先 20s 会在 Google 还在查邮箱时连点三次 Next。
     for (let w = 0; w < 90; w++) {
         await page.waitForTimeout(500);
         const url = String(page.url());
         const st = loginStep(url);
-        if (st === "password" || st === "totp") return true;
-        if (!/signin\/identifier/i.test(url) && /challenge|rejected|speedbump|signin\/v2|signin\/pwd/i.test(url)) return true;
-        if (await findLoginPasswordBox(page)) return true;
-        if (await totpFieldVisible(page)) return true;
-        if (await pwdSoon.isVisible({timeout: 150}).catch(() => false)) return true;
+        if (st === "password" || st === "totp") return {left: true};
+        if (!/signin\/identifier/i.test(url) && /challenge|rejected|speedbump|signin\/v2|signin\/pwd/i.test(url)) return {left: true};
+        if (await findLoginPasswordBox(page)) return {left: true};
+        if (await totpFieldVisible(page)) return {left: true};
+        if (await pwdSoon.isVisible({timeout: 150}).catch(() => false)) return {left: true};
+        const drops = netWatch?.recent(10000) || [];
+        if (drops.length && w >= 3) return {left: false, netDrop: drops[drops.length - 1]};
         if (w > 8 && await identifierStillLoading(page)) continue;
     }
-    return false;
+    return {left: false};
 }
 
 async function dismissGoogleConsent(page, write) {
@@ -425,6 +464,7 @@ export async function googleLogin(page, emailOrOpts, password = "", totpSecret =
     if (straight.swapped) write("  导入字段对调：totp/辅助邮箱已纠正");
     if (!totp && String(opts.totpSecret || opts.totp_secret || "")) write("  totp 字段不是合法密钥，改走其它验证");
 
+    const netWatch = attachGoogleNetWatch(page);
     try {
         let idleCount = 0;
         let totpAttempts = 0;
@@ -432,9 +472,10 @@ export async function googleLogin(page, emailOrOpts, password = "", totpSecret =
         let emailSubmitted = false;
         let emailNextClicks = 0;
         let identReloaded = false;
+        let identNetReloads = 0;
         let passwordNextClicks = 0;
         let tryAnotherClicks = 0;
-        for (let step = 0; step < 15; step++) {
+        for (let step = 0; step < 20; step++) {
             const err = await checkError(page);
             if (err) {
                 write(`  登录失败: ${err}`);
@@ -527,9 +568,18 @@ export async function googleLogin(page, emailOrOpts, password = "", totpSecret =
                         how = await clickIdentifierNext(page) || "retry";
                     }
                     write(`  邮箱页提交 #${emailNextClicks} via=${how || "?"} nextReady=${await hostNextReady(page, "#identifierNext")}`);
-                    const left = await waitLeftIdentifier(page, pwdSoon);
-                    if (left) await page.waitForTimeout(700);
-                    if (!left && !await totpFieldVisible(page)) {
+                    const wait = await waitLeftIdentifier(page, pwdSoon, netWatch);
+                    if (wait.left) await page.waitForTimeout(700);
+                    if (wait.netDrop && identNetReloads < 3) {
+                        identNetReloads += 1;
+                        emailSubmitted = false;
+                        emailNextClicks = 0;
+                        write(`  邮箱页请求被掐 ${wait.netDrop.err} ${wait.netDrop.url}，重开 ${identNetReloads}/3`);
+                        await page.waitForTimeout(1500);
+                        await hardReloadIdentifier(page, write);
+                        continue;
+                    }
+                    if (!wait.left && !await totpFieldVisible(page)) {
                         write(`  第 ${emailNextClicks} 次提交后仍在邮箱页 url=${String(page.url()).slice(0, 80)}`);
                     }
                     const e2 = await checkError(page);
@@ -917,6 +967,8 @@ export async function googleLogin(page, emailOrOpts, password = "", totpSecret =
     } catch (e) {
         write(`  登录异常: ${e?.message || e}`);
         return false;
+    } finally {
+        netWatch.detach();
     }
 }
 

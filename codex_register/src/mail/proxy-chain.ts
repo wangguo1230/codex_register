@@ -112,6 +112,8 @@ export function rewriteExitToLocal(exitUrl: string, localPort: number) {
 export async function openLocalRelay(jumpRaw: string, destHost: string, destPort: number) {
     const server = net.createServer((client) => {
         connectViaJump(jumpRaw, destHost, destPort, 12000).then((up) => {
+            try { client.setKeepAlive(true, 15000); } catch { /* */ }
+            try { up.setKeepAlive(true, 15000); } catch { /* */ }
             const pump = (a: net.Socket, b: net.Socket) => {
                 a.on("error", () => { try { b.destroy(); } catch { /* */ } });
                 b.on("error", () => { try { a.destroy(); } catch { /* */ } });
