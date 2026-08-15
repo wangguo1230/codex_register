@@ -567,6 +567,9 @@ export async function googleLogin(page, emailOrOpts, password = "", totpSecret =
                     continue;
                 }
                 write(`  登录失败: ${err}`);
+                if (/SSL|代理中断/i.test(err)) {
+                    throw new Error(`代理中断 ${err}，换 session 重开窗`);
+                }
                 return false;
             }
 
@@ -684,6 +687,7 @@ export async function googleLogin(page, emailOrOpts, password = "", totpSecret =
                             continue;
                         }
                         write(`  邮箱错误: ${e2}`);
+                        if (/SSL|代理中断/i.test(e2)) throw new Error(`代理中断 ${e2}，换 session 重开窗`);
                         return false;
                     }
                     if (loginStep(page.url()) === "password") {
@@ -797,6 +801,7 @@ export async function googleLogin(page, emailOrOpts, password = "", totpSecret =
                             continue;
                         }
                         write(`  密码错误: ${e2}`);
+                        if (/SSL|代理中断/i.test(e2)) throw new Error(`代理中断 ${e2}，换 session 重开窗`);
                         return false;
                     }
                 }
@@ -840,6 +845,7 @@ export async function googleLogin(page, emailOrOpts, password = "", totpSecret =
                         continue;
                     }
                     write(`  TOTP 验证失败: ${e2}`);
+                    if (/SSL|代理中断/i.test(e2)) throw new Error(`代理中断 ${e2}，换 session 重开窗`);
                     return false;
                 }
                 if (!await isOnGoogleLoginPage(page)) {
@@ -1521,7 +1527,7 @@ export async function ensureGoogleLoggedIn(page, targetUrl, creds = {}, log = co
         boot = await pageBodyText(page, 5000);
         if (!recovered && isSslOrSidDead(page.url(), boot)) {
             write("  打开目标页失败(网络/代理)");
-            return false;
+            throw new Error("代理不通: 打开目标页失败(网络/代理)，换 session 重开窗");
         }
     }
 

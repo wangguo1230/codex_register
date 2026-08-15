@@ -68,7 +68,11 @@ async function main() {
         emit({type: "progress", stage: "imap", message: "Gmail 已有 IMAP，跳过邮箱管理，走 IMAP 收码注册"});
     }
 
-    const shouldRotate = (err) => /代理中断|ERR_PROXY|chrome-error|代理不通|多次打开 auth\/login 失败|Cloudflare|Unable to load site|出口被|原生表单|未进验证码|邮箱输入框未出现|验证码输入框未找到|换 IP|security verification/i.test(String(err || ""));
+    const shouldRotate = async (err) => {
+        const {isProxySessionDead} = await import("./mail/proxy-pool.js");
+        return isProxySessionDead(err)
+            || /多次打开 auth\/login 失败|原生表单|未进验证码|邮箱输入框未出现|验证码输入框未找到|换 IP|security verification/i.test(String(err || ""));
+    };
 
     async function teardownBit(id, closeFn) {
         unbindGoogleLivePage();
@@ -155,7 +159,7 @@ async function main() {
             bitId = null;
         }
         if (r?.ok && r.token) break;
-        if (attempt < 2 && shouldRotate(r?.error)) continue;
+        if (attempt < 2 && await shouldRotate(r?.error)) continue;
         emit({type: "result", status: "failed", email, error: r?.error || "浏览器注册未拿到 token"});
         process.exit(1); return;
     }

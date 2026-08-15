@@ -62,12 +62,12 @@ function kookRegion(raw: string) {
     return /^global$/i.test(r) ? "global" : r.toUpperCase();
 }
 
-function withKookeeySession(url: string, session: string, duration = ""): string {
+function withKookeeySession(url: string, session: string, duration?: string): string {
     const u = new URL(url);
     const pass = decodeURIComponent(u.password || "");
     const m = pass.match(KOOK_PASS_RE);
     if (!m) return url;
-    const hold = duration || m[4] || "";
+    const hold = duration === undefined ? (m[4] || "") : duration;
     const next = hold
         ? `${m[1]}-${kookRegion(m[2])}-${session}-${hold}`
         : `${m[1]}-${kookRegion(m[2])}-${session}`;
@@ -107,6 +107,13 @@ export function rotateKookeeySession(url: string): string {
         if (!KOOK_PASS_RE.test(pass)) return url;
         return ensureKookeeySticky(withKookeeySession(url, randomSessionId()));
     } catch { return url; }
+}
+
+/** 代理/出口挂了：应换 session 重开窗。账密错、已停止不换。 */
+export function isProxySessionDead(err: unknown): boolean {
+    const s = String((err as {message?: string})?.message || err || "");
+    if (!s || /已停止|比特已退出登录/.test(s)) return false;
+    return /代理中断|ERR_PROXY|chrome-error|代理不通|Cloudflare|Unable to load site|出口被|换 session|ERR_TUNNEL|ERR_CONNECTION|ERR_TIMED_OUT|ERR_SSL|ERR_EMPTY_RESPONSE|ERR_NETWORK_CHANGED|ERR_INTERNET_DISCONNECTED|端口不通|Google 不通|出口失败|this site can.?t be reached|No internet|something wrong with the proxy|Checking the proxy address|SSL\/代理|打开目标页失败\(网络|Target closed|has been closed|Browser has been closed/i.test(s);
 }
 
 /** 一号一代理：新开一条粘性 session（不带 -5m），同一账号全程钉死这个出口。 */
@@ -269,7 +276,7 @@ export async function pickLiveMailProxy(rawUrl: string, {tries = 3, log = (_m: s
     if (!url) return {ok: false, url: "", probe: await probeMailProxy("", {jump})};
     let probe = await probeMailProxy(url, {jump});
     for (let i = 1; i < tries && !probe.ok; i++) {
-        const next = rotateKookeeySession(url);
+        const next = kookeeySessionOf(url) ? mintStickySession(url) : rotateKookeeySession(url);
         if (!next || next === url) break;
         log(`不通: ${probe.reason}，换 session 再测 (${i + 1}/${tries})`);
         url = next;
@@ -346,11 +353,11 @@ export class MailProxyPool {
             const extraParent = slots.find((u) => kookeeySessionOf(u));
             const extraCount = [...this.leased.keys()].filter((k) => k.startsWith("extra:")).length;
             if (extraParent && extraCount < cap) {
-                const live = rotateKookeeySession(extraParent);
+                const live = mintStickySession(extraParent);
                 const key = `extra:${live}`;
                 this.leased.set(key, {owner: String(owner || ""), at: Date.now(), url: live});
                 return {
-                    url: ensureKookeeySticky(live),
+                    url: live,
                     owner: String(owner || ""),
                     release: () => this.release(key),
                 };

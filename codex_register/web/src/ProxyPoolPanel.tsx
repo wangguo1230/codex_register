@@ -83,7 +83,7 @@ export function ProxyPoolPanel({
         try {
             const r = await setPool(poolText, {append: false, copies: 1});
             applyResult(r);
-            toast(r.total ? `代理池已覆盖保存 ${r.total} 条（1 代理 = 1 指纹）` : "代理池已清空，未配池时同时只跑 1 个指纹");
+            toast(r.total ? `代理池已覆盖保存 ${r.total} 条（一号一 session）` : "代理池已清空，未配池时同时只跑 1 个指纹");
         } catch (e: any) { toast("保存代理池失败: " + e.message); }
     };
     const doImportPool = async () => {

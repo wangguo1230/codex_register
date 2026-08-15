@@ -237,6 +237,9 @@ export async function hardenGoogleAccountOnPage(page, cred, log = () => {}, onCh
     const closed = (e) => /has been closed|Target page|Target closed|Browser has been closed/i.test(String(e || ""));
     const noteErr = (e, fallback) => {
         const s = String(e || fallback || "失败");
+        if (!closed(s) && /代理中断|ERR_PROXY|代理不通|换 session|ERR_TUNNEL|ERR_CONNECTION|ERR_SSL|SSL\/代理/i.test(s)) {
+            throw new Error(s.includes("换 session") ? s : `${s}，换 session 重开窗`);
+        }
         out.errors.push(closed(s) ? "窗口被关" : s.split("\n")[0].slice(0, 160));
     };
     const pageGone = () => {
@@ -408,12 +411,11 @@ export async function hardenGoogleAccountOnPage(page, cred, log = () => {}, onCh
     return out;
 }
 
-/** 开一个比特指纹窗口（可绑代理），用完关闭并删除。1 代理对应 1 指纹。 */
-export async function withGoogleBitSession({proxyUrl = "", name = "gmail", remark = "gmail-manage", log = () => {}, signal} = {}, fn) {
+async function openGoogleBitOnce({proxyUrl = "", name = "gmail", remark = "gmail-manage", log = () => {}, signal, fn} = {}) {
     const {bitSessionReady, createBitWindow, openBitWindow, closeBitWindow, deleteBitWindow, trackBitWindow, untrackBitWindow, isBitLoggedOut} = await import("../bitbrowser.js");
     const {chromium} = await import("playwright-core");
     const {pickLiveMailProxy, maskProxyUrl} = await import("./proxy-pool.js");
-    const {isMailboxJobStopped} = await import("./mailbox-job-stop.js");
+    const {isMailboxJobStopped, shouldForceDropWindow} = await import("./mailbox-job-stop.js");
     const stopped = () => !!(signal?.aborted || isMailboxJobStopped());
     if (stopped()) throw new Error("已停止");
     const bit = await bitSessionReady();
@@ -445,7 +447,6 @@ export async function withGoogleBitSession({proxyUrl = "", name = "gmail", remar
         }
     }
     let bitId = "";
-    const {shouldForceDropWindow} = await import("./mailbox-job-stop.js");
     const dropWindow = () => { if (bitId) closeBitWindow(bitId); };
     // 停止不要立刻关窗：改密/换2FA 可能已在 Google 生效，先等落库。
     const stopWatch = setInterval(() => { if (shouldForceDropWindow()) dropWindow(); }, 800);
@@ -493,6 +494,33 @@ export async function withGoogleBitSession({proxyUrl = "", name = "gmail", remar
     }
 }
 
+/** 开一个比特指纹窗口（可绑代理），用完关闭并删除。1 号 1 session，网络挂了换 session 重开。 */
+export async function withGoogleBitSession({proxyUrl = "", name = "gmail", remark = "gmail-manage", log = () => {}, signal} = {}, fn) {
+    const {isMailboxJobStopped} = await import("./mailbox-job-stop.js");
+    const {isProxySessionDead, mintStickySession, kookeeySessionOf} = await import("./proxy-pool.js");
+    const stopped = () => !!(signal?.aborted || isMailboxJobStopped());
+    let liveProxy = proxyUrl || "";
+    const maxAttempts = liveProxy && kookeeySessionOf(liveProxy) ? 3 : 1;
+    let lastErr;
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+        if (stopped()) throw new Error("已停止");
+        if (attempt) {
+            liveProxy = mintStickySession(liveProxy);
+            log(`[网络] 代理/出口有问题，换新 session 重开窗（${attempt + 1}/${maxAttempts}）`);
+        }
+        try {
+            return await openGoogleBitOnce({proxyUrl: liveProxy, name, remark, log, signal, fn});
+        } catch (e) {
+            lastErr = e;
+            const msg = String(e?.message || e);
+            if (stopped() || /已停止|比特已退出登录/.test(msg)) throw e;
+            if (attempt < maxAttempts - 1 && isProxySessionDead(e)) continue;
+            throw e;
+        }
+    }
+    throw lastErr;
+}
+
 /** 开比特窗口跑完整整备（邮箱面板 / 独立脚本用）。 */
 export async function runGoogleHardenWithBit(acc, {proxyUrl = "", log = () => {}, onCheckpoint = async () => {}, signal} = {}) {
     const {straightenGoogleCreds} = await import("../mfa.js");
@@ -538,6 +566,19 @@ export async function runGoogleHardenWithBit(acc, {proxyUrl = "", log = () => {}
     }
     const short = String(acc.email || "").split("@")[0].slice(0, 12);
     return withGoogleBitSession({proxyUrl, name: `harden-${short}`, remark: "gmail-harden", log, signal}, async (page) => {
+        try {
+            const {lookupMailboxesByEmails} = await import("../../server/db.js");
+            const [fresh] = await lookupMailboxesByEmails([acc.email]);
+            if (fresh) {
+                if (fresh.password) cred.password = fresh.password;
+                if (fresh.totp_secret) cred.totpSecret = fresh.totp_secret;
+                if (fresh.imap_password) cred.imapPassword = fresh.imap_password;
+                cred.recoveryEmail = fresh.recovery_email || "";
+                cred.pw_status = fresh.pw_status || cred.pw_status;
+                cred.google_state = fresh.google_state || cred.google_state;
+            }
+        } catch { /* 重开窗时读库失败仍用内存凭证 */ }
+        cred.skip = planHardenSkip(cred);
         const ok = await ensureGoogleLoggedIn(page, "https://myaccount.google.com/security?hl=en", {...cred, requireInbox: false}, log);
         if (!ok) return {ok: false, error: "Gmail 登录失败", errors: ["登录失败"], login: false};
         const done = await hardenGoogleAccountOnPage(page, cred, log, onCheckpoint);

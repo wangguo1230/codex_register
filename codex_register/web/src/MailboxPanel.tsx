@@ -720,7 +720,7 @@ export function MailboxPanel({notify}: {notify?: (m: string) => void}) {
                             <button onClick={doBatchDelete} disabled={selCount === 0} style={{padding: "5px 12px", background: "#dc2626", color: "#fff", border: "none", borderRadius: 6, cursor: selCount === 0 ? "not-allowed" : "pointer"}}>🗑 批量删除</button>
                         </>}
                     {!job.running && selCount > 0 && <button onClick={() => setSelected(new Set())} style={{padding: "5px 10px", fontSize: 13}}>清空选择</button>}
-                    <span style={{fontSize: 11, color: "#9ca3af"}}>整备/改密/换2FA 同一队列，各机用自己的代理池认领。Gmail 1 代理=1 指纹。mail.com 改密仍走 headed Chrome。</span>
+                    <span style={{fontSize: 11, color: "#9ca3af"}}>整备/改密/换2FA 同一队列，各机用自己的代理池认领。Gmail 一号一 session，网络挂了换。mail.com 改密仍走 headed Chrome。</span>
                 </div>
             )}
 

@@ -299,6 +299,7 @@ async function withLeasedMailProxy(owner, fn) {
     const lease = await mailProxyPool.lease(String(owner || "mail"), {
         fallback: scheduler.mailProxyFallback(),
         maxPerTemplate: cap,
+        freshSession: true,
     });
     try { return await fn(lease.url); }
     finally { lease.release(); }
@@ -310,7 +311,7 @@ function googleBitName(prefix, email) {
 
 async function changeGooglePasswordWithPool(mb, np, log) {
     return withLeasedMailProxy(mb.email, (proxyUrl) => {
-        log(`代理 ${maskProxyUrl(proxyUrl)}（1 代理 = 1 指纹）`);
+        log(`代理 ${maskProxyUrl(proxyUrl)}（一号一代理 · 新 session）`);
         return withGoogleBitSession({
             proxyUrl, name: googleBitName("pw", mb.email), remark: "gmail-pw", log,
         }, (page) => changePasswordOnPage(page, {
@@ -322,7 +323,7 @@ async function changeGooglePasswordWithPool(mb, np, log) {
 
 async function changeGoogleTotpWithPool(mb, log) {
     return withLeasedMailProxy(mb.email, (proxyUrl) => {
-        log(`代理 ${maskProxyUrl(proxyUrl)}（1 代理 = 1 指纹）`);
+        log(`代理 ${maskProxyUrl(proxyUrl)}（一号一代理 · 新 session）`);
         return withGoogleBitSession({
             proxyUrl, name: googleBitName("2fa", mb.email), remark: "gmail-2fa", log,
         }, (page) => change2faOnPage(page, {
@@ -387,7 +388,7 @@ async function runOneGoogleHarden(id, opts = {}) {
         const r = await withLeasedMailProxy(mb.email, (proxyUrl) => {
             if (batchHardenStop || isMailboxJobStopped() || ac.signal.aborted) throw new Error("已停止");
             const sess = kookeeySessionOf(proxyUrl);
-            logStep(`[整备] 代理 ${maskProxyUrl(proxyUrl)}${sess ? " session=" + sess : ""}（本窗独立指纹）`);
+            logStep(`[整备] 代理 ${maskProxyUrl(proxyUrl)}${sess ? " session=" + sess : ""}（一号一代理 · 新 session）`);
             return runGoogleHardenWithBit({
                 email: mb.email, password: mb.password,
                 totpSecret: mb.totp_secret || "", recoveryEmail: mb.recovery_email || "",
