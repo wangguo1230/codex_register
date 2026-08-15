@@ -607,28 +607,25 @@ async function clickDialogNext(page, log) {
     if (!dlg) return false;
     const codeBox = dlg.locator('input[placeholder*="code" i], input[name="totpPin"], input[autocomplete="one-time-code"]').first();
     if (await codeBox.isVisible({timeout: 200}).catch(() => false)) return false;
-    const names = await dlg.evaluate((el) => [...el.querySelectorAll("button, [role='button'], a")].map((b) => (b.textContent || "").replace(/\s+/g, " ").trim()).filter(Boolean).slice(0, 8)).catch(() => []);
-    log(`[2FA] 确认框按钮 ${JSON.stringify(names)}`);
-    const btn = dlg.getByRole("button", {name: /^(next|continue|下一步|继续)$/i}).first();
-    if (await btn.isVisible({timeout: 600}).catch(() => false)) {
-        await btn.click().catch(() => btn.click({force: true}));
-        log("[2FA] 点了确认框 Next");
+    const names = await dlg.evaluate((el) => [...el.querySelectorAll("button, [role='button'], a")].filter((b) => b.getClientRects().length).map((b) => (b.textContent || "").replace(/\s+/g, " ").trim()).filter(Boolean).slice(0, 8)).catch(() => []);
+    log(`[2FA] 确认框可见按钮 ${JSON.stringify(names)}`);
+    const nexts = dlg.getByRole("button", {name: /^(next|continue|下一步|继续)$/i});
+    const nn = await nexts.count().catch(() => 0);
+    for (let i = nn - 1; i >= 0; i--) {
+        const btn = nexts.nth(i);
+        if (!await btn.isVisible({timeout: 200}).catch(() => false)) continue;
+        await btn.click({timeout: 2500}).catch(() => btn.click({force: true, timeout: 1500}));
+        log("[2FA] 点了确认框可见 Next");
         return true;
     }
-    const txtNext = dlg.getByText(/^(next|continue|下一步|继续)$/i).first();
-    if (await txtNext.isVisible({timeout: 400}).catch(() => false)) {
-        await txtNext.click().catch(() => txtNext.click({force: true}));
-        log("[2FA] 点了确认框 Next 文案");
+    const txtNext = dlg.getByText(/^(next|continue|下一步|继续)$/i);
+    const tn = await txtNext.count().catch(() => 0);
+    for (let i = tn - 1; i >= 0; i--) {
+        const el = txtNext.nth(i);
+        if (!await el.isVisible({timeout: 200}).catch(() => false)) continue;
+        await el.click({timeout: 2500}).catch(() => el.click({force: true, timeout: 1500}));
+        log("[2FA] 点了确认框可见 Next 文案");
         return true;
-    }
-    const any = dlg.locator("button").last();
-    if (await any.isVisible({timeout: 400}).catch(() => false)) {
-        const txt = String(await any.innerText().catch(() => ""));
-        if (!/cancel|close|取消|关闭|verify|验证/i.test(txt)) {
-            await any.click({force: true}).catch(() => any.click());
-            log(`[2FA] 点了确认框按钮 ${txt.slice(0, 30)}`);
-            return true;
-        }
     }
     return false;
 }
