@@ -888,27 +888,30 @@ async function clickCantScanByDom(page, log) {
     const dlg = page.locator('[role="dialog"], [role="alertdialog"]').first();
     if (!await dlg.isVisible({timeout: 300}).catch(() => false)) return false;
     await scrollDialogToCantScan(page);
-    const clicked = await dlg.evaluate(() => {
+    await dlg.evaluate(() => {
         const root = document.querySelector('[role="dialog"], [role="alertdialog"]');
-        if (!root) return false;
-        const nodes = [...root.querySelectorAll("button, a, [role='button'], [role='link'], span, div")];
-        const hit = nodes.find((el) => /can.?t scan|cannot scan|无法扫描|não consegue|tidak dapat memindai|no se puede escanear/i.test((el.textContent || "").trim())
-            && (el.textContent || "").trim().length < 80);
-        if (!hit) return false;
-        hit.scrollIntoView({block: "center"});
-        hit.click();
-        return true;
-    }).catch(() => false);
-    if (!clicked) {
-        const el = dlg.getByRole("button", {name: /can.?t scan|cannot scan|无法扫描/i})
-            .or(dlg.getByText(/can.?t scan it\??/i)).first();
-        if (!await el.isVisible({timeout: 600}).catch(() => false)) return false;
-        await el.scrollIntoViewIfNeeded().catch(() => {});
-        await el.click({timeout: 2000}).catch(() => el.click({force: true, timeout: 1500}));
-    }
+        if (!root) return;
+        root.querySelectorAll("[data-cm-cant]").forEach((el) => el.removeAttribute("data-cm-cant"));
+        const want = /can.?t scan|cannot scan|无法扫描|não consegue|tidak dapat memindai|no se puede escanear/i;
+        const nodes = [...root.querySelectorAll("a, button, [role='link'], [role='button']")];
+        let hit = nodes.find((el) => want.test((el.textContent || "").trim()) && (el.textContent || "").trim().length < 80);
+        if (!hit) {
+            hit = [...root.querySelectorAll("span, div")].find((el) => /^can.?t scan it\??$/i.test((el.textContent || "").trim()));
+        }
+        if (hit) hit.setAttribute("data-cm-cant", "1");
+    }).catch(() => {});
+    const el = page.locator("[data-cm-cant='1']").first()
+        .or(dlg.getByRole("link", {name: /can.?t scan|cannot scan|无法扫描/i}))
+        .or(dlg.getByRole("button", {name: /can.?t scan|cannot scan|无法扫描/i}))
+        .or(dlg.getByText(/can.?t scan it\??/i)).first();
+    if (!await el.isVisible({timeout: 800}).catch(() => false)) return false;
+    await el.scrollIntoViewIfNeeded().catch(() => {});
+    const box = await el.boundingBox().catch(() => null);
+    if (box) await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+    else await el.click({timeout: 2500, noWaitAfter: true}).catch(() => el.click({force: true}));
     log("[2FA] 点了 Can't scan it?");
     const t0 = Date.now();
-    while (Date.now() - t0 < 5000) {
+    while (Date.now() - t0 < 8000) {
         const t = String(await dlg.innerText().catch(() => ""));
         if (dialogShowsSecretKey(t)) {
             log("[2FA] 已切到密钥文案");
@@ -916,7 +919,7 @@ async function clickCantScanByDom(page, log) {
         }
         await page.waitForTimeout(300);
     }
-    log("[2FA] 点了 Can't scan 但仍是 QR，多半没滚到链接");
+    log("[2FA] 点了 Can't scan 但仍是 QR");
     return false;
 }
 
