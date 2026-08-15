@@ -393,7 +393,8 @@ const MAILBOX_LIST_COLS = `
       WHEN google_state IS NULL OR google_state = '{}'::jsonb THEN NULL
       ELSE jsonb_build_object(
         'last_error', google_state->>'last_error',
-        'login_error', google_state->>'login_error'
+        'login_error', google_state->>'login_error',
+        'totp_rotated', google_state->'totp_rotated'
       )
     END AS google_state
 `;

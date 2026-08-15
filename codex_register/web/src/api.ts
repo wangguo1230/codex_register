@@ -5,7 +5,9 @@ export interface Account {
     password: string;
     status: "pending" | "running" | "success" | "failed";
     plan: string;
-    token: string;
+    /** 列表接口不再下发 JWT；详情/导出才有。用 has_token 判断是否有 AT */
+    token?: string;
+    has_token?: boolean;
     auth_file: string;
     rt_file?: string;
     phone?: string;
@@ -57,6 +59,7 @@ export interface Mailbox {
         devices?: string;
         imap?: string;
         gpt?: string;
+        totp_rotated?: boolean;
         last_error?: string;
         updated_at?: number;
     };
@@ -524,7 +527,7 @@ export const api = {
     rechargeLogs: () => j<{ts: number; line: string}[]>("/api/recharge/logs"),
     clearRechargeLogs: () => j<{ok: boolean}>("/api/recharge/logs/clear", {method: "POST"}),
     // 导出 / RT 获取
-    exportRechargeQueue: async (opts: {ids?: number[]; batch?: string; format: "account" | "full" | "card" | "session"}): Promise<{text?: string; async?: boolean; needRt?: number}> => {
+    exportRechargeQueue: async (opts: {ids?: number[]; batch?: string; format: "account" | "full" | "card" | "session" | "sub2json"}): Promise<{text?: string; async?: boolean; needRt?: number; total?: number; withRt?: number; missingRt?: number; ok?: boolean}> => {
         const res = await fetch("/api/recharge/queue/export", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(opts)});
         if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || `HTTP ${res.status}`);
         const ct = res.headers.get("content-type") || "";

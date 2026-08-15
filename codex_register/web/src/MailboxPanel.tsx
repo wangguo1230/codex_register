@@ -3,11 +3,14 @@
 //   - 导入独立邮箱(mail.com 可「导入后自动改密」;Gmail 可「导入后自动整备」);从指定分组的 free 池分配 N 个给 GPT/Claude(★物理隔离)
 //   - 单个改密 / 多选批量改密(mail.com 真改,覆盖所有邮箱)/ 删除(仅 free)
 //   - 邮箱密码校验工具(改密全归邮箱管理:导入后自动改密/手动/批量,注册流程不越界)
-import {useEffect, useMemo, useState} from "react";
+import {useCallback, useEffect, useMemo, useRef, useState} from "react";
 import {api, connectStream, type Mailbox, type MailboxJob} from "./api";
 import {MailCheckTool} from "./MailCheckTool";
 import {MailboxDetail} from "./MailboxDetail";
 import {ProxyPoolPanel} from "./ProxyPoolPanel";
+
+/** 列表一次最多挂 DOM 的行数；全量仍在内存里筛，避免 3000+ tr 卡死主线程 */
+const LIST_PAGE_SIZE = 150;
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const USAGE_LABEL: Record<string, string> = {free: "待分配", hold: "独立", gpt: "GPT", claude: "Claude", deleted: "已删除"};
@@ -160,15 +163,42 @@ export function MailboxPanel({notify}: {notify?: (m: string) => void}) {
     const [pwConc, setPwConc] = useState(1); // 改密并发
     const [detailMb, setDetailMb] = useState<Mailbox | null>(null); // 详情弹窗(日志+收件箱)
     const [poolSnap, setPoolSnap] = useState({total: 0, slots: 0, leased: 0, free: 0});
-    const [showPool, setShowPool] = useState(true);
+    // 默认收起代理池 / 导入分配 / 任务详情，主屏留给列表
+    const [showPool, setShowPool] = useState(false);
+    const [toolsOpen, setToolsOpen] = useState<null | "import" | "alloc">(null);
+    const [jobDetailOpen, setJobDetailOpen] = useState(false);
     const [jumpText, setJumpText] = useState("");
     const [job, setJob] = useState<MailboxJob>(emptyJob());
     const [stopping, setStopping] = useState(false);
+    const [listLimit, setListLimit] = useState(LIST_PAGE_SIZE);
+    const loadTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+    const jobRunningRef = useRef(false);
+    const toggleTools = (which: "import" | "alloc") => {
+        setToolsOpen((cur) => (cur === which ? null : which));
+        if (which === "import") setShowPool(false);
+    };
 
     const toast = (m: string) => notify?.(m);
-    const load = () =>
-        api.listMailboxes(usageFilter || undefined).then((r) => { setList(r.list); setStats(r.stats); setGroups(r.groups || []); }).catch(() => {});
-    useEffect(() => { load(); /* eslint-disable-next-line */ }, [usageFilter]);
+    const load = useCallback((immediate = false) => {
+        const run = () => {
+            api.listMailboxes(usageFilter || undefined)
+                .then((r) => { setList(r.list); setStats(r.stats); setGroups(r.groups || []); })
+                .catch(() => {});
+        };
+        if (immediate) {
+            if (loadTimer.current) { clearTimeout(loadTimer.current); loadTimer.current = null; }
+            run();
+            return;
+        }
+        // SSE 可能连发 mailboxes：合并成一次拉全表，避免进页后连环 1MB+ 请求
+        if (loadTimer.current) clearTimeout(loadTimer.current);
+        loadTimer.current = setTimeout(() => { loadTimer.current = null; run(); }, 400);
+    }, [usageFilter]);
+    useEffect(() => {
+        setListLimit(LIST_PAGE_SIZE);
+        load(true);
+        return () => { if (loadTimer.current) clearTimeout(loadTimer.current); };
+    }, [load]);
     useEffect(() => {
         api.state().then((s) => {
             if (s.state.mailSeparator) setMailSep(s.state.mailSeparator);
@@ -190,6 +220,7 @@ export function MailboxPanel({notify}: {notify?: (m: string) => void}) {
             const incoming = r.job || r.batchHarden;
             if (incoming) {
                 setJob((p) => mergeJob(p, incoming));
+                jobRunningRef.current = !!incoming.running;
                 if (!incoming.running) {
                     const last = rememberLastJob(incoming);
                     if (last) setLastJob((prev) => prev || last);
@@ -197,9 +228,12 @@ export function MailboxPanel({notify}: {notify?: (m: string) => void}) {
             }
         }).catch(() => {});
         pullJob();
-        const tick = setInterval(pullJob, 2000);
+        // 有任务时 2s；空闲 8s，降低进页后的后台噪音
+        const tick = setInterval(() => {
+            if (jobRunningRef.current || document.visibilityState === "visible") pullJob();
+        }, job.running ? 2000 : 8000);
         return () => clearInterval(tick);
-    }, []);
+    }, [job.running]);
     useEffect(() => {
         if (!job.running && !(job.current || []).length) return;
         const t = setInterval(() => setNowTick(Date.now()), 1000);
@@ -209,16 +243,17 @@ export function MailboxPanel({notify}: {notify?: (m: string) => void}) {
     useEffect(() => {
         const off = connectStream((ev, data) => {
             if (ev === "mailboxes") {
-                load();
+                load(false);
                 if (data?.proxyPool) setPoolSnap({total: data.proxyPool.total || 0, slots: data.proxyPool.slots || 0, leased: data.proxyPool.leased || 0, free: data.proxyPool.free || 0});
             }
             else if (ev === "batchPw" || ev === "batchHarden") {
                 setJob((p) => mergeJob(p, data));
+                jobRunningRef.current = !!data?.running;
                 if (data?.proxyPool) setPoolSnap({total: data.proxyPool.total || 0, slots: data.proxyPool.slots || 0, leased: data.proxyPool.leased || 0, free: data.proxyPool.free || 0});
                 if (!data.running) {
                     const last = rememberLastJob(data);
                     if (last) setLastJob(last);
-                    if (!(data.windows || []).some((w: any) => w.status === 1)) load();
+                    if (!(data.windows || []).some((w: any) => w.status === 1)) load(false);
                 }
             }
             else if (ev === "hello" && data?.state) {
@@ -232,8 +267,8 @@ export function MailboxPanel({notify}: {notify?: (m: string) => void}) {
                 if (typeof data.state.mailProxyJump === "string") setJumpText(data.state.mailProxyJump);
             }
         });
-        return off; /* eslint-disable-next-line */
-    }, []);
+        return off;
+    }, [load]);
 
     // 当前选中来源的可分配数 + 传给后端的 fromGrp(undefined=全池,字符串含''=该分组)
     const srcFromGrp = allocSrc === "__ALL__" ? undefined : allocSrc.slice(2);
@@ -259,7 +294,7 @@ export function MailboxPanel({notify}: {notify?: (m: string) => void}) {
                 setFGmail("");
             }
             if (r.ids?.length) setSelected(new Set(r.ids));
-            load();
+            load(true);
         } catch (e: any) { toast("导入失败:" + e.message); } finally { setBusy(false); }
     };
 
@@ -273,7 +308,7 @@ export function MailboxPanel({notify}: {notify?: (m: string) => void}) {
             const r = await api.allocateMailboxes(usage, allocCount, srcFromGrp || "", srcFromGrp);
             if (r.error) toast(r.error);
             else toast(`已从「${srcLabel}」分配 ${r.allocated} 个给 ${usage.toUpperCase()}`);
-            load();
+            load(true);
         } catch (e: any) { toast("分配失败:" + e.message); } finally { setBusy(false); }
     };
 
@@ -282,7 +317,7 @@ export function MailboxPanel({notify}: {notify?: (m: string) => void}) {
         try {
             const r = await api.deleteMailbox(m.id);
             if (!r.ok) toast(r.reason || "删除失败");
-            else { toast("已删除"); load(); }
+            else { toast("已删除"); load(true); }
         } catch (e: any) { toast(e.message); }
     };
 
@@ -292,17 +327,15 @@ export function MailboxPanel({notify}: {notify?: (m: string) => void}) {
         try {
             const r = await api.changeMailboxPasswd(m.id);
             toast(r.queued ? `已入队改密，预定新密码 ${r.newPassword}` : (r.ok ? `改密成功,新密码 ${r.newPassword}` : `改密未确认(新密码 ${r.newPassword} 已记录)`));
-            load();
+            load(true);
         } catch (e: any) { toast(e.message); } finally { setBusy(false); }
     };
 
     // 切换独立/待分配(仅 free↔hold)
     const doSetUsage = async (m: Mailbox, usage: "free" | "hold") => {
-        try { await api.setMailboxUsage(m.id, usage); toast(usage === "hold" ? "已设为独立(不参与业务分配)" : "已放回待分配"); load(); } catch (e: any) { toast(e.message); }
+        try { await api.setMailboxUsage(m.id, usage); toast(usage === "hold" ? "已设为独立(不参与业务分配)" : "已放回待分配"); load(true); } catch (e: any) { toast(e.message); }
     };
 
-    // 分组列表(当前 list 里所有 grp,去重)+ 改密状态判定 + 筛选后列表
-    const allGrps = [...new Set(list.map((m) => m.grp || "").filter(Boolean))].sort();
     const pwState = (m: Mailbox) => { const s = m.pw_status || ""; return s.startsWith("✅") ? "yes" : s.startsWith("❌") ? "fail" : "no"; };
     const extractedEmails = useMemo(() => extractEmails(fEmail), [fEmail]);
     const keywordQs = useMemo(() => {
@@ -342,48 +375,94 @@ export function MailboxPanel({notify}: {notify?: (m: string) => void}) {
     }, [list, lookupExtra]);
     const providerOf = (m: Mailbox): "mailcom" | "google" | "icloud" =>
         m.provider === "google" ? "google" : m.provider === "icloud" ? "icloud" : "mailcom";
-    const usageLabelOf = (m: Mailbox) => m.deleted_at ? "已删除" : (USAGE_LABEL[m.usage] || m.usage);
-    const searchHay = (m: Mailbox) => [
-        m.email,
-        usageLabelOf(m),
-        m.usage,
-        m.usage === "hold" ? "独立" : "",
-        m.usage === "free" ? "待分配 未分配" : "",
-        providerOf(m) === "google" ? "gmail google" : providerOf(m) === "icloud" ? "icloud" : "mail.com mailcom",
-        m.sold_at ? "已售 售出 sold" : "未售",
-        m.grp || "",
-        m.google_stage || "",
-        GOOGLE_STAGE_LABEL[m.google_stage || ""] || "",
-        GOOGLE_STAGE_SEARCH[m.google_stage || ""] || "",
-        m.imap_password ? "imap 有imap" : "",
-    ].join(" ").toLowerCase();
-    const filtered = searchBase.filter((m) => {
-        if (fProvider && providerOf(m) !== fProvider) return false;
+    const allGrps = useMemo(
+        () => [...new Set(list.map((m) => m.grp || "").filter(Boolean))].sort(),
+        [list],
+    );
+    const filtered = useMemo(() => {
+        const usageLabelOf = (m: Mailbox) => m.deleted_at ? "已删除" : (USAGE_LABEL[m.usage] || m.usage);
+        const emailSet = extractedEmails.length ? new Set(extractedEmails) : null;
+        return searchBase.filter((m) => {
+            if (fProvider && providerOf(m) !== fProvider) return false;
+            if (fSold === "yes" && !m.sold_at) return false;
+            if (fSold === "no" && m.sold_at) return false;
+            if (fGrp === "__NONE__") { if (m.grp) return false; } else if (fGrp && (m.grp || "") !== fGrp) return false;
+            if (fPw && pwState(m) !== fPw) return false;
+            if (fGmail && (m.google_stage || "") !== fGmail) return false;
+            if (emailSet) return emailSet.has(m.email.toLowerCase());
+            if (keywordQs.length) {
+                const hay = [
+                    m.email,
+                    usageLabelOf(m),
+                    m.usage,
+                    m.usage === "hold" ? "独立" : "",
+                    m.usage === "free" ? "待分配 未分配" : "",
+                    providerOf(m) === "google" ? "gmail google" : providerOf(m) === "icloud" ? "icloud" : "mail.com mailcom",
+                    m.sold_at ? "已售 售出 sold" : "未售",
+                    m.grp || "",
+                    m.google_stage || "",
+                    GOOGLE_STAGE_LABEL[m.google_stage || ""] || "",
+                    GOOGLE_STAGE_SEARCH[m.google_stage || ""] || "",
+                    m.imap_password ? "imap 有imap" : "",
+                ].join(" ").toLowerCase();
+                if (!keywordQs.some((q) => hay.includes(q))) return false;
+            }
+            return true;
+        });
+    }, [searchBase, fProvider, fSold, fGrp, fPw, fGmail, extractedEmails, keywordQs]);
+    // 筛选条件变时重置「显示更多」分页
+    useEffect(() => { setListLimit(LIST_PAGE_SIZE); }, [usageFilter, fGrp, fPw, fGmail, fProvider, fSold, fEmail]);
+    const visibleRows = useMemo(() => filtered.slice(0, listLimit), [filtered, listLimit]);
+    const typeCounts = useMemo(() => {
+        let mailcom = 0, google = 0, icloud = 0;
+        for (const m of searchBase) {
+            const p = providerOf(m);
+            if (p === "google") google++;
+            else if (p === "icloud") icloud++;
+            else mailcom++;
+        }
+        return {mailcom, google, icloud};
+    }, [searchBase]);
+    const searchMissing = useMemo(() => {
+        if (!extractedEmails.length) return [] as string[];
+        const have = new Set(searchBase.map((m) => m.email.toLowerCase()));
+        return extractedEmails.filter((e) => !have.has(e));
+    }, [extractedEmails, searchBase]);
+    const noPwCount = useMemo(() => list.filter((m) => pwState(m) === "no").length, [list]);
+    /** 整备下拉的数字跟当前分组/类型/售出走，不要用全库 Gmail 数。 */
+    const gmailInView = useMemo(() => searchBase.filter((m) => {
+        if (providerOf(m) !== "google") return false;
         if (fSold === "yes" && !m.sold_at) return false;
         if (fSold === "no" && m.sold_at) return false;
-        if (fGrp === "__NONE__") { if (m.grp) return false; } else if (fGrp && (m.grp || "") !== fGrp) return false;
-        if (fPw && pwState(m) !== fPw) return false;
-        if (fGmail && (m.google_stage || "") !== fGmail) return false;
-        if (extractedEmails.length) {
-            return extractedEmails.includes(m.email.toLowerCase());
-        }
-        if (keywordQs.length && !keywordQs.some((q) => searchHay(m).includes(q))) return false;
+        if (fGrp === "__NONE__") { if (m.grp) return false; }
+        else if (fGrp && (m.grp || "") !== fGrp) return false;
         return true;
-    });
-    const typeCounts = {
-        mailcom: searchBase.filter((m) => providerOf(m) === "mailcom").length,
-        google: searchBase.filter((m) => providerOf(m) === "google").length,
-        icloud: searchBase.filter((m) => providerOf(m) === "icloud").length,
+    }), [searchBase, fSold, fGrp]);
+    const gmailStageCounts = useMemo(() => {
+        const c: Record<string, number> = {};
+        for (const m of gmailInView) {
+            const k = m.google_stage || "imported";
+            c[k] = (c[k] || 0) + 1;
+        }
+        return c;
+    }, [gmailInView]);
+    const totpCell = (m: Mailbox) => {
+        if (m.google_state?.totp_rotated) return {text: "已换", color: "#059669", title: "2FA 已换成我们的密钥"};
+        if (m.totp_secret) return {text: "卖家", color: "#d97706", title: "库里有密钥，但还不是我们换过的"};
+        return {text: "—", color: "#d1d5db", title: "没有 2FA 密钥"};
     };
-    const searchMissing = extractedEmails.filter((e) => !searchBase.some((m) => m.email.toLowerCase() === e));
-    const noPwCount = list.filter((m) => pwState(m) === "no").length; // 未改密数
 
     // ---- 多选 + 批量改密/批量切换状态(基于筛选后列表) ----
     const toggleSel = (id: number) => setSelected((s) => { const n = new Set(s); n.has(id) ? n.delete(id) : n.add(id); return n; });
-    const visibleIds = filtered.map((m) => m.id);
+    const filteredIdSet = useMemo(() => new Set(filtered.map((m) => m.id)), [filtered]);
+    const visibleIds = useMemo(() => visibleRows.map((m) => m.id), [visibleRows]);
     const allSelected = visibleIds.length > 0 && visibleIds.every((id) => selected.has(id));
     const toggleAll = () => setSelected(allSelected ? new Set() : new Set(visibleIds));
-    const selCount = [...selected].filter((id) => filtered.some((m) => m.id === id)).length;
+    const selCount = useMemo(() => {
+        let n = 0;
+        for (const id of selected) if (filteredIdSet.has(id)) n++;
+        return n;
+    }, [selected, filteredIdSet]);
     const openWins = (job.windows || []).filter((w) => w.status === 1);
     const leftoverWins = (job.windows || []).filter((w) => w.status !== 1);
     const jobBusy = !!(job.running || openWins.length);
@@ -439,7 +518,7 @@ export function MailboxPanel({notify}: {notify?: (m: string) => void}) {
     const doBatchUsage = async (usage: "free" | "hold") => {
         const ids = [...selected].filter((id) => filtered.some((m) => m.id === id));
         if (!ids.length) { toast("请先勾选邮箱"); return; }
-        try { const r = await api.setMailboxesUsage(ids, usage); toast(`已${usage === "hold" ? "设为独立" : "放回待分配"} ${r.count} 个(gpt/claude 已跳过)`); setSelected(new Set()); load(); } catch (e: any) { toast(e.message); }
+        try { const r = await api.setMailboxesUsage(ids, usage); toast(`已${usage === "hold" ? "设为独立" : "放回待分配"} ${r.count} 个(gpt/claude 已跳过)`); setSelected(new Set()); load(true); } catch (e: any) { toast(e.message); }
     };
     const doBatchGrp = async () => {
         const ids = [...selected].filter((id) => filtered.some((m) => m.id === id && (m.usage === "free" || m.usage === "hold")));
@@ -449,7 +528,7 @@ export function MailboxPanel({notify}: {notify?: (m: string) => void}) {
         try {
             const r = await api.setMailboxesGrp(ids, name);
             toast(`已改分组 ${r.count} 个 → ${name || "（空）"}`);
-            load();
+            load(true);
         } catch (e: any) { toast(e.message); }
     };
     const doBatchAllocGpt = async () => {
@@ -476,7 +555,7 @@ export function MailboxPanel({notify}: {notify?: (m: string) => void}) {
             const skip = [r.skippedHarden && `未整备 ${r.skippedHarden}`, r.skippedImap && `无IMAP ${r.skippedImap}`, r.skippedSold && `已售 ${r.skippedSold}`, r.skippedBusy && `已挂GPT ${r.skippedBusy}`, r.skipped && `其它 ${r.skipped}`].filter(Boolean).join("，");
             toast(`已分配 ${r.allocated ?? 0} 个进 GPT${skip ? `（跳过 ${skip}）` : ""}。到 GPT 页点「开始」注册`);
             setSelected(new Set());
-            load();
+            load(true);
         } catch (e: any) { toast(e.message); }
         finally { setBusy(false); }
     };
@@ -494,7 +573,7 @@ export function MailboxPanel({notify}: {notify?: (m: string) => void}) {
         const ids = [...selected].filter((id) => filtered.some((m) => m.id === id));
         if (!ids.length) { toast("请先勾选邮箱"); return; }
         if (!confirm(`删除选中 ${ids.length} 个邮箱?被 gpt/claude 占用的会跳过(应从对应业务域删)。`)) return;
-        try { const r = await api.batchDeleteMailbox(ids); toast(`已删除 ${r.count} 个${r.skipped ? `(占用跳过 ${r.skipped})` : ""}`); setSelected(new Set()); load(); } catch (e: any) { toast(e.message); }
+        try { const r = await api.batchDeleteMailbox(ids); toast(`已删除 ${r.count} 个${r.skipped ? `(占用跳过 ${r.skipped})` : ""}`); setSelected(new Set()); load(true); } catch (e: any) { toast(e.message); }
     };
 
 
@@ -521,17 +600,17 @@ export function MailboxPanel({notify}: {notify?: (m: string) => void}) {
                     color: fProvider === v ? "#fff" : "#4b5563", fontWeight: fProvider === v ? 600 : 400,
                 }}>{label} {n}</button>
     );
-    const metric = (lab: string, val: string | number, color = "#111827") => (
-        <div style={{minWidth: 56}}>
-            <div style={{fontSize: 10, color: "#9ca3af", letterSpacing: 0.2}}>{lab}</div>
-            <div style={{fontSize: 16, fontWeight: 650, color, fontVariantNumeric: "tabular-nums", lineHeight: 1.2}}>{val}</div>
-        </div>
-    );
-
     return (
-        <div style={{padding: 18, display: "flex", flexDirection: "column", gap: 14, height: "100%", boxSizing: "border-box", background: "#f6f7f9"}}>
+        <div style={{
+            padding: 18, display: "flex", flexDirection: "column", gap: 12,
+            flex: 1, minHeight: 0, height: "100%", boxSizing: "border-box",
+            background: "#f6f7f9", overflow: "hidden",
+        }}>
+            <datalist id="mb-grp-options">
+                {groups.filter((g) => g.grp).map((g) => <option key={g.grp} value={g.grp}>{g.grp}({g.n})</option>)}
+            </datalist>
             {/* 头部:标题 + 统计chips + 右侧策略/工具 */}
-            <div style={{display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap"}}>
+            <div style={{display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap", flexShrink: 0}}>
                 <b style={{fontSize: 15, marginRight: 4}}>📮 邮箱资源池</b>
                 {chip("", "全部", stats.total)}
                 {chip("free", "待分配", stats.free)}
@@ -560,117 +639,71 @@ export function MailboxPanel({notify}: {notify?: (m: string) => void}) {
                 </div>
             </div>
 
+            {/* 任务：默认一行摘要，详情可展开（不占列表高度） */}
             {jobBusy || leftoverWins.length || lastJob ? (
                 <div style={{
-                    position: "sticky", top: 0, zIndex: 25,
-                    background: "#fff", border: "1px solid #e8eaed", borderRadius: 12,
-                    padding: "12px 14px", boxShadow: "0 1px 2px rgba(15,23,42,0.04)",
+                    flexShrink: 0, background: "#fff", border: "1px solid #e8eaed", borderRadius: 12,
+                    padding: "8px 12px", boxShadow: "0 1px 2px rgba(15,23,42,0.04)",
                 }}>
                     {jobBusy ? (
                         <>
-                            <div style={{display: "flex", alignItems: "center", gap: 16, flexWrap: "wrap"}}>
-                                <div style={{fontSize: 13, fontWeight: 650, color: "#111827", minWidth: 72}}>
+                            <div style={{display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap"}}>
+                                <span style={{fontSize: 13, fontWeight: 650, color: "#111827"}}>
                                     {jobKind || "任务"}
                                     {job.stopped ? <span style={{marginLeft: 6, fontSize: 11, color: "#b45309", fontWeight: 500}}>收尾中</span> : null}
-                                </div>
-                                {metric("执行中", runN, "#b45309")}
-                                {metric("已跑", jobTotal ? `${jobDone}/${jobTotal}` : jobDone)}
-                                {metric("排队", jobQueued, "#6b7280")}
-                                {metric("成功", jobOk, "#059669")}
-                                {metric("失败", jobFail, jobFail ? "#dc2626" : "#9ca3af")}
-                                {metric("成功率", jobDone ? `${jobRate}%` : "—", jobRate >= 70 ? "#059669" : jobDone ? "#d97706" : "#9ca3af")}
-                                {metric("已跑时长", fmtDur(job.startedAt ? nowTick - job.startedAt : job.elapsedMs), "#4338ca")}
-                                {metric("本小时", job.hourNow ? `${job.hourNow.done}（成${job.hourNow.ok}）` : "0", "#0f766e")}
-                                {metric("均时", fmtDur(job.avgMs), "#6b7280")}
-                                {job.etaMs ? metric("预计剩余", fmtDur(job.etaMs), "#9a3412") : null}
-                                <div style={{marginLeft: "auto"}}>
-                                    <button onClick={stopMailboxJob} disabled={stopping}
-                                            style={{height: 32, padding: "0 14px", background: stopping ? "#fca5a5" : "#dc2626", color: "#fff", border: "none", borderRadius: 8, cursor: stopping ? "wait" : "pointer", fontWeight: 600, fontSize: 12}}>
-                                        {stopping ? "停止中" : "停止任务"}
-                                    </button>
-                                </div>
-                            </div>
-                            <div style={{marginTop: 8, height: 4, background: "#f3f4f6", borderRadius: 99, overflow: "hidden"}}>
-                                <div style={{width: `${jobPct}%`, height: "100%", background: "#ea580c", borderRadius: 99}}/>
-                            </div>
-                            <div style={{marginTop: 8, display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center"}}>
-                                <span style={{fontSize: 11, color: "#6b7280"}}>
-                                    {job.startedAt ? `开始 ${fmtClock(job.startedAt)}` : "计时未到"}
-                                    {job.startedAt ? ` · 已跑 ${fmtDur(nowTick - job.startedAt)}` : ""}
                                 </span>
-                                {kindStats.map(([k, v]) => (
-                                    <span key={k} style={{fontSize: 11, color: "#4b5563", background: "#f3f4f6", borderRadius: 999, padding: "2px 8px"}}>
-                                        {KIND_LABEL[k] || k} 跑{v.running} 排{v.pending} 成{v.ok} 败{v.error}
-                                    </span>
-                                ))}
-                                <span style={{fontSize: 11, color: "#4338ca"}}>
-                                    本机代理 空闲 {poolSnap.free} / 占用 {poolSnap.leased} / 共 {poolSnap.slots || poolSnap.total || 0}
-                                </span>
+                                <span style={{fontSize: 12, color: "#b45309", fontVariantNumeric: "tabular-nums"}}>执行 {runN}</span>
+                                <span style={{fontSize: 12, color: "#374151", fontVariantNumeric: "tabular-nums"}}>{jobDone}/{jobTotal || "—"}</span>
+                                <span style={{fontSize: 12, color: "#059669"}}>成 {jobOk}</span>
+                                <span style={{fontSize: 12, color: jobFail ? "#dc2626" : "#9ca3af"}}>败 {jobFail}</span>
+                                <span style={{fontSize: 12, color: "#6b7280"}}>{jobDone ? `${jobRate}%` : "—"}</span>
+                                <span style={{fontSize: 12, color: "#4338ca"}}>{fmtDur(job.startedAt ? nowTick - job.startedAt : job.elapsedMs)}</span>
+                                {job.etaMs ? <span style={{fontSize: 12, color: "#9a3412"}}>余 {fmtDur(job.etaMs)}</span> : null}
+                                <div style={{flex: 1, minWidth: 48, height: 4, background: "#f3f4f6", borderRadius: 99, overflow: "hidden", maxWidth: 160}}>
+                                    <div style={{width: `${jobPct}%`, height: "100%", background: "#ea580c", borderRadius: 99}}/>
+                                </div>
+                                <button type="button" onClick={() => setJobDetailOpen((v) => !v)}
+                                        style={{height: 28, padding: "0 10px", fontSize: 12, border: "1px solid #e5e7eb", borderRadius: 8, background: jobDetailOpen ? "#fff7ed" : "#fff", cursor: "pointer", color: "#9a3412"}}>
+                                    {jobDetailOpen ? "收起日志" : `日志${(job.current || []).length ? `(${(job.current || []).length})` : ""} ▾`}
+                                </button>
+                                <button onClick={stopMailboxJob} disabled={stopping}
+                                        style={{height: 28, padding: "0 12px", background: stopping ? "#fca5a5" : "#dc2626", color: "#fff", border: "none", borderRadius: 8, cursor: stopping ? "wait" : "pointer", fontWeight: 600, fontSize: 12}}>
+                                    {stopping ? "停止中" : "停止"}
+                                </button>
                             </div>
-                            {(job.hourly || []).length > 0 && (
-                                <div style={{marginTop: 6, display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center"}}>
-                                    {(job.hourly || []).map((h) => {
-                                        const cur = job.hourNow && h.at === job.hourNow.at;
-                                        return (
-                                            <span key={h.at} style={{fontSize: 11, color: cur ? "#0f766e" : "#4b5563", background: cur ? "#ccfbf1" : "#f8fafc", border: `1px solid ${cur ? "#99f6e4" : "#e5e7eb"}`, borderRadius: 6, padding: "2px 8px"}}>
-                                                {fmtHourLabel(h.at)} 完成 {h.done}（成{h.ok} 败{h.fail}）
+                            {jobDetailOpen && (
+                                <div style={{marginTop: 8, maxHeight: "22vh", overflow: "auto", borderTop: "1px solid #f3f4f6", paddingTop: 8}}>
+                                    <div style={{display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 6}}>
+                                        {kindStats.map(([k, v]) => (
+                                            <span key={k} style={{fontSize: 11, color: "#4b5563", background: "#f3f4f6", borderRadius: 999, padding: "2px 8px"}}>
+                                                {KIND_LABEL[k] || k} 跑{v.running} 排{v.pending} 成{v.ok} 败{v.error}
                                             </span>
-                                        );
-                                    })}
-                                </div>
-                            )}
-                            {farm.length > 0 && (
-                                <div style={{marginTop: 6, display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center"}}>
-                                    <span style={{fontSize: 11, color: "#9ca3af"}}>农场 {farm.length} 台</span>
-                                    {farm.map((inst) => (
-                                        <span key={inst.instanceId} style={{fontSize: 11, color: inst.instanceId === job.instanceId ? "#111827" : "#6b7280", background: inst.instanceId === job.instanceId ? "#eef2ff" : "#f9fafb", borderRadius: 6, padding: "2px 8px"}}>
-                                            {inst.instanceId === job.instanceId ? "本机" : inst.instanceId}
-                                            {" "}任务{inst.runningJobs} 代理{inst.proxyLeased}/{inst.proxySlots}
-                                            {inst.stopClaim ? " · 暂停认领" : ""}
-                                        </span>
-                                    ))}
-                                </div>
-                            )}
-                            {(job.current || []).length > 0 && (
-                                <div style={{marginTop: 8, display: "flex", flexDirection: "column", gap: 2}}>
+                                        ))}
+                                        <span style={{fontSize: 11, color: "#4338ca"}}>代理 空闲{poolSnap.free}/占{poolSnap.leased}</span>
+                                    </div>
                                     {(job.current || []).map((c) => (
-                                        <div key={`${c.kind || "job"}-${c.id}`} style={{fontSize: 12, fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace", color: "#57534e"}}>
+                                        <div key={`${c.kind || "job"}-${c.id}`} style={{fontSize: 12, fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace", color: "#57534e", marginBottom: 2}}>
                                             <span style={{color: "#9a3412"}}>[{KIND_LABEL[c.kind || ""] || c.kind || "任务"}] {c.email}</span>
                                             <span style={{color: "#4338ca"}}>  {c.claimedAt ? fmtDur(nowTick - c.claimedAt) : (c.elapsedMs ? fmtDur(c.elapsedMs) : "")}</span>
                                             <span style={{color: "#a8a29e"}}>  {c.lastLine || "运行中"}</span>
-                                            {c.instanceId ? <span style={{color: "#c4b5fd"}}>  · {c.instanceId === job.instanceId ? "本机" : c.instanceId}</span> : null}
                                         </div>
                                     ))}
-                                </div>
-                            )}
-                            {openWins.length > 0 && !(job.current || []).length && (
-                                <div style={{marginTop: 8, fontSize: 12, color: "#78716c"}}>
-                                    外部整备 {openWins.length} 窗：{openWins.map((w) => w.name || w.id.slice(0, 8)).join("  ")}
+                                    {openWins.length > 0 && !(job.current || []).length && (
+                                        <div style={{fontSize: 12, color: "#78716c"}}>外部窗 {openWins.length}：{openWins.map((w) => w.name || w.id.slice(0, 8)).join("  ")}</div>
+                                    )}
                                 </div>
                             )}
                         </>
                     ) : leftoverWins.length ? (
                         <div style={{display: "flex", alignItems: "center", gap: 12}}>
-                            <span style={{fontSize: 13, color: "#475569"}}>残留指纹配置 {leftoverWins.length} 个</span>
+                            <span style={{fontSize: 13, color: "#475569"}}>残留指纹 {leftoverWins.length}</span>
                             <button onClick={stopMailboxJob} disabled={stopping}
-                                    style={{height: 30, padding: "0 12px", background: "#334155", color: "#fff", border: "none", borderRadius: 8, cursor: "pointer", fontSize: 12}}>清理残留</button>
+                                    style={{height: 28, padding: "0 12px", background: "#334155", color: "#fff", border: "none", borderRadius: 8, cursor: "pointer", fontSize: 12}}>清理</button>
                         </div>
                     ) : lastJob ? (
-                        <div style={{display: "flex", alignItems: "center", gap: 16, flexWrap: "wrap"}}>
-                            <div style={{fontSize: 13, color: "#6b7280"}}>上次{lastJob.kind}{lastJob.stopped ? "（已停）" : ""}</div>
-                            {metric("已跑", `${lastJob.done}/${lastJob.total}`)}
-                            {metric("成功", lastJob.ok, "#059669")}
-                            {metric("失败", lastJob.fail, lastJob.fail ? "#dc2626" : "#9ca3af")}
-                            {metric("成功率", `${lastJob.rate}%`, lastJob.rate >= 70 ? "#059669" : "#d97706")}
-                            {metric("总时长", fmtDur(lastJob.elapsedMs), "#4338ca")}
-                            {metric("均时", fmtDur(lastJob.avgMs), "#6b7280")}
-                            {lastJob.startedAt ? <span style={{fontSize: 11, color: "#9ca3af"}}>{fmtClock(lastJob.startedAt)}–{fmtClock(lastJob.endedAt)}</span> : null}
-                            {(lastJob.hourly || []).map((h) => (
-                                <span key={h.at} style={{fontSize: 11, color: "#4b5563", background: "#f8fafc", borderRadius: 6, padding: "2px 8px"}}>
-                                    {fmtHourLabel(h.at)} {h.done}个
-                                </span>
-                            ))}
-                            <button onClick={() => resumeMailboxJob(false)} style={{marginLeft: "auto", height: 28, padding: "0 12px", background: "#ea580c", color: "#fff", border: "none", borderRadius: 8, fontSize: 12, cursor: "pointer"}}>继续未完成</button>
+                        <div style={{display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap"}}>
+                            <span style={{fontSize: 13, color: "#6b7280"}}>上次{lastJob.kind}{lastJob.stopped ? "（已停）" : ""} {lastJob.done}/{lastJob.total} 成{lastJob.ok} 败{lastJob.fail}</span>
+                            <button onClick={() => resumeMailboxJob(false)} style={{marginLeft: "auto", height: 28, padding: "0 12px", background: "#ea580c", color: "#fff", border: "none", borderRadius: 8, fontSize: 12, cursor: "pointer"}}>继续</button>
                             <button onClick={() => resumeMailboxJob(true)} style={{height: 28, padding: "0 12px", background: "#dc2626", color: "#fff", border: "none", borderRadius: 8, fontSize: 12, cursor: "pointer"}}>重试失败</button>
                             <button onClick={() => setLastJob(null)} style={{height: 28, padding: "0 10px", border: "1px solid #e5e7eb", borderRadius: 8, background: "#fff", fontSize: 12, color: "#6b7280", cursor: "pointer"}}>关闭</button>
                         </div>
@@ -678,123 +711,50 @@ export function MailboxPanel({notify}: {notify?: (m: string) => void}) {
                 </div>
             ) : null}
 
-            {/* 控制区:导入卡 + 分配卡(限宽均衡,避免宽屏拉伸) */}
-            <div style={{display: "flex", gap: 14, alignItems: "stretch", flexWrap: "wrap", maxWidth: 1180}}>
-                {/* 导入卡 */}
-                <div style={{...card, flex: "1.8 1 420px", display: "flex", flexDirection: "column", gap: 10}}>
-                    <div style={{display: "flex", alignItems: "baseline", gap: 8, flexWrap: "wrap"}}>
-                        <span style={{fontSize: 13, fontWeight: 600, color: "#111827"}}>📥 导入邮箱</span>
-                        <span style={{fontSize: 11, color: "#9ca3af"}}>入池纯管理;默认「待分配」可被业务取用。Gmail 选类型后默认独立并勾整备,导入完立刻开代理池整备</span>
-                    </div>
-                    <textarea
-                        value={importText} onChange={(e) => setImportText(e.target.value)} disabled={busy}
-                        placeholder={importProvider === "google"
-                            ? `Gmail 老号每行: email${mailSep}password${mailSep}totp密钥${mailSep}辅助邮箱`
-                            : `每行一个:  email${mailSep}password  /  email:password`}
-                        style={{height: 84, resize: "vertical", padding: 10, fontFamily: "monospace", fontSize: 12, border: "1px solid #e5e7eb", borderRadius: 8, outline: "none"}}
-                    />
-                    <div style={{display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap"}}>
-                        {/* 可选已有分组(datalist 下拉)或直接输入新分组 */}
-                        <input value={grp} onChange={(e) => setGrp(e.target.value)} placeholder="分组/批次(选已有或输新)" list="mb-grp-options" style={{...inp, flex: "1 1 150px"}} />
-                        <datalist id="mb-grp-options">
-                            {groups.filter((g) => g.grp).map((g) => <option key={g.grp} value={g.grp}>{g.grp}({g.n})</option>)}
-                        </datalist>
-                        <label style={{fontSize: 12, color: "#7c3aed", display: "inline-flex", alignItems: "center", gap: 4, cursor: "pointer", whiteSpace: "nowrap"}} title="导入即设为独立(hold):永不被 GPT/Claude 分配,只纯管理">
-                            <input type="checkbox" checked={importHold} onChange={(e) => setImportHold(e.target.checked)} disabled={busy} />导入即独立
-                        </label>
-                        {importProvider === "google" ? (
-                            <label style={{fontSize: 12, color: "#b45309", display: "inline-flex", alignItems: "center", gap: 4, cursor: "pointer", whiteSpace: "nowrap"}} title="导入后立刻对这批 Gmail 开整备(删辅助/换2FA/改密/踢设备/开 IMAP)。已在库里的同地址也会一起跑。走代理池，1 代理=1 指纹。">
-                                <input type="checkbox" checked={importAutoHarden} onChange={(e) => setImportAutoHarden(e.target.checked)} disabled={busy} />导入后自动整备
-                            </label>
-                        ) : (
-                            <label style={{fontSize: 12, color: "#b45309", display: "inline-flex", alignItems: "center", gap: 4, cursor: "pointer", whiteSpace: "nowrap"}} title="导入后立即对这批邮箱改成随机20位密码(headed 串行,逐个弹浏览器)">
-                                <input type="checkbox" checked={importAutoPw} onChange={(e) => setImportAutoPw(e.target.checked)} disabled={busy} />导入后自动改密
-                            </label>
-                        )}
-                        <label style={{fontSize: 12, color: "#0d9488", display: "inline-flex", alignItems: "center", gap: 4, whiteSpace: "nowrap"}} title="mail.com / iCloud / Gmail 老号(带 TOTP 和辅助邮箱)">
-                            类型
-                            <select value={importProvider} onChange={(e) => {
-                                const p = e.target.value as "mailcom"|"icloud"|"google";
-                                setImportProvider(p);
-                                if (p === "google") { setImportHold(true); setImportAutoHarden(true); setImportAutoPw(false); }
-                            }} style={{padding: "2px 4px", border: "1px solid #d1d5db", borderRadius: 4, fontSize: 12}}>
-                                <option value="mailcom">mail.com</option>
-                                <option value="icloud">iCloud</option>
-                                <option value="google">Gmail 老号</option>
-                            </select>
-                        </label>
-                        <label style={{fontSize: 12, color: "#6b7280", display: "inline-flex", alignItems: "center", gap: 4, whiteSpace: "nowrap"}} title="邮箱与密码之间的分隔符(导入/校验共用)">
-                            分隔符
-                            <input value={mailSep} onChange={(e) => setMailSep(e.target.value)}
-                                   onBlur={() => { if (mailSep.trim()) api.setMailSeparator(mailSep.trim()).catch((err: any) => toast("设置分隔符失败:" + err.message)); }}
-                                   style={{width: 60, padding: "2px 6px", border: "1px solid #d1d5db", borderRadius: 4, fontFamily: "monospace", fontSize: 12, textAlign: "center"}} />
-                        </label>
-                        <button onClick={doImport} disabled={busy || !importText.trim()} style={{padding: "7px 20px", background: busy || !importText.trim() ? "#c7cbd1" : "#4f46e5", color: "#fff", border: "none", borderRadius: 8, cursor: busy || !importText.trim() ? "not-allowed" : "pointer", fontWeight: 500, fontSize: 13}}>导入</button>
-                    </div>
-                </div>
-                {/* 分配卡 */}
-                <div style={{...card, flex: "1 1 300px", display: "flex", flexDirection: "column", gap: 10}}>
-                    <span style={{fontSize: 13, fontWeight: 600, color: "#111827"}}>🎯 分配到业务域</span>
-                    <div style={{display: "flex", gap: 8, alignItems: "center"}}>
-                        <span style={{fontSize: 13, color: "#6b7280", width: 30}}>来源</span>
-                        <select value={allocSrc} onChange={(e) => setAllocSrc(e.target.value)} style={{...inp, flex: 1}}>
-                            <option value="__ALL__">全部待分配({stats.free})</option>
-                            {groups.map((g) => <option key={g.grp} value={"g:" + g.grp}>{g.grp || "(无分组)"}({g.n})</option>)}
-                        </select>
-                    </div>
-                    <div style={{display: "flex", gap: 8, alignItems: "center"}}>
-                        <span style={{fontSize: 13, color: "#6b7280", width: 30}}>数量</span>
-                        <input type="number" min={1} max={srcCount || 1} value={allocCount} onChange={(e) => setAllocCount(Math.max(1, Number(e.target.value) || 1))} style={{...inp, width: 84}} />
-                        <span style={{fontSize: 12, color: "#9ca3af"}}>可分配 {srcCount}</span>
-                    </div>
-                    <div style={{display: "flex", gap: 8}}>
-                        <button onClick={() => doAllocate("gpt")} disabled={busy || srcCount === 0} style={{flex: 1, padding: "7px 10px", background: "#10a37f", color: "#fff", border: "none", borderRadius: 8, cursor: srcCount === 0 ? "not-allowed" : "pointer", opacity: srcCount === 0 ? 0.5 : 1, fontWeight: 500, fontSize: 13}}>→ GPT</button>
-                        <button onClick={() => doAllocate("claude")} disabled={busy || srcCount === 0} style={{flex: 1, padding: "7px 10px", background: "#d97757", color: "#fff", border: "none", borderRadius: 8, cursor: srcCount === 0 ? "not-allowed" : "pointer", opacity: srcCount === 0 ? 0.5 : 1, fontWeight: 500, fontSize: 13}}>→ Claude</button>
-                    </div>
-                    <div style={{fontSize: 11, color: "#9ca3af", lineHeight: 1.5}}>只从选中来源取,<b>不动其他邮箱</b>。物理隔离不可串,GPT 立即进注册队列。</div>
-                </div>
-            </div>
-
             {showPool && (
-                <ProxyPoolPanel
-                    notify={toast}
-                    kind="mail"
-                    title="邮箱代理池"
-                    onMeta={(m) => {
-                        setPoolSnap({total: m.total, slots: m.slots, leased: m.leased, free: m.free});
-                        setJumpText(m.jump);
-                    }}
-                />
-            )}
-
-            {/* 批量操作栏(选中或改密进行中时显示) */}
-            {(selCount > 0 || job.running) && (
-                <div style={{display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap", background: "#fff", border: "1px solid #e8eaed", borderRadius: 12, padding: "10px 14px", boxShadow: "0 1px 3px rgba(0,0,0,0.04)"}}>
-                    <span style={{fontSize: 13, color: "#374151"}}>已选 <b>{selCount}</b> 个</span>
-                    {job.running
-                        ? <>
-                            <span style={{fontSize: 13, color: "#b45309"}}>{jobKind}中… {jobDone}/{jobTotal}(成功 {jobOk})</span>
-                            <button onClick={stopMailboxJob} disabled={stopping} style={{padding: "5px 12px", background: "#dc2626", color: "#fff", border: "none", borderRadius: 6, cursor: "pointer"}}>⏹ 停止任务</button>
-                        </>
-                        : <>
-                            <button onClick={doBatchChange} disabled={selCount === 0} style={{padding: "5px 14px", background: "#f59e0b", color: "#fff", border: "none", borderRadius: 6, cursor: selCount === 0 ? "not-allowed" : "pointer"}}>🔑 批量改密选中({selCount})</button>
-                            <button onClick={doBatchHarden} disabled={selCount === 0} style={{padding: "5px 12px", background: "#b45309", color: "#fff", border: "none", borderRadius: 6, cursor: selCount === 0 ? "not-allowed" : "pointer"}}>🛠 批量整备 Gmail</button>
-                            <button onClick={() => doBatchUsage("hold")} disabled={selCount === 0} style={{padding: "5px 12px", background: "#7c3aed", color: "#fff", border: "none", borderRadius: 6, cursor: selCount === 0 ? "not-allowed" : "pointer"}}>🔒 设为独立</button>
-                            <button onClick={() => doBatchUsage("free")} disabled={selCount === 0} style={{padding: "5px 12px", background: "#6b7280", color: "#fff", border: "none", borderRadius: 6, cursor: selCount === 0 ? "not-allowed" : "pointer"}}>↩ 放回待分配</button>
-                            <input value={moveGrp} onChange={(e) => setMoveGrp(e.target.value)} placeholder="新分组/批次" list="mb-grp-options"
-                                   style={{width: 140, height: 28, padding: "0 8px", border: "1px solid #d1d5db", borderRadius: 6, fontSize: 12}}/>
-                            <button onClick={doBatchGrp} disabled={selCount === 0} style={{padding: "5px 12px", background: "#4f46e5", color: "#fff", border: "none", borderRadius: 6, cursor: selCount === 0 ? "not-allowed" : "pointer"}}>改分组</button>
-                            <button onClick={doBatchAllocGpt} disabled={selCount === 0 || busy} style={{padding: "5px 12px", background: "#059669", color: "#fff", border: "none", borderRadius: 6, cursor: selCount === 0 ? "not-allowed" : "pointer"}}>→ 分配给 GPT</button>
-                            <button onClick={doCopySel} disabled={selCount === 0} style={{padding: "5px 12px", background: "#2563eb", color: "#fff", border: "none", borderRadius: 6, cursor: selCount === 0 ? "not-allowed" : "pointer"}}>📋 复制账密({selCount})</button>
-                            <button onClick={doBatchDelete} disabled={selCount === 0} style={{padding: "5px 12px", background: "#dc2626", color: "#fff", border: "none", borderRadius: 6, cursor: selCount === 0 ? "not-allowed" : "pointer"}}>🗑 批量删除</button>
-                        </>}
-                    {!job.running && selCount > 0 && <button onClick={() => setSelected(new Set())} style={{padding: "5px 10px", fontSize: 13}}>清空选择</button>}
-                    <span style={{fontSize: 11, color: "#9ca3af"}}>整备/改密/换2FA 同一队列，各机用自己的代理池认领。Gmail 一号一 session，网络挂了换。mail.com 改密仍走 headed Chrome。</span>
+                <div style={{flexShrink: 0, maxHeight: "28vh", overflow: "auto", minHeight: 0}}>
+                    <ProxyPoolPanel
+                        notify={toast}
+                        kind="mail"
+                        title="邮箱代理池"
+                        onMeta={(m) => {
+                            setPoolSnap({total: m.total, slots: m.slots, leased: m.leased, free: m.free});
+                            setJumpText(m.jump);
+                        }}
+                    />
                 </div>
             )}
 
-            <div style={{display: "flex", flexDirection: "column", gap: 8}}>
-                <div style={{display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap"}}>
+            {/* 批量操作：仅多选时出现（任务控制已在上方一行） */}
+            {selCount > 0 && !job.running && (
+                <div style={{display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap", background: "#fff", border: "1px solid #e8eaed", borderRadius: 12, padding: "8px 12px", flexShrink: 0}}>
+                    <span style={{fontSize: 13, color: "#374151"}}>已选 <b>{selCount}</b></span>
+                    <button onClick={doBatchChange} style={{padding: "5px 12px", background: "#f59e0b", color: "#fff", border: "none", borderRadius: 6, cursor: "pointer", fontSize: 12}}>改密</button>
+                    <button onClick={doBatchHarden} style={{padding: "5px 12px", background: "#b45309", color: "#fff", border: "none", borderRadius: 6, cursor: "pointer", fontSize: 12}}>整备 Gmail</button>
+                    <button onClick={() => doBatchUsage("hold")} style={{padding: "5px 12px", background: "#7c3aed", color: "#fff", border: "none", borderRadius: 6, cursor: "pointer", fontSize: 12}}>设独立</button>
+                    <button onClick={() => doBatchUsage("free")} style={{padding: "5px 12px", background: "#6b7280", color: "#fff", border: "none", borderRadius: 6, cursor: "pointer", fontSize: 12}}>放回</button>
+                    <input value={moveGrp} onChange={(e) => setMoveGrp(e.target.value)} placeholder="新分组" list="mb-grp-options"
+                           style={{width: 120, height: 28, padding: "0 8px", border: "1px solid #d1d5db", borderRadius: 6, fontSize: 12}}/>
+                    <button onClick={doBatchGrp} style={{padding: "5px 12px", background: "#4f46e5", color: "#fff", border: "none", borderRadius: 6, cursor: "pointer", fontSize: 12}}>改分组</button>
+                    <button onClick={doBatchAllocGpt} disabled={busy} style={{padding: "5px 12px", background: "#059669", color: "#fff", border: "none", borderRadius: 6, cursor: "pointer", fontSize: 12}}>→ GPT</button>
+                    <button onClick={doCopySel} style={{padding: "5px 12px", background: "#2563eb", color: "#fff", border: "none", borderRadius: 6, cursor: "pointer", fontSize: 12}}>复制账密</button>
+                    <button onClick={doBatchDelete} style={{padding: "5px 12px", background: "#dc2626", color: "#fff", border: "none", borderRadius: 6, cursor: "pointer", fontSize: 12}}>删除</button>
+                    <button onClick={() => setSelected(new Set())} style={{padding: "5px 10px", fontSize: 12}}>清空选择</button>
+                </div>
+            )}
+
+            {/* 列表主区：筛选 + 可折叠工具 + 表格 */}
+            <div style={{flex: 1, minHeight: 0, display: "flex", flexDirection: "column", gap: 8}}>
+                <div style={{display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap", flexShrink: 0}}>
+                    <button type="button" onClick={() => toggleTools("import")}
+                            style={{height: 32, padding: "0 12px", borderRadius: 8, fontSize: 12, cursor: "pointer", border: toolsOpen === "import" ? "1px solid #4f46e5" : "1px solid #e5e7eb", background: toolsOpen === "import" ? "#eef2ff" : "#fff", color: "#4338ca", fontWeight: 600}}>
+                        导入{toolsOpen === "import" ? " ▴" : " ▾"}
+                    </button>
+                    <button type="button" onClick={() => toggleTools("alloc")}
+                            style={{height: 32, padding: "0 12px", borderRadius: 8, fontSize: 12, cursor: "pointer", border: toolsOpen === "alloc" ? "1px solid #059669" : "1px solid #e5e7eb", background: toolsOpen === "alloc" ? "#ecfdf5" : "#fff", color: "#047857", fontWeight: 600}}>
+                        分配{toolsOpen === "alloc" ? " ▴" : " ▾"}
+                    </button>
+                    <span style={{width: 1, height: 16, background: "#e5e7eb"}}/>
                     {typeChip("", "全部", searchBase.length)}
                     {typeChip("mailcom", "mail.com", typeCounts.mailcom)}
                     {typeChip("google", "Gmail", typeCounts.google)}
@@ -825,10 +785,11 @@ export function MailboxPanel({notify}: {notify?: (m: string) => void}) {
                         <option value="fail">改密失败</option>
                     </select>
                     {fProvider !== "mailcom" && fProvider !== "icloud" && (
-                        <select value={fGmail} onChange={(e) => setFGmail(e.target.value)} style={sel}>
-                            <option value="">整备:全部</option>
+                        <select value={fGmail} onChange={(e) => setFGmail(e.target.value)} style={sel}
+                                title="已整备=已换成我们的2FA且有IMAP。卖家密钥+IMAP仍算未齐。数字随当前分组变化。">
+                            <option value="">整备:全部({gmailInView.length})</option>
                             {Object.entries(GOOGLE_STAGE_LABEL).map(([k, lab]) => (
-                                <option key={k} value={k}>{lab}({list.filter((m) => m.provider === "google" && m.google_stage === k).length})</option>
+                                <option key={k} value={k}>{lab}({gmailStageCounts[k] || 0})</option>
                             ))}
                         </select>
                     )}
@@ -854,7 +815,9 @@ export function MailboxPanel({notify}: {notify?: (m: string) => void}) {
                             批量
                         </button>
                     </div>
-                    <span style={{fontSize: 12, color: "#9ca3af", whiteSpace: "nowrap"}}>{filtered.length} 条{selCount ? ` · 已选 ${selCount}` : ""}</span>
+                    <span style={{fontSize: 12, color: "#9ca3af", whiteSpace: "nowrap"}}>
+                        {filtered.length} 条{filtered.length > visibleRows.length ? ` · 显示 ${visibleRows.length}` : ""}{selCount ? ` · 已选 ${selCount}` : ""}
+                    </span>
                     {filtered.length > 0 && (
                         <button onClick={() => copyCreds(filtered)}
                                 style={{height: 32, padding: "0 10px", fontSize: 12, border: "1px solid #e5e7eb", borderRadius: 8, background: "#fff", cursor: "pointer", color: "#374151"}}>
@@ -887,10 +850,94 @@ export function MailboxPanel({notify}: {notify?: (m: string) => void}) {
                         <button onClick={() => { setFEmail(""); setBatchSearch(false); }} style={{height: 26, padding: "0 8px", fontSize: 12, border: "1px solid #e5e7eb", borderRadius: 6, background: "#fff", cursor: "pointer", color: "#6b7280"}}>清除</button>
                     </div>
                 )}
-            </div>
 
-            {/* 邮箱列表 */}
-            <div style={{flex: 1, overflow: "auto", background: "#fff", border: "1px solid #e8eaed", borderRadius: 12, boxShadow: "0 1px 3px rgba(0,0,0,0.04)"}}>
+                {/* 导入 / 分配：默认折叠，点筛选行按钮展开；滚列表自动收起 */}
+                {toolsOpen && (
+                    <div style={{...card, flexShrink: 0, maxHeight: "36vh", overflow: "auto"}}>
+                        {toolsOpen === "import" && (
+                            <div style={{display: "flex", flexDirection: "column", gap: 10}}>
+                                <div style={{display: "flex", alignItems: "baseline", gap: 8, flexWrap: "wrap"}}>
+                                    <span style={{fontSize: 13, fontWeight: 600}}>📥 导入邮箱</span>
+                                    <span style={{fontSize: 11, color: "#9ca3af"}}>默认待分配；Gmail 可选独立+整备</span>
+                                    <button type="button" onClick={() => setToolsOpen(null)} style={{marginLeft: "auto", border: "none", background: "transparent", color: "#9ca3af", cursor: "pointer", fontSize: 12}}>收起</button>
+                                </div>
+                                <textarea
+                                    value={importText}
+                                    onChange={(e) => setImportText(e.target.value)}
+                                    disabled={busy}
+                                    autoFocus
+                                    placeholder={importProvider === "google"
+                                        ? `Gmail: email${mailSep}password${mailSep}totp${mailSep}辅助邮箱`
+                                        : `每行: email${mailSep}password`}
+                                    style={{height: 88, resize: "vertical", padding: 10, fontFamily: "monospace", fontSize: 12, border: "1px solid #e5e7eb", borderRadius: 8, outline: "none"}}
+                                />
+                                <div style={{display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap"}}>
+                                    <input value={grp} onChange={(e) => setGrp(e.target.value)} placeholder="分组/批次" list="mb-grp-options" style={{...inp, flex: "1 1 140px"}} />
+                                    <label style={{fontSize: 12, color: "#7c3aed", display: "inline-flex", alignItems: "center", gap: 4, cursor: "pointer"}}>
+                                        <input type="checkbox" checked={importHold} onChange={(e) => setImportHold(e.target.checked)} disabled={busy} />独立
+                                    </label>
+                                    {importProvider === "google" ? (
+                                        <label style={{fontSize: 12, color: "#b45309", display: "inline-flex", alignItems: "center", gap: 4, cursor: "pointer"}}>
+                                            <input type="checkbox" checked={importAutoHarden} onChange={(e) => setImportAutoHarden(e.target.checked)} disabled={busy} />自动整备
+                                        </label>
+                                    ) : (
+                                        <label style={{fontSize: 12, color: "#b45309", display: "inline-flex", alignItems: "center", gap: 4, cursor: "pointer"}}>
+                                            <input type="checkbox" checked={importAutoPw} onChange={(e) => setImportAutoPw(e.target.checked)} disabled={busy} />自动改密
+                                        </label>
+                                    )}
+                                    <select value={importProvider} onChange={(e) => {
+                                        const p = e.target.value as "mailcom"|"icloud"|"google";
+                                        setImportProvider(p);
+                                        if (p === "google") { setImportHold(true); setImportAutoHarden(true); setImportAutoPw(false); }
+                                    }} style={{padding: "4px 6px", border: "1px solid #d1d5db", borderRadius: 6, fontSize: 12}}>
+                                        <option value="mailcom">mail.com</option>
+                                        <option value="icloud">iCloud</option>
+                                        <option value="google">Gmail</option>
+                                    </select>
+                                    <input value={mailSep} onChange={(e) => setMailSep(e.target.value)}
+                                           onBlur={() => { if (mailSep.trim()) api.setMailSeparator(mailSep.trim()).catch((err: any) => toast("分隔符:" + err.message)); }}
+                                           title="分隔符" style={{width: 48, padding: "4px 6px", border: "1px solid #d1d5db", borderRadius: 6, fontFamily: "monospace", fontSize: 12, textAlign: "center"}} />
+                                    <button onClick={async () => { await doImport(); setToolsOpen(null); }} disabled={busy || !importText.trim()}
+                                            style={{padding: "7px 18px", background: busy || !importText.trim() ? "#c7cbd1" : "#4f46e5", color: "#fff", border: "none", borderRadius: 8, cursor: busy || !importText.trim() ? "not-allowed" : "pointer", fontWeight: 500, fontSize: 13}}>导入</button>
+                                </div>
+                            </div>
+                        )}
+                        {toolsOpen === "alloc" && (
+                            <div style={{display: "flex", flexDirection: "column", gap: 10, maxWidth: 420}}>
+                                <div style={{display: "flex", alignItems: "center", gap: 8}}>
+                                    <span style={{fontSize: 13, fontWeight: 600}}>🎯 分配到业务域</span>
+                                    <button type="button" onClick={() => setToolsOpen(null)} style={{marginLeft: "auto", border: "none", background: "transparent", color: "#9ca3af", cursor: "pointer", fontSize: 12}}>收起</button>
+                                </div>
+                                <div style={{display: "flex", gap: 8, alignItems: "center"}}>
+                                    <span style={{fontSize: 12, color: "#6b7280", width: 36}}>来源</span>
+                                    <select value={allocSrc} onChange={(e) => setAllocSrc(e.target.value)} style={{...inp, flex: 1}}>
+                                        <option value="__ALL__">全部待分配({stats.free})</option>
+                                        {groups.map((g) => <option key={g.grp} value={"g:" + g.grp}>{g.grp || "(无分组)"}({g.n})</option>)}
+                                    </select>
+                                </div>
+                                <div style={{display: "flex", gap: 8, alignItems: "center"}}>
+                                    <span style={{fontSize: 12, color: "#6b7280", width: 36}}>数量</span>
+                                    <input type="number" min={1} max={srcCount || 1} value={allocCount} onChange={(e) => setAllocCount(Math.max(1, Number(e.target.value) || 1))} style={{...inp, width: 84}} />
+                                    <span style={{fontSize: 12, color: "#9ca3af"}}>可分 {srcCount}</span>
+                                </div>
+                                <div style={{display: "flex", gap: 8}}>
+                                    <button onClick={async () => { await doAllocate("gpt"); setToolsOpen(null); }} disabled={busy || srcCount === 0}
+                                            style={{flex: 1, padding: "7px 10px", background: "#10a37f", color: "#fff", border: "none", borderRadius: 8, cursor: srcCount === 0 ? "not-allowed" : "pointer", opacity: srcCount === 0 ? 0.5 : 1, fontWeight: 500, fontSize: 13}}>→ GPT</button>
+                                    <button onClick={async () => { await doAllocate("claude"); setToolsOpen(null); }} disabled={busy || srcCount === 0}
+                                            style={{flex: 1, padding: "7px 10px", background: "#d97757", color: "#fff", border: "none", borderRadius: 8, cursor: srcCount === 0 ? "not-allowed" : "pointer", opacity: srcCount === 0 ? 0.5 : 1, fontWeight: 500, fontSize: 13}}>→ Claude</button>
+                                </div>
+                            </div>
+                        )}
+                    </div>
+                )}
+
+            {/* 邮箱列表：滚动时收起导入/分配，把主视口留给表格 */}
+            <div
+                onScroll={(e) => {
+                    if (toolsOpen && (e.currentTarget.scrollTop > 40)) setToolsOpen(null);
+                }}
+                style={{flex: 1, minHeight: 0, overflow: "auto", background: "#fff", border: "1px solid #e8eaed", borderRadius: 12, boxShadow: "0 1px 3px rgba(0,0,0,0.04)"}}
+            >
                 <table style={{width: "100%", borderCollapse: "collapse", fontSize: 13}}>
                     <thead style={{position: "sticky", top: 0, background: "#f9fafb"}}>
                         <tr style={{textAlign: "left", color: "#6b7280"}}>
@@ -907,7 +954,7 @@ export function MailboxPanel({notify}: {notify?: (m: string) => void}) {
                         </tr>
                     </thead>
                     <tbody>
-                        {filtered.map((m) => (
+                        {visibleRows.map((m) => (
                             <tr key={m.id} style={{borderTop: "1px solid #f3f4f6", background: runningEmails.has(m.email.toLowerCase()) ? "#fff7ed" : selected.has(m.id) ? "#f0fdf9" : undefined}}>
                                 <td style={{padding: "6px 10px"}}><input type="checkbox" checked={selected.has(m.id)} onChange={() => toggleSel(m.id)}/></td>
                                 <td style={{padding: "6px 10px", fontFamily: "monospace"}}>
@@ -922,8 +969,8 @@ export function MailboxPanel({notify}: {notify?: (m: string) => void}) {
                                     {m.password && <button onClick={() => copyCreds([m])} style={{marginLeft: 6, fontSize: 11, color: "#2563eb", background: "none", border: "none", cursor: "pointer"}}>复制</button>}
                                 </td>
                                 <td style={{padding: "6px 10px", fontSize: 12, color: "#6b7280"}}>{m.provider === "google" ? "Gmail" : m.provider === "icloud" ? "iCloud" : (m.provider || "mail.com")}</td>
-                                <td style={{padding: "6px 10px", fontSize: 12}} title={m.totp_secret || ""}>
-                                    {m.totp_secret ? <span style={{color: "#059669"}}>已绑</span> : <span style={{color: "#d1d5db"}}>—</span>}
+                                <td style={{padding: "6px 10px", fontSize: 12}} title={totpCell(m).title}>
+                                    {(() => { const t = totpCell(m); return <span style={{color: t.color}}>{t.text}</span>; })()}
                                     {m.provider === "google" && m.imap_password ? <span style={{marginLeft: 6, color: "#2563eb"}}>IMAP</span> : null}
                                     {m.provider === "google" && m.recovery_email ? <span style={{marginLeft: 6, color: "#d97706"}}>有辅助</span> : null}
                                 </td>
@@ -960,7 +1007,7 @@ export function MailboxPanel({notify}: {notify?: (m: string) => void}) {
                                                 try {
                                                     const r = await api.changeMailboxGoogle2fa(m.id);
                                                     toast(r.queued ? "2FA 已入队，空闲代理会认领" : (r.ok ? `2FA 已更新: ${r.totpSecret}` : `2FA 失败: ${r.error || ""}`));
-                                                    load();
+                                                    load(true);
                                                 } catch (e: any) { toast(e.message); }
                                             }} disabled={busy} style={{marginRight: 6, fontSize: 12, color: "#059669"}}>换2FA</button>}
                                             {m.usage === "free" && <button onClick={() => doSetUsage(m, "hold")} style={{marginRight: 6, fontSize: 12, color: "#7c3aed"}} title="设为独立:永不被 GPT/Claude 分配">设独立</button>}
@@ -973,8 +1020,29 @@ export function MailboxPanel({notify}: {notify?: (m: string) => void}) {
                         {filtered.length === 0 && (
                             <tr><td colSpan={10} style={{padding: 24, textAlign: "center", color: "#9ca3af"}}>{list.length ? "无匹配筛选的邮箱" : "暂无邮箱。可在上方导入独立邮箱。"}</td></tr>
                         )}
+                        {filtered.length > visibleRows.length && (
+                            <tr>
+                                <td colSpan={10} style={{padding: 16, textAlign: "center"}}>
+                                    <button
+                                        type="button"
+                                        onClick={() => setListLimit((n) => n + LIST_PAGE_SIZE)}
+                                        style={{height: 32, padding: "0 16px", borderRadius: 8, border: "1px solid #e5e7eb", background: "#fff", cursor: "pointer", fontSize: 13}}
+                                    >
+                                        显示更多（已 {visibleRows.length}/{filtered.length}）
+                                    </button>
+                                    <button
+                                        type="button"
+                                        onClick={() => setListLimit(filtered.length)}
+                                        style={{marginLeft: 8, height: 32, padding: "0 12px", borderRadius: 8, border: "none", background: "transparent", color: "#6b7280", cursor: "pointer", fontSize: 12}}
+                                    >
+                                        全部展开
+                                    </button>
+                                </td>
+                            </tr>
+                        )}
                     </tbody>
                 </table>
+            </div>
             </div>
 
             {detailMb && <MailboxDetail mailbox={detailMb} onClose={() => setDetailMb(null)}/>}

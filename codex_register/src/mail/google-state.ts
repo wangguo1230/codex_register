@@ -22,7 +22,7 @@ export const GOOGLE_STAGE_LABEL = {
     login_ok: "能登录",
     login_fail: "登不上",
     partial: "整备未齐",
-    ready: "可取件",
+    ready: "已整备",
     gpt_ok: "已注册 GPT",
     blocked: "卡住",
 };
