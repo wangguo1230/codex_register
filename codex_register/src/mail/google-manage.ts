@@ -386,6 +386,70 @@ async function isAccountPickerDialog(page) {
     return /Manage your Google Account|Add account|Sign out|管理您的 Google 账号|添加账号|退出账号/i.test(t);
 }
 
+function dialogLooksLikeChangeTotp(text) {
+    const t = String(text || "");
+    return /enter the 6-digit|enter code|输入.*6.*位|输入验证码/i.test(t)
+        && /change authenticator|authenticator app|更改身份验证|验证器/i.test(t);
+}
+
+async function findChangeTotpDialog(page) {
+    const dlg = page.locator('[role="dialog"], [role="alertdialog"]').first();
+    if (!await dlg.isVisible({timeout: 200}).catch(() => false)) return null;
+    const t = String(await dlg.innerText().catch(() => ""));
+    if (dialogLooksLikeChangeTotp(t)) return dlg;
+    return null;
+}
+
+/** 换验证器前要先用当前 TOTP 过一道。空点 Verify 会停在这个框里，被误报成「未找到更改」。 */
+async function fillChangeAuthenticatorCode(page, totpSecret, log) {
+    const dlg = await findChangeTotpDialog(page);
+    if (!dlg) return "missing";
+    const secret = String(totpSecret || "").trim();
+    if (!secret) {
+        log("[2FA] 更换框要验证码，但没有当前密钥");
+        return "missing";
+    }
+    await waitTotpSafeWindow(16);
+    const code = generateTotp(secret);
+    if (!code) return "missing";
+    const input = dlg.locator(
+        'input[name="totpPin"], input[autocomplete="one-time-code"], input[type="tel"], '
+        + 'input[aria-label*="code" i], input[placeholder*="code" i], input[placeholder*="码" i], '
+        + 'input[inputmode="numeric"]',
+    ).first();
+    if (!await input.isVisible({timeout: 800}).catch(() => false)) return "missing";
+    await input.click({force: true}).catch(() => {});
+    await input.press("Meta+A").catch(() => {});
+    await input.press("Control+A").catch(() => {});
+    await input.press("Backspace").catch(() => {});
+    await input.pressSequentially(code, {delay: 80}).catch(async () => {
+        await input.fill(code);
+    });
+    log(`[2FA] 更换前验证码已填 ${code}`);
+    const WRONG_RE = /wrong code|incorrect code|c[oó]digo (incorrecto|errado)|code incorrect|验证码有误/i;
+    for (let w = 0; w < 10; w++) {
+        await page.waitForTimeout(500);
+        const after = String(await page.innerText("body").catch(() => ""));
+        if (WRONG_RE.test(after)) {
+            log("[2FA] 更换前验证码 Wrong code");
+            return "wrong";
+        }
+        if (!await findChangeTotpDialog(page)) return "ok";
+    }
+    const verify = dlg.getByRole("button", {name: /^(verify|verif|验证|確認|确认)$/i}).first();
+    if (await verify.isVisible({timeout: 400}).catch(() => false)) {
+        await verify.click({force: true}).catch(() => verify.click());
+        log("[2FA] 点了更换前 Verify");
+    }
+    await page.waitForTimeout(1800);
+    const after = String(await page.innerText("body").catch(() => ""));
+    if (WRONG_RE.test(after)) {
+        log("[2FA] 更换前验证码 Wrong code");
+        return "wrong";
+    }
+    return await findChangeTotpDialog(page) ? "pending" : "ok";
+}
+
 async function waitAuthenticatorSetup(page, ms = 9000) {
     const deadline = Date.now() + ms;
     while (Date.now() < deadline) {
@@ -400,6 +464,7 @@ async function waitAuthenticatorSetup(page, ms = 9000) {
         const dlg = page.locator('[role="dialog"], [role="alertdialog"]').first();
         if (await dlg.isVisible({timeout: 180}).catch(() => false)) {
             const dt = String(await dlg.innerText().catch(() => ""));
+            if (dialogLooksLikeChangeTotp(dt)) return "reauth";
             if (/change authenticator|replace|next|continue|更改|替换|下一步/i.test(dt) && !/Manage your Google Account/i.test(dt)) return "confirm";
         }
         await page.waitForTimeout(350);
@@ -410,6 +475,9 @@ async function waitAuthenticatorSetup(page, ms = 9000) {
 async function clickDialogNext(page, log) {
     const dlg = page.locator('[role="dialog"], [role="alertdialog"]').first();
     if (!await dlg.isVisible({timeout: 400}).catch(() => false)) return false;
+    if (dialogLooksLikeChangeTotp(String(await dlg.innerText().catch(() => "")))) return false;
+    const codeBox = dlg.locator('input[placeholder*="code" i], input[name="totpPin"], input[autocomplete="one-time-code"]').first();
+    if (await codeBox.isVisible({timeout: 200}).catch(() => false)) return false;
     const btn = dlg.getByRole("button", {name: /^(next|continue|replace|change|ok|下一步|继续|更换|确定)$/i}).last();
     if (await btn.isVisible({timeout: 600}).catch(() => false)) {
         await btn.click({force: true}).catch(() => btn.click());
@@ -419,7 +487,7 @@ async function clickDialogNext(page, log) {
     const any = dlg.locator("button").last();
     if (await any.isVisible({timeout: 400}).catch(() => false)) {
         const txt = String(await any.innerText().catch(() => ""));
-        if (!/cancel|close|取消|关闭/i.test(txt)) {
+        if (!/cancel|close|取消|关闭|verify|验证/i.test(txt)) {
             await any.click({force: true}).catch(() => any.click());
             log(`[2FA] 点了确认框按钮 ${txt.slice(0, 30)}`);
             return true;
@@ -628,23 +696,45 @@ export async function change2faOnPage(page, {
     await dismissAccountFlyout(page);
 
     let setup = "";
-    for (let tryChange = 0; tryChange < 3 && !setup; tryChange++) {
+    for (let tryChange = 0; tryChange < 4 && !setup; tryChange++) {
         await dismissAccountFlyout(page);
-        let clickedAction = await clickAuthenticatorChangeByDom(page, log);
-        if (!clickedAction) {
-            clickedAction = !!(await clickText(page, CHANGE_KEYWORDS.concat(SETUP_KEYWORDS), 1500));
-            if (clickedAction) log("[2FA] 文案兜底点到了更改");
+        if (await findChangeTotpDialog(page)) {
+            setup = "reauth";
+        } else {
+            let clickedAction = await clickAuthenticatorChangeByDom(page, log);
+            if (!clickedAction) {
+                clickedAction = !!(await clickText(page, CHANGE_KEYWORDS.concat(SETUP_KEYWORDS), 1500));
+                if (clickedAction) log("[2FA] 文案兜底点到了更改");
+            }
+            if (!clickedAction) break;
+            setup = await waitAuthenticatorSetup(page, 8000);
         }
-        if (!clickedAction) break;
-        setup = await waitAuthenticatorSetup(page, 8000);
+        if (setup === "reauth") {
+            const filled = await fillChangeAuthenticatorCode(page, totpSecret, log);
+            if (filled === "wrong" || filled === "pending") {
+                await waitNextTotpWindow();
+                setup = "";
+                continue;
+            }
+            if (filled !== "ok") {
+                log("[2FA] 更换前验证码没填上");
+                setup = "";
+                continue;
+            }
+            setup = await waitAuthenticatorSetup(page, 9000);
+        }
         if (setup === "confirm") {
             await clickDialogNext(page, log);
             setup = await waitAuthenticatorSetup(page, 8000);
         }
-        if (!setup || setup === "confirm") log("[2FA] 点了更改但仍在总览，再点一次");
-        if (setup === "confirm") setup = "";
+        if (!setup || setup === "confirm" || setup === "reauth") log("[2FA] 点了更改但仍在总览，再点一次");
+        if (setup === "confirm" || setup === "reauth") setup = "";
     }
 
+    if (!setup && await findChangeTotpDialog(page)) {
+        const filled = await fillChangeAuthenticatorCode(page, totpSecret, log);
+        if (filled === "ok") setup = await waitAuthenticatorSetup(page, 9000);
+    }
     if (!setup && !(await clickAuthenticatorChangeByDom(page, log))) {
         log("[2FA] 未找到更改/设置按钮");
         await dumpPage(page, "2fa_no_action_btn", log, email);

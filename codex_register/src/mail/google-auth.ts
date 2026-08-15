@@ -703,7 +703,7 @@ export async function googleLogin(page, emailOrOpts, password = "", totpSecret =
             }
 
             // TOTP：窗口够用再填；Google 常自动提交，先等，再视情况点 Next。Wrong code 换下一窗重试。
-            if (totpAttempts < 4 && totp && await totpFieldVisible(page)) {
+            if (totpAttempts < 6 && totp && await totpFieldVisible(page)) {
                 totpAttempts += 1;
                 const submitted = await submitGoogleTotp(page, totp, write, totpAttempts);
                 if (submitted === "glitch") {
@@ -736,6 +736,11 @@ export async function googleLogin(page, emailOrOpts, password = "", totpSecret =
                         await box.click().catch(() => {});
                         await box.fill("").catch(() => {});
                     }
+                    await waitNextTotpWindow();
+                    continue;
+                }
+                if (submitted === "ok" || submitted === "pending") {
+                    write("  TOTP 后仍在验证页，等下一窗再填");
                     await waitNextTotpWindow();
                     continue;
                 }
@@ -1168,7 +1173,7 @@ async function pageHasWrongTotp(page) {
 /** 等离开验证码页，或出现「新的」Wrong code。上次留下的红字不算这次失败。 */
 async function waitTotpOutcome(page, hadWrong, write) {
     let sawClear = !hadWrong;
-    for (let i = 0; i < 14; i++) {
+    for (let i = 0; i < 22; i++) {
         await page.waitForTimeout(400);
         if (await googleGlitchVisible(page)) {
             write("  填码后弹出 Something went wrong");

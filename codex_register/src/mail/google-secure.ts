@@ -464,7 +464,7 @@ export async function runGoogleHardenWithBit(acc, {proxyUrl = "", log = () => {}
         google_state: acc.google_state || {},
         skip,
     };
-    if (straight.swapped) {
+    if (straight.swapped && straight.totpSecret) {
         log("  导入字段对调：totp/辅助邮箱已纠正");
         try {
             const {applyMailboxUpdate} = await import("../../server/db.js");
@@ -474,6 +474,8 @@ export async function runGoogleHardenWithBit(acc, {proxyUrl = "", log = () => {}
             });
             log("  已写回库：密钥和辅助邮箱对调");
         } catch { /* 跑任务时写回失败不挡登录 */ }
+    } else if (straight.swapped && !straight.totpSecret) {
+        log("  totp 列是邮箱但没有可用密钥，不把空密钥写回库");
     }
     if (skip.all) {
         log("[整备] 缺口已齐，不再开窗");
