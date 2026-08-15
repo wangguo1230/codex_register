@@ -779,14 +779,8 @@ async function runClaimedMailJob(job) {
             }
         } else {
             const r = await runOneGoogleHarden(job.mailbox_id, {jobId: job.id});
-            const doneBits = [
-                (r.totpRotated || r.totpSecret) && "已换2FA",
-                r.passwordChanged && "已改密",
-                (r.imapPassword || r.imap) && "已IMAP",
-            ].filter(Boolean);
-            const miss = (r.missing || []).filter(Boolean);
-            const rawErr = (r.errors || [r.error]).filter(Boolean).map((e) => String(e).split("\n")[0]).join("; ");
-            const err = r.ok ? rawErr : [doneBits.length ? `部分成功(${doneBits.join("/")})` : "", miss.length ? `缺${miss.join("/")}` : "", rawErr].filter(Boolean).join(" · ");
+            const {formatHardenPartialError} = await import("../src/mail/google-state.js");
+            const err = formatHardenPartialError(r);
             const {isBitTransientError, isProxyInfraError} = await import("../src/bitbrowser.js");
             if (!r.ok && isBitTransientError(err)) {
                 await parkJobsForBitDown(err);

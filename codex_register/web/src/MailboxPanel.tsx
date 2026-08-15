@@ -993,7 +993,18 @@ export function MailboxPanel({notify}: {notify?: (m: string) => void}) {
                                     </span>
                                     {m.sold_at ? <span style={{marginLeft: 6, padding: "1px 6px", borderRadius: 8, fontSize: 11, color: "#b45309", background: "#fef3c7"}}>已售</span> : null}
                                 </td>
-                                <td style={{padding: "6px 10px", color: (m.pw_status || "").startsWith("✅") ? "#10a37f" : (m.pw_status || "").startsWith("❌") ? "#dc2626" : "#9ca3af"}}>{m.pw_status || "—"}</td>
+                                <td style={{padding: "6px 10px", color: (() => {
+                                    const s = m.pw_status || "";
+                                    const unfinished = m.provider === "google" && !["ready", "gpt_ok"].includes(m.google_stage || "");
+                                    if (s.startsWith("✅改密") && unfinished) return "#d97706";
+                                    if (s.startsWith("✅")) return "#10a37f";
+                                    if (s.startsWith("❌")) return "#dc2626";
+                                    return "#9ca3af";
+                                })()}} title={m.provider === "google" && (m.pw_status || "").startsWith("✅改密") && !["ready", "gpt_ok"].includes(m.google_stage || "") ? "改密做过，但 2FA+IMAP 还没齐，不是整单成功" : ""}>
+                                    {(m.pw_status || "").startsWith("✅改密") && m.provider === "google" && !["ready", "gpt_ok"].includes(m.google_stage || "")
+                                        ? String(m.pw_status).replace(/^✅改密/, "改密已做·未齐")
+                                        : (m.pw_status || "—")}
+                                </td>
                                 <td style={{padding: "6px 10px", color: "#6b7280"}}>{m.grp || "—"}</td>
                                 <td style={{padding: "6px 10px", whiteSpace: "nowrap"}}>
                                     {usageFilter === "deleted" || m.deleted_at

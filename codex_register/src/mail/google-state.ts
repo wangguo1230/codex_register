@@ -105,7 +105,21 @@ export function deriveGoogleState(facts = {}, overlay = {}) {
 
 function passwordChangedByUs(mb = {}, st = {}) {
     if (st.password === "ok") return true;
-    return /^✅改密/.test(String(mb.pw_status || ""));
+    return /^✅(改密|整备)/.test(String(mb.pw_status || ""));
+}
+
+/** 整备失败但部分步骤已做成时，任务文案要带上已做成的项。 */
+export function formatHardenPartialError(r = {}) {
+    const done = [
+        (r.totpRotated || r.totpSecret || r.totp) && "已换2FA",
+        (r.passwordChanged || r.password) && "已改密",
+        (r.imapPassword || r.imap) && "已IMAP",
+    ].filter(Boolean);
+    const miss = (r.missing || []).filter(Boolean);
+    const raw = (r.errors || [r.error]).filter(Boolean).map((e) => String(e).split("\n")[0]).join("; ");
+    if (r.ok) return raw;
+    if (/^部分成功/.test(raw)) return raw.slice(0, 240);
+    return [done.length ? `部分成功(${done.join("/")})` : "", miss.length ? `缺${miss.join("/")}` : "", raw].filter(Boolean).join(" · ").slice(0, 240);
 }
 
 /** 再跑整备时跳过已经做成的步。换 2FA 只在本轮成功换过才跳（有卖家密钥不算）。 */
