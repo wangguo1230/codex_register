@@ -944,6 +944,8 @@ app.post("/api/mailboxes/batch-google-harden/stop", async (req, res) => {
 });
 async function resumeMailJobs({onlyError = false, ids = null} = {}) {
     await beginMailQueue();
+    const dropped = await db.cancelPendingHardenIfAlreadyUsable().catch(() => 0);
+    if (dropped) console.log(`[mail-jobs] 继续完成：撤掉 ${dropped} 个已整备（2FA+IMAP）的排队`);
     let left = await db.listResumableMailJobs({kinds: ["harden", "pw", "2fa"], onlyError}).catch(() => []);
     if (Array.isArray(ids) && ids.length) {
         const want = new Set(ids.map(Number).filter(Number.isInteger));
@@ -960,13 +962,14 @@ async function resumeMailJobs({onlyError = false, ids = null} = {}) {
         if (!mb || mb.deleted_at > 0) continue;
         if (it.kind === "harden") {
             if (mb.provider !== "google") continue;
-            if (planHardenSkip(mb).all) { skippedDone += 1; continue; }
+            if (mb.google_stage === "blocked" || mb.google_stage === "gpt_ok") continue;
+            if (planHardenSkip(mb).usable) { skippedDone += 1; continue; }
             harden.push(mb);
             seen.add(mb.id);
         } else if (it.kind === "pw") pw.push(mb);
         else if (it.kind === "2fa" && mb.provider === "google") twofa.push(mb);
     }
-    if (!onlyError) {
+    if (!onlyError && Array.isArray(ids) && ids.length) {
         const gaps = await db.listGoogleHardenGaps(ids).catch(() => []);
         for (const mb of gaps) {
             if (seen.has(mb.id) || !needsHardenRetry(mb)) continue;

@@ -126,10 +126,11 @@ export function planHardenSkip(mb = {}) {
     return skip;
 }
 
-/** 任一缺口（含改密/踢设备加分项）都应触发重跑。 */
+/** 继续完成 / 续跑：只收还没齐最低限度的（换成我们的 2FA + IMAP）。改密、踢设备是加分项，不因此把已整备整队再丢回去。 */
 export function needsHardenRetry(mb = {}) {
     if (String(mb.google_stage || "") === "blocked") return false;
-    return !planHardenSkip(mb).all;
+    if (String(mb.google_stage || "") === "gpt_ok") return false;
+    return !planHardenSkip(mb).usable;
 }
 
 export function googleStageLabel(stage) {

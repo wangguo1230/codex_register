@@ -1581,6 +1581,25 @@ export async function listResumableMailJobs({kinds = ["harden"], onlyError = fal
         }));
 }
 
+/** 继续完成误把已齐（2FA+IMAP）的号又排进去时，把还没开跑的撤掉。 */
+export async function cancelPendingHardenIfAlreadyUsable() {
+    const {planHardenSkip} = await import("../src/mail/google-state.ts");
+    const {rows} = await query(
+        `SELECT j.id, m.pw_status, m.google_state, m.totp_secret, m.imap_password, m.recovery_email, m.google_stage, m.provider
+         FROM mail_jobs j
+         JOIN mailboxes m ON m.id = j.mailbox_id
+         WHERE j.kind='harden' AND j.status='pending'`,
+    );
+    const ids = rows.filter((mb) => planHardenSkip(mb).usable).map((r) => r.id);
+    if (!ids.length) return 0;
+    const {rowCount} = await query(
+        `UPDATE mail_jobs SET status='canceled', finished_at=$1, last_line='已整备（2FA+IMAP），继续完成跳过'
+         WHERE id = ANY($2) AND status='pending'`,
+        [Date.now(), ids],
+    );
+    return rowCount || 0;
+}
+
 export async function cancelPendingMailJobs(kind = "") {
     const now = Date.now();
     const r = kind
