@@ -148,7 +148,7 @@ export function rotateKookeeySession(url: string): string {
 export function isProxySessionDead(err: unknown): boolean {
     const s = String((err as {message?: string})?.message || err || "");
     if (!s || /已停止|比特已退出登录/.test(s)) return false;
-    return /代理中断|ERR_PROXY|chrome-error|代理不通|Cloudflare|Unable to load site|出口被|换 session|ERR_TUNNEL|ERR_CONNECTION|ERR_TIMED_OUT|ERR_SSL|ERR_EMPTY_RESPONSE|ERR_NETWORK_CHANGED|ERR_INTERNET_DISCONNECTED|端口不通|Google 不通|出口失败|this site can.?t be reached|No internet|something wrong with the proxy|Checking the proxy address|SSL\/代理|打开目标页失败\(网络|Target closed|has been closed|Browser has been closed/i.test(s);
+    return /代理中断|ERR_PROXY|chrome-error|代理不通|Cloudflare|Unable to load site|出口被|换 session|ERR_TUNNEL|ERR_CONNECTION|ERR_TIMED_OUT|ERR_SSL|ERR_EMPTY_RESPONSE|ERR_NETWORK_CHANGED|ERR_INTERNET_DISCONNECTED|端口不通|Google 不通|出口失败|this site can.?t be reached|No internet|something wrong with the proxy|Checking the proxy|正在连接|代理IP自身连通|无法连接网络|SSL\/代理|打开目标页失败\(网络|Target closed|has been closed|Browser has been closed/i.test(s);
 }
 
 /** 一号一代理：新开一条粘性 session（不带 -5m），同一账号全程钉死这个出口。 */

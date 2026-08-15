@@ -454,7 +454,7 @@ async function openGoogleBitOnce({proxyUrl = "", jumpUrl = "", name = "gmail", r
         const {getMailProxyJump} = await import("./proxy-pool.js");
         const jumpNow = String(jumpUrl || getMailProxyJump() || "").trim();
         log(jumpNow ? `[网络] 先测代理出口 / Google（经跳板 ${jumpNow}）` : "[网络] 先测代理出口 / Google（无跳板，直连网关，国内会超时）");
-        const picked = await pickLiveMailProxy(liveProxy, {tries: 2, rotate: false, log: (m) => log(`[网络] ${m}`), jump: jumpNow});
+        const picked = await pickLiveMailProxy(liveProxy, {tries: 3, rotate: true, log: (m) => log(`[网络] ${m}`), jump: jumpNow});
         if (!picked.ok) throw new Error(`代理不通，先别登 Google: ${picked.probe.reason || "未知"}`);
         liveProxy = picked.url;
         log(`[网络] 通 出口 ${picked.probe.ip} Google=${picked.probe.google} ${picked.probe.ms}ms ${maskProxyUrl(liveProxy)}`);
@@ -470,6 +470,10 @@ async function openGoogleBitOnce({proxyUrl = "", jumpUrl = "", name = "gmail", r
             log(`[网络] 链式 跳板→${wrapped.destHost}:${wrapped.destPort} 本机转发 :${wrapped.localPort}${timeZone ? " tz=" + timeZone : ""}`);
         } else {
             bitProxy = liveProxy;
+        }
+        const bitProbe = await pickLiveMailProxy(bitProxy, {tries: 1, rotate: false, log: (m) => log(`[网络] 比特将用的链 ${m}`), jump: ""});
+        if (!bitProbe.ok) {
+            throw new Error(`代理不通 开窗前复测失败: ${bitProbe.probe.reason || "未知"}`);
         }
     }
     let bitId = "";
@@ -505,6 +509,11 @@ async function openGoogleBitOnce({proxyUrl = "", jumpUrl = "", name = "gmail", r
         await page.route(/accounts\.youtube\.com|youtube\.com\/accounts\/SetSID|accounts\.blogger\.com/i, (route) => route.abort()).catch(() => {});
         const {applyGoogleEnglish} = await import("./google-auth.js");
         await applyGoogleEnglish(page);
+        await page.waitForTimeout(1500);
+        const splash = String(await page.innerText("body").catch(() => ""));
+        if (/正在连接|代理IP自身连通|无法连接网络|Checking the proxy|something wrong with the proxy|No internet/i.test(splash)) {
+            throw new Error("代理不通 比特预检页连不上出口，换 session 重开窗");
+        }
         try {
             return await fn(page);
         } finally {
