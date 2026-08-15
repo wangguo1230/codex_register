@@ -30,7 +30,7 @@ import {appConfig} from "../src/config.js";
 import {fetchInboxList, fetchMailBodyFor, setMailProxy, changeMailcomPassword, verifyMailcomLogin, scanClaudeDisabledMail} from "./domain/mailbox-service.js";
 import {changePasswordOnPage, change2faOnPage} from "../src/mail/google-manage.js";
 import {runGoogleHardenWithBit, withGoogleBitSession} from "../src/mail/google-secure.js";
-import {mailProxyPool, mailJumpPool, gptJumpPool, maskProxyUrl, toProxyImportLine, kookeeySessionOf, probeMailProxy, JUMP_MAX_EXITS} from "../src/mail/proxy-pool.js";
+import {mailProxyPool, gptProxyPool, mailJumpPool, gptJumpPool, maskProxyUrl, toProxyImportLine, kookeeySessionOf, probeMailProxy, JUMP_MAX_EXITS} from "../src/mail/proxy-pool.js";
 import {randomPassword} from "../src/utils.js";
 import {straightenImportRow, looksLikeEmail} from "../src/mfa.js";
 import {openBrowserWithAuth} from "../src/simulate-chat.js";
@@ -450,6 +450,9 @@ async function runOneGoogleHarden(id, opts = {}) {
         const stopped = batchHardenStop || isMailboxJobStopped() || ac.signal.aborted || (/已停止/.test(msg) && !closed);
         const err = stopped ? "已停止" : (closed ? "比特窗口被关掉（未登录或被限频踢下线）" : msg);
         logStep(`[整备] ${stopped ? "已停止" : "异常"}: ${err}`);
+        if (/账号已停用/.test(err)) {
+            await db.refreshMailboxGoogleState(id, {login: "fail", last_error: "账号已停用"}).catch(() => {});
+        }
         return {ok: false, error: err};
     } finally {
         hardenAbort.delete(id);
@@ -835,7 +838,6 @@ async function tickMailJobs() {
             scheduleMailboxJobBroadcast();
             return;
         }
-        const {isBitLoggedOut, setExpectedBitTiles} = await import("../src/bitbrowser.js");
         const snap = scheduler.mailProxyPoolSnap();
         setExpectedBitTiles(Math.max(1, Number(snap.slots) || slots || 4));
         const bitDown = isBitLoggedOut();
@@ -1010,23 +1012,24 @@ app.post("/api/mailboxes/grp", async (req, res) => {
 });
 
 // ---- 邮箱域:收件箱/正文/操作日志(架构 v2:收件箱等邮箱能力集中到邮箱管理,覆盖 free/gpt/claude 所有邮箱)----
-// 收件箱:用邮箱账密登录 mail.com 拉列表(起浏览器,约 20~30s)。
+// Gmail → IMAP 应用专用密码；mail.com → Playwright 登录 maillist。
 app.get("/api/mailboxes/:id/inbox", async (req, res) => {
     const id = Number(req.params.id);
     const mb = await db.getMailbox(id);
     if (!mb) return res.status(404).json({error: "邮箱不存在"});
-    logMailbox(id, "[收信] 登录 mail.com 拉取收件箱…");
+    const isGoogle = mb.provider === "google" || /@(gmail|googlemail)\.com$/i.test(mb.email || "");
+    logMailbox(id, isGoogle ? "[收信] 经 IMAP 拉取 Gmail 收件箱…" : "[收信] 登录 mail.com 拉取收件箱…");
     try {
-        const mails = await fetchInboxList(mb.email, mb.password);
-        logMailbox(id, `[收信] 登录成功,收件箱 ${mails.length} 封`);
-        res.json({email: mb.email, mails});
+        const mails = await fetchInboxList(mb, 40);
+        logMailbox(id, `[收信] 成功,收件箱 ${mails.length} 封${isGoogle ? " (IMAP)" : ""}`);
+        res.json({email: mb.email, mails, via: isGoogle ? "imap" : "mailcom"});
     } catch (e: any) { logMailbox(id, `[收信] 失败: ${e?.message ?? e}`); res.status(500).json({error: String(e?.message ?? e)}); }
 });
-// 按需拉单封正文(复用收件箱缓存会话,秒级)
+// 按需拉单封正文(Gmail IMAP 缓存 / mail.com 会话)
 app.get("/api/mailboxes/:id/mail/:mailId/body", async (req, res) => {
     const mb = await db.getMailbox(Number(req.params.id));
     if (!mb) return res.status(404).json({error: "邮箱不存在"});
-    try { res.json({body: await fetchMailBodyFor(mb.email, req.params.mailId)}); }
+    try { res.json({body: await fetchMailBodyFor(mb, req.params.mailId)}); }
     catch (e: any) { res.status(500).json({error: String(e?.message ?? e)}); }
 });
 // 邮箱操作日志(登录/改密/收信,独立表 mailbox_logs,与 GPT 注册日志隔离)
@@ -1677,7 +1680,9 @@ function runRtWorker(acc, preferPhone, {onProgress, timeoutMs = 180000} = {}) {
         const useSessionRt = !!(acc.totp_secret || "").trim()
             || acc.provider === "mailcom"
             || /pro|plus|team/i.test(String(acc.plan || ""));
-        const mailcomHeadless = acc.provider === "mailcom" ? "0" : "1";
+        const mailcomHeadless = process.env.MAILCOM_HEADED === "1" ? "0" : "1";
+        const mailProxy = (scheduler.mailProxyEnabled !== false ? (scheduler.mailProxy || "") : "")
+            || scheduler.rtProxy || scheduler.regProxy || "";
         note(`启动 worker 获取 refresh_token${useSessionRt ? "(会话换rt,不接码)" : ""}${preferPhone ? `(复用绑定号 +${preferPhone})` : ""}${acc.mailbox_imap ? " +IMAP" : ""}…`);
         const child = spawn(CHAT_TSX_BIN, [useSessionRt ? "scripts/worker-rt-nosms.ts" : "src/worker-rt.ts"], { shell: IS_WIN,
             cwd: CHAT_ROOT,
@@ -1691,7 +1696,7 @@ function runRtWorker(acc, preferPhone, {onProgress, timeoutMs = 180000} = {}) {
                 SMS_MAX_BIND: String(scheduler.smsMaxBind ?? 0),
                 RT_PREFER_PHONE: preferPhone || "",
                 PROXY_URL: scheduler.rtProxy || scheduler.regProxy || "",
-                MAILCOM_PROXY: scheduler.mailProxyEnabled !== false ? (scheduler.mailProxy || "") : "",
+                MAILCOM_PROXY: mailProxy,
                 GPT_PASSWORD: (acc.gpt_password || appConfig.defaultPassword || "").trim(),
                 TOTP_SECRET: acc.totp_secret || "",
                 // PG 迁移后 worker 通过 process.env.DATABASE_URL 继承连接
@@ -1754,16 +1759,83 @@ function runRtWorker(acc, preferPhone, {onProgress, timeoutMs = 180000} = {}) {
 function rechargeProxy() {
     return scheduler.rtProxy || scheduler.regProxy || "";
 }
+
+/** Playwright/Chromium 不支持 socks5 账密；链式 kookeey 本地转发仍带 user:pass，不能给 mail.com。 */
+function proxyHasSocksAuth(raw) {
+    try {
+        const cleaned = String(raw || "").trim().replace(/#.*$/, "");
+        if (!cleaned) return false;
+        const u = new URL(/^[a-z][a-z0-9+.-]*:\/\//i.test(cleaned) ? cleaned : `socks5://${cleaned}`);
+        return u.protocol.startsWith("socks") && !!(u.username || u.password);
+    } catch {
+        return /socks[^:]*:\/\/[^/@]+@/i.test(String(raw || ""));
+    }
+}
+
+/** mail.com 收码专用：只要无账密 socks/http（优先配置的 mailProxy → 充值代理 10808）。 */
+function pickMailcomBrowserProxy(...candidates) {
+    for (const c of candidates) {
+        const u = String(c || "").trim();
+        if (!u) continue;
+        if (proxyHasSocksAuth(u)) continue;
+        return u;
+    }
+    return "";
+}
+
+/**
+ * 与邮箱整备同款：从 GPT 代理池租一条（1 代理 = 1 任务 · 新 sticky session）。
+ * 池空则 fallback 充值代理；池满超时则回退充值代理，不堵死换绑。
+ * 协议重登/authorize 429 靠换出口，不能全挤在 10808 一条线上。
+ */
+async function withLeasedGptProxy(owner, fn, {timeoutMs = 45_000, log} = {}) {
+    const who = String(owner || "gpt-relogin");
+    let jumpLease = null;
+    let lease = null;
+    const runFallback = async (why) => {
+        const proxyUrl = rechargeProxy() || "";
+        try { log?.(`GPT 代理池${why}，回退充值代理 ${maskProxyUrl(proxyUrl) || "直连"}`); } catch { /* */ }
+        return fn(proxyUrl, "");
+    };
+    try {
+        if (gptJumpPool.urls.length) {
+            jumpLease = await gptJumpPool.lease(who, {timeoutMs: Math.min(timeoutMs, 20_000), maxPerJump: JUMP_MAX_EXITS});
+        }
+        lease = await gptProxyPool.lease(who, {
+            fallback: rechargeProxy(),
+            maxPerTemplate: 1,
+            freshSession: true,
+            timeoutMs,
+        });
+        const proxyUrl = lease.url || rechargeProxy() || "";
+        const jumpUrl = jumpLease?.url || scheduler.gptProxyJump || "";
+        try {
+            log?.(`GPT 代理池 ${maskProxyUrl(proxyUrl) || "直连"}${jumpUrl ? " · 跳板 " + maskProxyUrl(jumpUrl) : ""}（一号一代理 · 新 session）`);
+        } catch { /* */ }
+        return await fn(proxyUrl, jumpUrl);
+    } catch (e) {
+        const msg = String(e?.message || e);
+        if (/代理池全忙|等待超时/i.test(msg)) return runFallback("忙");
+        // 无可用槽且无 fallback 时 lease 也可能抛别的错
+        if (!rechargeProxy() && !scheduler.gptProxyPool?.length) throw e;
+        return runFallback(`租约失败(${msg.slice(0, 60)})`);
+    } finally {
+        try { lease?.release(); } catch { /* */ }
+        try { jumpLease?.release(); } catch { /* */ }
+    }
+}
+
 /** 连续这么久没有一条新日志才当卡住。还在跑、还在出日志就不杀。 */
 function reloginIdleMs(_acc) {
     return 90_000;
 }
 // at 失效优先协议登录(密码/邮箱码/TOTP);协议失败再回退浏览器。
-// opts.proxy 覆盖过 CF 的代理;不传则用注册代理。充值重登传 rechargeProxy()。
-function spawnReloginWorker(acc, {proxy, script = "src/worker-login-http.ts", timeoutMs = 0, skipMfa = false, onProgress} = {}) {
-    return new Promise((resolve) => {
+// opts.proxy=出口；opts.jump=跳板。有跳板时 wrap 成本机链式 SOCKS 再塞给 worker（与比特整备同套 proxy-chain）。
+function spawnReloginWorker(acc, {proxy, jump = "", script = "src/worker-login-http.ts", timeoutMs = 0, skipMfa = false, onProgress} = {}) {
+    return new Promise(async (resolve) => {
         let settled = false;
         let beatTimer = null;
+        let chainClose = () => {};
         const note = (m) => {
             logAcct(acc.id, `[relogin-at] ${m}`);
             try { onProgress?.(m); } catch { /* */ }
@@ -1772,6 +1844,7 @@ function spawnReloginWorker(acc, {proxy, script = "src/worker-login-http.ts", ti
             if (settled) return;
             settled = true;
             if (beatTimer) { clearInterval(beatTimer); beatTimer = null; }
+            try { chainClose(); } catch { /* */ }
             resolve(v);
         };
         const tmpDir = mkdtempSync(path.join(os.tmpdir(), "codex-relogin-"));
@@ -1783,26 +1856,70 @@ function spawnReloginWorker(acc, {proxy, script = "src/worker-login-http.ts", ti
             recoveryEmail: acc.recovery_email || "",
             imapPassword: acc.mailbox_imap || "",
         });
-        const mailcomHeaded = String(acc.provider || "mailcom") === "mailcom";
-        note(`邮箱密码用库内当前值 ${String(acc.password || "").slice(0, 4)}…(${String(acc.password || "").length}位)${mailcomHeaded ? "；mail.com 收码开可见 Chrome" : ""}`);
-        const child = spawn(CHAT_TSX_BIN, [script], {
-            shell: IS_WIN, cwd: CHAT_ROOT,
-            env: {
-                ...process.env,
-                REG_EMAIL: acc.email,
-                MAIL_PROVIDER: acc.provider || "mailcom",
-                MAILCOM_TOKENS_FILE: tmpFile, ICLOUD_TOKENS_FILE: tmpFile,
-                MAILCOM_HEADLESS: mailcomHeaded ? "0" : "1",
-                PROXY_URL: (proxy !== undefined ? proxy : scheduler.regProxy) || "",
-                MAILCOM_PROXY: scheduler.mailProxyEnabled !== false ? (scheduler.mailProxy || "") : "",
-                REG_SIMULATE_CHAT: "", // 不养号
-                REG_TRY_RT: "0",       // 不取 rt,只拿 at
-                GPT_PASSWORD: (acc.gpt_password || appConfig.defaultPassword || "").trim(),
-                TOTP_SECRET: acc.totp_secret || "",
-                REG_TRY_MFA: skipMfa ? "0" : (acc.totp_secret ? "0" : "1"),
-                // PG 迁移后 worker 通过 process.env.DATABASE_URL 继承连接
-            },
-        });
+        // 换绑/重登收码默认无头；要看窗设 MAILCOM_HEADED=1。
+        const mailcomHeadless = process.env.MAILCOM_HEADED === "1" ? "0" : "1";
+        let exitProxy = (proxy !== undefined ? proxy : scheduler.regProxy) || "";
+        const jumpUrl = String(jump || "").trim()
+            || String(scheduler.gptProxyJump || scheduler.mailProxyJump || "").trim();
+        // 出口是外网网关时：本机 → 跳板 → kookeey。之前只日志「租到跳板」，PROXY_URL 仍直连 gate，国内必超时。
+        const exitHostLocal = (() => {
+            try {
+                const u = new URL(exitProxy.includes("://") ? exitProxy.split("#")[0] : `socks5://${exitProxy}`);
+                return u.hostname === "127.0.0.1" || u.hostname === "localhost";
+            } catch { return false; }
+        })();
+        if (exitProxy && jumpUrl && !exitHostLocal) {
+            try {
+                const {wrapExitThroughJump} = await import("../src/mail/proxy-chain.js");
+                const wrapped = await wrapExitThroughJump(exitProxy, jumpUrl);
+                note(`链式已接通 跳板 ${maskProxyUrl(jumpUrl)} → 出口 ${maskProxyUrl(exitProxy)} · 本机 :${wrapped.localPort}`);
+                chainClose = wrapped.close;
+                exitProxy = wrapped.url;
+            } catch (e) {
+                note(`跳板链式失败(${String(e?.message || e).slice(0, 80)})，仍直连出口（国内易超时）`);
+            }
+        } else if (exitProxy && !jumpUrl && !exitHostLocal) {
+            note(`无跳板，直连出口 ${maskProxyUrl(exitProxy)}（国内访问 kookeey 常超时）`);
+        }
+        // OpenAI 协议登录：PROXY_URL 可用 kookeey 账密（undici socks 支持）
+        // mail.com Playwright：绝不能带 socks 账密 → 用无账密本地充值代理（如 10808）
+        const mailProxyConfigured = (scheduler.mailProxyEnabled !== false && scheduler.mailProxy)
+            ? scheduler.mailProxy
+            : "";
+        const mailProxy = pickMailcomBrowserProxy(mailProxyConfigured, rechargeProxy());
+        const viaJump = !!(jumpUrl && String(exitProxy).includes("127.0.0.1"));
+        note(
+            `邮箱密码用库内当前值 ${String(acc.password || "").slice(0, 4)}…(${String(acc.password || "").length}位)`
+            + `${mailcomHeadless === "0" ? "；mail.com 有头" : "；mail.com 无头收码"}`
+            + ` · GPT代理=${exitProxy ? maskProxyUrl(exitProxy) : "直连"}${viaJump ? "（经跳板）" : ""}`
+            + ` · 收码代理=${mailProxy ? maskProxyUrl(mailProxy) : "直连"}`
+            + (proxyHasSocksAuth(exitProxy) && !mailProxy ? "（警告：无可用无账密收码代理）" : ""),
+        );
+        let child;
+        try {
+            child = spawn(CHAT_TSX_BIN, [script], {
+                shell: IS_WIN, cwd: CHAT_ROOT,
+                env: {
+                    ...process.env,
+                    REG_EMAIL: acc.email,
+                    MAIL_PROVIDER: acc.provider || "mailcom",
+                    MAILCOM_TOKENS_FILE: tmpFile, ICLOUD_TOKENS_FILE: tmpFile,
+                    MAILCOM_HEADLESS: mailcomHeadless,
+                    PROXY_URL: exitProxy || "",
+                    MAIL_PROXY_JUMP: jumpUrl,
+                    MAILCOM_PROXY: mailProxy,
+                    REG_SIMULATE_CHAT: "",
+                    REG_TRY_RT: "0",
+                    GPT_PASSWORD: (acc.gpt_password || appConfig.defaultPassword || "").trim(),
+                    TOTP_SECRET: acc.totp_secret || "",
+                    REG_TRY_MFA: skipMfa ? "0" : (acc.totp_secret ? "0" : "1"),
+                },
+            });
+        } catch (e) {
+            try { rmSync(tmpDir, {recursive: true, force: true}); } catch { /* */ }
+            finish({ok: false, reason: `启动 worker 失败: ${e?.message || e}`});
+            return;
+        }
         let buf = "", result = null;
         let idleTimer = null, killTimer = null, stopping = false;
         const idleMs = timeoutMs > 0 ? timeoutMs : 90_000;
@@ -1870,6 +1987,7 @@ function spawnReloginWorker(acc, {proxy, script = "src/worker-login-http.ts", ti
             if (idleTimer) clearTimeout(idleTimer);
             if (killTimer) clearTimeout(killTimer);
             if (beatTimer) clearInterval(beatTimer);
+            try { chainClose(); } catch { /* */ }
             try { rmSync(tmpDir, {recursive: true, force: true}); } catch { /* ignore */ }
             const saved = await persistRelogin(settled);
             if (saved) {
@@ -1881,16 +1999,103 @@ function spawnReloginWorker(acc, {proxy, script = "src/worker-login-http.ts", ti
             if (/account_deactivated/i.test(err)) { await db.updateAccount(acc.id, {error: err}); broadcast("snapshot", await db.listAccounts()); }
             finish({ok: false, reason: err});
         });
-        child.on("error", (e) => { if (idleTimer) clearTimeout(idleTimer); if (killTimer) clearTimeout(killTimer); if (beatTimer) clearInterval(beatTimer); try { rmSync(tmpDir, {recursive: true, force: true}); } catch { /* */ } finish({ok: false, reason: String(e?.message ?? e)}); });
+        child.on("error", (e) => {
+            if (idleTimer) clearTimeout(idleTimer);
+            if (killTimer) clearTimeout(killTimer);
+            if (beatTimer) clearInterval(beatTimer);
+            try { chainClose(); } catch { /* */ }
+            try { rmSync(tmpDir, {recursive: true, force: true}); } catch { /* */ }
+            finish({ok: false, reason: String(e?.message ?? e)});
+        });
     });
 }
-async function runReloginAtWorker(acc, {proxy, timeoutMs = 0, allowBrowser = true, skipMfa = false, onProgress} = {}) {
+async function runReloginAtWorker(acc, {proxy, jump = "", timeoutMs = 0, allowBrowser = true, skipMfa = false, onProgress} = {}) {
     const note = (m) => { logAcct(acc.id, `[at] ${m}`); try { onProgress?.(m); } catch { /* */ } };
     note("走协议登录重新获取 at(密码/邮箱码/TOTP)…");
-    const http = await spawnReloginWorker(acc, {proxy, script: "src/worker-login-http.ts", timeoutMs, skipMfa, onProgress});
+    const http = await spawnReloginWorker(acc, {proxy, jump, script: "src/worker-login-http.ts", timeoutMs, skipMfa, onProgress});
     if (http.ok || /account_deactivated/i.test(http.reason || "") || !allowBrowser) return http;
     note(`协议登录失败(${String(http.reason || "").slice(0, 80)}),回退浏览器…`);
-    return spawnReloginWorker(acc, {proxy, script: "src/worker-register-browser.ts", timeoutMs, skipMfa, onProgress});
+    return spawnReloginWorker(acc, {proxy, jump, script: "src/worker-register-browser.ts", timeoutMs, skipMfa, onProgress});
+}
+
+/** 可换出口再试：网络抖动 / CF 403 / 429 / TLS 掐断 / fetch failed 等 */
+function isReloginRetryable(reason) {
+    return /429|403|authorize|chatgpt\.com|打开 OpenAI|Proxy connection|timed out|timeout|ECONN|ENOTFOUND|EPIPE|EHOST|network|socket|TLS|fetch failed|disconnected|secure TLS|超时|限流|Cloudflare|Just a moment/i
+        .test(String(reason || ""));
+}
+
+/** authorize 出口被限流时才值得换 kookeey 池（换 IP）；纯网络/TLS/403 优先本地 10808 */
+function isAuthorizeRateLimited(reason) {
+    return /429|authorize 页|打开 OpenAI authorize|Retry-After|限流/i.test(String(reason || ""));
+}
+
+/**
+ * 协议重登路径（undici 实测）：
+ * - kookeey 经跳板：curl 能通，但 Node TLS 常 ECONNRESET / CF 403 → 不适合做默认
+ * - 充值代理 10808：本地无账密 socks，协议登录最稳（此前能打到 authorize）
+ * 顺序：先 10808 → 若 429 限流再换 GPT 池 sticky 出口 1～2 次
+ */
+async function runReloginAtWorkerPooled(acc, {
+    proxy,
+    jump,
+    timeoutMs = 0,
+    allowBrowser = true,
+    skipMfa = false,
+    onProgress,
+    usePool = true,
+} = {}) {
+    const note = (m) => { try { onProgress?.(m); } catch { /* */ } };
+    const defaultJump = jump || scheduler.gptProxyJump || scheduler.mailProxyJump || "";
+    if (!usePool) {
+        return runReloginAtWorker(acc, {
+            proxy: proxy !== undefined ? proxy : rechargeProxy(),
+            jump: "",
+            timeoutMs, allowBrowser, skipMfa, onProgress,
+        });
+    }
+    if (proxy !== undefined) {
+        return runReloginAtWorker(acc, {
+            proxy,
+            jump: defaultJump,
+            timeoutMs, allowBrowser, skipMfa, onProgress,
+        });
+    }
+
+    // ① 默认：充值代理（10808），不经 kookeey 链式
+    const localProxy = rechargeProxy();
+    let last = {ok: false, reason: "未尝试"};
+    if (localProxy) {
+        note(`协议重登优先充值代理 ${maskProxyUrl(localProxy)}（本地无账密，避开 kookeey→Node TLS 被掐）`);
+        last = await runReloginAtWorker(acc, {
+            proxy: localProxy,
+            jump: "",
+            timeoutMs, allowBrowser, skipMfa, onProgress,
+        });
+        if (last?.ok) return last;
+        note(`充值代理重登失败: ${String(last?.reason || "").slice(0, 100)}`);
+    }
+
+    // ② 仅当本地限流/网络仍可重试时，才上 GPT 池换出口（最多 2 次）
+    if (!isReloginRetryable(last?.reason) && last?.reason !== "未尝试") return last;
+    const maxPoolTries = isAuthorizeRateLimited(last?.reason) ? 2 : 1;
+    for (let i = 0; i < maxPoolTries; i++) {
+        note(`改走 GPT 代理池换出口（${i + 1}/${maxPoolTries}）…`);
+        last = await withLeasedGptProxy(acc.email, async (proxyUrl, jumpUrl) => {
+            note(`池出口 ${maskProxyUrl(proxyUrl)}${jumpUrl ? " + 跳板 " + maskProxyUrl(jumpUrl) : ""}`);
+            return runReloginAtWorker(acc, {
+                proxy: proxyUrl,
+                jump: jumpUrl || defaultJump,
+                timeoutMs, allowBrowser, skipMfa, onProgress,
+            });
+        }, {log: note, timeoutMs: 45_000});
+        if (last?.ok) return last;
+        if (i + 1 < maxPoolTries && isReloginRetryable(last?.reason)) {
+            await new Promise((r) => setTimeout(r, 2_000 + Math.random() * 2_000));
+            continue;
+        }
+        break;
+    }
+    return last;
 }
 
 // rt 三态：有效→刷新写回；已过期→复用绑定号重新获取；无rt→获取。acquire=false 时不自动获取(批量用，避免误耗接码)。
@@ -1962,15 +2167,45 @@ app.post("/api/control/enroll-mfa", async (req, res) => {
     res.json({ok: true, count: accs.length});
     (async () => {
         for (const acc of accs) {
-            const tok = extractTokens(getAuthData(acc));
+            let live = acc;
+            let authRec = getAuthData(live);
+            let tok = extractTokens(authRec);
             if (!tok?.accessToken) { logAcct(acc.id, "[2fa] 无 AT,跳过(请先重登或测 at)"); await db.updateAccount(acc.id, {mfa_status: "❌无AT"}); continue; }
             logAcct(acc.id, "[2fa] 绑定 TOTP…");
-            const r = await enrollTotp(tok.accessToken, {accountId: tok.accountId || decodeJwt(tok.accessToken)?.["https://api.openai.com/auth"]?.chatgpt_account_id || "", proxyUrl: scheduler.regProxy || ""});
+            const mfaProxy = scheduler.regProxy || scheduler.rtProxy || appConfig.defaultProxyUrl || process.env.PROXY_URL || process.env.ALL_PROXY || "";
+            const r = await enrollTotp(tok.accessToken, {
+                accountId: tok.accountId || decodeJwt(tok.accessToken)?.["https://api.openai.com/auth"]?.chatgpt_account_id || "",
+                proxyUrl: mfaProxy,
+                cookie: String(authRec?.cookie || "").trim(),
+                retryAltProxy: true,
+                browserFallback: process.env.MFA_NO_BROWSER !== "1",
+                headless: true,
+                log: (m) => logAcct(acc.id, "[2fa] " + m),
+                // 官网 enroll 要求 pwd_auth_time 约 4 分钟内；过期则协议重登拿新 AT 再绑
+                reauth: async () => {
+                    logAcct(acc.id, "[2fa] 需重新密码登录以刷新 pwd_auth…");
+                    const re = await runReloginAtWorkerPooled(live, {
+                        allowBrowser: true,
+                        skipMfa: true,
+                        onProgress: (m) => logAcct(acc.id, `[2fa] 重登 ${String(m || "").slice(0, 120)}`),
+                    });
+                    if (!re?.ok) throw new Error(re?.reason || "重登失败");
+                    live = await db.getAccount(acc.id) || live;
+                    authRec = getAuthData(live);
+                    tok = extractTokens(authRec);
+                    if (!tok?.accessToken) throw new Error("重登后仍无 AT");
+                    return {
+                        accessToken: tok.accessToken,
+                        accountId: tok.accountId || "",
+                        cookie: String(authRec?.cookie || "").trim(),
+                    };
+                },
+            });
             if (r.ok && r.secret) {
                 await db.updateAccount(acc.id, {totp_secret: r.secret, mfa_status: "✅已绑"});
-                logAcct(acc.id, "[2fa] ✅ 已绑定");
+                logAcct(acc.id, `[2fa] ✅ 已绑定(${r.via || "http"})`);
             } else if (r.ok && r.already) {
-                if (acc.totp_secret) {
+                if (acc.totp_secret || live.totp_secret) {
                     await db.updateAccount(acc.id, {mfa_status: "✅已绑"});
                     logAcct(acc.id, "[2fa] 该号已有 2FA");
                 } else {
@@ -2660,9 +2895,17 @@ async function precheckRechargeMailbox(q) {
         const pw = String(acc.password || "").trim();
         if (!pw) return {ok: false, reason: "mail.com 没有邮箱密码"};
         rememberMailcomPassword(acc.email, pw);
-        rechargeLog(`预检 ${acc.email}: 验 mail.com 密码`);
-        const v = await verifyMailcomLogin(acc.email, pw, (m) => rechargeLog(`预检 ${acc.email}: ${m}`));
-        if (!v.ok) return {ok: false, reason: `mail.com 密码不可用 (${String(v.reason || "登录失败").slice(0, 80)})`};
+        // 充值预检跟重登/RT 同一条「充值代理」(rtProxy→regProxy)，本地无账密 socks；
+        // 不要用 mail 代理池(kookeey 带 user:pass，Playwright Chrome 不支持 socks5 鉴权)。
+        const proxy = rechargeProxy();
+        rechargeLog(`预检 ${acc.email}: 验 mail.com 密码（代理=${proxy ? maskProxyUrl(proxy) : "直连"}）`);
+        const v = await verifyMailcomLogin(
+            acc.email,
+            pw,
+            (m) => rechargeLog(`预检 ${acc.email}: ${m}`),
+            {proxy, tries: 2, headless: true},
+        );
+        if (!v.ok) return {ok: false, reason: `mail.com 密码不可用 (${String(v.reason || "登录失败").slice(0, 100)})`};
         rechargeLog(`预检 ${acc.email}: mail.com 密码可用`);
         return {ok: true};
     }
@@ -3006,8 +3249,8 @@ async function runGmailRebind(queueId) {
         if (!at) {
             rechargeLog(`换绑 ${acc.email}: 无 at，先重登再换绑`);
             rememberMailcomPassword(acc.email, acc.password);
-            const re = await runReloginAtWorker(fresh, {
-                proxy: rechargeProxy(), timeoutMs: reloginIdleMs(fresh), allowBrowser: false, skipMfa: true,
+            const re = await runReloginAtWorkerPooled(fresh, {
+                timeoutMs: reloginIdleMs(fresh), allowBrowser: false, skipMfa: true,
                 onProgress: (m) => rechargeLog(`换绑 ${acc.email}: 重登 ${String(m || "").slice(0, 160)}`),
             });
             if (!re.ok) return fail(`重登失败: ${String(re.reason || "").slice(0, 120)}`, false);
@@ -3091,19 +3334,42 @@ async function runGmailRebind(queueId) {
                 // 换绑要新的 pwd_auth。旧 AT 去 enroll 只会 401，别再浪费一轮。
                 if (!(fresh.totp_secret || "").trim() && at && !needsPwdReauth(at)) {
                     rechargeLog(`换绑 ${acc.email}: 无 GPT 2FA，先用现有 AT 绑验证器（避开 mail.com 收码）`);
-                    const mfa = await enrollTotp(at, {accountId: tok?.accountId || "", proxyUrl: rechargeProxy()});
+                    const mfa = await enrollTotp(at, {
+                        accountId: tok?.accountId || "",
+                        proxyUrl: rechargeProxy(),
+                        cookie: String(getAuthData(fresh)?.cookie || getAuthData(acc)?.cookie || "").trim(),
+                        retryAltProxy: true,
+                        browserFallback: process.env.MFA_NO_BROWSER !== "1",
+                        log: (m) => rechargeLog(`换绑 ${acc.email}: ${m}`),
+                        reauth: async () => {
+                            rechargeLog(`换绑 ${acc.email}: 绑 2FA 需重登刷新 pwd_auth`);
+                            const re = await runReloginAtWorkerPooled(fresh, {
+                                allowBrowser: false, skipMfa: true,
+                                onProgress: (m) => rechargeLog(`换绑 ${acc.email}: 重登 ${String(m || "").slice(0, 120)}`),
+                            });
+                            if (!re?.ok) throw new Error(re?.reason || "重登失败");
+                            fresh = await db.getAccount(acc.id) || fresh;
+                            const t2 = extractTokens(getAuthData(fresh));
+                            if (!t2?.accessToken) throw new Error("重登后无 AT");
+                            return {
+                                accessToken: t2.accessToken,
+                                accountId: t2.accountId || "",
+                                cookie: String(getAuthData(fresh)?.cookie || "").trim(),
+                            };
+                        },
+                    });
                     if (mfa.ok && mfa.secret) {
                         await db.updateAccount(acc.id, {totp_secret: mfa.secret, mfa_status: "✅已绑"});
                         fresh = {...fresh, totp_secret: mfa.secret};
-                        rechargeLog(`换绑 ${acc.email}: GPT 2FA 已绑，重登走验证器`);
+                        rechargeLog(`换绑 ${acc.email}: GPT 2FA 已绑(${mfa.via || "http"})，重登走验证器`);
                     } else {
                         rechargeLog(`换绑 ${acc.email}: 绑 2FA 未成(${mfa.already ? "已有2FA缺密钥" : (mfa.reason || "失败")})，重登仍可能卡 mail.com`);
                     }
                 }
                 rechargeLog(`换绑 ${acc.email}: 换绑接口要重新验证密码（已存 session 不够新），开始协议登录`);
                 rememberMailcomPassword(acc.email, acc.password);
-                const re = await runReloginAtWorker(fresh, {
-                    proxy: rechargeProxy(), timeoutMs: reloginIdleMs(fresh), allowBrowser: false, skipMfa: true,
+                const re = await runReloginAtWorkerPooled(fresh, {
+                    timeoutMs: reloginIdleMs(fresh), allowBrowser: false, skipMfa: true,
                     onProgress: (m) => rechargeLog(`换绑 ${acc.email}: 重登 ${String(m || "").slice(0, 160)}`),
                 });
                 if (!re.ok) return fail(`重登失败: ${String(re.reason || "").slice(0, 120)}`);
@@ -3381,9 +3647,11 @@ app.post("/api/recharge/queue/relogin", async (req, res) => {
             if (queueReloginStop) { rechargeLog(`[重登] 已停止`); break; }
             const acc = await db.getAccount(q.account_id);
             if (!acc) { fail++; rechargeLog(`[重登] [${idx + 1}/${items.length}] ${q.email}: ❌ 账号不存在`); continue; }
-            rechargeLog(`[重登] [${idx + 1}/${items.length}] ${q.email}: 拉起浏览器登录(代理=${rechargeProxy() || "直连"})…`);
+            rechargeLog(`[重登] [${idx + 1}/${items.length}] ${q.email}: 协议重登（GPT 代理池）…`);
             try {
-                const re = await runReloginAtWorker(acc, {proxy: rechargeProxy()});
+                const re = await runReloginAtWorkerPooled(acc, {
+                    onProgress: (m) => rechargeLog(`[重登] ${q.email}: ${String(m || "").slice(0, 140)}`),
+                });
                 if (re.ok && re.authFile) {
                     const freshAcc = await db.getAccount(q.account_id);
                     const freshAuthData = getAuthData(freshAcc);
@@ -3448,9 +3716,11 @@ app.post("/api/recharge/queue/relogin-submit", async (req, res) => {
             // ① 浏览器重登刷新 session
             const acc = await db.getAccount(q0.account_id);
             if (!acc) { fail++; rechargeLog(`${tag}${q0.email}: ❌ 账号不存在`); continue; }
-            rechargeLog(`${tag}${q0.email}: 拉起浏览器登录(代理=${rechargeProxy() || "直连"})…`);
+            rechargeLog(`${tag}${q0.email}: 协议重登（GPT 代理池）…`);
             try {
-                const re = await runReloginAtWorker(acc, {proxy: rechargeProxy()});
+                const re = await runReloginAtWorkerPooled(acc, {
+                    onProgress: (m) => rechargeLog(`${tag}${q0.email}: ${String(m || "").slice(0, 140)}`),
+                });
                 if (!re.ok || !re.authFile) { fail++; rechargeLog(`${tag}${q0.email}: ❌ 登录失败: ${(re as any).reason || "未知"}`); continue; }
             } catch (e: any) { fail++; rechargeLog(`${tag}${q0.email}: ❌ 登录异常: ${String(e?.message || e).slice(0, 100)}`); continue; }
             const freshAcc = await db.getAccount(q0.account_id);
