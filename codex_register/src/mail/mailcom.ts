@@ -388,6 +388,8 @@ async function loginMailcom(email, password, opts = {}) {
 
         // 登录表单：先关 cookie/弹窗，再展开下拉（#login-email 常在 DOM 里但 display:none）
         if (!page.url().includes("navigator-lxa")) {
+            const pwHint = `${String(password || "").slice(0, 4)}…(${String(password || "").length}位)`;
+            console.log(`[mailcom] 填库内当前密码 ${pwHint}（不是 GPT 密码，也不是改密前旧密码）`);
             const emailBox = await openMailcomLoginForm(page);
             const filled = await emailBox.fill(email, {force: true, timeout: 8000}).then(() => true).catch(() => false);
             if (!filled) {
@@ -403,26 +405,30 @@ async function loginMailcom(email, password, opts = {}) {
             });
             let submitted = false;
             for (const sel of [
+                "form#login-form button[type='submit']",
+                "form[action*='login'] button[type='submit']",
+                "#login-form button",
+                "button.login-submit",
+                "input[type='submit']",
                 "#header-login-box button[type='submit']",
                 "#header-login-box button",
-                "#header-login-box span",
                 "button[type='submit']",
                 "button:has-text('Log in')",
                 "button:has-text('Login')",
+                "button:has-text('Sign in')",
             ]) {
-                try {
-                    const b = page.locator(sel).first();
-                    if (await b.isVisible({timeout: 800}).catch(() => false)) {
-                        await b.click({timeout: 4000});
-                        submitted = true;
-                        break;
-                    }
-                } catch { /* try next */ }
+                if (await clickIfVisible(page, sel, 800)) { submitted = true; break; }
+            }
+            if (!submitted) {
+                const anyBtn = page.locator("form button[type='submit'], form input[type='submit'], button[type='submit']").first();
+                if (await anyBtn.count()) {
+                    await anyBtn.click({force: true, timeout: 4000}).then(() => { submitted = true; }).catch(() => {});
+                }
             }
             if (!submitted) {
                 await pwdBox.press("Enter").catch(() => page.keyboard.press("Enter").catch(() => {}));
             }
-            console.log(`[mailcom] 已提交登录表单 submitted=${submitted} url=${page.url().slice(0, 80)}`);
+            console.log(`[mailcom] 已点登录 submitted=${submitted} url=${page.url().slice(0, 80)}`);
         }
         console.log(`[mailcom] 等跳转收件箱（最多 45s）`);
         try {
@@ -476,6 +482,8 @@ async function loginMailcom(email, password, opts = {}) {
                     reason = "mail.com 账号被风控封禁(irregular activity blocked)";
                 } else if (/invalid email address|password combination/i.test(body)) {
                     reason = "mail.com 账密无效(邮箱/密码组合错误)";
+                } else if (/\/login/i.test(page.url())) {
+                    reason = "mail.com 还停在登录页(表单没提交成功)，不是确认账密错";
                 } else if (/password/i.test(body) && /try again/i.test(body)) {
                     reason = "mail.com 登录失败(页面提示再试，可能账密或验证码)";
                 } else if (/\/logout/i.test(page.url())) {

@@ -1591,6 +1591,7 @@ function spawnReloginWorker(acc, {proxy, script = "src/worker-login-http.ts", ti
             recoveryEmail: acc.recovery_email || "",
             imapPassword: acc.mailbox_imap || "",
         });
+        note(`邮箱密码用库内当前值 ${String(acc.password || "").slice(0, 4)}…(${String(acc.password || "").length}位)`);
         const child = spawn(CHAT_TSX_BIN, [script], {
             shell: IS_WIN, cwd: CHAT_ROOT,
             env: {
