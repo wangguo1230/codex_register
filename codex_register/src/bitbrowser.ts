@@ -122,9 +122,13 @@ export function setExpectedBitTiles(n) {
 
 function plannedTileCount() {
     const live = liveBitIds.size || 0;
-    // 已经开了几个就按几个排：4 个必须是 2x2。不要用代理槽 5 排成 3x2 留一个大空洞。
-    if (live >= 2) return live;
-    return 4;
+    const expect = expectedBitTiles || 4;
+    const n = Math.max(live, expect, 1);
+    // 按并发预排：4 路 2x2，6 路 3x2。不要第 1 个窗先按半屏开、再被挤小。
+    if (n <= 4) return 4;
+    if (n <= 6) return 6;
+    if (n <= 9) return 9;
+    return n;
 }
 
 async function getScreenSize() {
@@ -139,10 +143,10 @@ async function getScreenSize() {
             const nums = String(stdout).split(/[^\d]+/).filter(Boolean).map(Number);
             if (nums.length >= 4) cachedScreen = {w: Math.max(800, nums[2] - nums[0]), h: Math.max(600, nums[3] - nums[1] - 26)};
         } else if (process.platform === "win32") {
-            // 必须用工作区逻辑像素。Win32_VideoController 是物理分辨率，150% 缩放下会把每个窗算成接近整屏。
+            // 工作区逻辑像素。物理分辨率 + 125%/150% 缩放会把每个窗算成接近整屏。
             const {stdout} = await execFileAsync("powershell", [
-                "-NoProfile", "-STA", "-Command",
-                "Add-Type -AssemblyName System.Windows.Forms; $w=[System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea; Write-Output $w.Width; Write-Output $w.Height",
+                "-NoProfile", "-Command",
+                "Add-Type -TypeDefinition 'using System;using System.Runtime.InteropServices;public class WA{[StructLayout(LayoutKind.Sequential)]public struct R{public int L,T,Rgt,B;}[DllImport(\"user32.dll\")]public static extern bool SystemParametersInfo(int a,int b,ref R r,int c);}' -ErrorAction Stop; $r=New-Object WA+R; [void][WA]::SystemParametersInfo(48,0,[ref]$r,0); Write-Output ($r.Rgt-$r.L); Write-Output ($r.B-$r.T)",
             ], {timeout: 8000});
             const nums = String(stdout).trim().split(/\s+/).map(Number).filter((n) => n > 200);
             if (nums.length >= 2) cachedScreen = {w: nums[0], h: nums[1]};
