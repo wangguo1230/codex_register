@@ -1,6 +1,6 @@
 // 邮箱详情右侧抽屉(架构 v2:邮箱能力集中,交互对齐 GPT 详情抽屉)。点邮箱名/详情拉出:
 //   - 操作日志(登录/改密/收信,读独立 mailbox_logs 表,与 GPT 注册日志隔离;SSE mbLog 实时追加)
-//   - 收件箱(登录 mail.com 拉列表 + 按需展开正文),覆盖 free/gpt/claude 所有邮箱
+//   - 收件箱:Gmail 走 IMAP 应用专用密码；mail.com 登录 maillist。按需展开正文
 import {useEffect, useState} from "react";
 import {api, connectStream, type Mailbox} from "./api";
 
@@ -112,7 +112,13 @@ export function MailboxDetail({mailbox, onClose}: {mailbox: Mailbox; onClose: ()
                                 ["imap", "IMAP"],
                                 ["gpt", "GPT"],
                             ] as const).map(([k, lab]) => {
-                                const v = (mailbox.google_state as any)?.[k];
+                                const st = mailbox.google_state as any;
+                                let v = st?.[k];
+                                if (k === "totp" && (st?.totp_rotated || mailbox.totp_secret)) v = st?.totp_rotated ? "ok" : (v || "fail");
+                                if (k === "imap" && mailbox.imap_password) v = "ok";
+                                if (k === "password" && /^(✅改密|✅整备)/.test(mailbox.pw_status || "")) v = "ok";
+                                if (k === "recovery" && !mailbox.recovery_email && (mailbox.google_stage === "ready" || mailbox.google_stage === "gpt_ok" || st?.recovery === "ok")) v = "ok";
+                                if (k === "login" && (mailbox.google_stage === "ready" || mailbox.google_stage === "gpt_ok" || mailbox.imap_password)) v = v || "ok";
                                 const color = v === "ok" ? "#059669" : v === "fail" ? "#dc2626" : "#9ca3af";
                                 const mark = v === "ok" ? "✓" : v === "fail" ? "✗" : "·";
                                 return <span key={k} style={{color}}>{mark}{lab}</span>;
@@ -142,9 +148,15 @@ export function MailboxDetail({mailbox, onClose}: {mailbox: Mailbox; onClose: ()
                         </div>
                     ) : (
                         <div className="p-4">
-                            {loading && <div className="text-center py-10 text-gray-500">正在登录 mail.com 拉取收件箱…（约 20~30s）</div>}
-                            {err && !loading && <div className="text-red-500 text-sm py-4">❌ 登录/收信失败：{err}</div>}
-                            {inbox && !loading && inbox.mails.length === 0 && <div className="text-emerald-600 text-center py-10">✓ 登录成功，收件箱为空</div>}
+                            {loading && (
+                                <div className="text-center py-10 text-gray-500">
+                                    {mailbox.provider === "google" || /@(gmail|googlemail)\.com$/i.test(mailbox.email)
+                                        ? (mailbox.imap_password ? "正在经 IMAP 拉取 Gmail 收件箱…" : "Gmail 需要先开通 IMAP 应用专用密码")
+                                        : "正在登录 mail.com 拉取收件箱…（约 20~30s）"}
+                                </div>
+                            )}
+                            {err && !loading && <div className="text-red-500 text-sm py-4">❌ 收信失败：{err}</div>}
+                            {inbox && !loading && inbox.mails.length === 0 && <div className="text-emerald-600 text-center py-10">✓ 已连接，收件箱为空</div>}
                             {inbox && inbox.mails.map((m: any) => (
                                 <div key={m.id} className="border-b py-2 cursor-pointer hover:bg-gray-50 -mx-2 px-2 rounded" onClick={() => toggleMail(m.id)}>
                                     <div className="flex justify-between text-xs text-gray-400 mb-0.5"><span className="truncate max-w-[60%]">{m.from}</span><span>{m.date}</span></div>

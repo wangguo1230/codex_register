@@ -394,7 +394,15 @@ const MAILBOX_LIST_COLS = `
       ELSE jsonb_build_object(
         'last_error', google_state->>'last_error',
         'login_error', google_state->>'login_error',
-        'totp_rotated', google_state->'totp_rotated'
+        'totp_rotated', google_state->'totp_rotated',
+        'login', google_state->>'login',
+        'phone', google_state->>'phone',
+        'recovery', google_state->>'recovery',
+        'totp', google_state->>'totp',
+        'password', google_state->>'password',
+        'devices', google_state->>'devices',
+        'imap', google_state->>'imap',
+        'gpt', google_state->>'gpt'
       )
     END AS google_state
 `;
