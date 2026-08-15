@@ -455,7 +455,6 @@ export function MailboxPanel({notify}: {notify?: (m: string) => void}) {
     // ---- 多选 + 批量改密/批量切换状态(基于筛选后列表) ----
     const toggleSel = (id: number) => setSelected((s) => { const n = new Set(s); n.has(id) ? n.delete(id) : n.add(id); return n; });
     const filteredIdSet = useMemo(() => new Set(filtered.map((m) => m.id)), [filtered]);
-    const visibleIds = useMemo(() => visibleRows.map((m) => m.id), [visibleRows]);
     const allFilteredSelected = filtered.length > 0 && filtered.every((m) => selected.has(m.id));
     const allSelected = allFilteredSelected;
     const toggleAll = () => setSelected(allFilteredSelected ? new Set() : new Set(filtered.map((m) => m.id)));
