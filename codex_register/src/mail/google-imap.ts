@@ -155,17 +155,28 @@ async function probeImapOnce(email, imapPassword, via = "") {
     }
 }
 
-export async function testGmailImap(email, imapPassword, {proxy = ""} = {}) {
+export async function testGmailImap(email, imapPassword, {proxy = "", log = (m) => {}} = {}) {
     const {getMailProxyJump} = await import("./proxy-pool.js");
     const jump = String(proxy || getMailProxyJump() || "").trim();
+    log(`[imap] ${email} 直连探活（最多约 12s）`);
     const direct = await probeImapOnce(email, imapPassword, "");
-    if (direct.ok) return direct;
-    if (!jump) return direct;
-    if (/ERR_SSL|bad record mac|decryption failed|ECONNREFUSED/i.test(direct.error || "")) {
-        // 直连 TLS 已经烂了，再套跳板更容易坏 MAC；应用密码照样保留。
+    if (direct.ok) {
+        log(`[imap] 直连通，收件箱 ${direct.messages ?? 0} 封`);
         return direct;
     }
-    return probeImapOnce(email, imapPassword, jump);
+    if (!jump) {
+        log(`[imap] 直连失败 ${direct.error}`);
+        return direct;
+    }
+    if (/ERR_SSL|bad record mac|decryption failed|ECONNREFUSED/i.test(direct.error || "")) {
+        // 直连 TLS 已经烂了，再套跳板更容易坏 MAC；应用密码照样保留。
+        log(`[imap] 直连 TLS 失败，不再走跳板: ${direct.error}`);
+        return direct;
+    }
+    log(`[imap] 直连失败 ${direct.error}，改跳板再探`);
+    const via = await probeImapOnce(email, imapPassword, jump);
+    log(via.ok ? `[imap] 跳板通，收件箱 ${via.messages ?? 0} 封` : `[imap] 跳板也失败 ${via.error}`);
+    return via;
 }
 
 /** 开 IMAP + 生成应用专用密码，并立刻用 IMAP 探活。 */

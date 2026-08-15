@@ -111,7 +111,9 @@ export function RechargePanel({notify}: {notify?: (m: string) => void}) {
                 a.click(); URL.revokeObjectURL(url);
             }
         });
-        return off;
+        // SSE 重连会丢中间事件；换绑卡在 mail.com 时也要靠轮询把磁盘日志刷出来
+        const poll = setInterval(() => { loadLogs(); loadQueue(); }, 4000);
+        return () => { off(); clearInterval(poll); };
     }, []);
 
     useEffect(() => {
@@ -677,12 +679,19 @@ export function RechargePanel({notify}: {notify?: (m: string) => void}) {
                     <button onClick={() => { api.clearRechargeLogs().then(() => setLogs([])).catch(() => setLogs([])); }} className="text-xs text-gray-400 hover:text-gray-600">清空</button>
                 </div>
                 <div ref={logBoxRef} className="max-h-[280px] overflow-auto bg-gray-50 p-3 font-mono text-xs text-gray-600 space-y-0.5">
-                    {logs.length ? logs.map((l, i) => (
+                    {logs.length ? logs.map((l, i) => {
+                        const line = String(l.line || "");
+                        const cls = /换绑 ✗|^✗/.test(line) ? "text-red-500"
+                            : /换绑 ✓|^✓/.test(line) ? "text-green-600"
+                            : /换绑/.test(line) ? "text-amber-800"
+                            : "";
+                        return (
                         <div key={`${l.ts}-${i}`} className="flex gap-2">
                             <span className="text-gray-400 shrink-0">{fmtLogTime(l.ts)}</span>
-                            <span className={l.line.startsWith("✗") ? "text-red-500" : l.line.startsWith("✓") ? "text-green-600" : ""}>{l.line}</span>
+                            <span className={cls}>{line}</span>
                         </div>
-                    )) : <div className="text-gray-400">暂无日志。提交/轮询/换绑会写到这里，刷新页面也会保留。</div>}
+                        );
+                    }) : <div className="text-gray-400">暂无日志。提交/轮询/换绑会写到这里，刷新页面也会保留。</div>}
                 </div>
             </div>
 

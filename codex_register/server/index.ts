@@ -1571,11 +1571,17 @@ function reloginIdleMs(_acc) {
 function spawnReloginWorker(acc, {proxy, script = "src/worker-login-http.ts", timeoutMs = 0, skipMfa = false, onProgress} = {}) {
     return new Promise((resolve) => {
         let settled = false;
+        let beatTimer = null;
         const note = (m) => {
             logAcct(acc.id, `[relogin-at] ${m}`);
             try { onProgress?.(m); } catch { /* */ }
         };
-        const finish = (v) => { if (settled) return; settled = true; resolve(v); };
+        const finish = (v) => {
+            if (settled) return;
+            settled = true;
+            if (beatTimer) { clearInterval(beatTimer); beatTimer = null; }
+            resolve(v);
+        };
         const tmpDir = mkdtempSync(path.join(os.tmpdir(), "codex-relogin-"));
         const tmpFile = path.join(tmpDir, `mc-${acc.id}.txt`);
         writeMailboxTokenFile(tmpFile, {
@@ -1606,6 +1612,8 @@ function spawnReloginWorker(acc, {proxy, script = "src/worker-login-http.ts", ti
         let buf = "", result = null;
         let idleTimer = null, killTimer = null, stopping = false;
         const idleMs = timeoutMs > 0 ? timeoutMs : 90_000;
+        const startedAt = Date.now();
+        let lastChildAt = Date.now();
         const persistRelogin = async (late = false) => {
             if (!result || result.status !== "success" || !result.authFile) return null;
             const authData = readJsonFileSafe(result.authFile);
@@ -1637,6 +1645,7 @@ function spawnReloginWorker(acc, {proxy, script = "src/worker-login-http.ts", ti
         };
         const touch = () => {
             if (settled) return;
+            lastChildAt = Date.now();
             if (stopping) {
                 if (killTimer) { clearTimeout(killTimer); killTimer = null; }
                 stopping = false;
@@ -1645,6 +1654,12 @@ function spawnReloginWorker(acc, {proxy, script = "src/worker-login-http.ts", ti
             armIdle();
         };
         armIdle();
+        beatTimer = setInterval(() => {
+            if (settled) return;
+            const elapsed = Math.round((Date.now() - startedAt) / 1000);
+            const silent = Math.round((Date.now() - lastChildAt) / 1000);
+            note(`仍在跑，已 ${elapsed}s（子进程 ${silent}s 无新步骤；mail.com 登录常见 30–90s）`);
+        }, 12_000);
         child.on("error", (e) => note(`worker 启动失败: ${e?.message || e}`));
         child.stdout.on("data", (d) => {
             touch();
@@ -1660,6 +1675,7 @@ function spawnReloginWorker(acc, {proxy, script = "src/worker-login-http.ts", ti
         child.on("close", async () => {
             if (idleTimer) clearTimeout(idleTimer);
             if (killTimer) clearTimeout(killTimer);
+            if (beatTimer) clearInterval(beatTimer);
             try { rmSync(tmpDir, {recursive: true, force: true}); } catch { /* ignore */ }
             const saved = await persistRelogin(settled);
             if (saved) {
@@ -1671,7 +1687,7 @@ function spawnReloginWorker(acc, {proxy, script = "src/worker-login-http.ts", ti
             if (/account_deactivated/i.test(err)) { await db.updateAccount(acc.id, {error: err}); broadcast("snapshot", await db.listAccounts()); }
             finish({ok: false, reason: err});
         });
-        child.on("error", (e) => { if (idleTimer) clearTimeout(idleTimer); if (killTimer) clearTimeout(killTimer); try { rmSync(tmpDir, {recursive: true, force: true}); } catch { /* */ } finish({ok: false, reason: String(e?.message ?? e)}); });
+        child.on("error", (e) => { if (idleTimer) clearTimeout(idleTimer); if (killTimer) clearTimeout(killTimer); if (beatTimer) clearInterval(beatTimer); try { rmSync(tmpDir, {recursive: true, force: true}); } catch { /* */ } finish({ok: false, reason: String(e?.message ?? e)}); });
     });
 }
 async function runReloginAtWorker(acc, {proxy, timeoutMs = 0, allowBrowser = true, skipMfa = false, onProgress} = {}) {
@@ -2676,12 +2692,15 @@ function enqueueGmailRebind(q, {force = false, target, pool} = {}) {
     gmailRebindCancelled.delete(id);
     gmailRebindQueued.add(id);
     gmailRebindTargets.set(id, dest);
-    const p = dest === "gmail" ? normalizeRebindPool(pool || {}) : {};
+    const p = dest === "gmail" ? normalizeRebindPool(pool || q?.rebind_pool || {}) : {};
     if (p.emails || p.grp !== undefined) gmailRebindPool.set(id, p);
     else gmailRebindPool.delete(id);
     gmailRebindIds.push(id);
     const ahead = gmailRebindRunning && gmailRebindCurrentId && gmailRebindCurrentId !== id;
-    db.updateQueueItem(id, {rebind_status: "pending", rebind_error: "", rebind_target: dest}).then(() => queueSync()).catch(() => {});
+    db.updateQueueItem(id, {
+        rebind_status: "pending", rebind_error: "", rebind_target: dest,
+        rebind_pool: (p.emails || p.grp !== undefined) ? p : null,
+    }).then(() => queueSync()).catch(() => {});
     if (ahead) rechargeLog(`换绑 ${q.email} → ${rebindTargetLabel(dest)} 已排队，等当前号跑完`);
     pumpGmailRebind();
     return true;
@@ -2774,9 +2793,10 @@ async function runGmailRebind(queueId) {
         let at = tok?.accessToken || "";
         if (!at) {
             rechargeLog(`换绑 ${acc.email}: 无 at，先重登再换绑`);
+            rememberMailcomPassword(acc.email, acc.password);
             const re = await runReloginAtWorker(fresh, {
                 proxy: rechargeProxy(), timeoutMs: reloginIdleMs(fresh), allowBrowser: false, skipMfa: true,
-                onProgress: (m) => rechargeLog(`  ${acc.email} 重登: ${String(m || "").slice(0, 140)}`),
+                onProgress: (m) => rechargeLog(`换绑 ${acc.email}: 重登 ${String(m || "").slice(0, 160)}`),
             });
             if (!re.ok) return fail(`重登失败: ${String(re.reason || "").slice(0, 120)}`, false);
             fresh = await db.getAccount(acc.id) || fresh;
@@ -2809,7 +2829,9 @@ async function runGmailRebind(queueId) {
                     const cand = gmailQueue[gmailCursor++];
                     if (excludeIds.includes(cand.id)) continue;
                     rechargeLog(`换绑 ${acc.email} → ${cand.email}：换绑前探 IMAP（仍未售，第 ${attempt} 个${poolHint}）`);
-                    const probe = await testGmailImap(cand.email, cand.imap_password);
+                    const probe = await testGmailImap(cand.email, cand.imap_password, {
+                        log: (m) => rechargeLog(`换绑 ${acc.email}: ${m}`),
+                    });
                     if (!probe.ok) {
                         const dead = imapAuthDead(probe.error);
                         rechargeLog(`换绑 ${cand.email} 不可用 IMAP 不通 (${probe.error})，${dead ? "标已售废号" : "仍可用、本轮跳过"}`);
@@ -2867,9 +2889,10 @@ async function runGmailRebind(queueId) {
                     }
                 }
                 rechargeLog(`换绑 ${acc.email}: 换绑接口要重新验证密码（已存 session 不够新），开始协议登录`);
+                rememberMailcomPassword(acc.email, acc.password);
                 const re = await runReloginAtWorker(fresh, {
                     proxy: rechargeProxy(), timeoutMs: reloginIdleMs(fresh), allowBrowser: false, skipMfa: true,
-                    onProgress: (m) => rechargeLog(`  ${acc.email} 重登: ${String(m || "").slice(0, 140)}`),
+                    onProgress: (m) => rechargeLog(`换绑 ${acc.email}: 重登 ${String(m || "").slice(0, 160)}`),
                 });
                 if (!re.ok) return fail(`重登失败: ${String(re.reason || "").slice(0, 120)}`);
                 fresh = await db.getAccount(acc.id) || fresh;
@@ -3591,7 +3614,8 @@ app.post("/api/recharge/rebind-gmail/cancel", async (req, res) => {
         if (i >= 0) gmailRebindIds.splice(i, 1);
         gmailRebindQueued.delete(id);
         gmailRebindTargets.delete(id);
-        await db.updateQueueItem(id, {rebind_status: "fail", rebind_error: "已取消换绑"});
+        gmailRebindPool.delete(id);
+        await db.updateQueueItem(id, {rebind_status: "fail", rebind_error: "已取消换绑", rebind_pool: null});
         rechargeLog(`换绑已取消 ${q.email}${gmailRebindCurrentId === id ? "（当前任务将在下一步停下）" : ""}`);
         count++;
     }
@@ -3787,7 +3811,7 @@ app.listen(PORT, () => {
     db.listPendingGmailRebinds().then((rows) => {
         if (!rows.length) return;
         rechargeLog(`启动恢复：${rows.length} 个换绑停在进行中，重新排队`);
-        for (const q of rows) enqueueGmailRebind(q, {force: true});
+        for (const q of rows) enqueueGmailRebind(q, {force: true, pool: q.rebind_pool || {}});
     }).catch((e) => console.warn("[server] 恢复换绑失败:", e?.message || e));
 });
 

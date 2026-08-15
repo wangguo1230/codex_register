@@ -1171,10 +1171,15 @@ export async function releaseInstanceWork(instId = instanceId) {
 }
 
 export async function updateQueueItem(id, fields) {
-    const allowed = ["status", "card_id", "card_code", "task_no", "task_status", "task_message", "error", "batch", "plan_type", "submitted_at", "finished_at", "instance_id", "email", "rebind_status", "rebind_email", "rebind_error", "rebind_target"];
+    const allowed = ["status", "card_id", "card_code", "task_no", "task_status", "task_message", "error", "batch", "plan_type", "submitted_at", "finished_at", "instance_id", "email", "rebind_status", "rebind_email", "rebind_error", "rebind_target", "rebind_pool"];
     const sets = [], vals = [];
     for (const k of allowed) {
-        if (fields[k] !== undefined) { sets.push(`${k}=$${vals.length + 1}`); vals.push(fields[k]); }
+        if (fields[k] !== undefined) {
+            let v = fields[k];
+            if (k === "rebind_pool" && v && typeof v === "object") v = JSON.stringify(v);
+            sets.push(`${k}=$${vals.length + 1}`);
+            vals.push(v);
+        }
     }
     if (!sets.length) return;
     vals.push(id);

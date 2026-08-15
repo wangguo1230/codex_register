@@ -221,6 +221,7 @@ export async function ensureSchema() {
         await client.query(`ALTER TABLE recharge_queue ADD COLUMN IF NOT EXISTS rebind_email TEXT DEFAULT ''`);
         await client.query(`ALTER TABLE recharge_queue ADD COLUMN IF NOT EXISTS rebind_error TEXT DEFAULT ''`);
         await client.query(`ALTER TABLE recharge_queue ADD COLUMN IF NOT EXISTS rebind_target TEXT DEFAULT ''`);
+        await client.query(`ALTER TABLE recharge_queue ADD COLUMN IF NOT EXISTS rebind_pool JSONB`);
 
         // ChatGPT 登录凭证(与邮箱密码分离):每号独立密码 + TOTP
         await client.query(`ALTER TABLE gpt_accounts ADD COLUMN IF NOT EXISTS gpt_password TEXT DEFAULT ''`);

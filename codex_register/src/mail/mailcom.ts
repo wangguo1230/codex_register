@@ -368,8 +368,9 @@ async function loginMailcom(email, password, opts = {}) {
         });
         page.setDefaultTimeout(20000);
 
-        console.log(`[mailcom] 登录 ${email} ...`);
+        console.log(`[mailcom] 登录 ${email} ... 打开首页`);
         await page.goto("https://www.mail.com/", {waitUntil: "commit", timeout: 90000});
+        console.log(`[mailcom] 首页已开 url=${page.url().slice(0, 80)}`);
         await page.waitForTimeout(4000);
 
         // consent
@@ -421,10 +422,15 @@ async function loginMailcom(email, password, opts = {}) {
             if (!submitted) {
                 await pwdBox.press("Enter").catch(() => page.keyboard.press("Enter").catch(() => {}));
             }
+            console.log(`[mailcom] 已提交登录表单 submitted=${submitted} url=${page.url().slice(0, 80)}`);
         }
+        console.log(`[mailcom] 等跳转收件箱（最多 45s）`);
         try {
             await page.waitForURL("**navigator-lxa.mail.com**", {timeout: 45000, waitUntil: "commit"});
-        } catch { /* 用下方判定成败 */ }
+            console.log(`[mailcom] 已进 navigator url=${page.url().slice(0, 80)}`);
+        } catch {
+            console.log(`[mailcom] 未跳到 navigator，当前 url=${page.url().slice(0, 90)}`);
+        }
 
         // 账密无效会跳 logout 页，提前识别、快速失败
         if (!session.bearer && /\/logout/i.test(page.url())) {
@@ -433,6 +439,9 @@ async function loginMailcom(email, password, opts = {}) {
 
         // 等 webmailer 自己去换 mail_mailbox_r。先到的几乎一定是 LPS 的 ppc_permission_r，那个票打 maillist 会 403。
         for (let i = 0; i < 30 && !session.bearer; i += 1) {
+            if (i === 0 || i === 10 || i === 20) {
+                console.log(`[mailcom] 等 mailbox 票 ${i}/30 url=${page.url().slice(0, 70)}`);
+            }
             await page.waitForTimeout(1000);
             if (i === 3 || i === 10) await dismissPopups(page);
             if (i === 5 || i === 15) {
@@ -448,26 +457,32 @@ async function loginMailcom(email, password, opts = {}) {
                         console.log(`[mailcom] oauthbridge 换到 mailbox token sid=${navsid.slice(0, 8)}…`);
                         break;
                     }
+                    console.log(`[mailcom] oauthbridge 换票未成 sid=${navsid.slice(0, 8)}…`);
                 }
             }
         }
         if (session.bearer) {
+            console.log(`[mailcom] 打开 3c 收件箱`);
             await page.goto("https://3c.mail.com/", {waitUntil: "domcontentloaded", timeout: 45000}).catch(() => {});
             await page.waitForTimeout(2500);
             await dismissPopups(page);
         }
         if (!session.bearer) {
             let reason = "登录后未拿到 mail_mailbox 票(截到 LPS 票打 maillist 会 403)";
+            let body = "";
             try {
-                const body = await page.innerText("body").catch(() => "");
+                body = await page.innerText("body").catch(() => "");
                 if (/blocked your account|irregular activity|contact.*support|precautionary measure/i.test(body)) {
                     reason = "mail.com 账号被风控封禁(irregular activity blocked)";
-                } else if (/invalid email address|password combination|try again/i.test(body)) {
+                } else if (/invalid email address|password combination/i.test(body)) {
                     reason = "mail.com 账密无效(邮箱/密码组合错误)";
+                } else if (/password/i.test(body) && /try again/i.test(body)) {
+                    reason = "mail.com 登录失败(页面提示再试，可能账密或验证码)";
                 } else if (/\/logout/i.test(page.url())) {
                     reason = "mail.com 账密无效或账号已停用(登录被拒)";
                 }
             } catch { /* ignore */ }
+            console.log(`[mailcom] 登录失败 ${reason} url=${page.url().slice(0, 90)} body=${String(body || "").replace(/\s+/g, " ").slice(0, 160)}`);
             throw new Error(`${reason}: ${email}`);
         }
         return session;
