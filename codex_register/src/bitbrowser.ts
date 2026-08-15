@@ -5,7 +5,21 @@
 // 文档: https://doc2.bitbrowser.cn/jiekou/ben-di-fu-wu-zhi-nan.html  默认本地端口 54345,无需鉴权。
 const BIT_API = process.env.BIT_API_URL || "http://127.0.0.1:54345";
 
+let bitApiTail = Promise.resolve();
+let lastBitApiAt = 0;
+function withBitApiGate(fn) {
+    const run = bitApiTail.then(async () => {
+        const wait = 180 - (Date.now() - lastBitApiAt);
+        if (wait > 0) await new Promise((r) => setTimeout(r, wait));
+        lastBitApiAt = Date.now();
+        return fn();
+    });
+    bitApiTail = run.then(() => {}, () => {});
+    return run;
+}
+
 async function bitPost(pathname, body) {
+    return withBitApiGate(async () => {
     const r = await fetch(`${BIT_API}${pathname}`, {
         method: "POST",
         headers: {"Content-Type": "application/json"},
@@ -20,6 +34,7 @@ async function bitPost(pathname, body) {
     }
     if (pathname === "/browser/list" || pathname === "/browser/update") markBitLoggedOut(false);
     return j.data;
+    });
 }
 
 // 健康检查(用于开关前探测比特是否在跑)

@@ -285,6 +285,16 @@ class Scheduler extends EventEmitter {
             if (!this.paused) acc = await db.claimNext();
             if (!acc && !this.pausedClaude) acc = await db.claimNextClaude();
             if (!acc) break;
+            const isGoogle = acc.provider === "google" || /@(gmail|googlemail)\.com$/i.test(String(acc.email || ""));
+            if (isGoogle && (acc.domain || "gpt") === "gpt") {
+                const snap = this.mailProxyPoolSnap();
+                const busy = [...this.running.values()].filter((i) => i.wantMailPool).length;
+                if (busy >= Math.max(1, snap.slots || 1)) {
+                    await db.releaseGptIfRunning(acc.id);
+                    this.log(acc.id, "代理池已满（1 代理 = 1 指纹），先退回排队");
+                    break;
+                }
+            }
             this.spawnWorker(acc);
         }
         this.emit("stats", await db.stats());
@@ -305,13 +315,32 @@ class Scheduler extends EventEmitter {
         const runId = `${domain}:${acc.id}`;
         const tmpFile = path.join(this.tmpDir, `mc-${domain}-${acc.id}.txt`);
         writeFileSync(tmpFile, [acc.email, acc.password, acc.mailbox_totp || "", acc.recovery_email || "", acc.mailbox_imap || ""].join("----") + "\n", "utf8");
+        const isGoogle = acc.provider === "google" || /@(gmail|googlemail)\.com$/i.test(String(acc.email || ""));
+        const info = {child: null, tmpFile, gotResult: false, engine: null, domain, id: acc.id, mailboxId: acc.mailbox_id, releasing: false, wantMailPool: isGoogle && domain === "gpt", mailLease: null};
+        this.running.set(runId, info);
+        if (info.wantMailPool) {
+            try {
+                info.mailLease = await mailProxyPool.lease(acc.email, {
+                    fallback: this.mailProxyFallback(),
+                    timeoutMs: 20_000,
+                    maxPerTemplate: 1,
+                });
+                this.logJob(info, `代理池租到 ${String(info.mailLease.url || "直连").replace(/:[^:@/]+@/, ":***@")}（1 代理 = 1 指纹）`);
+            } catch (e) {
+                this.running.delete(runId);
+                await db.releaseGptIfRunning(acc.id);
+                this.log(acc.id, `代理池租不到: ${e?.message || e}，退回排队`);
+                return;
+            }
+        }
 
         // 注册知识收敛在引擎:调度器只管进程/并发/事件(通用)。按账号所属域选引擎。
         const engine = resolveEngine(domain);
         const {script, env} = engine.buildSpawn(acc, this, tmpFile);
+        if (info.mailLease) env.PROXY_URL = info.mailLease.url || "";
         const child = spawn(TSX_BIN, [script], {cwd: CODEX_ROOT, env: {...process.env, ...env}, shell: IS_WIN});
-        const info = {child, tmpFile, gotResult: false, engine, domain, id: acc.id, mailboxId: acc.mailbox_id, releasing: false};
-        this.running.set(runId, info);
+        info.child = child;
+        info.engine = engine;
         if (domain === "claude") this.emit("claude", {stats: await db.claudeStats()});
         else { this.emit("status", {id: acc.id, status: "running"}); this.emit("stats", await db.stats()); }
         this.logJob(info, `▶ 启动注册 worker (pid=${child.pid})`);
@@ -369,9 +398,10 @@ class Scheduler extends EventEmitter {
         const info = this.running.get(runId);
         this.running.delete(runId);
         if (info) {
+            try { info.mailLease?.release(); } catch { /* */ }
             try { rmSync(info.tmpFile, {force: true}); } catch { /* ignore */ }
             // 没收到结果事件就退出 = 异常,交由引擎按域解释
-            if (!info.gotResult) await info.engine.onAbnormalExit(this, info.id, code, info);
+            if (!info.gotResult && info.engine) await info.engine.onAbnormalExit(this, info.id, code, info);
         }
         this.emit("stats", await db.stats());
         this.tick(); // 释放槽位，继续下一个
