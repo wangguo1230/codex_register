@@ -615,30 +615,29 @@ async function clickDialogNext(page, log) {
             if (n.scrollHeight - n.clientHeight > 20) n.scrollTop = n.scrollHeight;
         }
     }).catch(() => {});
-    await page.mouse.wheel(0, 600).catch(() => {});
-    await page.waitForTimeout(250);
+    const clicked = await dlg.evaluate((root) => {
+        const btns = [...root.querySelectorAll("button, [role='button']")];
+        const next = btns.reverse().find((b) => {
+            if (!b.getClientRects().length) return false;
+            if (b.disabled) return false;
+            return /^(next|continue|下一步|继续)$/i.test((b.textContent || "").replace(/\s+/g, " ").trim());
+        });
+        if (!next) return false;
+        next.click();
+        return true;
+    }).catch(() => false);
+    if (clicked) {
+        log("[2FA] 点了确认框 Next（DOM）");
+        return true;
+    }
     const nexts = dlg.getByRole("button", {name: /^(next|continue|下一步|继续)$/i});
     const nn = await nexts.count().catch(() => 0);
     for (let i = nn - 1; i >= 0; i--) {
         const btn = nexts.nth(i);
-        if (!await btn.isVisible({timeout: 200}).catch(() => false)) continue;
-        if (await btn.isDisabled().catch(() => false)) {
-            log("[2FA] Next 还是禁用，再滚");
-            continue;
-        }
-        const box = await btn.boundingBox().catch(() => null);
-        if (box) await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
-        else await btn.click({timeout: 2500}).catch(() => btn.click({force: true, timeout: 1500}));
+        if (!await btn.isVisible({timeout: 150}).catch(() => false)) continue;
+        if (await btn.isDisabled().catch(() => false)) continue;
+        await btn.click({timeout: 2000, force: true}).catch(() => {});
         log("[2FA] 点了确认框可见 Next");
-        return true;
-    }
-    const txtNext = dlg.getByText(/^(next|continue|下一步|继续)$/i);
-    const tn = await txtNext.count().catch(() => 0);
-    for (let i = tn - 1; i >= 0; i--) {
-        const el = txtNext.nth(i);
-        if (!await el.isVisible({timeout: 200}).catch(() => false)) continue;
-        await el.click({timeout: 2500}).catch(() => el.click({force: true, timeout: 1500}));
-        log("[2FA] 点了确认框可见 Next 文案");
         return true;
     }
     return false;
@@ -887,7 +886,7 @@ export async function change2faOnPage(page, {
         if (confirmOpen) {
             const hit = await clickDialogNext(page, log);
             log(hit ? "[2FA] 确认框已点 Next，等填码/QR" : "[2FA] 确认框 Next 没点到");
-            setup = await waitAuthenticatorSetup(page, 12000);
+            setup = await waitAuthenticatorSetup(page, 4000);
             continue;
         }
         if (["qr", "secret"].includes(setup)) break;
