@@ -507,13 +507,21 @@ export function MailboxPanel({notify}: {notify?: (m: string) => void}) {
     };
     const resumeMailboxJob = async (onlyFailed = false) => {
         try {
-            const ids = (selCount > 0
-                ? [...selected].filter((id) => filtered.some((m) => m.id === id))
-                : (fGrp
-                    ? searchBase.filter((m) => m.provider === "google" && (fGrp === "__NONE__" ? !m.grp : (m.grp || "") === fGrp)).map((m) => m.id)
-                    : filtered.filter((m) => m.provider === "google").map((m) => m.id)));
+            let ids: number[] | undefined;
+            let scope = "";
+            if (selCount > 0) {
+                ids = [...selected].filter((id) => filtered.some((m) => m.id === id));
+                scope = `已选 ${ids.length} 个里还缺 2FA/IMAP 的`;
+            } else if (fGrp) {
+                ids = searchBase.filter((m) => m.provider === "google" && (fGrp === "__NONE__" ? !m.grp : (m.grp || "") === fGrp)).map((m) => m.id);
+                scope = `分组「${fGrp}」里还缺 2FA/IMAP 的`;
+            } else {
+                ids = undefined;
+                scope = "只续最近失败/已取消的任务，不会把全库刚导入都拉进来";
+            }
+            const verb = onlyFailed ? "重试失败" : "继续未完成";
+            if (!confirm(`${verb}：${scope}？`)) return;
             const r = onlyFailed ? await api.retryFailedMailboxJobs(ids) : await api.resumeHardenMailboxGoogle(ids);
-            const verb = onlyFailed ? "重试失败" : "续跑";
             toast(r.count
                 ? `已${verb} ${r.count} 个${r.skippedDone ? `（${r.skippedDone} 个已齐跳过）` : ""}`
                 : (r.msg || `没有可${verb}的`));

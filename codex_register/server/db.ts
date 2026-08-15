@@ -1582,14 +1582,15 @@ export async function listGoogleHardenGaps(ids = null) {
     return rows.filter((mb) => needsHardenRetry(mb));
 }
 
-export async function listResumableMailJobs({kinds = ["harden"], onlyError = false} = {}) {
+export async function listResumableMailJobs({kinds = ["harden"], onlyError = false, since = 0} = {}) {
     const want = (kinds || ["harden"]).filter(Boolean);
+    const cut = Number(since) > 0 ? Number(since) : 0;
     const {rows} = await query(
-        `SELECT DISTINCT ON (kind, mailbox_id) mailbox_id, email, kind, status, error
+        `SELECT DISTINCT ON (kind, mailbox_id) mailbox_id, email, kind, status, error, finished_at
          FROM mail_jobs
-         WHERE kind = ANY($1)
+         WHERE kind = ANY($1) AND ($2=0 OR COALESCE(finished_at, created_at, 0) > $2)
          ORDER BY kind, mailbox_id, id DESC`,
-        [want],
+        [want, cut],
     );
     return rows
         .filter((r) => onlyError ? r.status === "error" : (r.status === "canceled" || r.status === "error"))

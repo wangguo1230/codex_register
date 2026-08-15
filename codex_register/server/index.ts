@@ -956,8 +956,12 @@ async function resumeMailJobs({onlyError = false, ids = null} = {}) {
     await beginMailQueue();
     const dropped = await db.cancelPendingHardenIfAlreadyUsable().catch(() => 0);
     if (dropped) console.log(`[mail-jobs] 继续完成：撤掉 ${dropped} 个已整备（2FA+IMAP）的排队`);
-    let left = await db.listResumableMailJobs({kinds: ["harden", "pw", "2fa"], onlyError}).catch(() => []);
-    if (Array.isArray(ids) && ids.length) {
+    const scoped = Array.isArray(ids) && ids.length;
+    let left = await db.listResumableMailJobs({
+        kinds: ["harden", "pw", "2fa"], onlyError,
+        since: scoped ? 0 : Date.now() - 3 * 60 * 60 * 1000,
+    }).catch(() => []);
+    if (scoped) {
         const want = new Set(ids.map(Number).filter(Number.isInteger));
         left = left.filter((it) => want.has(it.id));
     }
