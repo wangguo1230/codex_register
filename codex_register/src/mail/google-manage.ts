@@ -411,9 +411,21 @@ function dialogLooksLikeChangeTotp(text) {
 function dialogLooksLikeReplaceConfirm(text) {
     const t = String(text || "");
     if (/enter the 6-digit|enter code|输入.*6.*位|输入验证码/i.test(t)) return false;
-    if (/can.?t scan|cannot scan|无法扫描/i.test(t)) return false;
+    if (/can.?t scan|cannot scan|无法扫描|scan a qr|the qr code|loading/i.test(t)) return false;
     return /won.t be able to use your old|you will no longer|old authenticator|无法再使用|旧的身份验证|replace this authenticator/i.test(t)
         && !/scan a qr|qr code/i.test(t);
+}
+
+function dialogLooksLikeQrSetup(text) {
+    const t = String(text || "");
+    if (/enter the 6-digit|enter code|输入.*6.*位|输入验证码/i.test(t)) return false;
+    return /can.?t scan|cannot scan|无法扫描|the qr code|scan a qr/i.test(t);
+}
+
+function dialogLooksLikeLoadingQr(text) {
+    const t = String(text || "");
+    return /\bloading\b/i.test(t)
+        && /change authenticator|scan a qr|old authenticator|authenticator app/i.test(t);
 }
 
 async function findChangeTotpDialog(page) {
@@ -561,7 +573,7 @@ async function fillChangeAuthenticatorCode(page, totpSecret, log) {
 async function waitAuthenticatorSetup(page, ms = 9000) {
     const deadline = Date.now() + ms;
     const cant = page.getByText(/can.?t scan it\??|cannot scan|无法扫描/i);
-    const qr = page.locator("canvas, img[alt*='QR' i], img[src*='qr']");
+    const qr = page.locator("canvas, img[alt*='QR' i], img[src*='qr' i], [role='dialog'] img[src^='data:image']");
     const secret = page.getByText(/secret key|setup key|密钥|otpauth:\/\//i);
     while (Date.now() < deadline) {
         if (await isAccountPickerDialog(page)) {
@@ -569,13 +581,18 @@ async function waitAuthenticatorSetup(page, ms = 9000) {
             await page.waitForTimeout(150);
             continue;
         }
-        if (await qr.first().isVisible({timeout: 120}).catch(() => false)) return "qr";
         if (await cant.first().isVisible({timeout: 120}).catch(() => false)) return "secret";
+        if (await qr.first().isVisible({timeout: 120}).catch(() => false)) return "qr";
         if (await secret.first().isVisible({timeout: 120}).catch(() => false)) return "secret";
         if (await findChangeTotpDialog(page)) return "reauth";
         const dlg = page.locator('[role="dialog"], [role="alertdialog"]').first();
         if (await dlg.isVisible({timeout: 80}).catch(() => false)) {
             const dt = String(await dlg.innerText().catch(() => ""));
+            if (dialogLooksLikeLoadingQr(dt)) {
+                await page.waitForTimeout(250);
+                continue;
+            }
+            if (dialogLooksLikeQrSetup(dt)) return "qr";
             if (dialogLooksLikeReplaceConfirm(dt)) return "confirm";
         }
         await page.waitForTimeout(180);
@@ -700,10 +717,10 @@ async function clickCantScanByDom(page, log) {
     const dlg = page.locator('[role="dialog"], [role="alertdialog"]').first();
     const scope = await dlg.isVisible({timeout: 300}).catch(() => false) ? dlg : page;
     const candidates = [
-        scope.locator('[jsname="Pr7Yme"]'),
         scope.getByRole("button", {name: /can.?t scan|cannot scan|无法扫描/i}),
-        scope.getByText(/can.?t scan it\??/i),
         scope.locator("button").filter({hasText: /can.?t scan|无法扫描/i}),
+        scope.locator('[jsname="Pr7Yme"]').filter({hasText: /can.?t scan|无法扫描/i}),
+        scope.getByText(/can.?t scan it\??/i),
     ];
     for (const loc of candidates) {
         const el = loc.first();
@@ -894,23 +911,38 @@ export async function change2faOnPage(page, {
             setup = await waitAuthenticatorSetup(page, 10000);
             continue;
         }
-        const dlgText = String(await page.locator('[role="dialog"], [role="alertdialog"]').first().innerText().catch(() => ""));
-        if (/can.?t scan|cannot scan|无法扫描/i.test(dlgText)
-            || await page.locator("img[alt*='QR' i]").first().isVisible({timeout: 200}).catch(() => false)) {
+        const dlg = page.locator('[role="dialog"], [role="alertdialog"]').first();
+        const dlgOpen = await dlg.isVisible({timeout: 200}).catch(() => false);
+        const dlgText = dlgOpen ? String(await dlg.innerText().catch(() => "")) : "";
+        if (dialogLooksLikeLoadingQr(dlgText)) {
+            if (tryChange === 0 || tryChange === 3) log("[2FA] 确认框还在出 QR，继续等");
+            setup = await waitAuthenticatorSetup(page, 12000);
+            continue;
+        }
+        if (dialogLooksLikeQrSetup(dlgText)
+            || /can.?t scan|cannot scan|无法扫描/i.test(dlgText)
+            || await page.locator("img[alt*='QR' i], [role='dialog'] img[src^='data:image']").first().isVisible({timeout: 200}).catch(() => false)) {
             log("[2FA] 确认框已出 QR，点 Can't scan it?");
             if (await clickCantScanByDom(page, log)) {
-                setup = await waitAuthenticatorSetup(page, 6000);
+                setup = await waitAuthenticatorSetup(page, 8000);
                 if (!setup) setup = "secret";
+            } else {
+                log("[2FA] Can't scan 还没出来，再等");
+                setup = await waitAuthenticatorSetup(page, 8000);
             }
             continue;
         }
         if (dialogLooksLikeReplaceConfirm(dlgText)) {
             const hit = await clickDialogNext(page, log);
             log(hit ? "[2FA] 确认框已点 Next，等填码/QR" : "[2FA] 确认框 Next 没点到");
-            setup = await waitAuthenticatorSetup(page, 4000);
+            setup = await waitAuthenticatorSetup(page, 8000);
             continue;
         }
         if (["qr", "secret"].includes(setup)) break;
+        if (dlgOpen && /change authenticator|authenticator app/i.test(dlgText)) {
+            setup = await waitAuthenticatorSetup(page, 10000);
+            continue;
+        }
         if (!clickedChange || tryChange >= 2) {
             let clickedAction = await clickAuthenticatorChangeByDom(page, log);
             if (!clickedAction) {
@@ -923,7 +955,7 @@ export async function change2faOnPage(page, {
             }
             if (!clickedAction) break;
             clickedChange = true;
-            setup = await waitAuthenticatorSetup(page, 5000);
+            setup = await waitAuthenticatorSetup(page, 25000);
         }
     }
 
@@ -976,6 +1008,11 @@ export async function change2faOnPage(page, {
         }
     }
     if (!cantClicked && canSeeCantScan && await clickCantScanByDom(page, log)) cantClicked = true;
+    if (!cantClicked) {
+        log("[2FA] Can't scan 还没出现，再等 QR 加载");
+        setup = await waitAuthenticatorSetup(page, 20000);
+        if (["qr", "secret"].includes(setup) && await clickCantScanByDom(page, log)) cantClicked = true;
+    }
 
     if (!cantClicked && !/otpauth:\/\//i.test(String(await page.innerText("body").catch(() => "")))) {
         log("[2FA] 未找到无法扫描按钮");
