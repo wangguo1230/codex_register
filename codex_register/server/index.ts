@@ -92,7 +92,7 @@ function ancestorPids() {
             let cur = process.pid;
             for (let i = 0; i < 16; i++) {
                 const p = Number(ppidOf[cur] || 0);
-                if (!p || p <= 1 || keep.has(p)) break;
+                if (!p || p <= 1 || p === cur) break;
                 keep.add(p);
                 cur = p;
             }
@@ -106,7 +106,7 @@ function ancestorPids() {
             let cur = process.pid;
             for (let i = 0; i < 16; i++) {
                 const p = Number(ppidOf[cur] || 0);
-                if (!p || p <= 1 || keep.has(p)) break;
+                if (!p || p <= 1 || p === cur) break;
                 keep.add(p);
                 cur = p;
             }
