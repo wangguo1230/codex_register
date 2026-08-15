@@ -741,14 +741,14 @@ async function clickCantScanByDom(page, log) {
 
 async function openAuthenticatorDetail(page, log) {
     if (await onAuthenticatorDetail(page)) return true;
-    if (await clickVisibleHref(page, (h) => /\/authenticator/i.test(h) && !STORE_HREF_RE.test(h), log, "点开 Authenticator 行")) {
-        /* opened */
-    } else {
-        try {
-            await page.goto("https://myaccount.google.com/two-step-verification/authenticator?hl=en", {waitUntil: "domcontentloaded", timeout: 30000});
-            log("[2FA] 直达 authenticator 页");
-        } catch { /* ignore */ }
+    if (await isAccountPickerDialog(page) || /Choose an account|SignOutOptions/i.test(String(await page.innerText("body").catch(() => "")))) {
+        await dismissAccountFlyout(page);
+        await page.keyboard.press("Escape").catch(() => {});
     }
+    try {
+        await page.goto(AUTHENTICATOR_URL, {waitUntil: "domcontentloaded", timeout: 30000});
+        log("[2FA] 直达 authenticator 页");
+    } catch { /* ignore */ }
     for (let i = 0; i < 30; i++) {
         await page.waitForTimeout(400);
         if (await onAuthenticatorDetail(page)) return true;
