@@ -445,12 +445,18 @@ export function MailboxPanel({notify}: {notify?: (m: string) => void}) {
         const gmailReady = (m: Mailbox) => m.provider !== "google" || (m.google_stage === "ready" && !!String(m.imap_password || "").trim());
         const notReady = rows.filter((m) => !gmailReady(m));
         const ok = rows.filter(gmailReady);
-        if (!ok.length) { toast("选中的 Gmail 都还没整备完（要阶段=可取件且已开 IMAP）"); return; }
-        const batch = moveGrp.trim();
-        const bits = [`把 ${ok.length} 个已整备邮箱分配进 GPT 注册队列`];
-        if (batch) bits.push(`并改到分组「${batch}」`);
-        if (notReady.length) bits.push(`跳过 ${notReady.length} 个未整备完的 Gmail`);
-        if (!confirm(bits.join("\n") + "？")) return;
+        if (!ok.length) { toast("选中的 Gmail 都还没整备完（要阶段=已整备且已开 IMAP）"); return; }
+        const d = new Date();
+        const suggested = moveGrp.trim() || `${d.getMonth() + 1}月${d.getDate()}已整备GPT`;
+        const typed = window.prompt(
+            `给这 ${ok.length} 个号起个 GPT 分组名（可新建）${notReady.length ? `；另有 ${notReady.length} 个未整备会跳过` : ""}`,
+            suggested,
+        );
+        if (typed == null) return;
+        const batch = typed.trim();
+        if (!batch) { toast("分组名不能为空"); return; }
+        setMoveGrp(batch);
+        if (!confirm(`把 ${ok.length} 个已整备邮箱分到「${batch}」并分配进 GPT 注册队列？`)) return;
         setBusy(true);
         try {
             const r = await api.allocateMailboxIds("gpt", ok.map((m) => m.id), batch);
