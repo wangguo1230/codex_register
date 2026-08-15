@@ -562,7 +562,19 @@ function setupQrInDialog(page) {
     return page.locator("[role='dialog'] img, [role='alertdialog'] img, [role='dialog'] canvas, [role='alertdialog'] canvas");
 }
 
+function onAppPasswordsPage(page) {
+    return /apppasswords|app-passwords|signinoptions\/apppasswords/i.test(String(page.url() || ""));
+}
+
+async function leaveAppPasswordsForAuthenticator(page, log) {
+    if (!onAppPasswordsPage(page)) return false;
+    if (log) log("[2FA] 现在在应用专用密码页，说明 2FA 已开，改去 Authenticator 换密钥");
+    try { await page.goto(AUTHENTICATOR_URL, {waitUntil: "domcontentloaded", timeout: 60000}); } catch { /* */ }
+    return true;
+}
+
 async function onAuthenticatorDetail(page) {
+    if (onAppPasswordsPage(page)) return false;
     if (await changeAuthenticatorBtn(page).isVisible({timeout: 250}).catch(() => false)) return true;
     const ready = page.getByRole("button", {name: /change authenticator|set up authenticator|更改身份验证|设置身份验证/i})
         .or(page.getByText(/^your authenticator$/i));
@@ -1012,6 +1024,7 @@ export async function change2faOnPage(page, {
             return {ok: false, error: "Google 登录失败"};
         }
     }
+    if (onAppPasswordsPage(page)) await leaveAppPasswordsForAuthenticator(page, log);
     if (!await onAuthenticatorDetail(page)) {
         try { await page.goto(AUTHENTICATOR_URL, {waitUntil: "domcontentloaded", timeout: 60000}); } catch { /* ignore */ }
         if (await googleSslDead(page)) await recoverSslOrSlowPage(page, log, AUTHENTICATOR_URL, 3);
@@ -1114,6 +1127,12 @@ export async function change2faOnPage(page, {
         }
     }
 
+    if (!foundAuth) {
+        if (onAppPasswordsPage(page) || /app passwords|应用专用密码/i.test(String(await page.innerText("body").catch(() => "")))) {
+            await leaveAppPasswordsForAuthenticator(page, log);
+            foundAuth = await onAuthenticatorDetail(page) || /\/authenticator/i.test(page.url());
+        }
+    }
     if (!foundAuth) {
         const leftover = String(await page.innerText("body").catch(() => ""));
         if (isVerifyItsYouText(leftover) || /enter your password|to continue, first verify/i.test(leftover)
@@ -1238,6 +1257,16 @@ export async function change2faOnPage(page, {
     if (!setup && await findChangeTotpDialog(page)) {
         const filled = await fillChangeAuthenticatorCode(page, totpSecret, log);
         if (filled === "ok") setup = await waitAuthenticatorSetup(page, 9000);
+    }
+    if (!["qr", "secret"].includes(setup) && !await findChangeTotpDialog(page)) {
+        if (onAppPasswordsPage(page)) {
+            log("[2FA] 确认后落到应用专用密码页，回到 Authenticator 再换");
+            await leaveAppPasswordsForAuthenticator(page, log);
+            if (await onBoundAuthenticatorOverview(page)) {
+                await clickAuthenticatorChangeByDom(page, log);
+                setup = await waitAuthenticatorSetup(page, 20000);
+            }
+        }
     }
     if (!["qr", "secret"].includes(setup) && !await findChangeTotpDialog(page)) {
         log("[2FA] 确认后没有出现填码框或密钥");
