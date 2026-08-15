@@ -1487,13 +1487,18 @@ export async function requeueRecentBitTransientFails() {
     const {rows} = await query(
         `UPDATE mail_jobs j
          SET status='pending', instance_id='', last_line='比特恢复，重新排队', error='', ok=NULL, finished_at=NULL
-         WHERE j.kind='harden' AND j.status='error'
-           AND j.finished_at > $1
-           AND (j.error ILIKE '%比特%' OR j.error ILIKE '%Login Expired%' OR j.error ILIKE '%没有找到相应数据%')
-           AND NOT EXISTS (
-             SELECT 1 FROM mail_jobs x
-             WHERE x.mailbox_id=j.mailbox_id AND x.status IN ('pending','running')
-           )
+         WHERE j.id IN (
+           SELECT DISTINCT ON (mailbox_id) id FROM mail_jobs
+           WHERE kind='harden' AND status='error'
+             AND finished_at > $1
+             AND (error ILIKE '%比特%' OR error ILIKE '%Login Expired%' OR error ILIKE '%Login out%'
+                  OR error ILIKE '%没有找到相应数据%')
+           ORDER BY mailbox_id, id DESC
+         )
+         AND NOT EXISTS (
+           SELECT 1 FROM mail_jobs x
+           WHERE x.mailbox_id=j.mailbox_id AND x.status IN ('pending','running') AND x.id<>j.id
+         )
          RETURNING j.id, j.email`,
         [Date.now() - 2 * 60 * 60 * 1000],
     );
