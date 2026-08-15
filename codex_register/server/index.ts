@@ -67,8 +67,57 @@ const PORT = Number(process.env.PORT || 3100);
 const WEB_DIST = path.resolve(__dirname, "..", "web", "dist");
 let httpReady = false;
 
+function ancestorPids() {
+    const keep = new Set([process.pid, process.ppid].filter((n) => n > 1));
+    try {
+        if (process.platform === "win32") {
+            const out = execSync(
+                "wmic process get ProcessId,ParentProcessId /FORMAT:LIST",
+                {encoding: "utf8", windowsHide: true},
+            );
+            const ppidOf = {};
+            let pid = 0;
+            let ppid = 0;
+            for (const line of out.split(/\r?\n/)) {
+                const mPid = line.match(/^ProcessId=(\d+)/i);
+                const mPpid = line.match(/^ParentProcessId=(\d+)/i);
+                if (mPid) pid = Number(mPid[1]);
+                if (mPpid) ppid = Number(mPpid[1]);
+                if (pid && (ppid || /ParentProcessId=0/i.test(line))) {
+                    ppidOf[pid] = ppid;
+                    pid = 0;
+                    ppid = 0;
+                }
+            }
+            let cur = process.pid;
+            for (let i = 0; i < 16; i++) {
+                const p = Number(ppidOf[cur] || 0);
+                if (!p || p <= 1 || keep.has(p)) break;
+                keep.add(p);
+                cur = p;
+            }
+        } else {
+            const out = execSync("ps -ax -o pid=,ppid=", {encoding: "utf8"});
+            const ppidOf = {};
+            for (const line of out.split("\n")) {
+                const [pid, ppid] = line.trim().split(/\s+/).map(Number);
+                if (pid) ppidOf[pid] = ppid;
+            }
+            let cur = process.pid;
+            for (let i = 0; i < 16; i++) {
+                const p = Number(ppidOf[cur] || 0);
+                if (!p || p <= 1 || keep.has(p)) break;
+                keep.add(p);
+                cur = p;
+            }
+        }
+    } catch { /* ppid 已够 */ }
+    return keep;
+}
+
 function killSiblingIndexProcesses() {
     const me = process.pid;
+    const keep = ancestorPids();
     try {
         if (process.platform === "win32") {
             const out = execSync(
@@ -79,7 +128,7 @@ function killSiblingIndexProcesses() {
             for (const b of blocks) {
                 const cmd = (b.match(/CommandLine=(.*)/) || [])[1] || "";
                 const pid = Number((b.match(/ProcessId=(\d+)/) || [])[1] || 0);
-                if (!pid || pid === me) continue;
+                if (!pid || keep.has(pid)) continue;
                 if (!/server[/\\]index\.ts|tsx server/i.test(cmd)) continue;
                 try { execSync(`taskkill /F /PID ${pid}`, {stdio: "ignore", windowsHide: true}); } catch { /* */ }
                 console.log(`[server] 启动前清残留 index.ts pid=${pid}`);
@@ -89,8 +138,9 @@ function killSiblingIndexProcesses() {
             for (const line of out.split("\n")) {
                 if (!/server\/index\.ts|tsx server/i.test(line)) continue;
                 const pid = Number(line.trim().split(/\s+/)[0]);
-                if (!pid || pid === me) continue;
+                if (!pid || keep.has(pid)) continue;
                 try { process.kill(pid, "SIGKILL"); } catch { /* */ }
+                console.log(`[server] 启动前清残留 index.ts pid=${pid}`);
             }
         }
     } catch { /* */ }
