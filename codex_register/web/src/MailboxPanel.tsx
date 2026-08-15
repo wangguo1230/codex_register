@@ -509,7 +509,9 @@ export function MailboxPanel({notify}: {notify?: (m: string) => void}) {
         try {
             const ids = (selCount > 0
                 ? [...selected].filter((id) => filtered.some((m) => m.id === id))
-                : filtered.filter((m) => m.provider === "google").map((m) => m.id));
+                : (fGrp
+                    ? searchBase.filter((m) => m.provider === "google" && (fGrp === "__NONE__" ? !m.grp : (m.grp || "") === fGrp)).map((m) => m.id)
+                    : filtered.filter((m) => m.provider === "google").map((m) => m.id)));
             const r = onlyFailed ? await api.retryFailedMailboxJobs(ids) : await api.resumeHardenMailboxGoogle(ids);
             const verb = onlyFailed ? "重试失败" : "续跑";
             toast(r.count

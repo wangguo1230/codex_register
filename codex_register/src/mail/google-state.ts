@@ -126,7 +126,7 @@ export function planHardenSkip(mb = {}) {
     return skip;
 }
 
-/** 继续完成 / 续跑：只收还没齐最低限度的（换成我们的 2FA + IMAP）。改密、踢设备是加分项，不因此把已整备整队再丢回去。 */
+/** 继续完成：刚导入 / 整备未齐 / 整备部分，只要还缺「换成我们的 2FA」或 IMAP 就要进队。已齐这两项的不进。 */
 export function needsHardenRetry(mb = {}) {
     if (String(mb.google_stage || "") === "blocked") return false;
     if (String(mb.google_stage || "") === "gpt_ok") return false;
