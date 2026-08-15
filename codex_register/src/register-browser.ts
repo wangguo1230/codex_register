@@ -120,7 +120,14 @@ async function fillField(page, selectors, value, log, label) {
 async function fillOtpCode(page, code, log) {
     const digits = String(code || "").replace(/\D/g, "").slice(0, 6);
     if (digits.length !== 6) return false;
-    const boxes = page.locator('input[autocomplete="one-time-code"], input[name="code"], input[name="otp"], input[inputmode="numeric"], input[maxlength="1"]');
+    const boxes = page.locator('input[autocomplete="one-time-code"], input[name="code"], input[name="otp"], input[inputmode="numeric"], input[maxlength="1"], input[type="tel"]');
+    for (let w = 0; w < 12; w++) {
+        const n = await boxes.count().catch(() => 0);
+        let vis = 0;
+        for (let i = 0; i < n; i++) if (await boxes.nth(i).isVisible().catch(() => false)) vis += 1;
+        if (vis) break;
+        await page.waitForTimeout(800);
+    }
     const n = await boxes.count().catch(() => 0);
     const visible = [];
     for (let i = 0; i < n; i++) {
@@ -135,12 +142,20 @@ async function fillOtpCode(page, code, log) {
         log(`验证码按 6 格填入 ${digits}`);
         return true;
     }
-    return fillField(page, [
+    if (await fillField(page, [
         'input[autocomplete="one-time-code"]',
         'input[name="code"]',
         'input[name="otp"]',
         'input[name="totpPin"]',
-    ], digits, log, "验证码");
+        'input[type="tel"]',
+    ], digits, log, "验证码")) return true;
+    try {
+        await page.keyboard.type(digits, {delay: 60});
+        log(`验证码用键盘敲入 ${digits}`);
+        return true;
+    } catch {
+        return false;
+    }
 }
 
 /**
@@ -403,7 +418,15 @@ export async function registerViaBrowser(email, {password = "", totpSecret = "",
             return false;
         }
         let stage = "";
-        for (let i = 0; i < 8 && !stage; i++) { await page.waitForTimeout(800); stage = await detect(); }
+        for (let i = 0; i < 12 && !stage; i++) {
+            await assertPageUsable(page, log);
+            if (/accounts\/authorize|security verification/i.test(page.url() + (await page.innerText("body").catch(() => "")))) {
+                await page.waitForTimeout(2000);
+                await assertPageUsable(page, log);
+            }
+            await page.waitForTimeout(800);
+            stage = await detect();
+        }
         // 仅已有账号的验证页才改走密码；新号创建必须走邮箱 OTP，不能先点「用密码继续」把验证码框弄没
         const bodyNow = (await page.innerText("body").catch(() => "")).replace(/\s+/g, " ");
         if (stage === "code" && password && /log in with password|use (a )?password|使用密码|已有.*密码/i.test(bodyNow) && !/create-account|create a password|创建密码/i.test(bodyNow + page.url())) {
@@ -471,21 +494,33 @@ export async function registerViaBrowser(email, {password = "", totpSecret = "",
                 throw new Error(`未进入邮箱验证码页(url=${page.url().slice(0, 80)})`);
             }
             let codeOk = false, lastCode = "";
-            for (let ctry = 0; ctry < 2 && !codeOk; ctry += 1) {
+            for (let ctry = 0; ctry < 3 && !codeOk; ctry += 1) {
+                await assertPageUsable(page, log);
                 log(`从 IMAP 取邮箱验证码… url=${page.url().slice(0, 80)}`);
                 let code = "";
                 try {
                     code = await getEmailVerificationCode(email, lastCode ? {excludeCode: lastCode} : undefined);
                 } catch (e) {
                     log(`取码失败 ${String(e?.message || e).slice(0, 120)}，点 Resend 再取`);
-                    await page.getByText(/Resend email|重新发送|重发/i).first().click({timeout: 4000}).catch(() => {});
-                    await page.waitForTimeout(8000);
+                    await page.getByText(/Resend email|重新发送|重发|Resend/i).first().click({timeout: 4000}).catch(() => {});
+                    await page.waitForTimeout(10000);
                     code = await getEmailVerificationCode(email, lastCode ? {excludeCode: lastCode} : undefined);
                 }
                 lastCode = code;
-                if (!/^\d{6}$/.test(String(code || "").trim())) throw new Error(`拿到的验证码无效: ${String(code || "").slice(0, 20)}`);
+                if (!/^\d{6}$/.test(String(code || "").trim())) {
+                    if (ctry < 2) {
+                        log("码无效，Resend 后再取");
+                        await page.getByText(/Resend email|重新发送|重发|Resend/i).first().click({timeout: 4000}).catch(() => {});
+                        await page.waitForTimeout(8000);
+                        continue;
+                    }
+                    throw new Error(`拿到的验证码无效: ${String(code || "").slice(0, 20)}`);
+                }
                 log(`收到验证码 ${code}，填入`);
-                if (!await fillOtpCode(page, code, log)) throw new Error("验证码输入框未找到");
+                if (!await fillOtpCode(page, code, log)) {
+                    if (ctry < 2) { log("验证码框还没出来，等一会再填"); await page.waitForTimeout(4000); continue; }
+                    throw new Error("验证码输入框未找到");
+                }
                 await page.waitForTimeout(1500);
                 const oops = page.getByRole("button", {name: /try again|重试|tente novamente/i}).first();
                 if (await oops.isVisible({timeout: 800}).catch(() => false)
@@ -707,9 +742,10 @@ export async function registerViaBrowser(email, {password = "", totpSecret = "",
         }
 
         // 等进主站，最多 ~18s；中途再推一次提交
-        for (let i = 0; i < 12 && !isLoggedIn(); i += 1) {
+        for (let i = 0; i < 16 && !isLoggedIn(); i += 1) {
+            await assertPageUsable(page, log);
             if (isMfaContinueUrl(page.url()) && totpSecret) { await handleTotp(); continue; }
-            if (i === 4) { log("尚未进入主界面，再次尝试提交(Enter+继续)…"); await page.keyboard.press("Enter").catch(() => {}); await clickContinue(page, log); }
+            if (i === 4 || i === 9) { log("尚未进入主界面，再次尝试提交(Enter+继续)…"); await page.keyboard.press("Enter").catch(() => {}); await clickContinue(page, log); }
             await page.waitForTimeout(1500);
         }
         if (!isLoggedIn()) await checkDeactivated(page); // 没进登录态,可能是账号停用页 → 抛不可重试
@@ -731,13 +767,17 @@ export async function registerViaBrowser(email, {password = "", totpSecret = "",
         await page.waitForLoadState("domcontentloaded").catch(() => {});
         await page.waitForTimeout(3000);
         let session = null;
-        for (let i = 0; i < 6; i++) {
+        for (let i = 0; i < 10; i++) {
+            await assertPageUsable(page, log);
             try {
                 session = await page.evaluate(async () => {
                     try { const r = await fetch("/api/auth/session", {headers: {accept: "application/json"}}); return await r.json(); } catch { return null; }
                 });
                 if (session && session.accessToken) break;
             } catch (e) { /* context destroyed(导航中) → 等一下重试 */ }
+            if (i === 4 && !/^https:\/\/chatgpt\.com/.test(page.url())) {
+                await page.goto("https://chatgpt.com/", {waitUntil: "domcontentloaded", timeout: 45000}).catch(() => {});
+            }
             await page.waitForTimeout(2000);
         }
         const token = session?.accessToken || "";

@@ -74,7 +74,7 @@ export function rememberGoogleImapPassword(email, imapPassword) {
 }
 
 /** 只走 IMAP 轮询 ChatGPT 验证码（换绑/注册都可复用）。 */
-export async function waitGoogleImapOtp(cred, {minTimestampMs = 0, excludeCode = "", attempts = 8, intervalMs = 4000} = {}) {
+export async function waitGoogleImapOtp(cred, {minTimestampMs = 0, excludeCode = "", attempts = 12, intervalMs = 5000} = {}) {
     const c = rememberGoogleCred(cred) || cred;
     let lastErr = "";
     const n = Math.max(1, Number(attempts) || 8);
@@ -110,7 +110,7 @@ function parseProxyOpt(url) {
     } catch { return {server: url}; }
 }
 
-async function tryImapOtp(cred, {minTimestampMs = 0, excludeCode = ""} = {}) {
+async function tryImapOtpOnce(cred, {minTimestampMs = 0, excludeCode = ""} = {}) {
     const client = new ImapFlow({
         host: "imap.gmail.com",
         port: 993,
@@ -118,16 +118,16 @@ async function tryImapOtp(cred, {minTimestampMs = 0, excludeCode = ""} = {}) {
         auth: {user: cred.email, pass: cred.imapPassword || cred.password},
         logger: false,
         emitLogs: false,
-        connectionTimeout: 12_000,
-        greetingTimeout: 10_000,
-        socketTimeout: 15_000,
+        connectionTimeout: 16_000,
+        greetingTimeout: 12_000,
+        socketTimeout: 20_000,
     });
     client.on("error", () => {});
     try {
         await client.connect();
         const lock = await client.getMailboxLock("INBOX");
         try {
-            const since = new Date((minTimestampMs || Date.now()) - 10 * 60 * 1000);
+            const since = new Date((minTimestampMs || Date.now()) - 15 * 60 * 1000);
             const uids = await client.search({since, or: [{from: "openai.com"}, {from: "openai"}, {subject: "ChatGPT"}, {subject: "OpenAI"}]});
             const list = Array.isArray(uids) ? uids.slice(-8) : [];
             const candidates = [];
@@ -147,6 +147,17 @@ async function tryImapOtp(cred, {minTimestampMs = 0, excludeCode = ""} = {}) {
         throw e;
     }
     return "";
+}
+
+async function tryImapOtp(cred, {minTimestampMs = 0, excludeCode = ""} = {}) {
+    try {
+        return await tryImapOtpOnce(cred, {minTimestampMs, excludeCode});
+    } catch (e) {
+        const msg = String(e?.message || e);
+        if (!/Unexpected close|ECONNRESET|ETIMEDOUT|timeout|Socket timeout|closed/i.test(msg)) throw e;
+        await new Promise((r) => setTimeout(r, 2500));
+        return await tryImapOtpOnce(cred, {minTimestampMs, excludeCode});
+    }
 }
 
 async function scrapeGmailWebOtp(page, email, excludeCode = "") {
@@ -205,7 +216,7 @@ export async function getGoogleEmailVerificationCode(email, options = {}) {
 
     const hasImap = !!(cred.imapPassword);
     let imapErr = "";
-    for (let i = 0; i < (hasImap ? 8 : 1); i++) {
+    for (let i = 0; i < (hasImap ? 12 : 1); i++) {
         try {
             const imapCode = await tryImapOtp(cred, {minTimestampMs, excludeCode});
             if (imapCode) {
@@ -217,7 +228,7 @@ export async function getGoogleEmailVerificationCode(email, options = {}) {
             console.log(`[google] IMAP 不可用(${imapErr.slice(0, 80)})${hasImap ? "，稍后重试" : ",改走网页收件箱"}`);
             if (!hasImap) break;
         }
-        if (hasImap && i < 7) await new Promise((r) => setTimeout(r, 4000));
+        if (hasImap && i < 11) await new Promise((r) => setTimeout(r, 5000));
     }
     if (hasImap) throw new Error(`IMAP 未拿到 ChatGPT 验证码${imapErr ? `(${imapErr.slice(0, 80)})` : ""}: ${email}`);
 

@@ -68,7 +68,7 @@ async function main() {
         emit({type: "progress", stage: "imap", message: "Gmail 已有 IMAP，跳过邮箱管理，走 IMAP 收码注册"});
     }
 
-    const shouldRotate = (err) => /代理中断|ERR_PROXY|chrome-error|代理不通|多次打开 auth\/login 失败|Cloudflare|Unable to load site|出口被/i.test(String(err || ""));
+    const shouldRotate = (err) => /代理中断|ERR_PROXY|chrome-error|代理不通|多次打开 auth\/login 失败|Cloudflare|Unable to load site|出口被|原生表单|未进验证码|邮箱输入框未出现|验证码输入框未找到|换 IP|security verification/i.test(String(err || ""));
 
     async function teardownBit(id, closeFn) {
         unbindGoogleLivePage();
@@ -175,10 +175,27 @@ async function main() {
     if (process.env.REG_TRY_MFA === "1") {
         emit({type: "progress", stage: "mfa", message: "注册后绑定 TOTP…"});
         const accountId = decodeJwt(r.token)?.["https://api.openai.com/auth"]?.chatgpt_account_id || "";
-        const mfa = await enrollTotp(r.token, {accountId, proxyUrl: process.env.PROXY_URL || ""});
-        if (mfa.ok && mfa.secret) { totpSecret = mfa.secret; mfaStatus = "✅已绑"; emit({type: "progress", stage: "mfa", message: "TOTP 已绑定"}); }
-        else if (mfa.ok && mfa.already) { mfaStatus = "⚠已有2FA缺密钥"; emit({type: "progress", stage: "mfa", message: "该号已有 2FA 但本次未拿到 secret"}); }
-        else { mfaStatus = "❌" + (mfa.reason || "绑定失败"); emit({type: "progress", stage: "mfa", message: "TOTP 绑定失败: " + (mfa.reason || "")}); }
+        let mfaProxy = process.env.PROXY_URL || "";
+        let mfaClose = () => {};
+        try {
+            const jump = process.env.MAIL_PROXY_JUMP || "";
+            if (jump && mfaProxy) {
+                const {wrapExitThroughJump} = await import("./mail/proxy-chain.js");
+                const wrapped = await wrapExitThroughJump(mfaProxy, jump);
+                mfaProxy = wrapped.url;
+                mfaClose = wrapped.close;
+            }
+            let mfa = await enrollTotp(r.token, {accountId, proxyUrl: mfaProxy});
+            if (!mfa.ok && /fetch failed|ECONN|timeout|UND_ERR/i.test(String(mfa.reason || ""))) {
+                emit({type: "progress", stage: "mfa", message: "2FA 经代理失败，直连再试一次"});
+                mfa = await enrollTotp(r.token, {accountId, proxyUrl: ""});
+            }
+            if (mfa.ok && mfa.secret) { totpSecret = mfa.secret; mfaStatus = "✅已绑"; emit({type: "progress", stage: "mfa", message: "TOTP 已绑定"}); }
+            else if (mfa.ok && mfa.already) { mfaStatus = "⚠已有2FA缺密钥"; emit({type: "progress", stage: "mfa", message: "该号已有 2FA 但本次未拿到 secret"}); }
+            else { mfaStatus = "❌" + (mfa.reason || "绑定失败"); emit({type: "progress", stage: "mfa", message: "TOTP 绑定失败: " + (mfa.reason || "")}); }
+        } finally {
+            try { mfaClose(); } catch { /* */ }
+        }
     }
 
     // [注册后取 rt] 同 HTTP 引擎:REG_TRY_RT=1 → 新建干净 client 走 codex OAuth(authLoginHTTP,HTTP,不碰浏览器)拿可续期 rt。
