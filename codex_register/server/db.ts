@@ -408,16 +408,16 @@ const MAILBOX_LIST_COLS = `
 `;
 
 export async function listMailboxes(usage?) {
-    if (usage === 'deleted') {
-        const { rows } = await query(`SELECT ${MAILBOX_LIST_COLS} FROM mailboxes WHERE deleted_at>0 ORDER BY id`);
-        return rows;
+    const {liveGoogleStage} = await import("../src/mail/google-state.ts");
+    let rows;
+    if (usage === "deleted") {
+        ({rows} = await query(`SELECT ${MAILBOX_LIST_COLS} FROM mailboxes WHERE deleted_at>0 ORDER BY id`));
+    } else if (usage) {
+        ({rows} = await query(`SELECT ${MAILBOX_LIST_COLS} FROM mailboxes WHERE usage=$1 AND deleted_at=0 ORDER BY id`, [usage]));
+    } else {
+        ({rows} = await query(`SELECT ${MAILBOX_LIST_COLS} FROM mailboxes WHERE deleted_at=0 ORDER BY id`));
     }
-    if (usage) {
-        const { rows } = await query(`SELECT ${MAILBOX_LIST_COLS} FROM mailboxes WHERE usage=$1 AND deleted_at=0 ORDER BY id`, [usage]);
-        return rows;
-    }
-    const { rows } = await query(`SELECT ${MAILBOX_LIST_COLS} FROM mailboxes WHERE deleted_at=0 ORDER BY id`);
-    return rows;
+    return rows.map((r) => r.provider === "google" ? {...r, google_stage: liveGoogleStage(r)} : r);
 }
 
 export async function mailboxStats() {

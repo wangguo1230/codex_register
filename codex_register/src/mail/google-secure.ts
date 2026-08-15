@@ -248,9 +248,13 @@ export async function hardenGoogleAccountOnPage(page, cred, log = () => {}, onCh
     const {isMailboxJobStopped} = await import("./mailbox-job-stop.js");
     const stopNow = () => isMailboxJobStopped();
     const finalize = () => {
+        if (!out.imapPassword && (skip.imap || String(cred.imapPassword || "").trim())) {
+            out.imapPassword = cred.imapPassword || out.imapPassword || "kept";
+        }
+        if (!out.totpRotated && skip.totp) out.totpRotated = true;
         const missing = [];
         if (!(out.totpRotated || skip.totp)) missing.push("2FA");
-        if (!out.imapPassword) missing.push("IMAP");
+        if (!out.imapPassword && !skip.imap) missing.push("IMAP");
         if (!out.passwordChanged) missing.push("改密");
         if (!out.devicesDone && !skip.devices) missing.push("踢设备");
         if (!out.phoneCleared && !skip.phone) missing.push("手机");

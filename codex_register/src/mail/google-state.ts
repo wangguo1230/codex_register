@@ -180,6 +180,12 @@ export function needsHardenRetry(mb = {}) {
     return !planHardenSkip(mb).usable;
 }
 
+/** 列表/详情用：按库里的 2FA+IMAP 事实出阶段，避免关窗后还停在「整备未齐」。 */
+export function liveGoogleStage(mb = {}) {
+    if (String(mb.google_stage || "") === "gpt_ok") return "gpt_ok";
+    return deriveGoogleState(mb, {}).stage;
+}
+
 export function googleStageLabel(stage) {
     return GOOGLE_STAGE_LABEL[stage] || stage || "未知";
 }

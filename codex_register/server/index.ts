@@ -472,8 +472,9 @@ async function runOneGoogleHarden(id, opts = {}) {
     if (batchHardenStop || isMailboxJobStopped()) return {ok: false, error: "已停止"};
     const {planHardenSkip} = await import("../src/mail/google-state.js");
     const skip = planHardenSkip(mb);
-    if (skip.all) {
-        logMailbox(id, "[整备] 缺口已齐，不再开窗");
+    if (skip.all || skip.usable) {
+        logMailbox(id, skip.all ? "[整备] 缺口已齐，不再开窗" : "[整备] 2FA+IMAP 已齐，不再开窗补加分项");
+        await db.refreshMailboxGoogleState(id, {login: "ok", last_error: ""}).catch(() => {});
         return {
             ok: true, skipped: true, password: mb.password, totpSecret: mb.totp_secret,
             totpRotated: true,
