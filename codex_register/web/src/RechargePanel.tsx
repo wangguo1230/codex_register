@@ -242,7 +242,7 @@ export function RechargePanel({notify}: {notify?: (m: string) => void}) {
         const pendingIds = ids.filter((id) => { const q = queue.find((x) => x.id === id); return q && q.status === "pending"; });
         if (!pendingIds.length) { toast("所选项中无待提交状态的账号"); return; }
         if (cStats.unused < pendingIds.length) { toast(`可用卡密不足(需 ${pendingIds.length} 个,仅有 ${cStats.unused} 个)`); return; }
-        if (!confirm(`确认提交 ${pendingIds.length} 个账号充值?\n将自动配对 ${pendingIds.length} 个卡密。`)) return;
+        if (!confirm(`确认提交 ${pendingIds.length} 个账号充值?\n先预检：Gmail 探 IMAP，mail.com 验密码。不通的不配卡、不提交。`)) return;
         setBusy(true);
         try {
             await api.submitRecharge(pendingIds);
