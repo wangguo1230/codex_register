@@ -54,15 +54,39 @@ export function toProxyImportLine(url: string): string {
     return s;
 }
 
-const KOOK_PASS_RE = /^(.+)-([A-Za-z]{2})-(\d+)-(\d+m)$/;
+// pass-US-session-5m  或  pass-global-session（后台生成的粘性，无自动换出口）
+const KOOK_PASS_RE = /^(.+)-([A-Za-z]{2}|global)-(\d+)(?:-(\d+m))?$/i;
 
-function withKookeeySession(url: string, session: string): string {
+function kookRegion(raw: string) {
+    const r = String(raw || "");
+    return /^global$/i.test(r) ? "global" : r.toUpperCase();
+}
+
+function withKookeeySession(url: string, session: string, duration = ""): string {
     const u = new URL(url);
     const pass = decodeURIComponent(u.password || "");
     const m = pass.match(KOOK_PASS_RE);
     if (!m) return url;
-    const next = `${m[1]}-${m[2].toUpperCase()}-${session}-${m[4]}`;
+    const hold = duration || m[4] || "";
+    const next = hold
+        ? `${m[1]}-${kookRegion(m[2])}-${session}-${hold}`
+        : `${m[1]}-${kookRegion(m[2])}-${session}`;
     return `socks5://${encodeURIComponent(decodeURIComponent(u.username || ""))}:${encodeURIComponent(next)}@${u.hostname}:${u.port}`;
+}
+
+/** `-5m` 会定时换出口。`global-会话` 本身已是粘性，不再改写。 */
+export function ensureKookeeySticky(url: string, minMinutes = 30): string {
+    try {
+        const pass = decodeURIComponent(new URL(url).password || "");
+        const m = pass.match(KOOK_PASS_RE);
+        if (!m) return url;
+        if (!m[4]) return url;
+        const have = Number(String(m[4]).replace(/m$/i, "")) || 0;
+        if (have >= minMinutes) return url;
+        return withKookeeySession(url, m[3], `${minMinutes}m`);
+    } catch {
+        return url;
+    }
 }
 
 function randomSessionId() {
@@ -81,7 +105,7 @@ export function rotateKookeeySession(url: string): string {
     try {
         const pass = decodeURIComponent(new URL(url).password || "");
         if (!KOOK_PASS_RE.test(pass)) return url;
-        return withKookeeySession(url, randomSessionId());
+        return ensureKookeeySticky(withKookeeySession(url, randomSessionId()));
     } catch { return url; }
 }
 
@@ -301,7 +325,7 @@ export class MailProxyPool {
                 this.leased.set(url, {owner: String(owner || ""), at: Date.now(), url});
                 this.lastUsed.set(url, Date.now());
                 return {
-                    url: url === DIRECT ? "" : url,
+                    url: url === DIRECT ? "" : ensureKookeeySticky(url),
                     owner: String(owner || ""),
                     release: () => this.release(url),
                 };
@@ -313,7 +337,7 @@ export class MailProxyPool {
                 const key = `extra:${live}`;
                 this.leased.set(key, {owner: String(owner || ""), at: Date.now(), url: live});
                 return {
-                    url: live,
+                    url: ensureKookeeySticky(live),
                     owner: String(owner || ""),
                     release: () => this.release(key),
                 };

@@ -170,7 +170,7 @@ export const KOOK_COUNTRY_TZ: Record<string, string> = {
 export function timezoneFromExitUrl(exitUrl: string) {
     try {
         const pass = decodeURIComponent(new URL(exitUrl).password || "");
-        const m = pass.match(/-([A-Za-z]{2})-(\d+)-(\d+m)$/);
+        const m = pass.match(/-([A-Za-z]{2}|global)-(\d+)(?:-(\d+m))?$/i);
         if (m && KOOK_COUNTRY_TZ[m[1].toUpperCase()]) return KOOK_COUNTRY_TZ[m[1].toUpperCase()];
     } catch { /* */ }
     return "";
