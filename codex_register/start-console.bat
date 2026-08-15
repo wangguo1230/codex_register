@@ -17,11 +17,10 @@ call npm config set fetch-remote-tarball true >nul 2>&1
 call npm install --yes --registry https://registry.npmmirror.com
 cd /d "%~dp0"
 
-:: 清理旧进程
-for /f "tokens=5" %%a in ('netstat -ano ^| findstr "LISTENING" ^| findstr ":%PORT% "') do (
-    taskkill /F /PID %%a >nul 2>&1
-)
-timeout /t 1 /nobreak >nul 2>&1
+:: 先强杀旧后端（不走关窗收尾），再启动，避免双开叠出十几个比特窗
+echo [清理] 结束旧 server/index.ts 和 :%PORT% ...
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\kill-old-3100.ps1" -Port %PORT%
+timeout /t 2 /nobreak >nul 2>&1
 
 echo ============================================================
 echo   后端 API:  http://localhost:%PORT%

@@ -24,9 +24,9 @@ if not errorlevel 1 (
   exit /b 2
 )
 
-echo [3/4] 强制结束旧 :3100 后启动（index 里也会再杀一遍占端口的进程）
+echo [3/4] 用 start-console.bat 启动（它会先杀旧 :3100 再起来）
 cd /d D:\study\codex_register\codex_register
-start "mail3100" /MIN cmd /c "cd /d D:\study\codex_register\codex_register && start-mail-3100.cmd"
+start "mail3100" start-console.bat
 
 echo [4/4] 等服务起来
 timeout /t 6 /nobreak >nul
