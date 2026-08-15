@@ -6,7 +6,7 @@ import path from "node:path";
 import pg from "pg";
 import * as db from "../server/db.ts";
 import {clearMailboxJobStop} from "../src/mail/mailbox-job-stop.ts";
-import {sweepStaleBitWindows} from "../src/bitbrowser.ts";
+import {setExpectedBitTiles, sweepStaleBitWindows} from "../src/bitbrowser.ts";
 import {withGoogleBitSession} from "../src/mail/google-secure.ts";
 import {ensureGoogleLoggedIn} from "../src/mail/google-auth.ts";
 import {change2faOnPage} from "../src/mail/google-manage.ts";
@@ -76,6 +76,7 @@ async function trace(mb, line) {
 }
 
 async function runOne(kind, email, idx) {
+    if (idx > 0) await new Promise((r) => setTimeout(r, idx * 1200));
     const mb = await loadMb(email);
     if (!mb) return {email, kind, ok: false, error: "库里没有这个号"};
     const proxyRaw = poolLines[idx % Math.max(1, poolLines.length)] || "";
@@ -147,9 +148,16 @@ const swept = await sweepStaleBitWindows({includeClosed: true, log: (m) => conso
 console.log("清残留窗", swept);
 
 const changeOnly = process.argv.includes("--change-only");
+const parallel = process.argv.includes("--parallel");
 const loginResults = changeOnly ? [] : await Promise.all(LOGIN_EMAILS.map((e, i) => runOne("login", e, i)));
-const changeResults = [];
-for (const [i, e] of CHANGE_EMAILS.entries()) changeResults.push(await runOne("change", e, i + 2));
+setExpectedBitTiles(Math.max(1, CHANGE_EMAILS.length));
+const changeResults = parallel
+    ? await Promise.all(CHANGE_EMAILS.map((e, i) => runOne("change", e, i)))
+    : await (async () => {
+        const out = [];
+        for (const [i, e] of CHANGE_EMAILS.entries()) out.push(await runOne("change", e, i + 2));
+        return out;
+    })();
 
 const summary = {at: stamp(), login: loginResults, change: changeResults};
 console.log("=== 抽检结果 ===");
