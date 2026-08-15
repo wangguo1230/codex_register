@@ -30,7 +30,7 @@ import {appConfig} from "../src/config.js";
 import {fetchInboxList, fetchMailBodyFor, setMailProxy, changeMailcomPassword, verifyMailcomLogin, scanClaudeDisabledMail} from "./domain/mailbox-service.js";
 import {changePasswordOnPage, change2faOnPage} from "../src/mail/google-manage.js";
 import {runGoogleHardenWithBit, withGoogleBitSession} from "../src/mail/google-secure.js";
-import {mailProxyPool, maskProxyUrl, toProxyImportLine, kookeeySessionOf, probeMailProxy} from "../src/mail/proxy-pool.js";
+import {mailProxyPool, mailJumpPool, gptJumpPool, maskProxyUrl, toProxyImportLine, kookeeySessionOf, probeMailProxy, JUMP_MAX_EXITS} from "../src/mail/proxy-pool.js";
 import {randomPassword} from "../src/utils.js";
 import {straightenImportRow, looksLikeEmail} from "../src/mfa.js";
 import {openBrowserWithAuth} from "../src/simulate-chat.js";
@@ -77,7 +77,7 @@ app.use(express.json({limit: "10mb"}));
 app.use((req, res, next) => {
     if (req.url.startsWith("/api/gpt/")) {
         const rest = req.url.slice("/api/gpt/".length);
-        if (!rest.startsWith("mailboxes") && !rest.startsWith("claude") && !rest.startsWith("proxy-")) req.url = "/api/" + rest;
+        if (!rest.startsWith("mailboxes") && !rest.startsWith("claude") && !rest.startsWith("proxy-") && !rest.startsWith("jump-")) req.url = "/api/" + rest;
     }
     next();
 });
@@ -296,13 +296,21 @@ app.post("/api/mailboxes/batch-delete", async (req, res) => {
 // 真·改邮箱密码(操作 mail.com 改密页,free 邮箱也适用),改后同步库
 async function withLeasedMailProxy(owner, fn) {
     const cap = Math.max(1, Math.min(8, scheduler.pwConcurrency || 1));
-    const lease = await mailProxyPool.lease(String(owner || "mail"), {
+    const who = String(owner || "mail");
+    let jumpLease = null;
+    if (mailJumpPool.urls.length) {
+        jumpLease = await mailJumpPool.lease(who, {timeoutMs: 45_000, maxPerJump: JUMP_MAX_EXITS});
+    }
+    const lease = await mailProxyPool.lease(who, {
         fallback: scheduler.mailProxyFallback(),
         maxPerTemplate: cap,
         freshSession: true,
     });
-    try { return await fn(lease.url); }
-    finally { lease.release(); }
+    try { return await fn(lease.url, jumpLease?.url || scheduler.mailProxyJump || ""); }
+    finally {
+        lease.release();
+        try { jumpLease?.release(); } catch { /* */ }
+    }
 }
 
 function googleBitName(prefix, email) {
@@ -310,10 +318,10 @@ function googleBitName(prefix, email) {
 }
 
 async function changeGooglePasswordWithPool(mb, np, log) {
-    return withLeasedMailProxy(mb.email, (proxyUrl) => {
-        log(`代理 ${maskProxyUrl(proxyUrl)}（一号一代理 · 新 session）`);
+    return withLeasedMailProxy(mb.email, (proxyUrl, jumpUrl) => {
+        log(`代理 ${maskProxyUrl(proxyUrl)}（一号一代理 · 新 session${jumpUrl ? " · 跳板 " + jumpUrl : ""}）`);
         return withGoogleBitSession({
-            proxyUrl, name: googleBitName("pw", mb.email), remark: "gmail-pw", log,
+            proxyUrl, jumpUrl, name: googleBitName("pw", mb.email), remark: "gmail-pw", log,
         }, (page) => changePasswordOnPage(page, {
             email: mb.email, password: mb.password, totpSecret: mb.totp_secret || "",
             recoveryEmail: mb.recovery_email || "", newPassword: np, log,
@@ -322,10 +330,10 @@ async function changeGooglePasswordWithPool(mb, np, log) {
 }
 
 async function changeGoogleTotpWithPool(mb, log) {
-    return withLeasedMailProxy(mb.email, (proxyUrl) => {
-        log(`代理 ${maskProxyUrl(proxyUrl)}（一号一代理 · 新 session）`);
+    return withLeasedMailProxy(mb.email, (proxyUrl, jumpUrl) => {
+        log(`代理 ${maskProxyUrl(proxyUrl)}（一号一代理 · 新 session${jumpUrl ? " · 跳板 " + jumpUrl : ""}）`);
         return withGoogleBitSession({
-            proxyUrl, name: googleBitName("2fa", mb.email), remark: "gmail-2fa", log,
+            proxyUrl, jumpUrl, name: googleBitName("2fa", mb.email), remark: "gmail-2fa", log,
         }, (page) => change2faOnPage(page, {
             email: mb.email, password: mb.password, totpSecret: mb.totp_secret || "",
             recoveryEmail: mb.recovery_email || "", log,
@@ -385,17 +393,17 @@ async function runOneGoogleHarden(id, opts = {}) {
     };
     logStep(`[整备] 续跑 ${skip.left.join(" → ")}`);
     try {
-        const r = await withLeasedMailProxy(mb.email, (proxyUrl) => {
+        const r = await withLeasedMailProxy(mb.email, (proxyUrl, jumpUrl) => {
             if (batchHardenStop || isMailboxJobStopped() || ac.signal.aborted) throw new Error("已停止");
             const sess = kookeeySessionOf(proxyUrl);
-            logStep(`[整备] 代理 ${maskProxyUrl(proxyUrl)}${sess ? " session=" + sess : ""}（一号一代理 · 新 session）`);
+            logStep(`[整备] 代理 ${maskProxyUrl(proxyUrl)}${sess ? " session=" + sess : ""}（一号一代理 · 新 session${jumpUrl ? " · 跳板 " + jumpUrl : ""}）`);
             return runGoogleHardenWithBit({
                 email: mb.email, password: mb.password,
                 totpSecret: mb.totp_secret || "", recoveryEmail: mb.recovery_email || "",
                 imap_password: mb.imap_password || "", pw_status: mb.pw_status || "",
                 google_state: mb.google_state || {},
             }, {
-                proxyUrl, signal: ac.signal, log: logStep,
+                proxyUrl, jumpUrl, signal: ac.signal, log: logStep,
                 onCheckpoint: async (patch = {}) => {
                     if (patch.password) {
                         if (patch.verified === false) {
@@ -467,7 +475,21 @@ app.post("/api/mailboxes/proxy-pool", (req, res) => {
 });
 app.post("/api/mailboxes/proxy-jump", (req, res) => {
     const jump = scheduler.setMailProxyJump(String(req.body?.jump ?? ""));
-    res.json({ok: true, jump});
+    res.json({ok: true, jump, jumpPool: mailJumpPool.snapshot()});
+});
+app.get("/api/mailboxes/jump-pool", (req, res) => {
+    res.json({ok: true, ...mailJumpPool.snapshot()});
+});
+app.post("/api/mailboxes/jump-pool", async (req, res) => {
+    const text = req.body?.text != null ? String(req.body.text) : Array.isArray(req.body?.urls) ? req.body.urls.join("\n") : "";
+    const urls = text.split(/[\r\n,;]+/).map((s) => s.trim()).filter(Boolean);
+    const snap = scheduler.setMailJumpPool(urls);
+    if (req.body?.check) await mailJumpPool.checkAll();
+    res.json({ok: true, ...mailJumpPool.snapshot()});
+});
+app.post("/api/mailboxes/jump-pool/check", async (req, res) => {
+    await mailJumpPool.checkAll();
+    res.json({ok: true, ...mailJumpPool.snapshot()});
 });
 app.post("/api/mailboxes/proxy-jump/test", async (req, res) => {
     const jump = String(req.body?.jump ?? scheduler.mailProxyJump ?? "").trim();
@@ -496,7 +518,23 @@ app.post("/api/gpt/proxy-pool", (req, res) => {
 });
 app.post("/api/gpt/proxy-jump", (req, res) => {
     const jump = scheduler.setGptProxyJump(String(req.body?.jump ?? ""));
-    res.json({ok: true, jump});
+    if (jump) scheduler.setGptJumpPool([jump]);
+    else scheduler.setGptJumpPool([]);
+    res.json({ok: true, jump, jumpPool: gptJumpPool.snapshot()});
+});
+app.get("/api/gpt/jump-pool", (req, res) => {
+    res.json({ok: true, ...gptJumpPool.snapshot()});
+});
+app.post("/api/gpt/jump-pool", async (req, res) => {
+    const text = req.body?.text != null ? String(req.body.text) : Array.isArray(req.body?.urls) ? req.body.urls.join("\n") : "";
+    const urls = text.split(/[\r\n,;]+/).map((s) => s.trim()).filter(Boolean);
+    scheduler.setGptJumpPool(urls);
+    if (req.body?.check) await gptJumpPool.checkAll();
+    res.json({ok: true, ...gptJumpPool.snapshot()});
+});
+app.post("/api/gpt/jump-pool/check", async (req, res) => {
+    await gptJumpPool.checkAll();
+    res.json({ok: true, ...gptJumpPool.snapshot()});
 });
 app.post("/api/gpt/proxy-jump/test", async (req, res) => {
     const jump = String(req.body?.jump ?? scheduler.gptProxyJump ?? "").trim();

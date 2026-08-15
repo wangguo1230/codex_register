@@ -384,6 +384,13 @@ export const api = {
         j<{ok: boolean; urls: string[]; lines?: string[]; jump?: string; total: number; slots: number; leased: number; free: number; inserted?: number; skipped?: number}>(
             "/api/mailboxes/proxy-pool", {method: "POST", body: JSON.stringify({text, append: !!opts?.append, copies: opts?.copies || 1})}),
     setMailProxyJump: (jump: string) => j<{ok: boolean; jump: string}>("/api/mailboxes/proxy-jump", {method: "POST", body: JSON.stringify({jump})}),
+    mailJumpPool: () => j<{ok: boolean; total: number; maxPerJump: number; items: {url: string; masked: string; leased: number; cap: number; owners: string[]; ok: boolean | null; ip: string; reason: string; ms: number}[]}>("/api/mailboxes/jump-pool"),
+    setMailJumpPool: (text: string, check?: boolean) =>
+        j<{ok: boolean; total: number; maxPerJump: number; items: {url: string; masked: string; leased: number; cap: number; owners: string[]; ok: boolean | null; ip: string; reason: string; ms: number}[]}>(
+            "/api/mailboxes/jump-pool", {method: "POST", body: JSON.stringify({text, check: !!check})}),
+    checkMailJumpPool: () =>
+        j<{ok: boolean; total: number; maxPerJump: number; items: {url: string; masked: string; leased: number; cap: number; owners: string[]; ok: boolean | null; ip: string; reason: string; ms: number}[]}>(
+            "/api/mailboxes/jump-pool/check", {method: "POST", body: JSON.stringify({})}),
     testMailProxyJump: (jump?: string) =>
         j<{ok: boolean; jump?: string; sample?: string; ip?: string; google?: number; ms?: number; reason?: string; error?: string}>(
             "/api/mailboxes/proxy-jump/test", {method: "POST", body: JSON.stringify({jump: jump || ""})}),
@@ -392,6 +399,13 @@ export const api = {
         j<{ok: boolean; urls: string[]; lines?: string[]; jump?: string; total: number; slots: number; leased: number; free: number; inserted?: number; skipped?: number}>(
             "/api/gpt/proxy-pool", {method: "POST", body: JSON.stringify({text, append: !!opts?.append, copies: opts?.copies || 1})}),
     setGptProxyJump: (jump: string) => j<{ok: boolean; jump: string}>("/api/gpt/proxy-jump", {method: "POST", body: JSON.stringify({jump})}),
+    gptJumpPool: () => j<{ok: boolean; total: number; maxPerJump: number; items: {url: string; masked: string; leased: number; cap: number; owners: string[]; ok: boolean | null; ip: string; reason: string; ms: number}[]}>("/api/gpt/jump-pool"),
+    setGptJumpPool: (text: string, check?: boolean) =>
+        j<{ok: boolean; total: number; maxPerJump: number; items: {url: string; masked: string; leased: number; cap: number; owners: string[]; ok: boolean | null; ip: string; reason: string; ms: number}[]}>(
+            "/api/gpt/jump-pool", {method: "POST", body: JSON.stringify({text, check: !!check})}),
+    checkGptJumpPool: () =>
+        j<{ok: boolean; total: number; maxPerJump: number; items: {url: string; masked: string; leased: number; cap: number; owners: string[]; ok: boolean | null; ip: string; reason: string; ms: number}[]}>(
+            "/api/gpt/jump-pool/check", {method: "POST", body: JSON.stringify({})}),
     testGptProxyJump: (jump?: string) =>
         j<{ok: boolean; jump?: string; sample?: string; ip?: string; google?: number; ms?: number; reason?: string; error?: string}>(
             "/api/gpt/proxy-jump/test", {method: "POST", body: JSON.stringify({jump: jump || ""})}),

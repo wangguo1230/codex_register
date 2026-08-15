@@ -375,3 +375,144 @@ export class MailProxyPool {
 
 export const mailProxyPool = new MailProxyPool();
 export const gptProxyPool = new MailProxyPool();
+
+export const JUMP_MAX_EXITS = 2;
+
+export type JumpHealth = {ok: boolean; at: number; ms: number; ip: string; google: number; reason?: string};
+
+/** 只测跳板本身能不能出网（不经 kookeey）。 */
+export async function probeJumpAlive(rawUrl: string, timeoutSec = 10): Promise<JumpHealth> {
+    const url = normalizeProxyUrl(rawUrl) || String(rawUrl || "").trim();
+    const started = Date.now();
+    const empty = {ok: false, at: Date.now(), ms: 0, ip: "", google: 0, reason: "无跳板"};
+    if (!url) return empty;
+    let host = "", port = 1080;
+    try {
+        const u = new URL(url);
+        host = u.hostname;
+        port = Number(u.port || 1080);
+    } catch {
+        return {...empty, ms: Date.now() - started, reason: "跳板 URL 无效"};
+    }
+    const tcp = await tcpReach(host, port, 4000);
+    if (!tcp.ok) {
+        return {ok: false, at: Date.now(), ms: Date.now() - started, ip: "", google: 0, reason: `端口不通 ${host}:${port} (${tcp.reason})`};
+    }
+    const ipR = await curlVia(url, "https://api.ipify.org", [], timeoutSec);
+    const ip = ipR.ok && /^\d{1,3}(\.\d{1,3}){3}$/.test(ipR.stdout) ? ipR.stdout : "";
+    const gR = await curlVia(url, "https://www.google.com/generate_204", ["-o", "/dev/null", "-w", "%{http_code}"], timeoutSec);
+    const google = Number(gR.stdout || 0) || 0;
+    const googleOk = google === 204 || google === 200;
+    const ms = Date.now() - started;
+    if (!ip && !googleOk) {
+        return {ok: false, at: Date.now(), ms, ip: "", google, reason: `跳板出网失败 ${ipR.reason || ipR.stdout || "无IP"} google=${google || gR.reason || "?"}`};
+    }
+    if (!googleOk) {
+        return {ok: false, at: Date.now(), ms, ip, google, reason: `跳板 Google 不通 generate_204=${google || gR.reason || "?"}`};
+    }
+    return {ok: true, at: Date.now(), ms, ip: ip || "?", google};
+}
+
+export type JumpLease = {url: string; owner: string; release: () => void};
+
+export class JumpPool {
+    urls: string[] = [];
+    leased = new Map<string, {owner: string; at: number}[]>();
+    health = new Map<string, JumpHealth>();
+    maxPerJump = JUMP_MAX_EXITS;
+
+    setUrls(list: string[]) {
+        this.urls = parseProxyLines((list || []).join("\n"));
+        for (const k of [...this.leased.keys()]) {
+            if (!this.urls.includes(k)) this.leased.delete(k);
+        }
+        for (const k of [...this.health.keys()]) {
+            if (!this.urls.includes(k)) this.health.delete(k);
+        }
+    }
+
+    addUrl(raw: string) {
+        const url = normalizeProxyUrl(raw);
+        if (!url || this.urls.includes(url)) return this.urls.slice();
+        this.urls.push(url);
+        return this.urls.slice();
+    }
+
+    load(url: string) {
+        return (this.leased.get(url) || []).length;
+    }
+
+    snapshot() {
+        return {
+            total: this.urls.length,
+            maxPerJump: this.maxPerJump,
+            items: this.urls.map((url) => {
+                const h = this.health.get(url);
+                const owners = (this.leased.get(url) || []).map((x) => x.owner);
+                return {
+                    url,
+                    masked: maskProxyUrl(url),
+                    leased: owners.length,
+                    cap: this.maxPerJump,
+                    owners,
+                    ok: h ? h.ok : null,
+                    ip: h?.ip || "",
+                    google: h?.google || 0,
+                    ms: h?.ms || 0,
+                    reason: h?.reason || "",
+                    checkedAt: h?.at || 0,
+                };
+            }),
+        };
+    }
+
+    async checkOne(url: string) {
+        const h = await probeJumpAlive(url);
+        this.health.set(url, h);
+        return h;
+    }
+
+    async checkAll() {
+        const out = [];
+        for (const url of this.urls) out.push(await this.checkOne(url));
+        return this.snapshot();
+    }
+
+    async lease(owner: string, {timeoutMs = 60_000, maxPerJump = JUMP_MAX_EXITS} = {}): Promise<JumpLease | null> {
+        if (!this.urls.length) return null;
+        const cap = Math.max(1, Number(maxPerJump) || JUMP_MAX_EXITS);
+        const deadline = Date.now() + Math.max(1000, timeoutMs);
+        while (Date.now() < deadline) {
+            const ranked = this.urls.slice().sort((a, b) => this.load(a) - this.load(b));
+            for (const url of ranked) {
+                if (this.load(url) >= cap) continue;
+                let h = this.health.get(url);
+                if (!h || Date.now() - h.at > 90_000) {
+                    h = await this.checkOne(url);
+                }
+                if (!h.ok) continue;
+                const row = {owner: String(owner || ""), at: Date.now()};
+                const list = this.leased.get(url) || [];
+                list.push(row);
+                this.leased.set(url, list);
+                return {
+                    url,
+                    owner: row.owner,
+                    release: () => this.release(url, row.owner),
+                };
+            }
+            await new Promise((r) => setTimeout(r, 400));
+        }
+        throw new Error(`跳板池全忙或不可用（1 跳板最多 ${cap} 条出口）`);
+    }
+
+    release(url: string, owner: string) {
+        const list = this.leased.get(url) || [];
+        const next = list.filter((x) => x.owner !== owner);
+        if (next.length) this.leased.set(url, next);
+        else this.leased.delete(url);
+    }
+}
+
+export const mailJumpPool = new JumpPool();
+export const gptJumpPool = new JumpPool();

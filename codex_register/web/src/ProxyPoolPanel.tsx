@@ -25,6 +25,7 @@ export function ProxyPoolPanel({
     const [jumpBusy, setJumpBusy] = useState(false);
     const [vlessText, setVlessText] = useState("");
     const [jumpXray, setJumpXray] = useState<{running?: boolean; port?: number; node?: string; error?: string} | null>(null);
+    const [jumpItems, setJumpItems] = useState<{masked: string; leased: number; cap: number; ok: boolean | null; ip: string; reason: string}[]>([]);
 
     const toast = (m: string) => notify?.(m);
     const emit = (snap: {total?: number; slots?: number; leased?: number; free?: number}, jump?: string) => {
@@ -53,6 +54,10 @@ export function ProxyPoolPanel({
             if (st.jumpXrayVless) setVlessText(st.jumpXrayVless);
             else if (st.claudeXrayVless) setVlessText(st.claudeXrayVless);
             if (st.jumpXray) setJumpXray(st.jumpXray);
+            const jlines = isGpt ? st.gptJumpPool : st.mailJumpPool;
+            if (Array.isArray(jlines) && jlines.length) setJumpText(jlines.join("\n"));
+            const jsnap = isGpt ? st.gptJumpPoolSnap : st.mailJumpPoolSnap;
+            if (jsnap?.items) setJumpItems(jsnap.items);
         }).catch(() => {});
         const load = isGpt ? api.gptProxyPool() : api.mailProxyPool();
         load.then((r) => {
@@ -108,38 +113,63 @@ export function ProxyPoolPanel({
             <div style={{display: "flex", alignItems: "baseline", gap: 8, flexWrap: "wrap", marginBottom: 8}}>
                 <span style={{fontSize: 13, fontWeight: 600, color: "#111827"}}>{title}</span>
                 <span style={{fontSize: 11, color: "#9ca3af"}}>{hint || (isGpt
-                    ? "GPT 注册专用。和邮箱管理池分开租、分开停。先填跳板，再导入出口。1 个代理 = 1 个比特指纹。"
-                    : "邮箱整备 / 换 2FA / 改密专用。和 GPT 注册池分开。先填跳板，再导入出口。1 个代理 = 1 个比特指纹。")}</span>
+                    ? "GPT 注册专用。跳板池先探活，1 个跳板最多带 2 条出口。和邮箱池分开。"
+                    : "邮箱整备专用。跳板池先探活，1 个跳板最多带 2 条出口。和 GPT 池分开。")}</span>
             </div>
             <textarea value={poolText} onChange={(e) => setPoolText(e.target.value)}
                       placeholder={"一行一个，支持：\ngate-hk.kookeey.info:1000:user:pass-US-session-5m\nip:port:user:pass\nsocks5://user:pass@host:port"}
                       style={{width: "100%", height: 140, resize: "vertical", padding: 10, fontFamily: "monospace", fontSize: 12, border: "1px solid #e5e7eb", borderRadius: 8, outline: "none", boxSizing: "border-box"}}/>
-            <div style={{display: "flex", gap: 8, alignItems: "center", marginTop: 10, flexWrap: "wrap"}}>
-                <span style={{fontSize: 12, color: "#374151", whiteSpace: "nowrap"}}>跳板</span>
-                <input value={jumpText} onChange={(e) => setJumpText(e.target.value)}
-                       placeholder={jumpHint || "socks5://127.0.0.1:10808  本机先走它再连上面的代理网关"}
-                       style={{flex: "1 1 280px", ...inp, fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace"}}/>
-                <button onClick={async () => {
-                    const next = "socks5://127.0.0.1:10808";
-                    setJumpText(next);
-                    try { await setJump(next); toast("已用系统代理 10808 当跳板（会占用你自己的科学上网）"); onMeta?.({...poolSnap, jump: next}); }
-                    catch (e: any) { toast(e.message); }
-                }} style={{height: 32, padding: "0 10px", border: "1px solid #e5e7eb", background: "#fff", borderRadius: 8, fontSize: 12, cursor: "pointer", color: "#6b7280"}}>用我自己的 10808</button>
-                <button onClick={async () => {
-                    setJumpBusy(true);
-                    try {
-                        await setJump(jumpText.trim());
-                        const r = await testJump(jumpText.trim());
-                        onMeta?.({...poolSnap, jump: jumpText.trim()});
-                        toast(r.ok ? `跳板可用 出口 ${r.ip || "?"} Google=${r.google} ${r.ms}ms` : `跳板测不通: ${r.reason || r.error || ""}`);
-                    } catch (e: any) { toast("测跳板失败: " + e.message); }
-                    finally { setJumpBusy(false); }
-                }} disabled={jumpBusy} style={{height: 32, padding: "0 10px", border: "1px solid #d1d5db", background: "#fff", borderRadius: 8, fontSize: 12, cursor: jumpBusy ? "wait" : "pointer"}}>{jumpBusy ? "在测…" : "测链式"}</button>
-                <button onClick={async () => {
-                    setJumpText("");
-                    try { await setJump(""); toast("已关掉跳板，改回直连网关"); onMeta?.({...poolSnap, jump: ""}); }
-                    catch (e: any) { toast(e.message); }
-                }} style={{height: 32, padding: "0 10px", border: "none", background: "transparent", fontSize: 12, color: "#9ca3af", cursor: "pointer"}}>关掉</button>
+            <div style={{marginTop: 10}}>
+                <div style={{fontSize: 12, color: "#374151", marginBottom: 4}}>跳板池（一行一个，1 个跳板最多带 2 条出口，租之前会探活）</div>
+                <textarea value={jumpText} onChange={(e) => setJumpText(e.target.value)}
+                          placeholder={jumpHint || "socks5://127.0.0.1:10811\nsocks5://127.0.0.1:10812"}
+                          style={{width: "100%", height: 72, resize: "vertical", padding: 8, fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace", fontSize: 12, border: "1px solid #e5e7eb", borderRadius: 8, outline: "none", boxSizing: "border-box"}}/>
+                <div style={{display: "flex", gap: 8, alignItems: "center", marginTop: 6, flexWrap: "wrap"}}>
+                    <button onClick={async () => {
+                        setJumpBusy(true);
+                        try {
+                            const save = isGpt ? api.setGptJumpPool : api.setMailJumpPool;
+                            const r = await save(jumpText, true);
+                            setJumpItems(r.items || []);
+                            onMeta?.({...poolSnap, jump: (r.items || [])[0]?.url || ""});
+                            const ok = (r.items || []).filter((x) => x.ok).length;
+                            toast(`跳板池 ${r.total} 条，探活通过 ${ok}，每条最多带 ${r.maxPerJump} 个出口`);
+                        } catch (e: any) { toast("保存/探活跳板失败: " + e.message); }
+                        finally { setJumpBusy(false); }
+                    }} disabled={jumpBusy} style={{height: 32, padding: "0 10px", border: "none", background: "#4f46e5", color: "#fff", borderRadius: 8, fontSize: 12, cursor: jumpBusy ? "wait" : "pointer"}}>{jumpBusy ? "在测…" : "保存并探活"}</button>
+                    <button onClick={async () => {
+                        setJumpBusy(true);
+                        try {
+                            const r = isGpt ? await api.checkGptJumpPool() : await api.checkMailJumpPool();
+                            setJumpItems(r.items || []);
+                            const ok = (r.items || []).filter((x) => x.ok).length;
+                            toast(`探活 ${ok}/${r.total}`);
+                        } catch (e: any) { toast(e.message); }
+                        finally { setJumpBusy(false); }
+                    }} disabled={jumpBusy} style={{height: 32, padding: "0 10px", border: "1px solid #d1d5db", background: "#fff", borderRadius: 8, fontSize: 12, cursor: jumpBusy ? "wait" : "pointer"}}>再测一遍</button>
+                    <button onClick={async () => {
+                        const next = (jumpText ? jumpText + "\n" : "") + "socks5://127.0.0.1:10808";
+                        setJumpText(next);
+                    }} style={{height: 32, padding: "0 10px", border: "1px solid #e5e7eb", background: "#fff", borderRadius: 8, fontSize: 12, cursor: "pointer", color: "#6b7280"}}>加入 10808</button>
+                    <button onClick={async () => {
+                        setJumpText("");
+                        try {
+                            const save = isGpt ? api.setGptJumpPool : api.setMailJumpPool;
+                            await save("", false);
+                            setJumpItems([]);
+                            toast("已清空跳板池");
+                        } catch (e: any) { toast(e.message); }
+                    }} style={{height: 32, padding: "0 10px", border: "none", background: "transparent", fontSize: 12, color: "#9ca3af", cursor: "pointer"}}>清空</button>
+                </div>
+                {jumpItems.length > 0 && (
+                    <div style={{marginTop: 6, display: "flex", flexDirection: "column", gap: 3}}>
+                        {jumpItems.map((it, i) => (
+                            <div key={i} style={{fontSize: 11, color: it.ok === false ? "#b45309" : "#374151", fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace"}}>
+                                {it.ok === true ? "通" : it.ok === false ? "死" : "?"} {it.masked} · {it.leased}/{it.cap}{it.ip ? ` · ${it.ip}` : ""}{it.reason ? ` · ${it.reason}` : ""}
+                            </div>
+                        ))}
+                    </div>
+                )}
             </div>
             <div style={{display: "flex", gap: 8, alignItems: "center", marginTop: 8, flexWrap: "wrap"}}>
                 <span style={{fontSize: 12, color: "#374151", whiteSpace: "nowrap"}}>跳板 vless</span>
