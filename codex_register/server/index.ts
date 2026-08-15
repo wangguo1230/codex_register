@@ -65,6 +65,37 @@ function writeMailboxTokenFile(file, rec) {
 }
 const PORT = Number(process.env.PORT || 3100);
 const WEB_DIST = path.resolve(__dirname, "..", "web", "dist");
+let httpReady = false;
+
+function killSiblingIndexProcesses() {
+    const me = process.pid;
+    try {
+        if (process.platform === "win32") {
+            const out = execSync(
+                "wmic process where \"name='node.exe'\" get ProcessId,CommandLine /FORMAT:LIST",
+                {encoding: "utf8", windowsHide: true},
+            );
+            const blocks = out.split(/\r?\n\r?\n/);
+            for (const b of blocks) {
+                const cmd = (b.match(/CommandLine=(.*)/) || [])[1] || "";
+                const pid = Number((b.match(/ProcessId=(\d+)/) || [])[1] || 0);
+                if (!pid || pid === me) continue;
+                if (!/server[/\\]index\.ts|tsx server/i.test(cmd)) continue;
+                try { execSync(`taskkill /F /PID ${pid}`, {stdio: "ignore", windowsHide: true}); } catch { /* */ }
+                console.log(`[server] 启动前清残留 index.ts pid=${pid}`);
+            }
+        } else {
+            const out = execSync("ps -ax -o pid=,command=", {encoding: "utf8"});
+            for (const line of out.split("\n")) {
+                if (!/server\/index\.ts|tsx server/i.test(line)) continue;
+                const pid = Number(line.trim().split(/\s+/)[0]);
+                if (!pid || pid === me) continue;
+                try { process.kill(pid, "SIGKILL"); } catch { /* */ }
+            }
+        }
+    } catch { /* */ }
+}
+killSiblingIndexProcesses();
 
 const app = express();
 app.use(cors());
@@ -841,7 +872,7 @@ async function reportMailInstance() {
 
 let lastBitBudgetAt = 0;
 async function tickMailJobs() {
-    if (mailJobTickBusy || instanceShuttingDown) return;
+    if (!httpReady || mailJobTickBusy || instanceShuttingDown) return;
     mailJobTickBusy = true;
     try {
         const {isBitLoggedOut, ensureBitWindowBudget, setExpectedBitTiles, listAllBitWindows} = await import("../src/bitbrowser.js");
@@ -4456,11 +4487,13 @@ function killExistingHttp(port) {
     }
 }
 killExistingHttp(PORT);
+killSiblingIndexProcesses();
 try { writeFileSync(HTTP_PID_PATH, String(process.pid), "utf8"); } catch { /* */ }
 const dropHttpPid = () => { try { unlinkSync(HTTP_PID_PATH); } catch { /* */ } };
 process.on("exit", dropHttpPid);
 
-app.listen(PORT, () => {
+const httpServer = app.listen(PORT, "0.0.0.0", () => {
+    httpReady = true;
     console.log(`[server] http://localhost:${PORT}  instance=${db.instanceId}  (前端 ${existsSync(WEB_DIST) ? "已托管" : "未构建, 用 vite dev"})`);
     db.setMailClaimPaused(false).catch(() => {});
     db.drainPendingPwQueueToMailJobs().then((n) => {
@@ -4491,6 +4524,10 @@ app.listen(PORT, () => {
         rechargeLog(`启动恢复：${rows.length} 个换绑停在进行中，重新排队`);
         for (const q of rows) enqueueGmailRebind(q, {force: true, pool: q.rebind_pool || {}});
     }).catch((e) => console.warn("[server] 恢复换绑失败:", e?.message || e));
+});
+httpServer.on("error", (e) => {
+    console.error(`[server] 无法占用 :${PORT}（${e?.message || e}），本进程退出，避免无端口还领任务开窗`);
+    process.exit(1);
 });
 
 // 单实例关闭:停本机认领,杀本机 worker,把未完成任务退回共池(其他实例可接着跑)。不碰其他实例的 running。

@@ -5,6 +5,10 @@ cd /d "%~dp0"
 
 set PORT=3100
 
+:: 一进来先清旧后端，不要等 npm install 那几十秒里旧进程继续开窗
+echo [清理] 结束旧 server/index.ts 和 :%PORT% ...
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\kill-old-3100.ps1" -Port %PORT%
+
 :: 安装后端依赖
 echo [依赖] 检查并安装后端依赖 ...
 call npm config set fetch-remote-tarball true >nul 2>&1
@@ -17,8 +21,8 @@ call npm config set fetch-remote-tarball true >nul 2>&1
 call npm install --yes --registry https://registry.npmmirror.com
 cd /d "%~dp0"
 
-:: 先强杀旧后端（不走关窗收尾），再启动，避免双开叠出十几个比特窗
-echo [清理] 结束旧 server/index.ts 和 :%PORT% ...
+:: npm 装完再清一次，防止装依赖期间又被人点开第二份
+echo [清理] 再清一遍旧 :%PORT% ...
 powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\kill-old-3100.ps1" -Port %PORT%
 timeout /t 2 /nobreak >nul 2>&1
 
