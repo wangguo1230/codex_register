@@ -609,12 +609,26 @@ async function clickDialogNext(page, log) {
     if (await codeBox.isVisible({timeout: 200}).catch(() => false)) return false;
     const names = await dlg.evaluate((el) => [...el.querySelectorAll("button, [role='button'], a")].filter((b) => b.getClientRects().length).map((b) => (b.textContent || "").replace(/\s+/g, " ").trim()).filter(Boolean).slice(0, 8)).catch(() => []);
     log(`[2FA] 确认框可见按钮 ${JSON.stringify(names)}`);
+    await dlg.evaluate((el) => {
+        el.scrollTop = el.scrollHeight;
+        for (const n of el.querySelectorAll("*")) {
+            if (n.scrollHeight - n.clientHeight > 20) n.scrollTop = n.scrollHeight;
+        }
+    }).catch(() => {});
+    await page.mouse.wheel(0, 600).catch(() => {});
+    await page.waitForTimeout(250);
     const nexts = dlg.getByRole("button", {name: /^(next|continue|下一步|继续)$/i});
     const nn = await nexts.count().catch(() => 0);
     for (let i = nn - 1; i >= 0; i--) {
         const btn = nexts.nth(i);
         if (!await btn.isVisible({timeout: 200}).catch(() => false)) continue;
-        await btn.click({timeout: 2500}).catch(() => btn.click({force: true, timeout: 1500}));
+        if (await btn.isDisabled().catch(() => false)) {
+            log("[2FA] Next 还是禁用，再滚");
+            continue;
+        }
+        const box = await btn.boundingBox().catch(() => null);
+        if (box) await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+        else await btn.click({timeout: 2500}).catch(() => btn.click({force: true, timeout: 1500}));
         log("[2FA] 点了确认框可见 Next");
         return true;
     }
