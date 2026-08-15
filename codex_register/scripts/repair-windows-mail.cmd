@@ -24,11 +24,9 @@ if not errorlevel 1 (
   exit /b 2
 )
 
-echo [3/4] 强制结束旧 :3100（不走关窗收尾）后拉起新代码
-for /f "tokens=5" %%p in ('netstat -ano ^| findstr :3100 ^| findstr LISTENING') do taskkill /F /PID %%p >nul 2>&1
-timeout /t 2 /nobreak >nul
+echo [3/4] 强制结束旧 :3100 后启动（index 里也会再杀一遍占端口的进程）
 cd /d D:\study\codex_register\codex_register
-start "mail3100" /MIN cmd /c ""C:\Program Files\nodejs\node.exe" --require D:\study\codex_register\codex_register\node_modules\tsx\dist\preflight.cjs --import file:///D:/study/codex_register/codex_register/node_modules/tsx/dist/loader.mjs server/index.ts"
+start "mail3100" /MIN cmd /c "cd /d D:\study\codex_register\codex_register && start-mail-3100.cmd"
 
 echo [4/4] 等服务起来
 timeout /t 6 /nobreak >nul

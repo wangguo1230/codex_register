@@ -4377,17 +4377,46 @@ await initDb();
 await db.init();
 
 const HTTP_PID_PATH = path.resolve(__dirname, "..", "data", "http-3100.pid");
-function pidAlive(pid) {
-    if (!pid) return false;
-    try { process.kill(pid, 0); return true; } catch { return false; }
+function collectPidsOnPort(port) {
+    const me = process.pid;
+    const pids = new Set();
+    try {
+        if (process.platform === "win32") {
+            const out = execSync("netstat -ano", {encoding: "utf8"});
+            for (const line of out.split(/\r?\n/)) {
+                if (!/LISTENING/i.test(line)) continue;
+                if (!line.includes(`:${port} `) && !new RegExp(`:${port}\\s`).test(line)) continue;
+                const pid = Number(line.trim().split(/\s+/).pop());
+                if (pid && pid !== me) pids.add(pid);
+            }
+        } else {
+            const out = execSync(`lsof -ti tcp:${port} -sTCP:LISTEN || true`, {encoding: "utf8"});
+            for (const pid of out.split(/\s+/).map(Number).filter(Boolean)) {
+                if (pid !== me) pids.add(pid);
+            }
+        }
+    } catch { /* */ }
+    try {
+        const prev = existsSync(HTTP_PID_PATH) ? Number(String(readFileSync(HTTP_PID_PATH, "utf8") || "").trim()) : 0;
+        if (prev && prev !== me) pids.add(prev);
+    } catch { /* */ }
+    return [...pids];
 }
-try {
-    const prev = existsSync(HTTP_PID_PATH) ? Number(String(readFileSync(HTTP_PID_PATH, "utf8") || "").trim()) : 0;
-    if (prev && prev !== process.pid && pidAlive(prev)) {
-        console.error(`[server] :${PORT} 已在运行 pid=${prev}，本进程退出（避免双开叠出比特窗）`);
-        process.exit(1);
+function killExistingHttp(port) {
+    const pids = collectPidsOnPort(port);
+    for (const pid of pids) {
+        try {
+            if (process.platform === "win32") execSync(`taskkill /F /PID ${pid}`, {stdio: "ignore"});
+            else process.kill(pid, "SIGKILL");
+            console.log(`[server] 先结束旧 :${port} pid=${pid}，再启动（强制结束，不走关窗收尾）`);
+        } catch { /* 已经没了 */ }
     }
-} catch { /* 锁文件坏了就覆盖 */ }
+    const deadline = Date.now() + 3000;
+    while (Date.now() < deadline && collectPidsOnPort(port).length) {
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 80);
+    }
+}
+killExistingHttp(PORT);
 try { writeFileSync(HTTP_PID_PATH, String(process.pid), "utf8"); } catch { /* */ }
 const dropHttpPid = () => { try { unlinkSync(HTTP_PID_PATH); } catch { /* */ } };
 process.on("exit", dropHttpPid);
