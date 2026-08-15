@@ -427,13 +427,14 @@ async function openGoogleBitOnce({proxyUrl = "", name = "gmail", remark = "gmail
     let timeZone = "";
     if (liveProxy) {
         if (stopped()) throw new Error("已停止");
-        log("[网络] 先测代理出口 / Google");
+        const {getMailProxyJump} = await import("./proxy-pool.js");
+        const jumpNow = getMailProxyJump();
+        log(jumpNow ? `[网络] 先测代理出口 / Google（经跳板 ${jumpNow}）` : "[网络] 先测代理出口 / Google（无跳板，直连网关，国内会超时）");
         const picked = await pickLiveMailProxy(liveProxy, {tries: 3, log: (m) => log(`[网络] ${m}`)});
         if (!picked.ok) throw new Error(`代理不通，先别登 Google: ${picked.probe.reason || "未知"}`);
         liveProxy = picked.url;
         log(`[网络] 通 出口 ${picked.probe.ip} Google=${picked.probe.google} ${picked.probe.ms}ms ${maskProxyUrl(liveProxy)}`);
-        const {getMailProxyJump} = await import("./proxy-pool.js");
-        const jump = getMailProxyJump();
+        const jump = jumpNow;
         if (jump) {
             const {wrapExitThroughJump, timezoneFromExitUrl} = await import("./proxy-chain.js");
             const wrapped = await wrapExitThroughJump(liveProxy, jump);

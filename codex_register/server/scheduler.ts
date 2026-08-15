@@ -213,11 +213,23 @@ class Scheduler extends EventEmitter {
     }
 
     detectMailProxyJump() {
-        try {
-            execSync("lsof -tiTCP:10808 -sTCP:LISTEN", {stdio: "ignore"});
-            return "socks5://127.0.0.1:10808";
-        } catch { /* 系统代理没开 */ }
+        if (this.portListening(10808)) return "socks5://127.0.0.1:10808";
         return this.regProxy || "";
+    }
+
+    portListening(port) {
+        const p = Number(port);
+        if (!p) return false;
+        try {
+            if (IS_WIN) {
+                const out = execSync("netstat -ano -p tcp", {stdio: ["ignore", "pipe", "ignore"]}).toString();
+                return new RegExp(`[:.]${p}\\s+\\S+\\s+LISTENING`, "i").test(out);
+            }
+            execSync(`lsof -tiTCP:${p} -sTCP:LISTEN`, {stdio: "ignore"});
+            return true;
+        } catch {
+            return false;
+        }
     }
 
     setMailProxyJump(url) {
