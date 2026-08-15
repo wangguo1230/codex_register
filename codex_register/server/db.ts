@@ -8,9 +8,11 @@ import os from "node:os";
 export const instanceId = process.env.INSTANCE_ID || os.hostname();
 
 // 兼容 JOIN：gpt_accounts + mailboxes 拼回原 accounts 形状
+// 列表：不带 token/auth_data（JWT 单条~2KB，全表可到数 MB）；用 has_token 标记
 const ACC_COLS_LIST = `
   g.id AS id, m.email AS email, m.password AS password, g.status AS status,
-  g.plan AS plan, g.token AS token, g.auth_file AS auth_file, g.error AS error,
+  g.plan AS plan, g.auth_file AS auth_file, g.error AS error,
+  (COALESCE(g.token, '') <> '') AS has_token,
   g.started_at AS started_at, g.finished_at AS finished_at, g.created_at AS created_at,
   g.phone AS phone, g.card AS card, g.at_status AS at_status, g.rt_status AS rt_status,
   g.chat_status AS chat_status, g.rt_file AS rt_file, g.dead_at AS dead_at, g.sold_at AS sold_at,
@@ -18,7 +20,19 @@ const ACC_COLS_LIST = `
   m.recovery_email AS recovery_email, m.totp_secret AS mailbox_totp, m.imap_password AS mailbox_imap,
   g.gpt_password AS gpt_password, g.totp_secret AS totp_secret, g.mfa_status AS mfa_status,
   GREATEST(g.deleted_at, m.deleted_at) AS deleted_at`;
-const ACC_COLS_FULL = `${ACC_COLS_LIST}, g.auth_data, g.rt_data`;
+// 详情/导出/单号操作：含 token + auth_data + rt_data
+const ACC_COLS_FULL = `
+  g.id AS id, m.email AS email, m.password AS password, g.status AS status,
+  g.plan AS plan, g.token AS token, g.auth_file AS auth_file, g.error AS error,
+  (COALESCE(g.token, '') <> '') AS has_token,
+  g.started_at AS started_at, g.finished_at AS finished_at, g.created_at AS created_at,
+  g.phone AS phone, g.card AS card, g.at_status AS at_status, g.rt_status AS rt_status,
+  g.chat_status AS chat_status, g.rt_file AS rt_file, g.dead_at AS dead_at, g.sold_at AS sold_at,
+  m.pw_status AS pw_status, m.provider AS provider, g.batch AS batch, g.mailbox_id AS mailbox_id,
+  m.recovery_email AS recovery_email, m.totp_secret AS mailbox_totp, m.imap_password AS mailbox_imap,
+  g.gpt_password AS gpt_password, g.totp_secret AS totp_secret, g.mfa_status AS mfa_status,
+  GREATEST(g.deleted_at, m.deleted_at) AS deleted_at,
+  g.auth_data, g.rt_data`;
 const ACC_FROM = `FROM gpt_accounts g JOIN mailboxes m ON g.mailbox_id = m.id`;
 // 账号删除口径:GPT 记录软删(g) 或 邮箱软删联动(m),任一 >0 即视为已删除
 const ACC_ALIVE = `g.deleted_at=0 AND m.deleted_at=0`;
@@ -370,16 +384,30 @@ async function insertOrReviveGpt(client, mailboxId, batch, now) {
 
 // ---- 邮箱资源池 ----
 
+// 列表页专用列：不拉 password_prev / 完整 google_state（可省大量 JSON 体积）。
+// 详情/改密/整备仍走 getMailbox 全量行。
+const MAILBOX_LIST_COLS = `
+    id, email, password, provider, usage, grp, pw_status, google_stage,
+    totp_secret, imap_password, recovery_email, sold_at, deleted_at, created_at, note,
+    CASE
+      WHEN google_state IS NULL OR google_state = '{}'::jsonb THEN NULL
+      ELSE jsonb_build_object(
+        'last_error', google_state->>'last_error',
+        'login_error', google_state->>'login_error'
+      )
+    END AS google_state
+`;
+
 export async function listMailboxes(usage?) {
     if (usage === 'deleted') {
-        const { rows } = await query(`SELECT * FROM mailboxes WHERE deleted_at>0 ORDER BY id`);
+        const { rows } = await query(`SELECT ${MAILBOX_LIST_COLS} FROM mailboxes WHERE deleted_at>0 ORDER BY id`);
         return rows;
     }
     if (usage) {
-        const { rows } = await query(`SELECT * FROM mailboxes WHERE usage=$1 AND deleted_at=0 ORDER BY id`, [usage]);
+        const { rows } = await query(`SELECT ${MAILBOX_LIST_COLS} FROM mailboxes WHERE usage=$1 AND deleted_at=0 ORDER BY id`, [usage]);
         return rows;
     }
-    const { rows } = await query(`SELECT * FROM mailboxes WHERE deleted_at=0 ORDER BY id`);
+    const { rows } = await query(`SELECT ${MAILBOX_LIST_COLS} FROM mailboxes WHERE deleted_at=0 ORDER BY id`);
     return rows;
 }
 
@@ -1559,11 +1587,17 @@ export async function listMailInstances(maxAgeMs = 45_000) {
 export async function mailJobsProgress(kind = "") {
     const kindFilter = kind ? "AND kind=$1" : "";
     const params = kind ? [kind] : [];
+    const {rows: newest} = await query(
+        `SELECT batch_id FROM mail_jobs
+         WHERE status IN ('pending','running') AND COALESCE(batch_id,'')<>'' ${kindFilter}
+         ORDER BY id DESC LIMIT 1`,
+        params,
+    );
     const {rows: open} = await query(
         `SELECT DISTINCT batch_id FROM mail_jobs WHERE status IN ('pending','running') AND COALESCE(batch_id,'')<>'' ${kindFilter}`,
         params,
     );
-    let batchIds = open.map((r) => r.batch_id).filter(Boolean);
+    let batchIds = newest.map((r) => r.batch_id).filter(Boolean);
     if (!batchIds.length) {
         const {rows: [last]} = await query(
             `SELECT batch_id FROM mail_jobs WHERE COALESCE(batch_id,'')<>'' ${kindFilter} ORDER BY id DESC LIMIT 1`,
@@ -1574,11 +1608,18 @@ export async function mailJobsProgress(kind = "") {
     const paused = await isMailClaimPaused();
     const empty = {running: false, kind: kind || "mail", done: 0, total: 0, ok: 0, fail: 0, queued: 0, runningCount: 0, rate: 0, current: [], lastLine: "", batchId: "", byKind: {}, paused};
     if (!batchIds.length) return empty;
+    const allOpenIds = [...new Set(open.map((r) => r.batch_id).filter(Boolean).concat(batchIds))];
     const {rows} = await query(
         `SELECT kind, status, COUNT(*)::int AS n, COUNT(*) FILTER (WHERE ok)::int AS okc
          FROM mail_jobs WHERE batch_id = ANY($1) ${kind ? "AND kind=$2" : ""}
          GROUP BY kind, status`,
         kind ? [batchIds, kind] : [batchIds],
+    );
+    const {rows: liveRows} = await query(
+        `SELECT status, COUNT(*)::int AS n
+         FROM mail_jobs WHERE status IN ('pending','running') AND batch_id = ANY($1) ${kind ? "AND kind=$2" : ""}
+         GROUP BY status`,
+        kind ? [allOpenIds, kind] : [allOpenIds],
     );
     const by = {pending: 0, running: 0, done: 0, error: 0, canceled: 0};
     const byKind = {};
@@ -1590,6 +1631,12 @@ export async function mailJobsProgress(kind = "") {
         if (byKind[r.kind][r.status] !== undefined) byKind[r.kind][r.status] += r.n;
         if (r.status === "done") byKind[r.kind].ok += r.okc || 0;
     }
+    by.pending = 0;
+    by.running = 0;
+    for (const r of liveRows) {
+        if (r.status === "pending") by.pending = r.n;
+        if (r.status === "running") by.running = r.n;
+    }
     const fail = by.error;
     const done = by.done + by.error;
     const total = by.pending + by.running + by.done + by.error;
@@ -1598,7 +1645,7 @@ export async function mailJobsProgress(kind = "") {
         `SELECT id, kind, mailbox_id, email, last_line, instance_id, claimed_at
          FROM mail_jobs WHERE status='running' AND batch_id = ANY($1) ${kind ? "AND kind=$2" : ""}
          ORDER BY claimed_at`,
-        kind ? [batchIds, kind] : [batchIds],
+        kind ? [allOpenIds, kind] : [allOpenIds],
     );
     const {rows: [tm]} = await query(
         `SELECT
