@@ -284,35 +284,29 @@ async function dismissPopups(page) {
 }
 
 async function openMailcomLoginForm(page) {
-    const emailBox = page.locator("#login-email, input[name='username'], input[placeholder='Email address']").first();
-    if (await emailBox.isVisible({timeout: 1200}).catch(() => false)) return emailBox;
+    const emailBox = page.locator("#login-email").first();
+    if (await emailBox.isVisible({timeout: 800}).catch(() => false)) return emailBox;
 
     await dismissPopups(page);
+    // 首页右上角 Login 打开 .login-layer，不要进 /login/（该路径是 404 营销壳）
     for (const sel of [
-        "#login-button",
-        "button#login-button",
-        "a#login-button",
-        ".login-button",
-        "a[href*='login']",
-        "button:has-text('Log in')",
-        "a:has-text('Log in')",
-        "button:has-text('Login')",
-        "a:has-text('Login')",
-        "[data-testid='login']",
+        "a.button.button-login",
+        "a.nav-button.nav-login",
+        "a[href*='navlogin']",
+        "a[title='Login']",
     ]) {
-        if (await clickIfVisible(page, sel, 700)) {
-            await page.waitForTimeout(700);
-            if (await emailBox.isVisible({timeout: 1500}).catch(() => false)) return emailBox;
+        if (await clickIfVisible(page, sel, 800)) {
+            if (await emailBox.isVisible({timeout: 4000}).catch(() => false)) return emailBox;
         }
     }
-
     if (!(await emailBox.isVisible({timeout: 400}).catch(() => false))) {
-        await page.goto("https://www.mail.com/login/", {waitUntil: "domcontentloaded", timeout: 30000}).catch(() => {});
-        await page.waitForTimeout(1500);
+        console.log("[mailcom] 下拉没展开，改走首页 #navlogin");
+        await page.goto("https://www.mail.com/homepage.html#navlogin", {waitUntil: "domcontentloaded", timeout: 30000}).catch(() => {});
+        await page.waitForTimeout(1200);
         await dismissPopups(page);
     }
     if (await emailBox.isVisible({timeout: 4000}).catch(() => false)) return emailBox;
-    return emailBox;
+    throw new Error("mail.com 首页登录层没展开，#login-email 不可见（不要走 /login/ 404）");
 }
 
 async function loginMailcom(email, password, opts = {}) {
@@ -368,7 +362,8 @@ async function loginMailcom(email, password, opts = {}) {
         });
         page.setDefaultTimeout(20000);
 
-        console.log(`[mailcom] 登录 ${email} ... 打开首页`);
+        const headed = !(launchOpts.headless);
+        console.log(`[mailcom] 登录 ${email} ... 打开首页 ${headed ? "可见 Chrome" : "无头"}`);
         await page.goto("https://www.mail.com/", {waitUntil: "commit", timeout: 90000});
         console.log(`[mailcom] 首页已开 url=${page.url().slice(0, 80)}`);
         await page.waitForTimeout(4000);
@@ -386,49 +381,40 @@ async function loginMailcom(email, password, opts = {}) {
         }
         await dismissPopups(page);
 
-        // 登录表单：先关 cookie/弹窗，再展开下拉（#login-email 常在 DOM 里但 display:none）
+        // 登录表单：先关 cookie/弹窗，再展开首页下拉（#login-email 未展开时 display:none）
         if (!page.url().includes("navigator-lxa")) {
             const pwHint = `${String(password || "").slice(0, 4)}…(${String(password || "").length}位)`;
-            console.log(`[mailcom] 填库内当前密码 ${pwHint}（不是 GPT 密码，也不是改密前旧密码）`);
-            const emailBox = await openMailcomLoginForm(page);
-            const filled = await emailBox.fill(email, {force: true, timeout: 8000}).then(() => true).catch(() => false);
-            if (!filled) {
-                await page.goto("https://www.mail.com/int/en/login/", {waitUntil: "domcontentloaded", timeout: 30000}).catch(() => {});
-                await page.waitForTimeout(1200);
-                await dismissPopups(page);
-                const again = page.locator("#login-email, input[name='username'], input[type='email'], input[placeholder*='mail' i]").first();
-                await again.fill(email, {force: true, timeout: 8000});
+            console.log(`[mailcom] 填库内当前密码 ${pwHint}（首页下拉，不走 /login/ 404）`);
+            if (/\/login\/?(\?|$)/i.test(page.url())) {
+                console.log("[mailcom] 当前是 /login/ 404 壳，回到首页再开下拉");
+                await page.goto("https://www.mail.com/", {waitUntil: "domcontentloaded", timeout: 30000});
+                await page.waitForTimeout(1000);
             }
-            const pwdBox = page.locator("#login-password, input[name='password'], input[type='password']").first();
-            await pwdBox.fill(password, {force: true, timeout: 8000}).catch(async () => {
-                await page.locator("input[type='password']").first().fill(password, {force: true, timeout: 8000});
-            });
+            const emailBox = await openMailcomLoginForm(page);
+            await emailBox.fill(email, {timeout: 8000});
+            const pwdBox = page.locator("#login-password").first();
+            await pwdBox.waitFor({state: "visible", timeout: 8000});
+            await pwdBox.fill(password, {timeout: 8000});
             let submitted = false;
             for (const sel of [
-                "form#login-form button[type='submit']",
-                "form[action*='login'] button[type='submit']",
-                "#login-form button",
                 "button.login-submit",
-                "input[type='submit']",
                 "#header-login-box button[type='submit']",
-                "#header-login-box button",
-                "button[type='submit']",
-                "button:has-text('Log in')",
-                "button:has-text('Login')",
-                "button:has-text('Sign in')",
+                "form[action*='login.mail.com'] button[type='submit']",
+                ".login-layer button[type='submit']",
             ]) {
                 if (await clickIfVisible(page, sel, 800)) { submitted = true; break; }
             }
             if (!submitted) {
-                const anyBtn = page.locator("form button[type='submit'], form input[type='submit'], button[type='submit']").first();
-                if (await anyBtn.count()) {
-                    await anyBtn.click({force: true, timeout: 4000}).then(() => { submitted = true; }).catch(() => {});
-                }
+                submitted = await page.locator("form[action*='login.mail.com']").first()
+                    .evaluate((f) => { f.requestSubmit(); return true; }).catch(() => false);
             }
             if (!submitted) {
-                await pwdBox.press("Enter").catch(() => page.keyboard.press("Enter").catch(() => {}));
+                await pwdBox.press("Enter").catch(() => {});
             }
             console.log(`[mailcom] 已点登录 submitted=${submitted} url=${page.url().slice(0, 80)}`);
+            if (/\/login\/?(\?|$)/i.test(page.url()) && !submitted) {
+                throw new Error("mail.com 还停在 /login/ 404，表单没提交成功");
+            }
         }
         console.log(`[mailcom] 等跳转收件箱（最多 45s）`);
         try {

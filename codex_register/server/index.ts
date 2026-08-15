@@ -1591,7 +1591,8 @@ function spawnReloginWorker(acc, {proxy, script = "src/worker-login-http.ts", ti
             recoveryEmail: acc.recovery_email || "",
             imapPassword: acc.mailbox_imap || "",
         });
-        note(`邮箱密码用库内当前值 ${String(acc.password || "").slice(0, 4)}…(${String(acc.password || "").length}位)`);
+        const mailcomHeaded = String(acc.provider || "mailcom") === "mailcom";
+        note(`邮箱密码用库内当前值 ${String(acc.password || "").slice(0, 4)}…(${String(acc.password || "").length}位)${mailcomHeaded ? "；mail.com 收码开可见 Chrome" : ""}`);
         const child = spawn(CHAT_TSX_BIN, [script], {
             shell: IS_WIN, cwd: CHAT_ROOT,
             env: {
@@ -1599,7 +1600,7 @@ function spawnReloginWorker(acc, {proxy, script = "src/worker-login-http.ts", ti
                 REG_EMAIL: acc.email,
                 MAIL_PROVIDER: acc.provider || "mailcom",
                 MAILCOM_TOKENS_FILE: tmpFile, ICLOUD_TOKENS_FILE: tmpFile,
-                MAILCOM_HEADLESS: "1",
+                MAILCOM_HEADLESS: mailcomHeaded ? "0" : "1",
                 PROXY_URL: (proxy !== undefined ? proxy : scheduler.regProxy) || "",
                 MAILCOM_PROXY: scheduler.mailProxyEnabled !== false ? (scheduler.mailProxy || "") : "",
                 REG_SIMULATE_CHAT: "", // 不养号
