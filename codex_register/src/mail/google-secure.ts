@@ -1,7 +1,8 @@
 // @ts-nocheck
 /**
  * Gmail 老号安全整备：拆掉卖家找回入口，再换钥匙。
- * 顺序：删恢复手机 → 删辅助邮箱 → 换 TOTP → 改密 → 登出其它设备 → 开 IMAP。
+ * 顺序：删恢复手机 → 删辅助邮箱 → 换 TOTP → 开 IMAP → 改密 → 登出其它设备。
+ * 底线（2FA+IMAP）放在改密前面，避免改密后的「再登录」把取件卡死。
  */
 import {mkdirSync} from "node:fs";
 import path from "node:path";
@@ -284,12 +285,46 @@ export async function hardenGoogleAccountOnPage(page, cred, log = () => {}, onCh
         }
     };
 
+    const gone = (step) => {
+        if (!pageGone()) return false;
+        noteErr("窗口被关", "窗口被关");
+        log(`[邮箱管理] 窗口已关（${step} 之后），后续步骤不再跑`);
+        return true;
+    };
+
+    if (stopNow()) return stopAndKeep();
+    if (skip.phone) {
+        log("[邮箱管理 1/6] 恢复手机已清，跳过");
+        out.phoneCleared = true;
+    } else {
+        log("[邮箱管理 1/6] 删除恢复手机号");
+        const phone = await runTimed("删手机", () => removeRecoveryPhone(page, cred, log).catch((e) => ({ok: false, error: String(e?.message || e)})));
+        out.phoneCleared = !!phone?.ok || !!phone?.timeout;
+        if (!phone?.ok && !phone?.timeout) noteErr(phone?.error, "删手机号失败");
+    }
+    if (gone("删手机")) return finalize();
+
+    if (stopNow()) return stopAndKeep();
+    if (skip.recovery) {
+        log("[邮箱管理 2/6] 辅助邮箱已清，跳过");
+        out.recoveryCleared = true;
+        cred.recoveryEmail = "";
+    } else {
+        log("[邮箱管理 2/6] 删除辅助邮箱");
+        const rec = await runTimed("删辅助邮箱", () => removeRecoveryEmail(page, cred, log).catch((e) => ({ok: false, error: String(e?.message || e)})));
+        out.recoveryCleared = !!(rec?.ok && !rec?.skipped) || (!hadRecovery && !!rec?.ok) || !!rec?.timeout;
+        if (rec?.skipped && !hadRecovery) out.recoveryCleared = true;
+        if (out.recoveryCleared) cred.recoveryEmail = "";
+        if (!rec?.ok && !rec?.timeout) noteErr(rec?.error, "删辅助邮箱失败");
+    }
+    if (gone("删辅助邮箱")) return finalize();
+
     if (skip.totp) {
-        log("[邮箱管理 1/5] 换 2FA 已做过，跳过");
+        log("[邮箱管理 3/6] 换 2FA 已做过，跳过");
         out.totpRotated = true;
         out.totpSecret = cred.totpSecret || out.totpSecret;
     } else {
-        log("[邮箱管理 1/5] 更换 Google 2FA");
+        log("[邮箱管理 3/6] 更换 Google 2FA");
         if (stopNow()) return stopAndKeep();
         const oldTotp = cred.totpSecret;
         const t = await runTimed("换2FA", () => change2faOnPage(page, {
@@ -309,20 +344,36 @@ export async function hardenGoogleAccountOnPage(page, cred, log = () => {}, onCh
             log(`[邮箱管理] 换 2FA 失败: ${t?.error || ""}`);
         }
     }
+    if (gone("换2FA")) return finalize();
 
-    if (pageGone()) {
-        noteErr("窗口被关", "窗口被关");
-        log("[邮箱管理] 窗口已关，后续步骤不再跑");
-        return finalize();
+    if (stopNow()) return stopAndKeep();
+    if (skip.imap) {
+        log("[邮箱管理 4/6] IMAP 已通，跳过");
+        out.imapPassword = cred.imapPassword || "";
+    } else {
+        log("[邮箱管理 4/6] 开通 IMAP（改密之前）");
+        try {
+            const fetchR = await enableGmailFetch(page, {
+                email: cred.email, password: cred.password,
+                totpSecret: cred.totpSecret, totpFallback: cred.totpPrev || "", log,
+            });
+            if (fetchR?.ok && fetchR.imapPassword) {
+                out.imapPassword = fetchR.imapPassword;
+                await onCheckpoint({imapPassword: fetchR.imapPassword});
+            } else noteErr(fetchR?.error, "IMAP 开通失败");
+        } catch (e) {
+            noteErr(e?.message || e, "IMAP 开通失败");
+        }
     }
+    if (gone("IMAP")) return finalize();
 
     if (skip.password) {
-        log("[邮箱管理 2/5] 密码已换过，跳过");
+        log("[邮箱管理 5/6] 密码已换过，跳过");
         out.passwordChanged = true;
     } else if (stopNow()) {
         return stopAndKeep();
     } else {
-        log("[邮箱管理 2/5] 修改 Google 密码");
+        log("[邮箱管理 5/6] 修改 Google 密码");
         const pw = await changePasswordOnPage(page, {
             email: cred.email, password: cred.password,
             totpSecret: cred.totpSecret, totpFallback: cred.totpPrev || "",
@@ -344,68 +395,18 @@ export async function hardenGoogleAccountOnPage(page, cred, log = () => {}, onCh
             log(`[邮箱管理] 改密失败: ${pw?.detail || pw?.error || ""}`);
         }
     }
-
-    if (pageGone()) {
-        noteErr("窗口被关", "窗口被关");
-        log("[邮箱管理] 窗口已关，后续步骤不再跑");
-        return finalize();
-    }
+    if (gone("改密")) return finalize();
 
     if (stopNow()) return stopAndKeep();
     if (process.env.REG_SKIP_DEVICES === "1" || skip.devices) {
-        log("[邮箱管理 3/5] 踢设备已做过，跳过");
+        log("[邮箱管理 6/6] 踢设备已做过，跳过");
         out.devicesDone = true;
     } else {
-        log("[邮箱管理 3/5] 踢出其它设备");
+        log("[邮箱管理 6/6] 踢出其它设备");
         const sess = await runTimed("踢设备", () => signOutOtherDevices(page, cred, log).catch((e) => ({ok: false, error: String(e?.message || e)})));
         out.sessionsSignedOut = sess?.signed || 0;
         out.devicesDone = !!sess?.ok || !!sess?.timeout;
         if (!sess?.ok && !sess?.timeout) noteErr(sess?.error, "登出设备失败");
-    }
-
-    if (stopNow()) return stopAndKeep();
-    if (skip.phone) {
-        log("[邮箱管理 4/5] 恢复手机已清，跳过");
-        out.phoneCleared = true;
-    } else {
-        log("[邮箱管理 4/5] 删除恢复手机号");
-        const phone = await runTimed("删手机", () => removeRecoveryPhone(page, cred, log).catch((e) => ({ok: false, error: String(e?.message || e)})));
-        out.phoneCleared = !!phone?.ok || !!phone?.timeout;
-        if (!phone?.ok && !phone?.timeout) noteErr(phone?.error, "删手机号失败");
-    }
-
-    if (stopNow()) return stopAndKeep();
-    if (skip.recovery) {
-        log("[邮箱管理 4/5] 辅助邮箱已清，跳过");
-        out.recoveryCleared = true;
-        cred.recoveryEmail = "";
-    } else {
-        log("[邮箱管理 4/5] 删除辅助邮箱");
-        const rec = await runTimed("删辅助邮箱", () => removeRecoveryEmail(page, cred, log).catch((e) => ({ok: false, error: String(e?.message || e)})));
-        out.recoveryCleared = !!(rec?.ok && !rec?.skipped) || (!hadRecovery && !!rec?.ok) || !!rec?.timeout;
-        if (rec?.skipped && !hadRecovery) out.recoveryCleared = true;
-        if (out.recoveryCleared) cred.recoveryEmail = "";
-        if (!rec?.ok && !rec?.timeout) noteErr(rec?.error, "删辅助邮箱失败");
-    }
-
-    if (stopNow()) return stopAndKeep();
-    if (skip.imap) {
-        log("[邮箱管理 5/5] IMAP 已通，跳过");
-        out.imapPassword = cred.imapPassword || "";
-    } else {
-        log("[邮箱管理 5/5] 开通 IMAP");
-        try {
-            const fetchR = await enableGmailFetch(page, {
-                email: cred.email, password: cred.password,
-                totpSecret: cred.totpSecret, totpFallback: cred.totpPrev || "", log,
-            });
-            if (fetchR?.ok && fetchR.imapPassword) {
-                out.imapPassword = fetchR.imapPassword;
-                await onCheckpoint({imapPassword: fetchR.imapPassword});
-            } else noteErr(fetchR?.error, "IMAP 开通失败");
-        } catch (e) {
-            noteErr(e?.message || e, "IMAP 开通失败");
-        }
     }
 
     finalize();

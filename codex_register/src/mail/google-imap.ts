@@ -438,7 +438,7 @@ export async function fetchGmailImapBody(email, mailId, imapPassword, {proxy = "
 export async function enableGmailFetch(page, {
     email, password = "", totpSecret = "", totpFallback = "", log = () => {},
 } = {}) {
-    await enableGmailImap(page, log).catch((e) => log(`[取件] IMAP 设置跳过: ${e?.message || e}`));
+    log("[取件] 消费级 Gmail 默认已开 IMAP，直接去应用专用密码");
     const imapPassword = await createGmailAppPassword(page, {email, password, totpSecret, totpFallback, log});
     const probe = await testGmailImap(email, imapPassword);
     if (!probe.ok) {

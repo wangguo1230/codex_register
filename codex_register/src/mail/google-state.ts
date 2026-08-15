@@ -119,7 +119,7 @@ export function planHardenSkip(mb = {}) {
         phone: st.phone === "ok",
         devices: st.devices === "ok",
     };
-    skip.left = ["totp", "imap", "password", "devices", "phone", "recovery"].filter((k) => !skip[k]);
+    skip.left = ["phone", "recovery", "totp", "imap", "password", "devices"].filter((k) => !skip[k]);
     skip.requiredLeft = skip.left.filter((k) => k === "totp" || k === "imap");
     skip.all = skip.left.length === 0;
     skip.usable = skip.requiredLeft.length === 0;
