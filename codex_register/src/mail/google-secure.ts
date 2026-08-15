@@ -520,7 +520,14 @@ export async function runGoogleHardenWithBit(acc, {proxyUrl = "", log = () => {}
             log("  已写回库：密钥和辅助邮箱对调");
         } catch { /* 跑任务时写回失败不挡登录 */ }
     } else if (straight.swapped && !straight.totpSecret) {
-        log("  totp 列是邮箱但没有可用密钥，不把空密钥写回库");
+        log(`  totp 列是邮箱 ${straight.recoveryEmail || ""}，当辅助邮箱用，不把空密钥写回 totp`);
+        if (straight.recoveryEmail) {
+            try {
+                const {applyMailboxUpdate} = await import("../../server/db.js");
+                await applyMailboxUpdate(acc.email, {recovery_email: straight.recoveryEmail});
+                log("  已写回库：辅助邮箱（totp 列原值）");
+            } catch { /* 写回失败仍用内存里的辅助邮箱登录 */ }
+        }
     }
     if (skip.all) {
         log("[整备] 缺口已齐，不再开窗");

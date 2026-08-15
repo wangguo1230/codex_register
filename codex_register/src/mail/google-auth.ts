@@ -863,7 +863,9 @@ export async function googleLogin(page, emailOrOpts, password = "", totpSecret =
                 }
                 write("  TOTP 后仍在验证页，继续处理挑战");
             } else if (!totp && await totpFieldVisible(page)) {
-                if (tryAnotherClicks < 2) {
+                if (recovery) {
+                    write(`  验证码页没有可用密钥，改走辅助邮箱 ${recovery}`);
+                } else if (tryAnotherClicks < 3) {
                     write("  验证码页没有可用密钥，改走其它方式");
                 } else {
                     write("  验证码页没有可用密钥，其它方式也走不通");
@@ -935,7 +937,7 @@ export async function googleLogin(page, emailOrOpts, password = "", totpSecret =
 
             // 有 TOTP 密钥时别在填码前点其它方式。没有密钥时验证码页也要能切走。
             const totpShowing = await totpFieldVisible(page);
-            if (tryAnotherClicks < 2 && !pwdVisible && (!totpShowing || !totp)) {
+            if (tryAnotherClicks < 3 && !pwdVisible && (!totpShowing || !totp)) {
                 let tryBtn = page.locator('[jsname="Njthtb"]');
                 if (!await tryBtn.first().isVisible({timeout: 400}).catch(() => false)) {
                     tryBtn = page.getByText(/try another way|试试其他方式|autre fa[cç]on|cara lain|otra manera|tentar de outra/i).first();
@@ -944,18 +946,32 @@ export async function googleLogin(page, emailOrOpts, password = "", totpSecret =
                     tryAnotherClicks += 1;
                     await tryBtn.first().click().catch(() => {});
                     write("  点击试试其他方式");
-                    await page.waitForTimeout(3000);
+                    await page.waitForTimeout(2000);
+                    await page.waitForFunction(() => {
+                        const u = location.href;
+                        return !/\/totp/i.test(u) || !!document.querySelector("[data-challengetype]");
+                    }, {timeout: 8000}).catch(() => {});
                     continue;
                 }
             }
+            const recDomain = recovery.includes("@") ? recovery.split("@")[1] : "";
             const recOpt = page.locator('[data-challengetype], li, [role="link"], [role="button"], div').filter({
-                hasText: /recovery email|辅助邮箱|e-mail de recupera|correo de recupera|email de récupér|confirm.*email/i,
+                hasText: /recovery email|辅助邮箱|e-mail de recupera|correo de recupera|email de récupér|confirm.*email|verification code at|codigo.*correo|fastmail/i,
             }).first();
             if (recovery && await recOpt.isVisible({timeout: 800}).catch(() => false)) {
                 await recOpt.click({force: true}).catch(() => {});
                 write("  选择辅助邮箱验证");
                 await page.waitForTimeout(3000);
                 continue;
+            }
+            if (recovery && recDomain) {
+                const byDomain = page.getByText(new RegExp(recDomain.replace(/\./g, "\\."), "i")).first();
+                if (await byDomain.isVisible({timeout: 600}).catch(() => false)) {
+                    await byDomain.click({force: true}).catch(() => {});
+                    write(`  按域名点辅助邮箱 ${recDomain}`);
+                    await page.waitForTimeout(3000);
+                    continue;
+                }
             }
 
             const content = await page.content();
@@ -968,12 +984,16 @@ export async function googleLogin(page, emailOrOpts, password = "", totpSecret =
             ];
             const contentLower = String(content || "").toLowerCase();
             // 密码页 URL 也带 challenge，不能当辅助邮箱页。泛匹配 type=text 会填错框再点 Next。
-            const recBox = page.locator('input[name="knowledgePreregisteredEmailResponse"]:visible').first();
+            const recBox = page.locator(
+                'input[name="knowledgePreregisteredEmailResponse"]:visible, input[id*="knowledge" i]:visible, input[aria-label*="email" i]:visible, input[type="email"]:visible',
+            ).first();
             const recVisible = await recBox.isVisible({timeout: 800}).catch(() => false);
-            if (recovery && recVisible && step === "other" && recoveryHints.some((h) => contentLower.includes(h.toLowerCase()))) {
+            const where = loginStep(page.url());
+            if (recovery && recVisible && where !== "password" && where !== "identifier" && where !== "totp"
+                && (recoveryHints.some((h) => contentLower.includes(h.toLowerCase())) || where === "other")) {
                 await recBox.fill(recovery);
                 await recBox.press("Enter").catch(() => {});
-                write("  辅助邮箱已输入");
+                write(`  辅助邮箱已输入 ${recovery}`);
                 await page.waitForTimeout(5000);
                 continue;
             }
