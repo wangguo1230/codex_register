@@ -982,10 +982,10 @@ export async function change2faOnPage(page, {
         return {ok: false, error: "确认后没有出现填码框或密钥"};
     }
 
-    let cantClicked = setup === "secret";
-    const canSeeCantScan = await page.getByText(/can.?t scan|cannot scan|无法扫描/i).first().isVisible({timeout: 500}).catch(() => false);
-    if (!cantClicked && (setup === "qr" || setup === "dialog" || canSeeCantScan)) {
-        if (canSeeCantScan && await clickCantScanByDom(page, log)) cantClicked = true;
+    let cantClicked = false;
+    const canSeeCantScan = await page.getByText(/can.?t scan|cannot scan|无法扫描/i).first().isVisible({timeout: 800}).catch(() => false);
+    if (["qr", "secret"].includes(setup) || canSeeCantScan) {
+        if (await clickCantScanByDom(page, log)) cantClicked = true;
     }
     if (!cantClicked) {
         const qrNearby = await page.evaluate(() => {
