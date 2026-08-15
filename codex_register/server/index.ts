@@ -16,7 +16,7 @@ process.on("uncaughtException", (err) => {
     process.exit(1);
 });
 import cors from "cors";
-import {existsSync, readFileSync, writeFileSync, mkdtempSync, rmSync} from "node:fs";
+import {existsSync, readFileSync, writeFileSync, unlinkSync, mkdtempSync, rmSync} from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import {fileURLToPath} from "node:url";
@@ -877,8 +877,9 @@ async function tickMailJobs() {
             return;
         }
         const snap = scheduler.mailProxyPoolSnap();
-        setExpectedBitTiles(Math.max(1, Number(snap.slots) || slots || 4));
-        const jobs = await db.claimMailJobs(db.instanceId, slots, bitDown ? "pw" : "");
+        const jobCap = Math.max(1, Math.min(scheduler.pwConcurrency || 1, snap.slots || 1));
+        setExpectedBitTiles(jobCap);
+        const jobs = await db.claimMailJobs(db.instanceId, slots, bitDown ? "pw" : "", jobCap);
         if (bitDown && !jobs.length) {
             scheduleMailboxJobBroadcast();
             return;
@@ -2898,11 +2899,12 @@ function runRtWorkerStandalone(email, mailPassword, gptPassword, onProgress): Pr
 //   可导:success 且未失效;另外「有 GPT 密码的谷歌邮箱」全部导出(不要求 success/未失效)。
 //   scope=all|hasRt|atOnly 再按 rt 细分。
 //   格式 format:
-//     full   : Gmail=邮箱----邮箱密码----谷歌2FA[----GPT密码----GPT2FA----rt]
+//     full   : Gmail=邮箱----邮箱密码----谷歌2FA----IMAP[----GPT密码----GPT2FA----rt]
+//              其它=邮箱----邮箱密码----IMAP[----GPT密码----GPT2FA----rt]
 //     at     : 邮箱----邮箱密码----accessToken(从 auth_file 解析)
 //     session: 邮箱----邮箱密码----session json(可恢复登录态)
-//     jsonl  : 每行含 password/mailbox_totp/gpt_password/totp_secret/rt
-//     csv    : 统一列(邮箱,邮箱密码,邮箱2FA,GPT密码,GPT2FA,rt)
+//     jsonl  : 每行含 password/mailbox_totp/imap_password/gpt_password/totp_secret/rt
+//     csv    : 统一列(邮箱,邮箱密码,邮箱2FA,IMAP,GPT密码,GPT2FA,rt)
 //   markSold:true 导出同时标记已售出。用 POST 避免选中量大时 URL 超长。
 function isGoogleMailbox(r) {
     return r?.provider === "google" || /@(gmail|googlemail)\.com$/i.test(String(r?.email || ""));
@@ -2964,15 +2966,18 @@ function exportableAccount(r) {
     if (isGoogleMailbox(r) && String(r?.gpt_password || "").trim()) return true;
     return r?.status === "success" && !r?.dead_at;
 }
-// Gmail: 邮箱----邮箱密码----谷歌2FA；有 GPT 密码再接 ----GPT密码----GPT2FA----rt
+// Gmail: 邮箱----邮箱密码----谷歌2FA----IMAP[----GPT密码----GPT2FA----rt]
+// 其它: 邮箱----邮箱密码----IMAP[----GPT密码----GPT2FA----rt]（无 IMAP 时该段为空）
 function formatAccountExportLine(r, {rt = "", sep = "----"} = {}) {
     const email = r.email || "";
     const mailPw = r.password || r.mailPw || "";
     const mail2fa = String(r.mailbox_totp || r.mail2fa || "").trim();
+    const imap = String(r.mailbox_imap || r.imap_password || r.imap || "").trim();
     const gptPw = String(r.gpt_password || "").trim();
     const gpt2fa = String(r.totp_secret || r.gpt2fa || "").trim();
-    const parts = isGoogleMailbox(r) ? [email, mailPw, mail2fa] : [email, mailPw];
-    if (gptPw) parts.push(gptPw, gpt2fa, rt || "");
+    const parts = isGoogleMailbox(r) ? [email, mailPw, mail2fa, imap] : [email, mailPw, imap];
+    // 有 GPT 密码或 rt 时补齐尾部三段，方便「导出含 RT」固定位解析
+    if (gptPw || rt) parts.push(gptPw, gpt2fa, rt || "");
     return parts.join(sep);
 }
 
@@ -2995,6 +3000,7 @@ app.post("/api/export/full", async (req, res) => {
     const gptPwOf = (r) => (r.gpt_password || appConfig.defaultPassword || "").trim();
     const mailTotpOf = (r) => String(r.mailbox_totp || "").trim();
     const gptTotpOf = (r) => String(r.totp_secret || "").trim();
+    const imapOf = (r) => String(r.mailbox_imap || r.imap_password || r.imap || "").trim();
 
     if (format === "at") {
         const lines = rows.map((r) => {
@@ -3016,6 +3022,7 @@ app.post("/api/export/full", async (req, res) => {
                 email: r.email,
                 password: r.password || "",
                 mailbox_totp: mailTotpOf(r),
+                imap_password: imapOf(r),
                 gpt_password: gptPwOf(r),
                 totp_secret: gptTotpOf(r),
                 card: r.card || "",
@@ -3035,6 +3042,8 @@ app.post("/api/export/full", async (req, res) => {
             email: r.email,
             password: r.password || "",
             mailbox_totp: mailTotpOf(r),
+            mailbox_imap: imapOf(r),
+            imap_password: imapOf(r),
             gpt_password: String(r.gpt_password || "").trim(),
             totp_secret: gptTotpOf(r),
             rt,
@@ -3042,13 +3051,13 @@ app.post("/api/export/full", async (req, res) => {
         };
     });
     if (format === "csv") {
-        const head = "邮箱,邮箱密码,邮箱2FA,GPT密码,GPT2FA,rt\n";
-        const body = recs.map((r) => [r.email, r.password, r.mailbox_totp, r.gpt_password, r.totp_secret, r.rt]
+        const head = "邮箱,邮箱密码,邮箱2FA,IMAP,GPT密码,GPT2FA,rt\n";
+        const body = recs.map((r) => [r.email, r.password, r.mailbox_totp, r.imap_password, r.gpt_password, r.totp_secret, r.rt]
             .map((v) => `"${String(v ?? "").replace(/"/g, '""')}"`).join(",")).join("\n");
         res.set("Content-Type", "text/csv; charset=utf-8");
         return res.send(head + body);
     }
-    // full: Gmail 邮箱----邮箱密码----谷歌2FA[----GPT密码----GPT2FA----rt]
+    // full: Gmail 邮箱----邮箱密码----谷歌2FA----IMAP[----GPT密码----GPT2FA----rt]
     const lines = recs.map((r) => formatAccountExportLine(r, {rt: r.rt}));
     res.set("Content-Type", "text/plain; charset=utf-8");
     res.send(lines.join("\n"));
@@ -4191,6 +4200,38 @@ app.post("/api/recharge/queue/export", async (req, res) => {
         return res.set("Content-Type", "text/plain; charset=utf-8").send(lines.join("\n"));
     }
 
+    // sub2json 预备行：email----密码----refresh_token（Gmail / mail.com 通用）
+    // 密码优先 gpt_password（Gmail 登录 GPT 用），否则邮箱密码；无 rt 也输出（末段空，前端可提示补 RT）
+    if (format === "sub2json") {
+        let withRt = 0;
+        const lines = rows.map((r: any) => {
+            const sources = [
+                r.gpt_rt_data,
+                readJsonFileSafe(r.rt_file),
+                r.gpt_auth_data,
+                readJsonFileSafe(r.gpt_auth_file),
+                r.auth_data,
+                readJsonFileSafe(r.auth_file),
+            ];
+            let rt = "";
+            for (const src of sources) {
+                const t = extractTokens(src);
+                if (t?.refreshToken) { rt = t.refreshToken; break; }
+            }
+            if (rt) withRt++;
+            // Gmail 必须用 GPT 密码；mail.com 通常 gpt_password 空则回落邮箱密码
+            const pw = String(r.gpt_password || r.password || "").trim();
+            return `${r.email}${sep}${pw}${sep}${rt}`;
+        });
+        return res.json({
+            ok: true,
+            text: lines.join("\n"),
+            total: rows.length,
+            withRt,
+            missingRt: rows.length - withRt,
+        });
+    }
+
     // full 格式: 先检查是否需要获取 RT，需要则异步执行后通过 SSE 推送结果
     const needRt = rows.filter((r: any) => {
         const tok = extractTokens(r.gpt_rt_data || r.gpt_auth_data || readJsonFileSafe(r.rt_file) || readJsonFileSafe(r.gpt_auth_file));
@@ -4334,6 +4375,22 @@ try {
 await ensureSchema();
 await initDb();
 await db.init();
+
+const HTTP_PID_PATH = path.resolve(__dirname, "..", "data", "http-3100.pid");
+function pidAlive(pid) {
+    if (!pid) return false;
+    try { process.kill(pid, 0); return true; } catch { return false; }
+}
+try {
+    const prev = existsSync(HTTP_PID_PATH) ? Number(String(readFileSync(HTTP_PID_PATH, "utf8") || "").trim()) : 0;
+    if (prev && prev !== process.pid && pidAlive(prev)) {
+        console.error(`[server] :${PORT} 已在运行 pid=${prev}，本进程退出（避免双开叠出比特窗）`);
+        process.exit(1);
+    }
+} catch { /* 锁文件坏了就覆盖 */ }
+try { writeFileSync(HTTP_PID_PATH, String(process.pid), "utf8"); } catch { /* */ }
+const dropHttpPid = () => { try { unlinkSync(HTTP_PID_PATH); } catch { /* */ } };
+process.on("exit", dropHttpPid);
 
 app.listen(PORT, () => {
     console.log(`[server] http://localhost:${PORT}  instance=${db.instanceId}  (前端 ${existsSync(WEB_DIST) ? "已托管" : "未构建, 用 vite dev"})`);

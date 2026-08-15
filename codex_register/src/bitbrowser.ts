@@ -52,7 +52,11 @@ export async function bitSessionReady() {
 
 // 创建随机指纹窗口(proxy 可选,格式 socks5://host:port 或 http://user:pass@host:port)。返回窗口 id。
 export async function createBitWindow({proxy = "", name = "reg", remark = "codex-reg", timeZone = ""} = {}) {
-    await ensureBitWindowBudget({log: () => {}});
+    const cap = Math.max(1, expectedBitTiles || 4);
+    await ensureBitWindowBudget({log: () => {}, reserve: 1});
+    if (liveBitIds.size >= cap) {
+        throw new Error(`比特窗口已达并发上限 ${cap}（本机已登记 ${liveBitIds.size}）`);
+    }
     const screen = await getScreenSize();
     const tile = tileLayout(plannedTileCount(), screen);
     const body = {
@@ -364,10 +368,12 @@ function windowAgeMs(w) {
 }
 
 /**
- * 只删已经关掉且超过 10 分钟的配置。开着的窗一律不关。
+ * 开着的窗：本进程登记的不关；没登记的只在「开着的自动化窗 > 并发」时从最老的关起。
+ * 关着的配置超过 10 分钟再删。不会在未超限时清场。
  */
-export async function ensureBitWindowBudget({log = () => {}} = {}) {
+export async function ensureBitWindowBudget({log = () => {}, reserve = 0} = {}) {
     const cap = Math.max(1, expectedBitTiles || 4);
+    const keepOpen = Math.max(0, cap - Math.max(0, Number(reserve) || 0));
     let windows = [];
     try { windows = await listAllBitWindows({force: true}); }
     catch (e) {
@@ -375,16 +381,27 @@ export async function ensureBitWindowBudget({log = () => {}} = {}) {
         return 0;
     }
     const ours = windows.filter(isOurAutomationWindow);
+    const open = ours.filter((w) => w?.id && Number(w.status) === 1);
+    const untracked = open
+        .filter((w) => !liveBitIds.has(w.id))
+        .sort((a, b) => windowAgeMs(b) - windowAgeMs(a));
+    let openCount = open.length;
     let n = 0;
+    for (const w of untracked) {
+        if (openCount <= keepOpen) break;
+        await closeBitWindow(w.id);
+        await deleteBitWindow(w.id);
+        openCount -= 1;
+        n += 1;
+        log(`[指纹] 超出并发 ${cap}，关掉空闲窗 ${w.name || w.id} 开着=${openCount} 登记=${liveBitIds.size}`);
+    }
     for (const w of ours) {
-        if (!w?.id) continue;
-        const open = Number(w.status) === 1;
-        if (open) continue;
+        if (!w?.id || Number(w.status) === 1) continue;
         if (liveBitIds.has(w.id)) continue;
         if (windowAgeMs(w) < 10 * 60 * 1000) continue;
         await deleteBitWindow(w.id);
         n += 1;
-        log(`[指纹] 清已关残留 ${w.name || w.id} 本机登记=${liveBitIds.size} 上限=${cap}`);
+        log(`[指纹] 清已关残留 ${w.name || w.id} 上限=${cap}`);
     }
     return n;
 }

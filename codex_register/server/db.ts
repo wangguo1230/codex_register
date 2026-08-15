@@ -1317,6 +1317,7 @@ export async function rechargeQueueBatches() {
 
 export async function listRechargeQueueFull(ids?: number[], batch?: string) {
     let sql = `SELECT rq.*, m.password, m.provider, m.totp_secret AS mailbox_totp,
+                      m.imap_password AS mailbox_imap, m.imap_password,
                       g.gpt_password, g.totp_secret, g.rt_file,
                       g.auth_file AS gpt_auth_file, g.auth_data AS gpt_auth_data, g.rt_data AS gpt_rt_data
                FROM recharge_queue rq
@@ -1423,9 +1424,20 @@ export async function enqueueMailJobs(items, kind = "harden", batchId = "") {
     return {inserted, batchId: bid};
 }
 
-export async function claimMailJobs(instId = instanceId, limit = 1, kind = "") {
-    const n = Math.max(1, Math.min(8, Number(limit) || 1));
+export async function claimMailJobs(instId = instanceId, limit = 1, kind = "", maxRunning = 0) {
+    const want = Math.max(1, Math.min(8, Number(limit) || 1));
+    const cap = Math.max(0, Number(maxRunning) || 0);
     return withTransaction(async (client) => {
+        await client.query(`SELECT pg_advisory_xact_lock(hashtext($1))`, [`mail-claim:${instId}`]);
+        let n = want;
+        if (cap > 0) {
+            const {rows: [{n: running}]} = await client.query(
+                `SELECT COUNT(*)::int AS n FROM mail_jobs WHERE status='running' AND instance_id=$1`,
+                [instId],
+            );
+            n = Math.min(want, Math.max(0, cap - Number(running || 0)));
+            if (!n) return [];
+        }
         const {rows} = await client.query(
             kind
                 ? `SELECT id, kind, mailbox_id, email, batch_id, payload
