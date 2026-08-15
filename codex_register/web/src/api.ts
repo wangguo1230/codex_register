@@ -76,6 +76,14 @@ export interface MailboxJobCurrent {
     lastLine: string;
     instanceId?: string;
     kind?: string;
+    claimedAt?: number;
+    elapsedMs?: number;
+}
+export interface MailJobHourStat {
+    at: number;
+    done: number;
+    ok: number;
+    fail: number;
 }
 export interface MailFarmInstance {
     instanceId: string;
@@ -111,6 +119,13 @@ export interface MailboxJob {
     instances?: MailFarmInstance[];
     instanceId?: string;
     source?: string;
+    startedAt?: number;
+    endedAt?: number;
+    elapsedMs?: number;
+    avgMs?: number;
+    etaMs?: number;
+    hourly?: MailJobHourStat[];
+    hourNow?: MailJobHourStat | null;
 }
 
 export interface Stats {

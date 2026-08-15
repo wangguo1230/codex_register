@@ -605,6 +605,13 @@ function snapshotMailboxJob() {
         source: "queue",
         instanceId: db.instanceId,
         stopped: !!dbp.paused,
+        startedAt: Number(dbp.startedAt || 0) || 0,
+        endedAt: Number(dbp.endedAt || 0) || 0,
+        elapsedMs: Number(dbp.elapsedMs || 0) || 0,
+        avgMs: Number(dbp.avgMs || 0) || 0,
+        etaMs: Number(dbp.etaMs || 0) || 0,
+        hourly: Array.isArray(dbp.hourly) ? dbp.hourly : [],
+        hourNow: dbp.hourNow || null,
     };
 }
 

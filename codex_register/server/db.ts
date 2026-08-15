@@ -1570,15 +1570,59 @@ export async function mailJobsProgress(kind = "") {
     const fail = by.error;
     const done = by.done + by.error;
     const total = by.pending + by.running + by.done + by.error;
+    const now = Date.now();
     const {rows: current} = await query(
-        `SELECT id, kind, mailbox_id, email, last_line, instance_id
+        `SELECT id, kind, mailbox_id, email, last_line, instance_id, claimed_at
          FROM mail_jobs WHERE status='running' AND batch_id = ANY($1) ${kind ? "AND kind=$2" : ""}
          ORDER BY claimed_at`,
         kind ? [batchIds, kind] : [batchIds],
     );
+    const {rows: [tm]} = await query(
+        `SELECT
+            MIN(created_at) AS first_created,
+            MIN(claimed_at) FILTER (WHERE claimed_at>0) AS first_claim,
+            MAX(finished_at) FILTER (WHERE finished_at>0) AS last_finish,
+            AVG(finished_at - claimed_at) FILTER (
+                WHERE finished_at>0 AND claimed_at>0 AND finished_at>claimed_at
+            ) AS avg_ms
+         FROM mail_jobs WHERE batch_id = ANY($1) ${kind ? "AND kind=$2" : ""}`,
+        kind ? [batchIds, kind] : [batchIds],
+    );
+    const {rows: finished} = await query(
+        `SELECT finished_at, ok FROM mail_jobs
+         WHERE batch_id = ANY($1) AND status IN ('done','error') AND finished_at>0
+         ${kind ? "AND kind=$2" : ""}`,
+        kind ? [batchIds, kind] : [batchIds],
+    );
+    const hourStart = (ts) => {
+        const d = new Date(Number(ts) || 0);
+        d.setMinutes(0, 0, 0);
+        return d.getTime();
+    };
+    const hourMap = new Map();
+    for (const r of finished) {
+        const at = hourStart(r.finished_at);
+        if (!at) continue;
+        const row = hourMap.get(at) || {at, done: 0, ok: 0, fail: 0};
+        row.done += 1;
+        if (r.ok) row.ok += 1;
+        else row.fail += 1;
+        hourMap.set(at, row);
+    }
+    const hourly = [...hourMap.values()].sort((a, b) => a.at - b.at);
+    const startedAt = Number(tm?.first_claim || tm?.first_created || 0) || 0;
+    const lastFinish = Number(tm?.last_finish || 0) || 0;
+    const live = by.running + by.pending > 0;
+    const endedAt = live ? 0 : lastFinish;
+    const elapsedMs = startedAt ? Math.max(0, (live ? now : (endedAt || now)) - startedAt) : 0;
+    const avgMs = Math.round(Number(tm?.avg_ms || 0) || 0);
+    const thisHourAt = hourStart(now);
+    const hourNow = hourly.find((h) => h.at === thisHourAt) || {at: thisHourAt, done: 0, ok: 0, fail: 0};
+    const remain = by.pending + by.running;
+    const etaMs = avgMs && remain ? Math.round((avgMs * remain) / Math.max(1, by.running || 1)) : 0;
     const lastLine = current[0]?.last_line || (by.pending || by.running ? `排队 ${by.pending} · 执行 ${by.running}` : `结束 成功 ${ok}/${done}`);
     return {
-        running: by.running + by.pending > 0,
+        running: live,
         kind: kind || "mail",
         done,
         total,
@@ -1590,10 +1634,19 @@ export async function mailJobsProgress(kind = "") {
         current: current.map((r) => ({
             id: r.mailbox_id, email: r.email, lastLine: r.last_line || "运行中",
             instanceId: r.instance_id, kind: r.kind,
+            claimedAt: Number(r.claimed_at || 0) || 0,
+            elapsedMs: r.claimed_at ? Math.max(0, now - Number(r.claimed_at)) : 0,
         })),
         lastLine,
         batchId: batchIds.join(","),
         byKind,
         paused,
+        startedAt,
+        endedAt,
+        elapsedMs,
+        avgMs,
+        etaMs,
+        hourly,
+        hourNow,
     };
 }

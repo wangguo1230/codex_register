@@ -53,7 +53,29 @@ const GOOGLE_STAGE_COLOR: Record<string, string> = {
     partial: "#d97706", ready: "#059669", gpt_ok: "#10a37f", blocked: "#b91c1c",
 };
 const KIND_LABEL: Record<string, string> = {harden: "整备", pw: "改密", "2fa": "2FA", mail: "任务"};
-const emptyJob = (): MailboxJob => ({running: false, done: 0, total: 0, ok: 0, fail: 0, queued: 0, rate: 0, current: [], windows: [], byKind: {}, instances: []});
+const emptyJob = (): MailboxJob => ({running: false, done: 0, total: 0, ok: 0, fail: 0, queued: 0, rate: 0, current: [], windows: [], byKind: {}, instances: [], hourly: []});
+
+function pad2(n: number) { return String(n).padStart(2, "0"); }
+function fmtClock(ts?: number) {
+    if (!ts) return "—";
+    const d = new Date(ts);
+    return `${pad2(d.getHours())}:${pad2(d.getMinutes())}:${pad2(d.getSeconds())}`;
+}
+function fmtDur(ms?: number) {
+    const n = Math.max(0, Math.floor(Number(ms) || 0));
+    if (!n) return "—";
+    const s = Math.floor(n / 1000);
+    const h = Math.floor(s / 3600);
+    const m = Math.floor((s % 3600) / 60);
+    const sec = s % 60;
+    if (h) return `${h}小时${m}分`;
+    if (m) return `${m}分${pad2(sec)}秒`;
+    return `${sec}秒`;
+}
+function fmtHourLabel(ts: number) {
+    const d = new Date(ts);
+    return `${pad2(d.getHours())}:00`;
+}
 
 function jobTitle(j: MailboxJob) {
     const live = Object.entries(j.byKind || {}).filter(([, v]) => (v.pending + v.running) > 0).map(([k]) => KIND_LABEL[k] || k);
@@ -72,6 +94,11 @@ function rememberLastJob(data: Partial<MailboxJob> | undefined) {
         fail: Math.max(0, data.fail ?? ((data.done || 0) - (data.ok || 0))),
         rate: data.rate ?? (data.done ? Math.round((data.ok || 0) / data.done * 100) : 0),
         stopped: !!data.stopped,
+        startedAt: data.startedAt || 0,
+        endedAt: data.endedAt || 0,
+        elapsedMs: data.elapsedMs || 0,
+        avgMs: data.avgMs || 0,
+        hourly: data.hourly || [],
     };
 }
 
@@ -93,6 +120,13 @@ function mergeJob(prev: MailboxJob, next: Partial<MailboxJob> | undefined): Mail
     if (next?.windows) n.windows = next.windows;
     if (next?.instances) n.instances = next.instances;
     if (next?.byKind) n.byKind = next.byKind;
+    if (Array.isArray(next?.hourly)) n.hourly = next.hourly;
+    if (next?.hourNow) n.hourNow = next.hourNow;
+    if (next?.startedAt) n.startedAt = next.startedAt;
+    if (next?.endedAt != null) n.endedAt = next.endedAt;
+    if (next?.elapsedMs != null) n.elapsedMs = next.elapsedMs;
+    if (next?.avgMs != null) n.avgMs = next.avgMs;
+    if (next?.etaMs != null) n.etaMs = next.etaMs;
     return n;
 }
 
@@ -108,7 +142,8 @@ export function MailboxPanel({notify}: {notify?: (m: string) => void}) {
     const [fSold, setFSold] = useState<"" | "yes" | "no">("");
     const [fEmail, setFEmail] = useState(""); // 筛选:邮箱关键词
     const [batchSearch, setBatchSearch] = useState(false);
-    const [lastJob, setLastJob] = useState<{kind: string; done: number; total: number; ok: number; fail: number; rate: number; stopped?: boolean} | null>(null);
+    const [lastJob, setLastJob] = useState<{kind: string; done: number; total: number; ok: number; fail: number; rate: number; stopped?: boolean; startedAt?: number; endedAt?: number; elapsedMs?: number; avgMs?: number; hourly?: {at: number; done: number; ok: number; fail: number}[]} | null>(null);
+    const [nowTick, setNowTick] = useState(Date.now());
     const [importText, setImportText] = useState("");
     const [grp, setGrp] = useState("");
     const [importAutoPw, setImportAutoPw] = useState(false); // 导入后自动改密(mail.com)
@@ -165,6 +200,11 @@ export function MailboxPanel({notify}: {notify?: (m: string) => void}) {
         const tick = setInterval(pullJob, 2000);
         return () => clearInterval(tick);
     }, []);
+    useEffect(() => {
+        if (!job.running && !(job.current || []).length) return;
+        const t = setInterval(() => setNowTick(Date.now()), 1000);
+        return () => clearInterval(t);
+    }, [job.running, (job.current || []).length]);
     // 实时刷新(邮箱变化/批量改密进度)
     useEffect(() => {
         const off = connectStream((ev, data) => {
@@ -539,6 +579,10 @@ export function MailboxPanel({notify}: {notify?: (m: string) => void}) {
                                 {metric("成功", jobOk, "#059669")}
                                 {metric("失败", jobFail, jobFail ? "#dc2626" : "#9ca3af")}
                                 {metric("成功率", jobDone ? `${jobRate}%` : "—", jobRate >= 70 ? "#059669" : jobDone ? "#d97706" : "#9ca3af")}
+                                {metric("已跑时长", fmtDur(job.startedAt ? nowTick - job.startedAt : job.elapsedMs), "#4338ca")}
+                                {metric("本小时", job.hourNow ? `${job.hourNow.done}（成${job.hourNow.ok}）` : "0", "#0f766e")}
+                                {metric("均时", fmtDur(job.avgMs), "#6b7280")}
+                                {job.etaMs ? metric("预计剩余", fmtDur(job.etaMs), "#9a3412") : null}
                                 <div style={{marginLeft: "auto"}}>
                                     <button onClick={stopMailboxJob} disabled={stopping}
                                             style={{height: 32, padding: "0 14px", background: stopping ? "#fca5a5" : "#dc2626", color: "#fff", border: "none", borderRadius: 8, cursor: stopping ? "wait" : "pointer", fontWeight: 600, fontSize: 12}}>
@@ -550,6 +594,10 @@ export function MailboxPanel({notify}: {notify?: (m: string) => void}) {
                                 <div style={{width: `${jobPct}%`, height: "100%", background: "#ea580c", borderRadius: 99}}/>
                             </div>
                             <div style={{marginTop: 8, display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center"}}>
+                                <span style={{fontSize: 11, color: "#6b7280"}}>
+                                    {job.startedAt ? `开始 ${fmtClock(job.startedAt)}` : "计时未到"}
+                                    {job.startedAt ? ` · 已跑 ${fmtDur(nowTick - job.startedAt)}` : ""}
+                                </span>
                                 {kindStats.map(([k, v]) => (
                                     <span key={k} style={{fontSize: 11, color: "#4b5563", background: "#f3f4f6", borderRadius: 999, padding: "2px 8px"}}>
                                         {KIND_LABEL[k] || k} 跑{v.running} 排{v.pending} 成{v.ok} 败{v.error}
@@ -559,6 +607,18 @@ export function MailboxPanel({notify}: {notify?: (m: string) => void}) {
                                     本机代理 空闲 {poolSnap.free} / 占用 {poolSnap.leased} / 共 {poolSnap.slots || poolSnap.total || 0}
                                 </span>
                             </div>
+                            {(job.hourly || []).length > 0 && (
+                                <div style={{marginTop: 6, display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center"}}>
+                                    {(job.hourly || []).map((h) => {
+                                        const cur = job.hourNow && h.at === job.hourNow.at;
+                                        return (
+                                            <span key={h.at} style={{fontSize: 11, color: cur ? "#0f766e" : "#4b5563", background: cur ? "#ccfbf1" : "#f8fafc", border: `1px solid ${cur ? "#99f6e4" : "#e5e7eb"}`, borderRadius: 6, padding: "2px 8px"}}>
+                                                {fmtHourLabel(h.at)} 完成 {h.done}（成{h.ok} 败{h.fail}）
+                                            </span>
+                                        );
+                                    })}
+                                </div>
+                            )}
                             {farm.length > 0 && (
                                 <div style={{marginTop: 6, display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center"}}>
                                     <span style={{fontSize: 11, color: "#9ca3af"}}>农场 {farm.length} 台</span>
@@ -576,6 +636,7 @@ export function MailboxPanel({notify}: {notify?: (m: string) => void}) {
                                     {(job.current || []).map((c) => (
                                         <div key={`${c.kind || "job"}-${c.id}`} style={{fontSize: 12, fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace", color: "#57534e"}}>
                                             <span style={{color: "#9a3412"}}>[{KIND_LABEL[c.kind || ""] || c.kind || "任务"}] {c.email}</span>
+                                            <span style={{color: "#4338ca"}}>  {c.claimedAt ? fmtDur(nowTick - c.claimedAt) : (c.elapsedMs ? fmtDur(c.elapsedMs) : "")}</span>
                                             <span style={{color: "#a8a29e"}}>  {c.lastLine || "运行中"}</span>
                                             {c.instanceId ? <span style={{color: "#c4b5fd"}}>  · {c.instanceId === job.instanceId ? "本机" : c.instanceId}</span> : null}
                                         </div>
@@ -601,6 +662,14 @@ export function MailboxPanel({notify}: {notify?: (m: string) => void}) {
                             {metric("成功", lastJob.ok, "#059669")}
                             {metric("失败", lastJob.fail, lastJob.fail ? "#dc2626" : "#9ca3af")}
                             {metric("成功率", `${lastJob.rate}%`, lastJob.rate >= 70 ? "#059669" : "#d97706")}
+                            {metric("总时长", fmtDur(lastJob.elapsedMs), "#4338ca")}
+                            {metric("均时", fmtDur(lastJob.avgMs), "#6b7280")}
+                            {lastJob.startedAt ? <span style={{fontSize: 11, color: "#9ca3af"}}>{fmtClock(lastJob.startedAt)}–{fmtClock(lastJob.endedAt)}</span> : null}
+                            {(lastJob.hourly || []).map((h) => (
+                                <span key={h.at} style={{fontSize: 11, color: "#4b5563", background: "#f8fafc", borderRadius: 6, padding: "2px 8px"}}>
+                                    {fmtHourLabel(h.at)} {h.done}个
+                                </span>
+                            ))}
                             <button onClick={() => resumeMailboxJob(false)} style={{marginLeft: "auto", height: 28, padding: "0 12px", background: "#ea580c", color: "#fff", border: "none", borderRadius: 8, fontSize: 12, cursor: "pointer"}}>继续未完成</button>
                             <button onClick={() => resumeMailboxJob(true)} style={{height: 28, padding: "0 12px", background: "#dc2626", color: "#fff", border: "none", borderRadius: 8, fontSize: 12, cursor: "pointer"}}>重试失败</button>
                             <button onClick={() => setLastJob(null)} style={{height: 28, padding: "0 10px", border: "1px solid #e5e7eb", borderRadius: 8, background: "#fff", fontSize: 12, color: "#6b7280", cursor: "pointer"}}>关闭</button>
