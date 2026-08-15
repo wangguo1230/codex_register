@@ -1142,6 +1142,7 @@ export async function googleLogin(page, emailOrOpts, password = "", totpSecret =
         return true;
     } catch (e) {
         write(`  登录异常: ${e?.message || e}`);
+        if (/换 session|代理中断|ERR_PROXY|ERR_SSL|ERR_CONNECTION|SSL\/代理/i.test(String(e?.message || e))) throw e;
         return false;
     } finally {
         netWatch.detach();
