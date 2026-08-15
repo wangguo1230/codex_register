@@ -144,27 +144,67 @@ export async function createGmailAppPassword(page, {
         throw new Error("应用专用密码页二次验证未过");
     }
 
-    const nameInput = page.locator(
+    const nameBox = () => page.locator(
         'input[type="text"]:visible, input[aria-label*="App name" i], input[aria-label*="应用" i], input[name*="name" i]',
     ).first();
-    if (await nameInput.isVisible({timeout: 4000}).catch(() => false)) {
+
+    const fillAppName = async () => {
+        const nameInput = nameBox();
+        if (!await nameInput.isVisible({timeout: 4000}).catch(() => false)) return "";
+        const label = `${appName}-${Date.now().toString(36).slice(-4)}`;
+        await nameInput.click().catch(() => {});
         await nameInput.fill("");
-        await nameInput.fill(`${appName}-${Date.now().toString(36).slice(-4)}`);
-        await page.waitForTimeout(400);
-        log("[取件] 已填应用名");
-    }
+        await nameInput.fill(label);
+        await page.waitForTimeout(300);
+        await nameInput.press("Tab").catch(() => {});
+        log(`[取件] 已填应用名 ${label}`);
+        return label;
+    };
+
+    await fillAppName();
+    await page.waitForTimeout(800);
 
     let secret = "";
-    for (let tryCreate = 0; tryCreate < 3 && !secret; tryCreate++) {
+    for (let tryCreate = 0; tryCreate < 5 && !secret; tryCreate++) {
+        if (tryCreate > 0) {
+            const body = String(await page.innerText("body").catch(() => ""));
+            if (/error generating your app password|生成.*应用.*密码|无法生成应用/i.test(body)) {
+                log(`[取件] Google 拒绝生成应用密码，等一会再试 ${tryCreate}/5`);
+                await page.waitForTimeout(6000);
+                try { await page.goto(APP_PASSWORD_URL, {waitUntil: "domcontentloaded", timeout: 60000}); } catch { /* */ }
+                await page.waitForTimeout(1500);
+                if (isVerifyItsYouText(String(await page.innerText("body").catch(() => "")))) {
+                    await googleReauthPassword(page, {password, totpSecret, totpFallback, log});
+                }
+                await fillAppName();
+            }
+        }
         const created = await clickCreateAppPassword(page, log);
-        if (!created && tryCreate === 0) log("[取件] 未点到创建按钮，尝试从页面直接抽密码");
-        for (let w = 0; w < 8 && !secret; w++) {
+        if (!created && tryCreate === 0) {
+            const nb = nameBox();
+            if (await nb.isVisible({timeout: 400}).catch(() => false)) {
+                await nb.press("Enter").catch(() => {});
+                log("[取件] Create 没点到，应用名框回车");
+            } else {
+                log("[取件] 未点到创建按钮，尝试从页面直接抽密码");
+            }
+        }
+        let genErr = false;
+        for (let w = 0; w < 12 && !secret; w++) {
             await page.waitForTimeout(500);
             secret = await readAppPassword(page);
+            const body = String(await page.innerText("body").catch(() => ""));
+            if (/error generating your app password|生成.*应用.*密码|无法生成应用/i.test(body)) {
+                genErr = true;
+                break;
+            }
         }
-        if (!secret && isVerifyItsYouText(String(await page.innerText("body").catch(() => "")))) {
+        if (secret) break;
+        if (genErr) continue;
+        if (isVerifyItsYouText(String(await page.innerText("body").catch(() => "")))) {
             log("[取件] 点 Create 后又要二次验证");
             await googleReauthPassword(page, {password, totpSecret, totpFallback, log});
+            await fillAppName();
         }
     }
     if (!secret) {
@@ -233,6 +273,155 @@ export async function testGmailImap(email, imapPassword, {proxy = "", log = (m) 
     const via = await probeImapOnce(email, imapPassword, jump);
     log(via.ok ? `[imap] 跳板通，收件箱 ${via.messages ?? 0} 封` : `[imap] 跳板也失败 ${via.error}`);
     return via;
+}
+
+// ---- 邮箱管理「收件箱」：Gmail 用应用专用密码走 IMAP 列表/正文 ----
+const gmailImapBodyCache = new Map(); // email -> {at, byId: Map<id, text>}
+
+function normalizeGmailKey(email) {
+    return String(email || "").trim().toLowerCase();
+}
+
+function addrListToStr(list) {
+    if (!Array.isArray(list) || !list.length) return "";
+    return list.map((a) => {
+        const name = String(a?.name || "").trim();
+        const addr = String(a?.address || "").trim();
+        if (name && addr) return `${name} <${addr}>`;
+        return addr || name;
+    }).filter(Boolean).join(", ");
+}
+
+function sourceToReadable(raw) {
+    let s = Buffer.isBuffer(raw) ? raw.toString("utf8") : String(raw || "");
+    // 粗拆 MIME：优先 text/plain，再 text/html
+    const plain = s.match(/Content-Type:\s*text\/plain[\s\S]*?\r?\n\r?\n([\s\S]*?)(?=\r?\n--|\r?\nContent-Type:|$)/i);
+    const html = s.match(/Content-Type:\s*text\/html[\s\S]*?\r?\n\r?\n([\s\S]*?)(?=\r?\n--|\r?\nContent-Type:|$)/i);
+    let body = (plain?.[1] || html?.[1] || s).trim();
+    // 去 base64 块（简单场景）
+    if (/^[A-Za-z0-9+/=\r\n]+$/.test(body.slice(0, 200)) && body.length > 80) {
+        try {
+            const b64 = body.replace(/\s+/g, "");
+            if (b64.length > 40 && b64.length % 4 === 0) body = Buffer.from(b64, "base64").toString("utf8");
+        } catch { /* keep */ }
+    }
+    body = body
+        .replace(/<(script|style)\b[^>]*>[\s\S]*?<\/\1>/gi, " ")
+        .replace(/<a\b[^>]*\bhref\s*=\s*["']?([^"'\s>]+)["']?[^>]*>([\s\S]*?)<\/a>/gi, (_m, href, txt) => {
+            const text = String(txt).replace(/<[^>]+>/g, "").replace(/&nbsp;/gi, " ").trim();
+            return text && !text.includes(href) ? `${text} (${href})` : (text || href);
+        })
+        .replace(/<\/(p|div|tr|li|h[1-6]|table)>/gi, "\n")
+        .replace(/<br\s*\/?>/gi, "\n")
+        .replace(/<[^>]+>/g, " ")
+        .replace(/&nbsp;/gi, " ").replace(/&amp;/gi, "&").replace(/&lt;/gi, "<").replace(/&gt;/gi, ">")
+        .replace(/&quot;/gi, '"').replace(/&#39;/gi, "'");
+    return body.split("\n").map((l) => l.replace(/[ \t]+/g, " ").trim()).join("\n").replace(/\n{3,}/g, "\n\n").trim();
+}
+
+async function withGmailImap(email, imapPassword, fn, {proxy = ""} = {}) {
+    const pass = String(imapPassword || "").replace(/\s+/g, "");
+    if (!pass) throw new Error("Gmail 没有 IMAP 应用专用密码，请先整备开通");
+    const {getMailProxyJump} = await import("./proxy-pool.js");
+    const jump = String(proxy || getMailProxyJump() || "").trim();
+    const attempts = jump ? ["", jump] : [""];
+    let lastErr;
+    for (const via of attempts) {
+        const client = attachImapErrorSink(new ImapFlow({
+            host: "imap.gmail.com", port: 993, secure: true,
+            auth: {user: email, pass},
+            logger: false,
+            emitLogs: false,
+            connectionTimeout: 15_000,
+            greetingTimeout: 12_000,
+            socketTimeout: 25_000,
+            ...(via ? {proxy: via} : {}),
+        }));
+        try {
+            await client.connect();
+            const out = await fn(client);
+            await client.logout().catch(() => {});
+            return out;
+        } catch (e) {
+            lastErr = e;
+            try { client.close(); } catch { /* */ }
+            try { await client.logout(); } catch { /* */ }
+            if (via || !jump) break;
+            if (/ERR_SSL|bad record mac|decryption failed|authentication|Invalid credentials|LOGIN failed/i.test(String(e?.message || e))) break;
+        }
+    }
+    throw new Error(String(lastErr?.message || lastErr || "IMAP 失败").replace(/\s+/g, " ").slice(0, 160));
+}
+
+/** 拉 Gmail INBOX 最近 amount 封（头信息），供邮箱管理收件箱。 */
+export async function fetchGmailImapInbox(email, imapPassword, amount = 30, {proxy = ""} = {}) {
+    const key = normalizeGmailKey(email);
+    const n = Math.max(1, Math.min(100, Number(amount) || 30));
+    return withGmailImap(email, imapPassword, async (client) => {
+        const lock = await client.getMailboxLock("INBOX");
+        try {
+            const status = await client.status("INBOX", {messages: true});
+            const total = Number(status?.messages || 0);
+            if (!total) {
+                gmailImapBodyCache.set(key, {at: Date.now(), byId: new Map()});
+                return [];
+            }
+            const start = Math.max(1, total - n + 1);
+            const mails = [];
+            const byId = new Map();
+            for await (const msg of client.fetch(`${start}:*`, {
+                uid: true,
+                envelope: true,
+                source: true,
+            })) {
+                const env = msg.envelope || {};
+                const ts = env.date ? new Date(env.date).getTime() : 0;
+                const id = String(msg.uid);
+                const head = {
+                    id,
+                    from: addrListToStr(env.from),
+                    subject: String(env.subject || ""),
+                    timestamp: ts,
+                    date: ts ? new Date(ts).toISOString().replace("T", " ").slice(0, 16) : "",
+                };
+                mails.push(head);
+                try { byId.set(id, sourceToReadable(msg.source)); } catch { byId.set(id, ""); }
+            }
+            // 新→旧
+            mails.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
+            gmailImapBodyCache.set(key, {at: Date.now(), byId});
+            return mails;
+        } finally {
+            try { lock.release(); } catch { /* */ }
+        }
+    }, {proxy});
+}
+
+/** 按 UID 取正文（优先列表缓存）。 */
+export async function fetchGmailImapBody(email, mailId, imapPassword, {proxy = ""} = {}) {
+    const key = normalizeGmailKey(email);
+    const id = String(mailId || "");
+    const cached = gmailImapBodyCache.get(key);
+    if (cached?.byId?.has(id) && Date.now() - (cached.at || 0) < 10 * 60_000) {
+        return cached.byId.get(id) || "(无正文)";
+    }
+    return withGmailImap(email, imapPassword, async (client) => {
+        const lock = await client.getMailboxLock("INBOX");
+        try {
+            let text = "";
+            for await (const msg of client.fetch(String(id), {uid: true, source: true}, {uid: true})) {
+                text = sourceToReadable(msg.source);
+                break;
+            }
+            if (!gmailImapBodyCache.has(key)) gmailImapBodyCache.set(key, {at: Date.now(), byId: new Map()});
+            const bag = gmailImapBodyCache.get(key);
+            bag.at = Date.now();
+            bag.byId.set(id, text || "(无正文)");
+            return text || "(无正文)";
+        } finally {
+            try { lock.release(); } catch { /* */ }
+        }
+    }, {proxy});
 }
 
 /** 开 IMAP + 生成应用专用密码，并立刻用 IMAP 探活。 */

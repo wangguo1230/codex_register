@@ -606,18 +606,31 @@ export async function googleLogin(page, emailOrOpts, password = "", totpSecret =
                 const ei = await findIdentifierBox(page) || page.locator('input[name="identifier"], #identifierId').first();
                 if (await ei.isVisible({timeout: 1500}).catch(() => false)) {
                     identBlankTries = 0;
-                    if (!emailSubmitted) {
+                    const shownNow = String(await ei.inputValue().catch(() => "")).trim();
+                    const emptyErr = /enter an email or phone number|输入.*邮箱|输入.*电话/i.test(String(await page.innerText("body").catch(() => "")));
+                    if (!emailSubmitted || !shownNow || shownNow.toLowerCase() !== email.toLowerCase() || emptyErr) {
+                        await ei.click({timeout: 1500}).catch(() => {});
                         await typeGoogleInput(ei, email);
-                        const shown = String(await ei.inputValue().catch(() => ""));
+                        let shown = String(await ei.inputValue().catch(() => "")).trim();
                         if (shown.toLowerCase() !== email.toLowerCase()) {
                             await ei.click().catch(() => {});
                             await ei.fill("").catch(() => {});
-                            await ei.pressSequentially(email, {delay: 45});
+                            await ei.pressSequentially(email, {delay: 50});
+                            shown = String(await ei.inputValue().catch(() => "")).trim();
                         }
-                        emailSubmitted = true;
-                        write(`  邮箱已输入: ${email} 框内=${String(await ei.inputValue().catch(() => "")).slice(0, 40)}`);
-                        await ei.press("Tab").catch(() => {});
-                        await page.waitForTimeout(250);
+                        emailSubmitted = shown.toLowerCase() === email.toLowerCase();
+                        write(`  邮箱已输入: ${email} 框内=${shown.slice(0, 40) || "空"}`);
+                        if (!emailSubmitted) {
+                            write("  邮箱没留在框里，不点 Next");
+                            await page.waitForTimeout(400);
+                            continue;
+                        }
+                    }
+                    const still = String(await ei.inputValue().catch(() => "")).trim();
+                    if (!still || still.toLowerCase() !== email.toLowerCase()) {
+                        write("  点 Next 前邮箱框空了，重填");
+                        emailSubmitted = false;
+                        continue;
                     }
                     if (emailNextClicks >= 3) {
                         const leftover = String(await page.innerText("body").catch(() => "")).replace(/\s+/g, " ").slice(0, 160);
