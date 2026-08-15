@@ -250,10 +250,6 @@ export async function changePasswordOnPage(page, {
             await submit.click().catch(() => submit.click({force: true}));
             clicked = true;
             log("[密码] 点了表单提交按钮");
-            if (typeof onPersist === "function" && np) {
-                await onPersist(np).catch(() => {});
-                log("[密码] 已提交，新密码先落库");
-            }
             await page.waitForTimeout(5000);
         } finally {
             leaveCritical();
@@ -269,10 +265,6 @@ export async function changePasswordOnPage(page, {
                     await btn.first().click();
                     clicked = true;
                     log(`[密码] 点击: ${kw}`);
-                    if (typeof onPersist === "function" && np) {
-                        await onPersist(np).catch(() => {});
-                        log("[密码] 已提交，新密码先落库");
-                    }
                     await page.waitForTimeout(5000);
                 } finally {
                     leaveCritical();
@@ -286,10 +278,6 @@ export async function changePasswordOnPage(page, {
         const leaveCritical = enterMailJobCritical();
         try {
             await page.keyboard.press("Enter").catch(() => {});
-            if (typeof onPersist === "function" && np) {
-                await onPersist(np).catch(() => {});
-                log("[密码] 已回车提交，新密码先落库");
-            }
             await page.waitForTimeout(5000);
         } finally {
             leaveCritical();
@@ -322,12 +310,15 @@ export async function changePasswordOnPage(page, {
             verified = true;
             text = afterDump;
         } else {
-            // 已经点过 Change password，Google 可能已生效。空 newPassword 会让上层继续用旧密。
-            log("[密码] 未见成功文案，仍先保存已提交的新密码");
-            return {ok: true, newPassword: np, verified: false, detail: String(text).slice(0, 200)};
+            log("[密码] 未见成功文案，不覆盖库内密码（只留痕）");
+            return {ok: false, newPassword: np, verified: false, submitted: true, detail: String(text).slice(0, 200)};
         }
     }
-    log("[密码] 密码修改成功");
+    log("[密码] 密码修改成功（已见成功文案）");
+    if (typeof onPersist === "function" && np) {
+        await onPersist(np).catch(() => {});
+        log("[密码] 已验证，新密码落库");
+    }
 
     for (const t of ["OK", "知道了", "Got it", "Mulai", "始める", "开始", "Start", "Get started"]) {
         const btn = page.locator(`button:has-text("${t}")`);

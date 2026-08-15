@@ -298,15 +298,19 @@ export async function hardenGoogleAccountOnPage(page, cred, log = () => {}, onCh
         const pw = await changePasswordOnPage(page, {
             email: cred.email, password: cred.password,
             totpSecret: cred.totpSecret, recoveryEmail: cred.recoveryEmail, log,
-            onPersist: async (np) => { await onCheckpoint({password: np, passwordChanged: true}); },
+            onPersist: async (np) => { await onCheckpoint({password: np, passwordChanged: true, verified: true}); },
         }).catch((e) => ({ok: false, error: String(e?.message || e)}));
-        if (pw?.ok && pw.newPassword) {
+        if (pw?.ok && pw.newPassword && pw.verified !== false) {
             cred.password = pw.newPassword;
             out.password = pw.newPassword;
             out.passwordChanged = true;
-            log("[邮箱管理] 新 Google 密码已生效");
-            await onCheckpoint({password: pw.newPassword, passwordChanged: true});
+            log("[邮箱管理] 新 Google 密码已生效（已验证）");
+            await onCheckpoint({password: pw.newPassword, passwordChanged: true, verified: true});
         } else {
+            if (pw?.submitted && pw.newPassword) {
+                log(`[留痕] 改密已提交但未见成功文案，不覆盖库内密码 候选=${pw.newPassword}`);
+                await onCheckpoint({password: pw.newPassword, verified: false});
+            }
             noteErr(pw?.detail || pw?.error, "改密失败");
             log(`[邮箱管理] 改密失败: ${pw?.detail || pw?.error || ""}`);
         }

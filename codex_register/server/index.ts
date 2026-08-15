@@ -387,12 +387,17 @@ async function runOneGoogleHarden(id, opts = {}) {
                 proxyUrl, signal: ac.signal, log: logStep,
                 onCheckpoint: async (patch = {}) => {
                     if (patch.password) {
-                        await db.setMailboxPassword(id, patch.password, `✅改密 ${pwStamp()}`);
-                        logStep("[落库] 新密码已写入");
+                        if (patch.verified === false) {
+                            logStep(`[留痕] 改密未验证，不覆盖库内密码 候选=${patch.password}`);
+                        } else {
+                            await db.setMailboxPassword(id, patch.password, `✅改密(已验证) ${pwStamp()}`);
+                            logStep("[落库] 新密码已写入（已验证）");
+                        }
                     }
                     if (patch.totpSecret) {
                         await db.setMailboxTotp(id, patch.totpSecret);
-                        logStep("[落库] 新 TOTP 已写入");
+                        await db.refreshMailboxGoogleState(id, {totp: "ok", totp_rotated: true}).catch(() => {});
+                        logStep("[落库] 新 TOTP 已写入（已验证）");
                     }
                     if (patch.imapPassword) await db.applyMailboxUpdate(mb.email, {imap_password: patch.imapPassword});
                     if (patch.recoveryCleared) await db.applyMailboxUpdate(mb.email, {recovery_email: ""});
