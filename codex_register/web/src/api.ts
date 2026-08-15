@@ -61,6 +61,8 @@ export interface Mailbox {
         gpt?: string;
         totp_rotated?: boolean;
         last_error?: string;
+        imap_gen_fail?: number;
+        imap_next_try?: number;
         updated_at?: number;
     };
     created_at: number;

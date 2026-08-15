@@ -3,6 +3,7 @@
 //   - 收件箱:Gmail 走 IMAP 应用专用密码；mail.com 登录 maillist。按需展开正文
 import {useEffect, useState} from "react";
 import {api, connectStream, type Mailbox} from "./api";
+import {formatHardenListReason} from "./google-harden-reason";
 
 // 把正文里的 http(s) 链接渲染成可点击 <a>(新标签打开),其余原样。让邮件里的链接可见可点。
 function linkify(text: string) {
@@ -92,13 +93,15 @@ export function MailboxDetail({mailbox, onClose}: {mailbox: Mailbox; onClose: ()
                                 : mailbox.google_stage === "login_ok" ? "能登录"
                                 : mailbox.google_stage === "imported" ? "刚导入"
                                 : "未记录"}
-                            {mailbox.google_state?.last_error ? ` · ${mailbox.google_state.last_error}` : ""}
+                            {formatHardenListReason(mailbox) ? ` · ${formatHardenListReason(mailbox)}` : (mailbox.google_state?.last_error ? ` · ${mailbox.google_state.last_error}` : "")}
                         </span>
                     </> : null}
                     <span className="text-gray-400">归属</span>
                     <span className="text-gray-700">{usageLabel}{mailbox.sold_at ? " · 已售" : ""}{mailbox.grp ? ` · 分组 ${mailbox.grp}` : ""}</span>
                     <span className="text-gray-400">改密状态</span>
-                    <span className={(mailbox.pw_status || "").startsWith("✅") ? "text-emerald-600" : (mailbox.pw_status || "").startsWith("❌") ? "text-red-500" : "text-gray-500"}>{mailbox.pw_status || "未改过"}</span>
+                    <span className={(mailbox.pw_status || "").startsWith("✅") && !formatHardenListReason(mailbox) ? "text-emerald-600" : formatHardenListReason(mailbox) ? "text-amber-700" : (mailbox.pw_status || "").startsWith("❌") ? "text-red-500" : "text-gray-500"}>
+                        {formatHardenListReason(mailbox) || mailbox.pw_status || "未改过"}
+                    </span>
                     {mailbox.provider === "google" && mailbox.google_state ? <>
                         <span className="text-gray-400">缺口</span>
                         <span className="text-gray-700 flex flex-wrap gap-1">

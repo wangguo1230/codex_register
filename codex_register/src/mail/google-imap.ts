@@ -171,29 +171,32 @@ export async function createGmailAppPassword(page, {
         return label;
     };
 
+    const genBlocked = (text) => /error generating your app password|生成.*应用.*密码|无法生成应用/i.test(String(text || ""));
+    const waitToastGone = async () => {
+        for (let i = 0; i < 20; i++) {
+            if (!genBlocked(await page.innerText("body").catch(() => ""))) return;
+            await page.waitForTimeout(500);
+        }
+    };
+
     await fillAppName();
     await page.waitForTimeout(800);
 
     let secret = "";
     let genErrs = 0;
-    for (let tryCreate = 0; tryCreate < 5 && !secret; tryCreate++) {
+    for (let tryCreate = 0; tryCreate < 2 && !secret; tryCreate++) {
         if (tryCreate > 0) {
-            const body = String(await page.innerText("body").catch(() => ""));
-            if (/error generating your app password|生成.*应用.*密码|无法生成应用/i.test(body)) {
-                genErrs += 1;
-                if (genErrs >= 2) {
-                    await dumpAppPwFail(page);
-                    throw new Error("Google 拒绝生成应用密码");
-                }
-                log(`[取件] Google 拒绝生成应用密码，换个名字再试 ${genErrs}/2`);
-                await page.waitForTimeout(8000);
-                try { await page.goto(APP_PASSWORD_URL, {waitUntil: "domcontentloaded", timeout: 60000}); } catch { /* */ }
-                await page.waitForTimeout(1500);
-                if (isVerifyItsYouText(String(await page.innerText("body").catch(() => "")))) {
-                    await googleReauthPassword(page, {password, totpSecret, totpFallback, log});
-                }
-                await fillAppName();
+            genErrs += 1;
+            log("[取件] Google 拒发应用密码，等 toast 消失后再开一次页，不再连点 Create");
+            await page.waitForTimeout(25000);
+            await waitToastGone();
+            try { await page.goto(APP_PASSWORD_URL, {waitUntil: "domcontentloaded", timeout: 60000}); } catch { /* */ }
+            await page.waitForTimeout(1500);
+            if (await googleSslDead(page)) await recoverSslOrSlowPage(page, log, APP_PASSWORD_URL, 2);
+            if (isVerifyItsYouText(String(await page.innerText("body").catch(() => "")))) {
+                await googleReauthPassword(page, {password, totpSecret, totpFallback, log});
             }
+            await fillAppName();
         }
         const created = await clickCreateAppPassword(page, log);
         if (!created && tryCreate === 0) {
@@ -206,11 +209,11 @@ export async function createGmailAppPassword(page, {
             }
         }
         let genErr = false;
-        for (let w = 0; w < 12 && !secret; w++) {
+        for (let w = 0; w < 16 && !secret; w++) {
             await page.waitForTimeout(500);
             secret = await readAppPassword(page);
             const body = String(await page.innerText("body").catch(() => ""));
-            if (/error generating your app password|生成.*应用.*密码|无法生成应用/i.test(body)) {
+            if (genBlocked(body)) {
                 genErr = true;
                 break;
             }

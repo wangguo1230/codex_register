@@ -395,6 +395,8 @@ const MAILBOX_LIST_COLS = `
         'last_error', google_state->>'last_error',
         'login_error', google_state->>'login_error',
         'totp_rotated', google_state->'totp_rotated',
+        'imap_gen_fail', google_state->'imap_gen_fail',
+        'imap_next_try', google_state->'imap_next_try',
         'login', google_state->>'login',
         'phone', google_state->>'phone',
         'recovery', google_state->>'recovery',

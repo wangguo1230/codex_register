@@ -352,6 +352,9 @@ export async function hardenGoogleAccountOnPage(page, cred, log = () => {}, onCh
     if (skip.imap) {
         log("[邮箱管理 4/6] IMAP 已通，跳过");
         out.imapPassword = cred.imapPassword || "";
+    } else if (out.totpRotated && !skip.totp) {
+        log("[邮箱管理 4/6] 本轮刚换完 2FA，Google 这时常拒发应用密码，IMAP 留到下一轮");
+        noteErr("刚换2FA，IMAP 改下一轮再取", "IMAP 留待冷却");
     } else {
         log("[邮箱管理 4/6] 开通 IMAP（改密之前）");
         try {

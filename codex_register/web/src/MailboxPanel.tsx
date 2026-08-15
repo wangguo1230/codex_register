@@ -5,6 +5,7 @@
 //   - 邮箱密码校验工具(改密全归邮箱管理:导入后自动改密/手动/批量,注册流程不越界)
 import {useCallback, useEffect, useMemo, useRef, useState} from "react";
 import {api, connectStream, type Mailbox, type MailboxJob} from "./api";
+import {formatHardenListReason} from "./google-harden-reason";
 import {MailCheckTool} from "./MailCheckTool";
 import {MailboxDetail} from "./MailboxDetail";
 import {ProxyPoolPanel} from "./ProxyPoolPanel";
@@ -404,6 +405,8 @@ export function MailboxPanel({notify}: {notify?: (m: string) => void}) {
                     GOOGLE_STAGE_LABEL[m.google_stage || ""] || "",
                     GOOGLE_STAGE_SEARCH[m.google_stage || ""] || "",
                     m.imap_password ? "imap 有imap" : "",
+                    formatHardenListReason(m),
+                    m.google_state?.last_error || "",
                 ].join(" ").toLowerCase();
                 if (!keywordQs.some((q) => hay.includes(q))) return false;
             }
@@ -964,7 +967,7 @@ export function MailboxPanel({notify}: {notify?: (m: string) => void}) {
                             <th style={{padding: "8px 10px"}}>2FA</th>
                             <th style={{padding: "8px 10px"}}>Gmail 状态</th>
                             <th style={{padding: "8px 10px"}}>归属</th>
-                            <th style={{padding: "8px 10px"}}>改密状态</th>
+                            <th style={{padding: "8px 10px"}}>整备原因</th>
                             <th style={{padding: "8px 10px"}}>分组</th>
                             <th style={{padding: "8px 10px"}}>操作</th>
                         </tr>
@@ -992,7 +995,7 @@ export function MailboxPanel({notify}: {notify?: (m: string) => void}) {
                                 </td>
                                 <td style={{padding: "6px 10px"}}>
                                     {m.provider === "google"
-                                        ? <span title={[m.google_state?.last_error, m.google_state?.login_error].filter(Boolean).join(" · ")}
+                                        ? <span title={formatHardenListReason(m) || m.google_state?.last_error || ""}
                                               style={{padding: "1px 8px", borderRadius: 10, fontSize: 12, color: "#fff", background: GOOGLE_STAGE_COLOR[m.google_stage || ""] || "#9ca3af"}}>
                                             {GOOGLE_STAGE_LABEL[m.google_stage || ""] || "未记录"}
                                           </span>
@@ -1004,16 +1007,16 @@ export function MailboxPanel({notify}: {notify?: (m: string) => void}) {
                                     </span>
                                     {m.sold_at ? <span style={{marginLeft: 6, padding: "1px 6px", borderRadius: 8, fontSize: 11, color: "#b45309", background: "#fef3c7"}}>已售</span> : null}
                                 </td>
-                                <td style={{padding: "6px 10px", color: (() => {
+                                <td style={{padding: "6px 10px", maxWidth: 260, color: (() => {
+                                    const reason = m.provider === "google" ? formatHardenListReason(m) : "";
                                     const s = m.pw_status || "";
-                                    const unfinished = m.provider === "google" && !["ready", "gpt_ok"].includes(m.google_stage || "");
-                                    if (s.startsWith("✅改密") && unfinished) return "#d97706";
+                                    if (reason) return "#b45309";
                                     if (s.startsWith("✅")) return "#10a37f";
                                     if (s.startsWith("❌")) return "#dc2626";
                                     return "#9ca3af";
-                                })()}} title={m.provider === "google" && (m.pw_status || "").startsWith("✅改密") && !["ready", "gpt_ok"].includes(m.google_stage || "") ? "改密做过，但 2FA+IMAP 还没齐，不是整单成功" : ""}>
-                                    {(m.pw_status || "").startsWith("✅改密") && m.provider === "google" && !["ready", "gpt_ok"].includes(m.google_stage || "")
-                                        ? String(m.pw_status).replace(/^✅改密/, "改密已做·未齐")
+                                })()}} title={m.provider === "google" ? (formatHardenListReason(m) || m.google_state?.last_error || m.pw_status || "") : (m.pw_status || "")}>
+                                    {m.provider === "google"
+                                        ? (formatHardenListReason(m) || (["ready", "gpt_ok"].includes(m.google_stage || "") ? (m.pw_status || "已齐") : (m.pw_status || "—")))
                                         : (m.pw_status || "—")}
                                 </td>
                                 <td style={{padding: "6px 10px", color: "#6b7280"}}>{m.grp || "—"}</td>
