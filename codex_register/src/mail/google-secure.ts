@@ -499,27 +499,43 @@ async function openGoogleBitOnce({proxyUrl = "", jumpUrl = "", name = "gmail", r
     }
 }
 
-/** 开一个比特指纹窗口（可绑代理），用完关闭并删除。1 号 1 session，网络挂了换 session 重开。 */
+/**
+ * 开比特窗跑一轮。
+ * 只有「还没登录进 Google」时，出口死了才关窗换 IP。
+ * 一旦 markLoggedIn，窗里已有账号会话，再关会拆掉刚换的 2FA/密码，只许记步骤失败。
+ */
 export async function withGoogleBitSession({proxyUrl = "", jumpUrl = "", name = "gmail", remark = "gmail-manage", log = () => {}, signal, onProxy} = {}, fn) {
     const {isMailboxJobStopped} = await import("./mailbox-job-stop.js");
     const {isProxySessionDead, mintStickySession, kookeeySessionOf} = await import("./proxy-pool.js");
     const stopped = () => !!(signal?.aborted || isMailboxJobStopped());
     let liveProxy = proxyUrl || "";
     const maxAttempts = liveProxy && kookeeySessionOf(liveProxy) ? 2 : 1;
+    const sess = {
+        loggedIn: false,
+        markLoggedIn() { this.loggedIn = true; },
+    };
     let lastErr;
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
         if (stopped()) throw new Error("已停止");
         if (attempt) {
+            if (sess.loggedIn) break;
             liveProxy = mintStickySession(liveProxy);
-            log(`[网络] 原出口挂了才换 session（${attempt + 1}/${maxAttempts}）`);
+            log(`[网络] 登录前出口挂了，换 session（${attempt + 1}/${maxAttempts}）`);
             try { onProxy?.(liveProxy, ""); } catch { /* */ }
         }
         try {
-            return await openGoogleBitOnce({proxyUrl: liveProxy, jumpUrl, name, remark, log, signal, fn, onProxy});
+            return await openGoogleBitOnce({
+                proxyUrl: liveProxy, jumpUrl, name, remark, log, signal, onProxy,
+                fn: (page) => fn(page, sess),
+            });
         } catch (e) {
             lastErr = e;
             const msg = String(e?.message || e);
             if (stopped() || /已停止|比特已退出登录/.test(msg)) throw e;
+            if (sess.loggedIn) {
+                log("[网络] 已在账号里，步骤失败不关窗换出口");
+                throw e;
+            }
             if (attempt < maxAttempts - 1 && isProxySessionDead(e)) continue;
             throw e;
         }
@@ -572,7 +588,7 @@ export async function runGoogleHardenWithBit(acc, {proxyUrl = "", jumpUrl = "", 
         };
     }
     const short = String(acc.email || "").split("@")[0].slice(0, 12);
-    return withGoogleBitSession({proxyUrl, jumpUrl, name: `harden-${short}`, remark: "gmail-harden", log, signal, onProxy}, async (page) => {
+    return withGoogleBitSession({proxyUrl, jumpUrl, name: `harden-${short}`, remark: "gmail-harden", log, signal, onProxy}, async (page, sess) => {
         try {
             const {lookupMailboxesByEmails} = await import("../../server/db.js");
             const [fresh] = await lookupMailboxesByEmails([acc.email]);
@@ -588,7 +604,15 @@ export async function runGoogleHardenWithBit(acc, {proxyUrl = "", jumpUrl = "", 
         cred.skip = planHardenSkip(cred);
         const ok = await ensureGoogleLoggedIn(page, "https://myaccount.google.com/security?hl=en", {...cred, requireInbox: false}, log);
         if (!ok) return {ok: false, error: "Gmail 登录失败", errors: ["登录失败"], login: false};
-        const done = await hardenGoogleAccountOnPage(page, cred, log, onCheckpoint);
-        return {...done, login: true};
+        sess?.markLoggedIn?.();
+        // 进账号后整段都算改钥窗口：停任务也不能 2.5 秒就拆窗。
+        const {enterMailJobCritical} = await import("./mailbox-job-stop.js");
+        const leave = enterMailJobCritical();
+        try {
+            const done = await hardenGoogleAccountOnPage(page, cred, log, onCheckpoint);
+            return {...done, login: true};
+        } finally {
+            leave();
+        }
     });
 }

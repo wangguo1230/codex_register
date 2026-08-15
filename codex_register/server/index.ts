@@ -412,9 +412,10 @@ async function changeGooglePasswordWithPool(mb, np, log) {
         log(`代理 ${maskProxyUrl(proxyUrl)}（一号一代理 · ${mb.proxy_url ? "复用出口" : "新出口"}${jumpUrl ? " · 跳板 " + jumpUrl : ""}）`);
         return withGoogleBitSession({
             proxyUrl, jumpUrl, name: googleBitName("pw", mb.email), remark: "gmail-pw", log, onProxy: remember,
-        }, (page) => changePasswordOnPage(page, {
+        }, (page, sess) => changePasswordOnPage(page, {
             email: mb.email, password: mb.password, totpSecret: mb.totp_secret || "",
             recoveryEmail: mb.recovery_email || "", newPassword: np, log,
+            onLoggedIn: () => sess?.markLoggedIn?.(),
         }));
     }, mb);
 }
@@ -424,9 +425,10 @@ async function changeGoogleTotpWithPool(mb, log) {
         log(`代理 ${maskProxyUrl(proxyUrl)}（一号一代理 · ${mb.proxy_url ? "复用出口" : "新出口"}${jumpUrl ? " · 跳板 " + jumpUrl : ""}）`);
         return withGoogleBitSession({
             proxyUrl, jumpUrl, name: googleBitName("2fa", mb.email), remark: "gmail-2fa", log, onProxy: remember,
-        }, (page) => change2faOnPage(page, {
+        }, (page, sess) => change2faOnPage(page, {
             email: mb.email, password: mb.password, totpSecret: mb.totp_secret || "",
             recoveryEmail: mb.recovery_email || "", log,
+            onLoggedIn: () => sess?.markLoggedIn?.(),
         }));
     }, mb);
 }

@@ -113,14 +113,14 @@ export async function createGmailAppPassword(page, {
         const dest = APP_PASSWORD_URL;
         const recovered = await recoverSslOrSlowPage(page, log, dest, 3);
         if (!recovered && await googleSslDead(page)) {
-            throw new Error("代理中断 应用专用密码页 SSL，换 session 重开窗");
+            throw new Error("应用专用密码页 SSL，当前窗继续记失败");
         }
     }
 
     for (let gate = 0; gate < 4; gate++) {
         const body = String(await page.innerText("body").catch(() => ""));
         if (await googleSslDead(page)) {
-            throw new Error("代理中断 应用专用密码页 SSL，换 session 重开窗");
+            throw new Error("应用专用密码页 SSL，当前窗继续记失败");
         }
         if (isVerifyItsYouText(body) || /accounts\.google\.com\/(signin|challenge|v3)/i.test(page.url())) {
             log("[取件] 应用专用密码页要二次验证");

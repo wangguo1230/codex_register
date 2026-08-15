@@ -309,7 +309,7 @@ async function withGooglePage(fn) {
  * 登录失败 / 无输入框返回 {ok:false}；提交后返回新密码（verified 看成功文案）。
  */
 export async function changePasswordOnPage(page, {
-    email, password, totpSecret = "", totpFallback = "", recoveryEmail = "", newPassword = "", log = () => {}, onPersist,
+    email, password, totpSecret = "", totpFallback = "", recoveryEmail = "", newPassword = "", log = () => {}, onPersist, onLoggedIn,
 } = {}) {
     log("[密码] 开始修改密码");
     const ok = await ensureGoogleLoggedIn(
@@ -321,6 +321,7 @@ export async function changePasswordOnPage(page, {
         log("[密码] 登录失败");
         return {ok: false, newPassword: newPassword || "", detail: "Google 登录失败"};
     }
+    try { onLoggedIn?.(); } catch { /* */ }
     try { await page.goto(PASSWORD_URL, {waitUntil: "domcontentloaded", timeout: 30000}); } catch { /* ignore */ }
     await bounceOffSslOrSid(page, log);
     await page.waitForTimeout(1500);
@@ -427,7 +428,7 @@ export async function changePasswordOnPage(page, {
         const recovered = await recoverSslOrSlowPage(page, log, PASSWORD_URL, 3);
         text = String(await page.innerText("body").catch(() => ""));
         if (!recovered && (await googleSslDead(page) || /ERR_SSL|chrome-error/i.test(text))) {
-            throw new Error("代理中断 改密提交后 SSL，换 session 重开窗");
+            throw new Error("改密提交后 SSL，当前窗继续确认/记失败");
         }
     }
     let verified = looksChanged(text);
@@ -1007,7 +1008,7 @@ async function openAuthenticatorDetail(page, log) {
 
 /** 在已打开的 page 上添加 / 替换 TOTP（对应原 change_2fa）。 */
 export async function change2faOnPage(page, {
-    email, password, totpSecret = "", recoveryEmail = "", log = () => {}, onPersist,
+    email, password, totpSecret = "", recoveryEmail = "", log = () => {}, onPersist, onLoggedIn,
 } = {}) {
     log("[2FA] 开始修改 TOTP");
 
@@ -1024,6 +1025,7 @@ export async function change2faOnPage(page, {
             return {ok: false, error: "Google 登录失败"};
         }
     }
+    try { onLoggedIn?.(); } catch { /* */ }
     if (onAppPasswordsPage(page)) await leaveAppPasswordsForAuthenticator(page, log);
     if (!await onAuthenticatorDetail(page)) {
         try { await page.goto(AUTHENTICATOR_URL, {waitUntil: "domcontentloaded", timeout: 60000}); } catch { /* ignore */ }
