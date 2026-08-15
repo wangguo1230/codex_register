@@ -306,18 +306,38 @@ export async function probeMailProxy(rawUrl: string, {timeoutSec = 12, jump}: {t
     return {ok: true, ip: ip || "?", google: google || accounts, accounts, ms};
 }
 
-export async function pickLiveMailProxy(rawUrl: string, {tries = 3, log = (_m: string) => {}, jump}: {tries?: number; log?: (m: string) => void; jump?: string} = {}) {
+export async function pickLiveMailProxy(rawUrl: string, {
+    tries = 3, rotate = true, log = (_m: string) => {}, jump,
+}: {tries?: number; rotate?: boolean; log?: (m: string) => void; jump?: string} = {}) {
     let url = normalizeProxyUrl(rawUrl) || String(rawUrl || "").trim();
     if (!url) return {ok: false, url: "", probe: await probeMailProxy("", {jump})};
     let probe = await probeMailProxy(url, {jump});
     for (let i = 1; i < tries && !probe.ok; i++) {
-        const next = kookeeySessionOf(url) ? mintStickySession(url) : rotateKookeeySession(url);
-        if (!next || next === url) break;
-        log(`不通: ${probe.reason}，换 session 再测 (${i + 1}/${tries})`);
-        url = next;
+        if (!rotate) {
+            log(`不通: ${probe.reason}，仍用原 session 再测 (${i + 1}/${tries})`);
+        } else {
+            const next = kookeeySessionOf(url) ? mintStickySession(url) : rotateKookeeySession(url);
+            if (!next || next === url) break;
+            log(`不通: ${probe.reason}，换 session 再测 (${i + 1}/${tries})`);
+            url = next;
+        }
         probe = await probeMailProxy(url, {jump});
     }
     return {ok: probe.ok, url, probe};
+}
+
+/** 把记住的粘性 session 套回当前池子线路上（同一家网关/账号才套）。 */
+export function applyRememberedSession(slotUrl: string, remembered: string): string {
+    const mem = String(remembered || "").trim();
+    if (!mem) return "";
+    try {
+        if (templateKey(slotUrl) !== templateKey(mem)) return "";
+        const sess = kookeeySessionOf(mem);
+        if (sess && kookeeySessionOf(slotUrl)) return withKookeeySession(slotUrl, sess, "");
+        return mem;
+    } catch {
+        return "";
+    }
 }
 
 export function maskProxyUrl(url: string): string {
@@ -371,11 +391,32 @@ export class MailProxyPool {
         };
     }
 
-    async lease(owner: string, {fallback = "", timeoutMs = 10 * 60 * 1000, maxPerTemplate = 1, freshSession = false} = {}): Promise<MailProxyLease> {
+    async lease(owner: string, {fallback = "", timeoutMs = 10 * 60 * 1000, maxPerTemplate = 1, freshSession = false, preferUrl = ""} = {}): Promise<MailProxyLease> {
         const deadline = Date.now() + Math.max(1000, timeoutMs);
         const cap = Math.max(1, Number(maxPerTemplate) || 1);
+        const prefer = String(preferUrl || "").trim();
         while (Date.now() < deadline) {
             const slots = this.slots(fallback);
+            if (prefer) {
+                const compatible = slots.filter((u) => u !== DIRECT && applyRememberedSession(u, prefer));
+                if (compatible.length) {
+                    const match = compatible.find((u) => !this.leased.has(u));
+                    if (match) {
+                        const live = applyRememberedSession(match, prefer) || prefer;
+                        this.leased.set(match, {owner: String(owner || ""), at: Date.now(), url: live});
+                        this.lastUsed.set(match, Date.now());
+                        return {url: live, owner: String(owner || ""), release: () => this.release(match)};
+                    }
+                    const extraKey = `extra:${templateKey(prefer)}:${kookeeySessionOf(prefer) || prefer}`;
+                    const extraCount = [...this.leased.keys()].filter((k) => k.startsWith("extra:")).length;
+                    if (!this.leased.has(extraKey) && extraCount < cap) {
+                        this.leased.set(extraKey, {owner: String(owner || ""), at: Date.now(), url: prefer});
+                        return {url: prefer, owner: String(owner || ""), release: () => this.release(extraKey)};
+                    }
+                    await new Promise((r) => setTimeout(r, 400));
+                    continue;
+                }
+            }
             const freeExact = slots.filter((u) => !this.leased.has(u))
                 .sort((a, b) => (this.lastUsed.get(a) || 0) - (this.lastUsed.get(b) || 0));
             if (freeExact[0]) {

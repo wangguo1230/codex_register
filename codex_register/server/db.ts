@@ -854,6 +854,16 @@ export async function setMailboxPwStatus(id, pwStatus) {
     await refreshMailboxGoogleState(id).catch(() => {});
 }
 
+export async function setMailboxProxy(id, url, ip = "") {
+    const u = String(url || "").trim();
+    const p = String(ip || "").trim();
+    if (p) {
+        await query(`UPDATE mailboxes SET proxy_url=$1, proxy_ip=$2 WHERE id=$3`, [u, p, id]);
+    } else {
+        await query(`UPDATE mailboxes SET proxy_url=$1 WHERE id=$2`, [u, id]);
+    }
+}
+
 export async function setMailboxTotp(id, totpSecret) {
     await query(`UPDATE mailboxes SET totp_secret=$1 WHERE id=$2`, [totpSecret || "", id]);
     await refreshMailboxGoogleState(id).catch(() => {});

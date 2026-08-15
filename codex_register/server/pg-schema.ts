@@ -212,6 +212,8 @@ export async function ensureSchema() {
         await client.query(`ALTER TABLE mailboxes ADD COLUMN IF NOT EXISTS sold_at BIGINT DEFAULT 0`);
         await client.query(`ALTER TABLE mailboxes ADD COLUMN IF NOT EXISTS password_prev TEXT DEFAULT ''`);
         await client.query(`CREATE INDEX IF NOT EXISTS idx_mailboxes_google_stage ON mailboxes(google_stage)`);
+        await client.query(`ALTER TABLE mailboxes ADD COLUMN IF NOT EXISTS proxy_url TEXT DEFAULT ''`);
+        await client.query(`ALTER TABLE mailboxes ADD COLUMN IF NOT EXISTS proxy_ip TEXT DEFAULT ''`);
 
         // 充值提交时间 + 多实例认领(谁点的谁跑)
         await client.query(`ALTER TABLE recharge_queue ADD COLUMN IF NOT EXISTS submitted_at BIGINT DEFAULT 0`);

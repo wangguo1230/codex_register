@@ -416,7 +416,7 @@ export async function hardenGoogleAccountOnPage(page, cred, log = () => {}, onCh
     return out;
 }
 
-async function openGoogleBitOnce({proxyUrl = "", jumpUrl = "", name = "gmail", remark = "gmail-manage", log = () => {}, signal, fn} = {}) {
+async function openGoogleBitOnce({proxyUrl = "", jumpUrl = "", name = "gmail", remark = "gmail-manage", log = () => {}, signal, fn, onProxy} = {}) {
     const {bitSessionReady, createBitWindow, openBitWindow, closeBitWindow, deleteBitWindow, trackBitWindow, untrackBitWindow, isBitLoggedOut} = await import("../bitbrowser.js");
     const {chromium} = await import("playwright-core");
     const {pickLiveMailProxy, maskProxyUrl} = await import("./proxy-pool.js");
@@ -435,10 +435,11 @@ async function openGoogleBitOnce({proxyUrl = "", jumpUrl = "", name = "gmail", r
         const {getMailProxyJump} = await import("./proxy-pool.js");
         const jumpNow = String(jumpUrl || getMailProxyJump() || "").trim();
         log(jumpNow ? `[网络] 先测代理出口 / Google（经跳板 ${jumpNow}）` : "[网络] 先测代理出口 / Google（无跳板，直连网关，国内会超时）");
-        const picked = await pickLiveMailProxy(liveProxy, {tries: 3, log: (m) => log(`[网络] ${m}`), jump: jumpNow});
+        const picked = await pickLiveMailProxy(liveProxy, {tries: 2, rotate: false, log: (m) => log(`[网络] ${m}`), jump: jumpNow});
         if (!picked.ok) throw new Error(`代理不通，先别登 Google: ${picked.probe.reason || "未知"}`);
         liveProxy = picked.url;
         log(`[网络] 通 出口 ${picked.probe.ip} Google=${picked.probe.google} ${picked.probe.ms}ms ${maskProxyUrl(liveProxy)}`);
+        try { onProxy?.(liveProxy, picked.probe.ip || ""); } catch { /* */ }
         const jump = jumpNow;
         if (jump) {
             const {wrapExitThroughJump, timezoneFromExitUrl} = await import("./proxy-chain.js");
@@ -501,21 +502,22 @@ async function openGoogleBitOnce({proxyUrl = "", jumpUrl = "", name = "gmail", r
 }
 
 /** 开一个比特指纹窗口（可绑代理），用完关闭并删除。1 号 1 session，网络挂了换 session 重开。 */
-export async function withGoogleBitSession({proxyUrl = "", jumpUrl = "", name = "gmail", remark = "gmail-manage", log = () => {}, signal} = {}, fn) {
+export async function withGoogleBitSession({proxyUrl = "", jumpUrl = "", name = "gmail", remark = "gmail-manage", log = () => {}, signal, onProxy} = {}, fn) {
     const {isMailboxJobStopped} = await import("./mailbox-job-stop.js");
     const {isProxySessionDead, mintStickySession, kookeeySessionOf} = await import("./proxy-pool.js");
     const stopped = () => !!(signal?.aborted || isMailboxJobStopped());
     let liveProxy = proxyUrl || "";
-    const maxAttempts = liveProxy && kookeeySessionOf(liveProxy) ? 3 : 1;
+    const maxAttempts = liveProxy && kookeeySessionOf(liveProxy) ? 2 : 1;
     let lastErr;
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
         if (stopped()) throw new Error("已停止");
         if (attempt) {
             liveProxy = mintStickySession(liveProxy);
-            log(`[网络] 代理/出口有问题，换新 session 重开窗（${attempt + 1}/${maxAttempts}）`);
+            log(`[网络] 原出口挂了才换 session（${attempt + 1}/${maxAttempts}）`);
+            try { onProxy?.(liveProxy, ""); } catch { /* */ }
         }
         try {
-            return await openGoogleBitOnce({proxyUrl: liveProxy, jumpUrl, name, remark, log, signal, fn});
+            return await openGoogleBitOnce({proxyUrl: liveProxy, jumpUrl, name, remark, log, signal, fn, onProxy});
         } catch (e) {
             lastErr = e;
             const msg = String(e?.message || e);
@@ -528,7 +530,7 @@ export async function withGoogleBitSession({proxyUrl = "", jumpUrl = "", name = 
 }
 
 /** 开比特窗口跑完整整备（邮箱面板 / 独立脚本用）。 */
-export async function runGoogleHardenWithBit(acc, {proxyUrl = "", jumpUrl = "", log = () => {}, onCheckpoint = async () => {}, signal} = {}) {
+export async function runGoogleHardenWithBit(acc, {proxyUrl = "", jumpUrl = "", log = () => {}, onCheckpoint = async () => {}, onProxy, signal} = {}) {
     const {straightenGoogleCreds} = await import("../mfa.js");
     const straight = straightenGoogleCreds(acc);
     const {planHardenSkip} = await import("./google-state.js");
@@ -572,7 +574,7 @@ export async function runGoogleHardenWithBit(acc, {proxyUrl = "", jumpUrl = "", 
         };
     }
     const short = String(acc.email || "").split("@")[0].slice(0, 12);
-    return withGoogleBitSession({proxyUrl, jumpUrl, name: `harden-${short}`, remark: "gmail-harden", log, signal}, async (page) => {
+    return withGoogleBitSession({proxyUrl, jumpUrl, name: `harden-${short}`, remark: "gmail-harden", log, signal, onProxy}, async (page) => {
         try {
             const {lookupMailboxesByEmails} = await import("../../server/db.js");
             const [fresh] = await lookupMailboxesByEmails([acc.email]);

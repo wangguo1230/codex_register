@@ -294,9 +294,10 @@ app.post("/api/mailboxes/batch-delete", async (req, res) => {
     res.json({ok: true, ...r});
 });
 // 真·改邮箱密码(操作 mail.com 改密页,free 邮箱也适用),改后同步库
-async function withLeasedMailProxy(owner, fn) {
+async function withLeasedMailProxy(owner, fn, mb = null) {
     const cap = Math.max(1, Math.min(8, scheduler.pwConcurrency || 1));
     const who = String(owner || "mail");
+    const prefer = String(mb?.proxy_url || "").trim();
     let jumpLease = null;
     if (mailJumpPool.urls.length) {
         jumpLease = await mailJumpPool.lease(who, {timeoutMs: 45_000, maxPerJump: JUMP_MAX_EXITS});
@@ -304,9 +305,17 @@ async function withLeasedMailProxy(owner, fn) {
     const lease = await mailProxyPool.lease(who, {
         fallback: scheduler.mailProxyFallback(),
         maxPerTemplate: cap,
-        freshSession: true,
+        freshSession: !prefer,
+        preferUrl: prefer,
     });
-    try { return await fn(lease.url, jumpLease?.url || scheduler.mailProxyJump || ""); }
+    const remember = (url, ip = "") => {
+        if (!mb?.id || !url) return;
+        db.setMailboxProxy(mb.id, url, ip).catch(() => {});
+        mb.proxy_url = url;
+        if (ip) mb.proxy_ip = ip;
+    };
+    if (lease.url) remember(lease.url, mb?.proxy_ip || "");
+    try { return await fn(lease.url, jumpLease?.url || scheduler.mailProxyJump || "", remember); }
     finally {
         lease.release();
         try { jumpLease?.release(); } catch { /* */ }
@@ -318,27 +327,27 @@ function googleBitName(prefix, email) {
 }
 
 async function changeGooglePasswordWithPool(mb, np, log) {
-    return withLeasedMailProxy(mb.email, (proxyUrl, jumpUrl) => {
-        log(`代理 ${maskProxyUrl(proxyUrl)}（一号一代理 · 新 session${jumpUrl ? " · 跳板 " + jumpUrl : ""}）`);
+    return withLeasedMailProxy(mb.email, (proxyUrl, jumpUrl, remember) => {
+        log(`代理 ${maskProxyUrl(proxyUrl)}（一号一代理 · ${mb.proxy_url ? "复用出口" : "新出口"}${jumpUrl ? " · 跳板 " + jumpUrl : ""}）`);
         return withGoogleBitSession({
-            proxyUrl, jumpUrl, name: googleBitName("pw", mb.email), remark: "gmail-pw", log,
+            proxyUrl, jumpUrl, name: googleBitName("pw", mb.email), remark: "gmail-pw", log, onProxy: remember,
         }, (page) => changePasswordOnPage(page, {
             email: mb.email, password: mb.password, totpSecret: mb.totp_secret || "",
             recoveryEmail: mb.recovery_email || "", newPassword: np, log,
         }));
-    });
+    }, mb);
 }
 
 async function changeGoogleTotpWithPool(mb, log) {
-    return withLeasedMailProxy(mb.email, (proxyUrl, jumpUrl) => {
-        log(`代理 ${maskProxyUrl(proxyUrl)}（一号一代理 · 新 session${jumpUrl ? " · 跳板 " + jumpUrl : ""}）`);
+    return withLeasedMailProxy(mb.email, (proxyUrl, jumpUrl, remember) => {
+        log(`代理 ${maskProxyUrl(proxyUrl)}（一号一代理 · ${mb.proxy_url ? "复用出口" : "新出口"}${jumpUrl ? " · 跳板 " + jumpUrl : ""}）`);
         return withGoogleBitSession({
-            proxyUrl, jumpUrl, name: googleBitName("2fa", mb.email), remark: "gmail-2fa", log,
+            proxyUrl, jumpUrl, name: googleBitName("2fa", mb.email), remark: "gmail-2fa", log, onProxy: remember,
         }, (page) => change2faOnPage(page, {
             email: mb.email, password: mb.password, totpSecret: mb.totp_secret || "",
             recoveryEmail: mb.recovery_email || "", log,
         }));
-    });
+    }, mb);
 }
 
 async function applyGoogleHardenResult(id, mb, r) {
@@ -402,17 +411,17 @@ async function runOneGoogleHarden(id, opts = {}) {
     };
     logStep(`[整备] 续跑 ${skip.left.join(" → ")}`);
     try {
-        const r = await withLeasedMailProxy(mb.email, (proxyUrl, jumpUrl) => {
+        const r = await withLeasedMailProxy(mb.email, (proxyUrl, jumpUrl, remember) => {
             if (batchHardenStop || isMailboxJobStopped() || ac.signal.aborted) throw new Error("已停止");
             const sess = kookeeySessionOf(proxyUrl);
-            logStep(`[整备] 代理 ${maskProxyUrl(proxyUrl)}${sess ? " session=" + sess : ""}（一号一代理 · 新 session${jumpUrl ? " · 跳板 " + jumpUrl : ""}）`);
+            logStep(`[整备] 代理 ${maskProxyUrl(proxyUrl)}${sess ? " session=" + sess : ""}（一号一代理 · ${mb.proxy_url ? "复用出口" : "新出口"}${jumpUrl ? " · 跳板 " + jumpUrl : ""}）`);
             return runGoogleHardenWithBit({
                 email: mb.email, password: mb.password,
                 totpSecret: mb.totp_secret || "", recoveryEmail: mb.recovery_email || "",
                 imap_password: mb.imap_password || "", pw_status: mb.pw_status || "",
                 google_state: mb.google_state || {},
             }, {
-                proxyUrl, jumpUrl, signal: ac.signal, log: logStep,
+                proxyUrl, jumpUrl, signal: ac.signal, log: logStep, onProxy: remember,
                 onCheckpoint: async (patch = {}) => {
                     if (patch.password) {
                         if (patch.verified === false) {
@@ -431,7 +440,7 @@ async function runOneGoogleHarden(id, opts = {}) {
                     if (patch.recoveryCleared) await db.applyMailboxUpdate(mb.email, {recovery_email: ""});
                 },
             });
-        });
+        }, mb);
         await applyGoogleHardenResult(id, mb, r);
         const miss = (r.missing || []).join("/") || (r.ok ? "" : "部分步骤失败");
         const errBrief = (r.errors || []).map((e) => String(e).split("\n")[0]).join("；").slice(0, 200);
