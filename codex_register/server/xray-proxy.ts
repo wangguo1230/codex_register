@@ -77,7 +77,7 @@ function buildConfig({uuid, host, port, q}, localPort) {
 
 // 多实例:按名字各跑一个 vless 代理(reg=GPT 注册/10809,claude=Claude 注册/10810,互不干扰)。
 const INSTANCES = {}; // name -> {proc, state}
-const DEFAULT_PORT = {reg: 10809, claude: 10810};
+const DEFAULT_PORT = {reg: 10809, claude: 10810, jump: 10811};
 function inst(name) { if (!INSTANCES[name]) INSTANCES[name] = {proc: null, state: {running: false, port: 0, node: "", vless: "", pid: 0, error: ""}}; return INSTANCES[name]; }
 
 export function xrayStatus(name = "reg") { return {...inst(name).state}; }

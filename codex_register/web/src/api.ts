@@ -406,6 +406,8 @@ export const api = {
     setClaudeProxy: (proxy: string) => j<{claudeProxy: string}>("/api/control/claude-proxy", {method: "POST", body: JSON.stringify({proxy})}),
     startClaudeXray: (vlessUrl: string) => j<{xray: XrayStatus; claudeProxy: string}>("/api/control/claude-xray", {method: "POST", body: JSON.stringify({vlessUrl})}),
     stopClaudeXray: () => j<{xray: XrayStatus}>("/api/control/claude-xray/stop", {method: "POST"}),
+    startJumpXray: (vlessUrl: string) => j<{ok: boolean; xray: XrayStatus; jump: string}>("/api/control/jump-xray", {method: "POST", body: JSON.stringify({vlessUrl})}),
+    stopJumpXray: () => j<{ok: boolean; xray: XrayStatus}>("/api/control/jump-xray/stop", {method: "POST"}),
     // 配置独立 xray 本地端口(持久化):用专属端口隔离,避免与系统 v2rayN/其他服务冲突及清理误杀
     setProxyPorts: (regPort: number, claudePort: number) => j<{regProxyPort: number; claudeProxyPort: number; regProxy: string; claudeProxy: string}>("/api/control/proxy-ports", {method: "POST", body: JSON.stringify({regPort, claudePort})}),
     // 查存活+订阅/套餐(比特浏览器过 CF,后台跑,结果走 SSE claude 事件的 result 字段)

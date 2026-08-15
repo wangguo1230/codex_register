@@ -24,7 +24,7 @@ const EVENT_PREFIX = "@@EVENT@@";
 const DAILY_FILE = path.resolve(CODEX_ROOT, "data", "daily.json"); // 定时任务配置+统计持久化
 const SETTINGS_FILE = path.resolve(CODEX_ROOT, "data", "settings.json"); // 运行时配置持久化(前端改的开关/代理/上限等)
 // 持久化的运行时配置字段(其余如 paused/running 是运行态不存)
-const SETTINGS_KEYS = ["concurrency", "otpSingle", "simulateChat", "regProxy", "mailProxy", "mailProxyEnabled", "smsEnabled", "smsLinkTemplate", "rtEnabled", "smsMaxBind", "xrayVless", "regEngine", "bitBrowser", "claudeProxy", "claudeXrayVless", "regProxyPort", "claudeProxyPort", "mailSeparator", "rechargeBaseUrl", "rechargeAppId", "rechargeApiKey", "rechargeForwardIp", "rechargeConcurrency", "rechargeInterval", "xrayBinPath", "pwConcurrency", "rtProxy", "rtConcurrency", "mfaEnabled", "rebindGmailAfterPaid", "rebindAfterPaid", "mailProxyPool", "mailProxyJump", "gptProxyPool", "gptProxyJump"];
+const SETTINGS_KEYS = ["concurrency", "otpSingle", "simulateChat", "regProxy", "mailProxy", "mailProxyEnabled", "smsEnabled", "smsLinkTemplate", "rtEnabled", "smsMaxBind", "xrayVless", "regEngine", "bitBrowser", "claudeProxy", "claudeXrayVless", "regProxyPort", "claudeProxyPort", "jumpProxyPort", "jumpXrayVless", "mailSeparator", "rechargeBaseUrl", "rechargeAppId", "rechargeApiKey", "rechargeForwardIp", "rechargeConcurrency", "rechargeInterval", "xrayBinPath", "pwConcurrency", "rtProxy", "rtConcurrency", "mfaEnabled", "rebindGmailAfterPaid", "rebindAfterPaid", "mailProxyPool", "mailProxyJump", "gptProxyPool", "gptProxyJump"];
 
 // 定时任务默认配置(含运行统计)。持久化到 data/daily.json，重启保留。
 const DAILY_DEFAULT = {
@@ -72,6 +72,8 @@ class Scheduler extends EventEmitter {
         // 独立 xray 的本地监听端口(可配置+持久化):用专属端口与系统 v2rayN/其他服务隔离,清理时只按各自端口精确清,永不误杀。
         this.regProxyPort = 10809;
         this.claudeProxyPort = 10810;
+        this.jumpProxyPort = 10811;    // 邮箱/GPT 跳板独立 xray，不占用用户 10808
+        this.jumpXrayVless = "";       // 跳板 vless，自启后 mail/gpt jump 都指向 127.0.0.1:10811
         this.mailSeparator = "----";   // 邮箱----密码 分隔符(导入/校验共用)
         this.xrayBinPath = "";         // xray 二进制路径(前端可配;空=自动探测)
         this.pwConcurrency = 1;        // 邮箱批量改密并发(headed Chrome,默认串行)
@@ -239,6 +241,15 @@ class Scheduler extends EventEmitter {
         return this.mailProxyJump;
     }
 
+    applyJumpSocks(port) {
+        const jump = `socks5://127.0.0.1:${Number(port) || this.jumpProxyPort || 10811}`;
+        this.mailProxyJump = jump;
+        this.gptProxyJump = jump;
+        setMailProxyJump(jump);
+        this.saveSettings();
+        return jump;
+    }
+
     setGptProxyPool(textOrList, {append = false, copies = 1} = {}) {
         const incoming = Array.isArray(textOrList)
             ? expandProxyImport(textOrList.join("\n"), copies)
@@ -313,7 +324,7 @@ class Scheduler extends EventEmitter {
     }
 
     state() {
-        return {instanceId: db.instanceId, paused: this.paused, pausedClaude: this.pausedClaude, concurrency: this.concurrency, otpSingle: this.otpSingle, simulateChat: this.simulateChat, smsEnabled: this.smsEnabled, smsLinkTemplate: this.smsLinkTemplate, rtEnabled: this.rtEnabled, mfaEnabled: this.mfaEnabled !== false, smsMaxBind: this.smsMaxBind, regEngine: this.regEngine, bitBrowser: this.bitBrowser, daily: this.daily, regProxy: this.regProxy, mailProxy: this.mailProxy, mailProxyEnabled: this.mailProxyEnabled !== false, claudeProxy: this.claudeProxy, xrayVless: this.xrayVless || "", claudeXrayVless: this.claudeXrayVless, regProxyPort: this.regProxyPort, claudeProxyPort: this.claudeProxyPort, mailSeparator: this.mailSeparator, xrayBinPath: this.xrayBinPath || "",
+        return {instanceId: db.instanceId, paused: this.paused, pausedClaude: this.pausedClaude, concurrency: this.concurrency, otpSingle: this.otpSingle, simulateChat: this.simulateChat, smsEnabled: this.smsEnabled, smsLinkTemplate: this.smsLinkTemplate, rtEnabled: this.rtEnabled, mfaEnabled: this.mfaEnabled !== false, smsMaxBind: this.smsMaxBind, regEngine: this.regEngine, bitBrowser: this.bitBrowser, daily: this.daily, regProxy: this.regProxy, mailProxy: this.mailProxy, mailProxyEnabled: this.mailProxyEnabled !== false, claudeProxy: this.claudeProxy, xrayVless: this.xrayVless || "", claudeXrayVless: this.claudeXrayVless, jumpXrayVless: this.jumpXrayVless || "", jumpProxyPort: this.jumpProxyPort || 10811, regProxyPort: this.regProxyPort, claudeProxyPort: this.claudeProxyPort, mailSeparator: this.mailSeparator, xrayBinPath: this.xrayBinPath || "",
             pwConcurrency: this.pwConcurrency, rtProxy: this.rtProxy || "", rtConcurrency: this.rtConcurrency, defaultPassword: String(appConfig.defaultPassword || "").trim(),
             mailProxyPool: this.mailProxyPool || [], mailProxyPoolLines: (this.mailProxyPool || []).map(toProxyImportLine), mailProxyPoolSnap: this.mailProxyPoolSnap(),
             mailProxyJump: this.mailProxyJump || "",

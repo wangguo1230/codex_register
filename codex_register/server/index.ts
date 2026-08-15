@@ -970,6 +970,27 @@ app.post("/api/control/claude-xray", (req, res) => {
     } catch (e: any) { res.status(400).json({error: String(e?.message ?? e)}); }
 });
 app.post("/api/control/claude-xray/stop", (req, res) => { stopXray("claude"); scheduler.claudeXrayVless = ""; scheduler.saveSettings(); res.json({ok: true, xray: xrayStatus("claude")}); });
+// 邮箱/GPT 共用跳板：独立 xray @10811，不占用用户自己的 10808。
+function applyJumpXray(vlessUrl: string) {
+    const port = Number(scheduler.jumpProxyPort) || 10811;
+    const r = startXray(vlessUrl, {name: "jump", localPort: port, binPath: scheduler.xrayBinPath || undefined});
+    scheduler.jumpXrayVless = vlessUrl;
+    scheduler.jumpProxyPort = r.port;
+    const jump = scheduler.applyJumpSocks(r.port);
+    return {xray: xrayStatus("jump"), jump};
+}
+app.post("/api/control/jump-xray", (req, res) => {
+    const vlessUrl = String(req.body?.vlessUrl || scheduler.jumpXrayVless || scheduler.claudeXrayVless || "").trim();
+    if (!vlessUrl) return res.status(400).json({error: "缺少 vless 链接"});
+    try { res.json({ok: true, ...applyJumpXray(vlessUrl)}); }
+    catch (e: any) { res.status(400).json({error: String(e?.message ?? e)}); }
+});
+app.post("/api/control/jump-xray/stop", (req, res) => {
+    stopXray("jump");
+    scheduler.jumpXrayVless = "";
+    scheduler.saveSettings();
+    res.json({ok: true, xray: xrayStatus("jump")});
+});
 // 删除 Claude 账号(始终软删邮箱)
 app.delete("/api/claude/accounts/:id", async (req, res) => {
     const id = Number(req.params.id);
@@ -2005,7 +2026,7 @@ app.get("/api/state", async (req, res) => {
         lastMailJobProg.paused = await db.isMailClaimPaused();
         lastMailInstances = await db.listMailInstances();
     } catch { /* 表未就绪 */ }
-    res.json({state: {...scheduler.state(), xray: xrayStatus(), claudeXray: xrayStatus("claude"), ...mailboxStateExtras()}, stats: await db.stats()});
+    res.json({state: {...scheduler.state(), xray: xrayStatus(), claudeXray: xrayStatus("claude"), jumpXray: xrayStatus("jump"), ...mailboxStateExtras()}, stats: await db.stats()});
 });
 app.get("/api/stats", async (req, res) => res.json(await db.stats()));
 
@@ -3863,6 +3884,12 @@ if (scheduler.claudeXrayVless) {
         scheduler.claudeProxy = `socks5://127.0.0.1:${r.port}`;
         console.log(`[server] Claude 独立 xray 已自启: ${r.node} @ 127.0.0.1:${r.port}`);
     } catch (e: any) { console.warn(`[server] Claude xray 自启失败(不影响服务): ${e?.message ?? e}`); }
+}
+if (scheduler.jumpXrayVless) {
+    try {
+        const r = applyJumpXray(String(scheduler.jumpXrayVless));
+        console.log(`[server] 跳板独立 xray 已自启: ${r.xray.node} @ ${r.jump}（不占用 10808）`);
+    } catch (e: any) { console.warn(`[server] 跳板 xray 自启失败: ${e?.message ?? e}`); }
 }
 await ensureSchema();
 await initDb();

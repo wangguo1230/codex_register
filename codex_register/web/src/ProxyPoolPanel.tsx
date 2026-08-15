@@ -23,6 +23,8 @@ export function ProxyPoolPanel({
     const [jumpText, setJumpText] = useState("");
     const [jumpHint, setJumpHint] = useState("");
     const [jumpBusy, setJumpBusy] = useState(false);
+    const [vlessText, setVlessText] = useState("");
+    const [jumpXray, setJumpXray] = useState<{running?: boolean; port?: number; node?: string; error?: string} | null>(null);
 
     const toast = (m: string) => notify?.(m);
     const emit = (snap: {total?: number; slots?: number; leased?: number; free?: number}, jump?: string) => {
@@ -48,6 +50,9 @@ export function ProxyPoolPanel({
             if (snap) emit(snap, typeof jump === "string" ? jump : undefined);
             else if (typeof jump === "string") setJumpText(jump);
             if (st.regProxy) setJumpHint(st.regProxy);
+            if (st.jumpXrayVless) setVlessText(st.jumpXrayVless);
+            else if (st.claudeXrayVless) setVlessText(st.claudeXrayVless);
+            if (st.jumpXray) setJumpXray(st.jumpXray);
         }).catch(() => {});
         const load = isGpt ? api.gptProxyPool() : api.mailProxyPool();
         load.then((r) => {
@@ -117,9 +122,9 @@ export function ProxyPoolPanel({
                 <button onClick={async () => {
                     const next = "socks5://127.0.0.1:10808";
                     setJumpText(next);
-                    try { await setJump(next); toast("已用系统代理 10808 当跳板"); onMeta?.({...poolSnap, jump: next}); }
+                    try { await setJump(next); toast("已用系统代理 10808 当跳板（会占用你自己的科学上网）"); onMeta?.({...poolSnap, jump: next}); }
                     catch (e: any) { toast(e.message); }
-                }} style={{height: 32, padding: "0 10px", border: "1px solid #c7d2fe", background: "#eef2ff", borderRadius: 8, fontSize: 12, cursor: "pointer", color: "#3730a3"}}>用系统代理 10808</button>
+                }} style={{height: 32, padding: "0 10px", border: "1px solid #e5e7eb", background: "#fff", borderRadius: 8, fontSize: 12, cursor: "pointer", color: "#6b7280"}}>用我自己的 10808</button>
                 <button onClick={async () => {
                     setJumpBusy(true);
                     try {
@@ -136,8 +141,38 @@ export function ProxyPoolPanel({
                     catch (e: any) { toast(e.message); }
                 }} style={{height: 32, padding: "0 10px", border: "none", background: "transparent", fontSize: 12, color: "#9ca3af", cursor: "pointer"}}>关掉</button>
             </div>
-            <div style={{fontSize: 11, color: jumpText.trim() ? "#4338ca" : "#9ca3af", marginTop: 4}}>
-                {jumpText.trim() ? `链式已开：本机 → ${jumpText.trim()} → 代理池网关。直连网关超时时用这个。` : "未开跳板：本机直连代理池网关。"}
+            <div style={{display: "flex", gap: 8, alignItems: "center", marginTop: 8, flexWrap: "wrap"}}>
+                <span style={{fontSize: 12, color: "#374151", whiteSpace: "nowrap"}}>跳板 vless</span>
+                <input value={vlessText} onChange={(e) => setVlessText(e.target.value)}
+                       placeholder="vless://…  自己起 xray @10811，不占用你的 10808"
+                       style={{flex: "1 1 320px", ...inp, fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace"}}/>
+                <button onClick={async () => {
+                    if (!vlessText.trim()) { toast("先贴一条 vless"); return; }
+                    setJumpBusy(true);
+                    try {
+                        const r = await api.startJumpXray(vlessText.trim());
+                        setJumpXray(r.xray);
+                        setJumpText(r.jump);
+                        onMeta?.({...poolSnap, jump: r.jump});
+                        toast(`跳板 xray 已起 ${r.xray.node || ""} @${r.jump}，10808 还给你`);
+                    } catch (e: any) { toast("起跳板 vless 失败: " + e.message); }
+                    finally { setJumpBusy(false); }
+                }} style={{height: 32, padding: "0 10px", border: "none", background: "#4f46e5", color: "#fff", borderRadius: 8, fontSize: 12, cursor: "pointer"}}>起独立跳板</button>
+                {jumpXray?.running && <button onClick={async () => {
+                    try {
+                        const r = await api.stopJumpXray();
+                        setJumpXray(r.xray);
+                        toast("已停跳板 xray");
+                    } catch (e: any) { toast(e.message); }
+                }} style={{height: 32, padding: "0 10px", border: "none", background: "#dc2626", color: "#fff", borderRadius: 8, fontSize: 12, cursor: "pointer"}}>停跳板</button>}
+            </div>
+            <div style={{fontSize: 11, color: jumpXray?.error ? "#dc2626" : (jumpText.trim() ? "#4338ca" : "#9ca3af"), marginTop: 4}}>
+                {jumpXray?.running
+                    ? `独立跳板运行中 ${jumpXray.node || ""} @127.0.0.1:${jumpXray.port || 10811}。10808 是你自己的，任务不占用。`
+                    : jumpText.trim()
+                        ? `链式已开：本机 → ${jumpText.trim()} → 代理池网关。`
+                        : "未开跳板：本机直连代理池网关。贴一条 vless 点「起独立跳板」。"}
+                {jumpXray?.error ? ` ${jumpXray.error}` : ""}
             </div>
             <div style={{display: "flex", gap: 10, alignItems: "center", marginTop: 8, flexWrap: "wrap"}}>
                 <button onClick={doImportPool} style={{padding: "6px 14px", background: "#0d9488", color: "#fff", border: "none", borderRadius: 8, cursor: "pointer", fontSize: 13}}>批量导入追加</button>
