@@ -77,7 +77,7 @@ app.use(express.json({limit: "10mb"}));
 app.use((req, res, next) => {
     if (req.url.startsWith("/api/gpt/")) {
         const rest = req.url.slice("/api/gpt/".length);
-        if (!rest.startsWith("mailboxes") && !rest.startsWith("claude")) req.url = "/api/" + rest;
+        if (!rest.startsWith("mailboxes") && !rest.startsWith("claude") && !rest.startsWith("proxy-")) req.url = "/api/" + rest;
     }
     next();
 });
