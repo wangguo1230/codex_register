@@ -3675,7 +3675,16 @@ app.listen(PORT, () => {
         if (n) console.log(`[mail-jobs] 已把 ${n} 条旧 pw_queue 迁入 mail_jobs`);
     }).catch((e) => console.warn("[mail-jobs] 迁移 pw_queue 失败:", e?.message || e));
     refreshMailboxJobWindows({listBit: false}).catch(() => {});
-    tickMailJobs().catch(() => {});
+    (async () => {
+        try {
+            const {sweepStaleBitWindows} = await import("../src/bitbrowser.js");
+            const n = await sweepStaleBitWindows({includeClosed: true, log: (m) => console.log(m)});
+            if (n) console.log(`[指纹] 启动清残留 ${n} 个（避免重启叠出 8 个窗）`);
+        } catch (e: any) {
+            console.warn(`[指纹] 启动清理失败: ${e?.message || e}`);
+        }
+        tickMailJobs().catch(() => {});
+    })();
     setInterval(() => {
         const busy = lastMailJobProg?.running || lastHardenWindows.some((w) => w.status === 1) || localMailJobIds.size > 0;
         refreshMailboxJobWindows({listBit: busy}).catch(() => {});
@@ -3698,6 +3707,10 @@ async function shutdownThisInstance(signal: string) {
     rechargeStop = true;
     batchHardenStop = true;
     try { await closeTrackedBitWindows(); } catch { /* */ }
+    try {
+        const {sweepStaleBitWindows} = await import("../src/bitbrowser.js");
+        await sweepStaleBitWindows({includeClosed: true, log: (m) => console.log(m)});
+    } catch { /* */ }
     scheduler.pause();
     scheduler.pauseClaude();
     scheduler.releasingGpt = true;
