@@ -260,7 +260,9 @@ export async function registerViaBrowser(email, {password = "", totpSecret = "",
             // 邮箱框出来再短等 hydrate。CF 挑战先等它自己过，不要 15s 就扔。
             const emailEl = page.locator("#email, input[type='email'], input[name='email']").first();
             let sawEmail = false;
+            const alreadyNext = () => /email-verification|about-you|create-account|mfa-challenge/i.test(page.url());
             for (let w = 0; w < 20 && !sawEmail; w++) {
+                if (alreadyNext()) { log(`已到下一页 ${page.url().slice(0, 70)}，跳过邮箱框`); break; }
                 if (await emailEl.isVisible().catch(() => false)) { sawEmail = true; break; }
                 if (w === 8) {
                     log("登录页还没有邮箱框，刷新一次等 CF…");
@@ -268,6 +270,7 @@ export async function registerViaBrowser(email, {password = "", totpSecret = "",
                 }
                 await page.waitForTimeout(800);
             }
+            if (alreadyNext()) break;
             if (!sawEmail) {
                 if (loginAttempt < LOGIN_MAX_RETRY - 1) {
                     log(`邮箱输入框未出现(url=${page.url().slice(0, 60)})，重载重试`);
@@ -426,9 +429,18 @@ export async function registerViaBrowser(email, {password = "", totpSecret = "",
             }
             let codeOk = false, lastCode = "";
             for (let ctry = 0; ctry < 2 && !codeOk; ctry += 1) {
-                log(`从 mailcom 取邮箱验证码… url=${page.url().slice(0, 80)}`);
-                const code = await getEmailVerificationCode(email, lastCode ? {excludeCode: lastCode} : undefined);
+                log(`从 IMAP 取邮箱验证码… url=${page.url().slice(0, 80)}`);
+                let code = "";
+                try {
+                    code = await getEmailVerificationCode(email, lastCode ? {excludeCode: lastCode} : undefined);
+                } catch (e) {
+                    log(`取码失败 ${String(e?.message || e).slice(0, 120)}，点 Resend 再取`);
+                    await page.getByText(/Resend email|重新发送|重发/i).first().click({timeout: 4000}).catch(() => {});
+                    await page.waitForTimeout(8000);
+                    code = await getEmailVerificationCode(email, lastCode ? {excludeCode: lastCode} : undefined);
+                }
                 lastCode = code;
+                if (!/^\d{6}$/.test(String(code || "").trim())) throw new Error(`拿到的验证码无效: ${String(code || "").slice(0, 20)}`);
                 log(`收到验证码 ${code}，填入`);
                 if (!await fillOtpCode(page, code, log)) throw new Error("验证码输入框未找到");
                 await page.waitForTimeout(1500);
@@ -441,11 +453,16 @@ export async function registerViaBrowser(email, {password = "", totpSecret = "",
                     continue;
                 }
                 if (/email-verification/i.test(page.url())) {
-                    const submit = page.locator('form button[type="submit"], button[type="submit"]').first();
-                    if (await submit.isVisible().catch(() => false) && await submit.isEnabled().catch(() => false)) {
-                        await submit.click({timeout: 4000}).catch(() => {});
+                    const typed = String(await page.locator(codeSel).first().inputValue().catch(() => "")).replace(/\D/g, "");
+                    if (typed.length < 6) {
+                        log("验证码框是空的，不点继续");
                     } else {
-                        await clickContinue(page, log);
+                        const submit = page.locator('form button[type="submit"], button[type="submit"]').first();
+                        if (await submit.isVisible().catch(() => false) && await submit.isEnabled().catch(() => false)) {
+                            await submit.click({timeout: 4000}).catch(() => {});
+                        } else {
+                            await clickContinue(page, log);
+                        }
                     }
                 }
                 // 等待离开验证页: about-you / 主站都算过。最多 ~30s。
