@@ -434,16 +434,11 @@ async function findChangeTotpDialog(page) {
             if (!await dlg.isVisible({timeout: 150}).catch(() => false)) continue;
             if (dialogLooksLikeChangeTotp(String(await dlg.innerText().catch(() => "")))) return dlg;
         }
-        const enter = scope.getByText(/enter the 6-digit code you see in the app|enter code/i).first();
+        const enter = scope.getByText(/enter the 6-digit code you see in the app/i).first();
         if (await enter.isVisible({timeout: 150}).catch(() => false)) {
-            const box = enter.locator("xpath=ancestor::*[.//input or .//*[@role='textbox'] or @role='dialog'][1]");
+            const box = enter.locator("xpath=ancestor::*[@role='dialog' or @role='alertdialog'][1]");
             if (await box.isVisible({timeout: 150}).catch(() => false)) return box;
             return enter;
-        }
-        const heading = scope.getByRole("heading", {name: /change authenticator|更改身份验证/i}).first();
-        if (await heading.isVisible({timeout: 150}).catch(() => false)) {
-            const box = heading.locator("xpath=ancestor::*[.//input or .//*[@role='textbox'] or @role='dialog'][1]");
-            if (await box.isVisible({timeout: 150}).catch(() => false)) return box;
         }
     }
     return null;
