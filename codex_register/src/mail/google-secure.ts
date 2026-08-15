@@ -632,8 +632,16 @@ export async function runGoogleHardenWithBit(acc, {proxyUrl = "", jumpUrl = "", 
             }
         } catch { /* 重开窗时读库失败仍用内存凭证 */ }
         cred.skip = planHardenSkip(cred);
-        const ok = await ensureGoogleLoggedIn(page, "https://myaccount.google.com/security?hl=en", {...cred, requireInbox: false}, log);
-        if (!ok) return {ok: false, error: "Gmail 登录失败", errors: ["登录失败"], login: false};
+        let loginFail = "";
+        const ok = await ensureGoogleLoggedIn(page, "https://myaccount.google.com/security?hl=en", {...cred, requireInbox: false}, (m) => {
+            const s = String(m || "");
+            if (/登录失败|reCAPTCHA|人机|密码框空|邮箱页|拒绝页/i.test(s)) loginFail = s.replace(/^\s+/, "");
+            log(m);
+        });
+        if (!ok) {
+            const why = loginFail || "登录失败";
+            return {ok: false, error: why, errors: [why], login: false};
+        }
         sess?.markLoggedIn?.();
         // 进账号后整段都算改钥窗口：停任务也不能 2.5 秒就拆窗。
         const {enterMailJobCritical} = await import("./mailbox-job-stop.js");

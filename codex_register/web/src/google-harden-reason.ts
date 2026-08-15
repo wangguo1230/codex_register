@@ -10,6 +10,7 @@ export function classifyHardenIssue(raw = "") {
     if (/Wrong password|密码错误|Senha incorreta/i.test(s)) return "登不上·密码错";
     if (/找不到您的 Google|Couldn't find your Google/i.test(s)) return "登不上·找不到账号";
     if (/已停用|disabled/i.test(s)) return "登不上·账号停用";
+    if (/reCAPTCHA|人机验证|not a robot/i.test(s)) return "登不上·人机验证";
     if (/登录失败/.test(s)) return "登不上";
     if (/窗口被关/.test(s)) return "中途关窗";
     if (/已停止/.test(s)) return "任务被停止";
