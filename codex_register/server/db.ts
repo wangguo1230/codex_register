@@ -1459,6 +1459,24 @@ export async function listResumableHardenMailboxIds() {
     return listResumableMailJobs({kinds: ["harden"], onlyError: false});
 }
 
+export async function listGoogleHardenGaps(ids = null) {
+    const {needsHardenRetry} = await import("../src/mail/google-state.ts");
+    const want = Array.isArray(ids) ? ids.map(Number).filter(Number.isInteger) : [];
+    const {rows} = want.length
+        ? await query(
+            `SELECT id, email, password, pw_status, google_state, totp_secret, imap_password, recovery_email, provider
+             FROM mailboxes
+             WHERE deleted_at=0 AND provider='google' AND COALESCE(google_stage,'')<>'gpt_ok' AND id = ANY($1)`,
+            [want],
+        )
+        : await query(
+            `SELECT id, email, password, pw_status, google_state, totp_secret, imap_password, recovery_email, provider
+             FROM mailboxes
+             WHERE deleted_at=0 AND provider='google' AND COALESCE(google_stage,'')<>'gpt_ok'`,
+        );
+    return rows.filter((mb) => needsHardenRetry(mb));
+}
+
 export async function listResumableMailJobs({kinds = ["harden"], onlyError = false} = {}) {
     const want = (kinds || ["harden"]).filter(Boolean);
     const {rows} = await query(

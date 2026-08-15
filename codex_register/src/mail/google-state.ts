@@ -8,8 +8,8 @@ import {looksLikeTotpSecret} from "../mfa.js";
  *   imported  刚导入，还没验证能不能登
  *   login_ok  能进 Google，整备还没做完
  *   login_fail 登不上（错密/验证码/插页）
- *   partial   整备做了一部分（2FA/改密/IMAP/辅助邮箱有缺口）
- *   ready     IMAP 通且 2FA 已换成我们的，可以取件注册
+ *   partial   整备做了一部分（2FA/IMAP 还没齐）
+ *   ready     最低限度已齐：2FA 已换成我们的 + IMAP 通。改密/踢设备是加分项，缺了仍会重跑
  *   gpt_ok    GPT 已注册
  *   blocked   自动化过不去，要换策略或人工
  */
@@ -78,7 +78,7 @@ export function deriveGoogleState(facts = {}, overlay = {}) {
     s.totp = looksLikeTotpSecret(facts.totp_secret) ? "ok" : "none";
     s.imap = hasText(facts.imap_password) ? "ok" : (s.imap === "fail" ? "fail" : "none");
     s.recovery = hasText(facts.recovery_email) ? "fail" : "ok";
-    if (String(facts.pw_status || "").startsWith("✅") || /整备/.test(String(facts.pw_status || ""))) s.password = "ok";
+    if (/^✅改密/.test(String(facts.pw_status || ""))) s.password = "ok";
 
     const gptStatus = String(facts.gpt_status || "");
     if (gptStatus === "success") s.gpt = "ok";
@@ -103,21 +103,32 @@ export function deriveGoogleState(facts = {}, overlay = {}) {
     return s;
 }
 
+function passwordChangedByUs(mb = {}, st = {}) {
+    if (st.password === "ok") return true;
+    return /^✅改密/.test(String(mb.pw_status || ""));
+}
+
 /** 再跑整备时跳过已经做成的步。换 2FA 只在本轮成功换过才跳（有卖家密钥不算）。 */
 export function planHardenSkip(mb = {}) {
     const st = mb.google_state && typeof mb.google_state === "object" ? mb.google_state : {};
-    const pwOk = String(mb.pw_status || "").startsWith("✅") || st.password === "ok";
     const skip = {
         totp: st.totp_rotated === true,
-        password: pwOk,
+        password: passwordChangedByUs(mb, st),
         imap: String(mb.imap_password || "").trim().length > 0,
         recovery: !String(mb.recovery_email || "").trim() || st.recovery === "ok",
         phone: st.phone === "ok",
         devices: st.devices === "ok",
     };
-    skip.left = ["totp", "password", "devices", "phone", "recovery", "imap"].filter((k) => !skip[k]);
+    skip.left = ["totp", "imap", "password", "devices", "phone", "recovery"].filter((k) => !skip[k]);
+    skip.requiredLeft = skip.left.filter((k) => k === "totp" || k === "imap");
     skip.all = skip.left.length === 0;
+    skip.usable = skip.requiredLeft.length === 0;
     return skip;
+}
+
+/** 任一缺口（含改密/踢设备加分项）都应触发重跑。 */
+export function needsHardenRetry(mb = {}) {
+    return !planHardenSkip(mb).all;
 }
 
 export function googleStageLabel(stage) {
@@ -133,6 +144,10 @@ export function googleStateSummary(state) {
     else if (s.imap === "none") bits.push("无IMAP");
     if (s.totp_rotated) bits.push("2FA已换");
     else if (s.totp === "ok") bits.push("2FA未换");
+    if (s.password === "ok") bits.push("已改密");
+    else bits.push("密码未换");
+    if (s.devices === "ok") bits.push("已踢设备");
+    else if (s.devices !== "ok") bits.push("未踢设备");
     if (s.recovery === "fail") bits.push("有辅助邮箱");
     else if (s.recovery === "ok") bits.push("辅助已清");
     if (s.gpt === "ok") bits.push("GPT");

@@ -342,10 +342,14 @@ async function changeGoogleTotpWithPool(mb, log) {
 }
 
 async function applyGoogleHardenResult(id, mb, r) {
+    const {planHardenSkip} = await import("../src/mail/google-state.js");
+    const alreadyUsable = planHardenSkip(mb).usable;
     if (r.passwordChanged && r.password) {
-        await db.setMailboxPassword(id, r.password, r.ok ? `✅整备 ${pwStamp()}` : `⚠整备部分 ${pwStamp()}`);
+        await db.setMailboxPassword(id, r.password, r.ok ? `✅整备 ${pwStamp()}` : `✅改密 ${pwStamp()}`);
     } else if (r.ok) {
         await db.setMailboxPwStatus(id, `✅整备 ${pwStamp()}`);
+    } else if (!r.skipped && !alreadyUsable && !/^✅改密/.test(String(mb.pw_status || ""))) {
+        await db.setMailboxPwStatus(id, `⚠整备部分 ${pwStamp()}`);
     }
     if (r.totpSecret) await db.setMailboxTotp(id, r.totpSecret);
     await db.applyMailboxUpdate(mb.email, {
@@ -380,7 +384,7 @@ async function runOneGoogleHarden(id, opts = {}) {
             imapPassword: mb.imap_password, recoveryCleared: true, passwordChanged: true, devicesDone: true,
         };
     }
-    logMailbox(id, `[整备] 续跑 ${skip.left.join("/")}`);
+    logMailbox(id, `[整备] 续跑 ${skip.left.join("/")}${skip.usable ? "（底线已齐，补加分项）" : ""}`);
     const ac = new AbortController();
     hardenAbort.set(id, ac);
     hardenCurrent.set(id, {id, email: mb.email, lastLine: "开始整备"});
@@ -858,12 +862,12 @@ async function resumeMailJobs({onlyError = false, ids = null} = {}) {
         const want = new Set(ids.map(Number).filter(Number.isInteger));
         left = left.filter((it) => want.has(it.id));
     }
-    if (!left.length) return {ok: true, count: 0, skippedDone: 0, msg: onlyError ? "没有失败可重试" : "没有可续跑的任务"};
-    const {planHardenSkip} = await import("../src/mail/google-state.js");
+    const {planHardenSkip, needsHardenRetry} = await import("../src/mail/google-state.js");
     const harden = [];
     const pw = [];
     const twofa = [];
     let skippedDone = 0;
+    const seen = new Set();
     for (const it of left) {
         const mb = await db.getMailbox(it.id);
         if (!mb || mb.deleted_at > 0) continue;
@@ -871,8 +875,20 @@ async function resumeMailJobs({onlyError = false, ids = null} = {}) {
             if (mb.provider !== "google") continue;
             if (planHardenSkip(mb).all) { skippedDone += 1; continue; }
             harden.push(mb);
+            seen.add(mb.id);
         } else if (it.kind === "pw") pw.push(mb);
         else if (it.kind === "2fa" && mb.provider === "google") twofa.push(mb);
+    }
+    if (!onlyError) {
+        const gaps = await db.listGoogleHardenGaps(ids).catch(() => []);
+        for (const mb of gaps) {
+            if (seen.has(mb.id) || !needsHardenRetry(mb)) continue;
+            harden.push(mb);
+            seen.add(mb.id);
+        }
+    }
+    if (!harden.length && !pw.length && !twofa.length) {
+        return {ok: true, count: 0, skippedDone, msg: onlyError ? "没有失败可重试" : "没有可续跑的任务"};
     }
     let inserted = 0;
     if (harden.length) {

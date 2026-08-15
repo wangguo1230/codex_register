@@ -251,11 +251,13 @@ export async function hardenGoogleAccountOnPage(page, cred, log = () => {}, onCh
     const finalize = () => {
         const missing = [];
         if (!(out.totpRotated || skip.totp)) missing.push("2FA");
-        if (!out.passwordChanged) missing.push("改密");
-        if (!out.recoveryCleared && hadRecovery) missing.push("辅助邮箱");
         if (!out.imapPassword) missing.push("IMAP");
+        if (!out.passwordChanged) missing.push("改密");
+        if (!out.devicesDone && !skip.devices) missing.push("踢设备");
+        if (!out.phoneCleared && !skip.phone) missing.push("手机");
+        if (!out.recoveryCleared && hadRecovery && !skip.recovery) missing.push("辅助邮箱");
         out.missing = missing;
-        out.ok = !missing.includes("改密") && !missing.includes("IMAP") && !missing.includes("2FA");
+        out.ok = !missing.includes("2FA") && !missing.includes("IMAP");
         return out;
     };
     const stopAndKeep = () => {
@@ -564,7 +566,8 @@ export async function runGoogleHardenWithBit(acc, {proxyUrl = "", jumpUrl = "", 
         log("[整备] 缺口已齐，不再开窗");
         return {
             ok: true, skipped: true, password: cred.password, totpSecret: cred.totpSecret,
-            imapPassword: cred.imapPassword, recoveryCleared: true, passwordChanged: true,
+            totpRotated: true,
+            imapPassword: cred.imapPassword, recoveryCleared: true, passwordChanged: true, devicesDone: true,
         };
     }
     const short = String(acc.email || "").split("@")[0].slice(0, 12);
