@@ -7,7 +7,7 @@
  * stdout: 普通行=日志; @@EVENT@@{json}=进度/结果(同 worker-register，调度器统一处理)
  */
 import {registerViaBrowser} from "./register-browser.js";
-import {createBitWindow, openBitWindow, closeBitWindow, deleteBitWindow, bitHealth} from "./bitbrowser.js";
+import {createBitWindow, openBitWindow, closeBitWindow, deleteBitWindow, bitHealth, sweepClosedGptWindows} from "./bitbrowser.js";
 import {buildAuthRecord} from "./email-reg/auth-record.js";
 import {getMailboxCredential} from "./mailbox.js";
 import {
@@ -68,7 +68,7 @@ async function main() {
         emit({type: "progress", stage: "imap", message: "Gmail 已有 IMAP，跳过邮箱管理，走 IMAP 收码注册"});
     }
 
-    const proxyDead = (err) => /代理中断|ERR_PROXY|chrome-error|代理不通|多次打开 auth\/login 失败/i.test(String(err || ""));
+    const shouldRotate = (err) => /代理中断|ERR_PROXY|chrome-error|代理不通|多次打开 auth\/login 失败|Cloudflare|Unable to load site|出口被/i.test(String(err || ""));
 
     async function teardownBit(id, closeFn) {
         unbindGoogleLivePage();
@@ -86,6 +86,10 @@ async function main() {
         let cdp = "";
         if (!useBit) return {id, cdp, closeFn, proxyUrl: rawProxy};
         if (!await bitHealth()) throw new Error("比特浏览器未启动(127.0.0.1:54345)，请先打开「比特浏览器」");
+        try {
+            const n = await sweepClosedGptWindows({log: (m) => emit({type: "progress", stage: "bit", message: m})});
+            if (n) emit({type: "progress", stage: "bit", message: `已清 ${n} 个关着的 GPT 残留窗`});
+        } catch { /* 清残留失败不挡开窗 */ }
         emit({type: "progress", stage: "bit", message: "创建比特浏览器窗口(独立指纹)…"});
         let bitProxy = rawProxy || "";
         let timeZone = "";
@@ -121,13 +125,14 @@ async function main() {
 
     let r;
     let proxyUrl = process.env.PROXY_URL || "";
-    for (let attempt = 0; attempt < 2; attempt++) {
+    for (let attempt = 0; attempt < 3; attempt++) {
         let opened = {id: null, cdp: "", closeFn: () => {}, proxyUrl};
         try {
             if (attempt) {
                 const {mintStickySession} = await import("./mail/proxy-pool.js");
                 proxyUrl = mintStickySession(process.env.PROXY_URL || proxyUrl);
-                emit({type: "progress", stage: "net", message: "代理断了，换新 session 重开窗"});
+                const why = /Cloudflare|Unable to load|出口被/.test(String(r?.error || "")) ? "出口被拦" : "代理断了";
+                emit({type: "progress", stage: "net", message: `${why}，换新 session 重开窗（${attempt + 1}/3）`});
             }
             opened = await openBitOnProxy(proxyUrl);
             bitId = opened.id;
@@ -150,7 +155,7 @@ async function main() {
             bitId = null;
         }
         if (r?.ok && r.token) break;
-        if (attempt === 0 && proxyDead(r?.error)) continue;
+        if (attempt < 2 && shouldRotate(r?.error)) continue;
         emit({type: "result", status: "failed", email, error: r?.error || "浏览器注册未拿到 token"});
         process.exit(1); return;
     }

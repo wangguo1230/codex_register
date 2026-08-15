@@ -17,25 +17,34 @@ import {resolveGoogleCred} from "./mail/google-account.js";
 
 const AUTH_URL = "https://chatgpt.com/auth/login";
 
-function proxyDeadReason(url = "", text = "") {
+function pageBlockReason(url = "", text = "") {
     const blob = `${url} ${text}`;
-    if (/ERR_PROXY_CONNECTION_FAILED|ERR_PROXY|something wrong with the proxy|Checking the proxy address/i.test(blob)) {
-        return "ERR_PROXY_CONNECTION_FAILED";
+    if (/ERR_PROXY_CONNECTION_FAILED|ERR_PROXY|No internet|something wrong with the proxy|Checking the proxy address/i.test(blob)) {
+        return {kind: "proxy", why: "ERR_PROXY_CONNECTION_FAILED"};
     }
-    if (/chrome-error:|ERR_TUNNEL|ERR_CONNECTION_CLOSED|ERR_CONNECTION_RESET|ERR_INTERNET_DISCONNECTED/i.test(blob)) {
-        return "chrome-error";
+    if (/Unable to load site|try turning it off|Check the status page|Ray ID\s*:/i.test(blob)) {
+        return {kind: "cf", why: "Unable to load site"};
     }
-    return "";
+    if (/Performing security verification|not a bot|Sorry, you have been blocked|Attention Required/i.test(blob)) {
+        return {kind: "cf", why: "Cloudflare 人机验证"};
+    }
+    if (/chrome-error:|ERR_TUNNEL|ERR_CONNECTION_CLOSED|ERR_CONNECTION_RESET|ERR_INTERNET_DISCONNECTED|can.?t provide a secure connection/i.test(blob)) {
+        return {kind: "proxy", why: "chrome-error"};
+    }
+    return null;
 }
 
-async function assertProxyAlive(page, log) {
+async function assertPageUsable(page, log) {
     const url = page.url();
     const text = await page.innerText("body").catch(() => "");
-    const why = proxyDeadReason(url, text);
-    if (why) {
-        log(`代理断了 ${why} url=${String(url).slice(0, 60)}`);
-        throw new Error(`代理中断 ${why}，换 session 重开窗`);
+    const hit = pageBlockReason(url, text);
+    if (!hit) return;
+    if (hit.kind === "cf") {
+        log(`出口被拦 ${hit.why} url=${String(url).slice(0, 70)}`);
+        throw new Error(`出口被 Cloudflare 拦截(${hit.why})，换 session 重开窗`);
     }
+    log(`代理断了 ${hit.why} url=${String(url).slice(0, 60)}`);
+    throw new Error(`代理中断 ${hit.why}，换 session 重开窗`);
 }
 
 function parseProxyOpt(url) {
@@ -263,11 +272,20 @@ export async function registerViaBrowser(email, {password = "", totpSecret = "",
         // 代理不稳(机房 IP 对 chatgpt 偶发 ERR_CONNECTION_CLOSED) → 打开失败重试
         let opened = false;
         for (let i = 0; i < 3 && !opened; i += 1) {
-            try { await page.goto(AUTH_URL, {waitUntil: "domcontentloaded", timeout: 60000}); opened = true; }
-            catch (e: any) { log(`打开失败(${String(e?.message ?? e).slice(0, 50)})，重试 ${i + 1}/3`); await page.waitForTimeout(3000); }
+            try {
+                await page.goto(AUTH_URL, {waitUntil: "domcontentloaded", timeout: 60000});
+                opened = true;
+            } catch (e: any) {
+                const msg = String(e?.message ?? e);
+                if (/ERR_PROXY|PROXY_CONNECTION|ERR_TUNNEL/i.test(msg)) {
+                    throw new Error("代理中断 ERR_PROXY_CONNECTION_FAILED，换 session 重开窗");
+                }
+                log(`打开失败(${msg.slice(0, 50)})，重试 ${i + 1}/3`);
+                await page.waitForTimeout(3000);
+            }
         }
         if (!opened) throw new Error("多次打开 auth/login 失败(代理/网络不稳，ERR_CONNECTION_CLOSED)");
-        await assertProxyAlive(page, log);
+        await assertPageUsable(page, log);
         const useGoogleSso = !!preferGoogleSso;
         if (useGoogleSso) {
             await page.waitForTimeout(2500);
@@ -284,7 +302,7 @@ export async function registerViaBrowser(email, {password = "", totpSecret = "",
             let sawEmail = false;
             const alreadyNext = () => /email-verification|about-you|create-account|mfa-challenge/i.test(page.url());
             for (let w = 0; w < 20 && !sawEmail; w++) {
-                await assertProxyAlive(page, log);
+                await assertPageUsable(page, log);
                 if (alreadyNext()) { log(`已到下一页 ${page.url().slice(0, 70)}，跳过邮箱框`); break; }
                 if (await emailEl.isVisible().catch(() => false)) { sawEmail = true; break; }
                 if (w === 8) {
@@ -295,6 +313,7 @@ export async function registerViaBrowser(email, {password = "", totpSecret = "",
             }
             if (alreadyNext()) break;
             if (!sawEmail) {
+                await assertPageUsable(page, log);
                 if (loginAttempt < LOGIN_MAX_RETRY - 1) {
                     log(`邮箱输入框未出现(url=${page.url().slice(0, 60)})，重载重试`);
                     await page.goto(AUTH_URL, {waitUntil: "domcontentloaded", timeout: 60000}).catch(() => {});
@@ -321,6 +340,7 @@ export async function registerViaBrowser(email, {password = "", totpSecret = "",
                 {timeout: 8000},
             ).catch(() => {});
             // 兜底:若点继续触发了浏览器原生 GET 提交(仍在 login 页、未出现验证码/密码框) → 此时 React 已 hydrate,重填邮箱重点一次
+            await assertPageUsable(page, log);
             if (/email-verification|about-you|create-account|mfa-challenge/i.test(page.url())) break;
             await page.waitForTimeout(600);
             if (/auth\/login/.test(page.url()) && !(await page.locator('input[autocomplete="one-time-code"], input[type="password"]').first().isVisible().catch(() => false))) {
@@ -514,6 +534,7 @@ export async function registerViaBrowser(email, {password = "", totpSecret = "",
         } else if (stage === "loggedin") {
             log("提交邮箱后已直接登录(免 OTP)，跳到拿 token");
         } else {
+            await assertPageUsable(page, log);
             const body = (await page.innerText("body").catch(() => "")).replace(/\s+/g, " ").slice(0, 200);
             throw new Error(`提交邮箱后未进验证码/密码/登录页(url=${page.url().slice(0, 60)}) 页面:${body}`);
         }

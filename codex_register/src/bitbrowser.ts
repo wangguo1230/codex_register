@@ -232,6 +232,8 @@ export async function deleteBitWindow(id) { try { await bitPost("/browser/delete
 const liveBitIds = new Set();
 const STALE_NAME_RE = /^(harden-|totp-|probe-|gmail-|recharge|pw-|2fa-)/i;
 const STALE_REMARKS = new Set(["gmail-harden", "gmail-manage", "gmail-gpt", "gmail-pw", "gmail-2fa"]);
+const GPT_WIN_NAME_RE = /^(gpt-|reg-)/i;
+const GPT_WIN_REMARKS = new Set(["gmail-gpt-imap", "codex-reg"]);
 
 export function trackBitWindow(id) { if (id) liveBitIds.add(id); }
 export function untrackBitWindow(id) { liveBitIds.delete(id); }
@@ -317,6 +319,27 @@ export async function closeTrackedBitWindows() {
         liveBitIds.delete(id);
     }
     return ids.length;
+}
+
+/** 只清已关掉的 GPT 注册残留配置，不动正在跑的窗。 */
+export async function sweepClosedGptWindows({log = () => {}} = {}) {
+    let windows = [];
+    try { windows = await listAllBitWindows(); }
+    catch (e) {
+        log(`[指纹] 列举失败: ${e?.message || e}`);
+        return 0;
+    }
+    let n = 0;
+    for (const w of windows) {
+        const name = String(w?.name || "");
+        const remark = String(w?.remark || "");
+        const ours = GPT_WIN_NAME_RE.test(name) || GPT_WIN_REMARKS.has(remark);
+        if (!ours || Number(w.status) === 1) continue;
+        await deleteBitWindow(w.id);
+        n += 1;
+        log(`[指纹] 清已关 GPT 残留 ${name || w.id}`);
+    }
+    return n;
 }
 
 /**
