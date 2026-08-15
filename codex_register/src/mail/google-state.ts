@@ -128,6 +128,7 @@ export function planHardenSkip(mb = {}) {
 
 /** 任一缺口（含改密/踢设备加分项）都应触发重跑。 */
 export function needsHardenRetry(mb = {}) {
+    if (String(mb.google_stage || "") === "blocked") return false;
     return !planHardenSkip(mb).all;
 }
 

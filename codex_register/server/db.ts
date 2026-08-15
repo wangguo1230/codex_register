@@ -1494,13 +1494,13 @@ export async function listGoogleHardenGaps(ids = null) {
         ? await query(
             `SELECT id, email, password, pw_status, google_state, totp_secret, imap_password, recovery_email, provider
              FROM mailboxes
-             WHERE deleted_at=0 AND provider='google' AND COALESCE(google_stage,'')<>'gpt_ok' AND id = ANY($1)`,
+             WHERE deleted_at=0 AND provider='google' AND COALESCE(google_stage,'') NOT IN ('gpt_ok','blocked') AND id = ANY($1)`,
             [want],
         )
         : await query(
             `SELECT id, email, password, pw_status, google_state, totp_secret, imap_password, recovery_email, provider
              FROM mailboxes
-             WHERE deleted_at=0 AND provider='google' AND COALESCE(google_stage,'')<>'gpt_ok'`,
+             WHERE deleted_at=0 AND provider='google' AND COALESCE(google_stage,'') NOT IN ('gpt_ok','blocked')`,
         );
     return rows.filter((mb) => needsHardenRetry(mb));
 }

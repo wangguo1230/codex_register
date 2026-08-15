@@ -50,6 +50,10 @@ export function isVerifyItsYouText(text) {
     return VERIFY_YOU_RE.test(String(text || ""));
 }
 
+export function isGoogleAccountDisabledText(text) {
+    return /account disabled|account has been disabled|locked it to protect|try to restore|unusual activity|帐号已停用|帐户已停用|账号已停用|账号被停用/i.test(String(text || ""));
+}
+
 const ACK_TEXTS = [
     "Yes, it was me", "This was me", "It was me", "I understand",
     "是我", "是我本人", "我知道了", "知道了",
@@ -1651,6 +1655,10 @@ export async function ensureGoogleLoggedIn(page, targetUrl, creds = {}, log = co
 
     write("  需要登录");
     const ok = await googleLogin(page, {email, password, totpSecret, totpFallback, recoveryEmail, log: write});
+    if (isGoogleAccountDisabledText(String(await page.innerText("body").catch(() => "")))) {
+        write("  账号已被 Google 停用");
+        throw new Error("账号已停用");
+    }
     if (!ok) return false;
 
     // 等 Google SPA 完成跳转 + 处理可能的二次验证
