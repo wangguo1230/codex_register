@@ -500,9 +500,32 @@ async function clickVisibleHref(page, pred, log, tag) {
 }
 
 function changeAuthenticatorBtn(page) {
-    return page.locator("button").filter({
-        hasText: /change authenticator app|set up authenticator app|更改身份验证|设置身份验证/i,
-    }).first();
+    return page.getByRole("link", {name: /change authenticator app|set up authenticator app|更改身份验证|设置身份验证/i})
+        .or(page.getByRole("button", {name: /change authenticator app|set up authenticator app|更改身份验证|设置身份验证/i}))
+        .or(page.locator("a, button, [role='link'], [role='button']").filter({
+            hasText: /change authenticator app|set up authenticator app|更改身份验证|设置身份验证/i,
+        }))
+        .first();
+}
+
+/** 已绑定总览：有 Your authenticator + Change，没有换新密钥的 QR/Can't scan 对话框。 */
+async function onBoundAuthenticatorOverview(page) {
+    const body = String(await page.innerText("body").catch(() => ""));
+    if (/can.?t scan it\??|enter this secret key|otpauth:\/\//i.test(body)) return false;
+    const dlg = page.locator('[role="dialog"], [role="alertdialog"]').first();
+    if (await dlg.isVisible({timeout: 150}).catch(() => false)) {
+        const dt = String(await dlg.innerText().catch(() => ""));
+        if (dialogLooksLikeQrSetup(dt) || dialogLooksLikeChangeTotp(dt) || dialogLooksLikeReplaceConfirm(dt)) return false;
+    }
+    const change = changeAuthenticatorBtn(page);
+    const listed = page.getByText(/^your authenticator$/i)
+        .or(page.getByText(/added \d+\s+(day|hour|minute|week|month|second)s?\s+ago/i));
+    return (await change.isVisible({timeout: 350}).catch(() => false))
+        && (await listed.first().isVisible({timeout: 350}).catch(() => false));
+}
+
+function setupQrInDialog(page) {
+    return page.locator("[role='dialog'] img, [role='alertdialog'] img, [role='dialog'] canvas, [role='alertdialog'] canvas");
 }
 
 async function onAuthenticatorDetail(page) {
@@ -703,7 +726,7 @@ async function fillChangeAuthenticatorCode(page, totpSecret, log) {
 async function waitAuthenticatorSetup(page, ms = 9000) {
     const deadline = Date.now() + ms;
     const cant = page.getByText(/can.?t scan it\??|cannot scan|无法扫描/i);
-    const qr = page.locator("[role='dialog'] img, [role='alertdialog'] img, canvas, img[alt*='QR' i], img[src*='qr' i]");
+    const qr = setupQrInDialog(page);
     const secret = page.getByText(/secret key|setup key|密钥|otpauth:\/\//i);
     while (Date.now() < deadline) {
         if (await isAccountPickerDialog(page)) {
@@ -1041,12 +1064,30 @@ export async function change2faOnPage(page, {
             setup = await waitAuthenticatorSetup(page, 15000);
             continue;
         }
+        if (await onBoundAuthenticatorOverview(page)) {
+            log("[2FA] 已有 Authenticator，点 Change authenticator app 换新密钥");
+            let clickedAction = await clickAuthenticatorChangeByDom(page, log);
+            if (!clickedAction) {
+                const named = changeAuthenticatorBtn(page).or(page.getByText(/^change authenticator app$/i));
+                if (await named.first().isVisible({timeout: 600}).catch(() => false)) {
+                    await named.first().scrollIntoViewIfNeeded().catch(() => {});
+                    await named.first().click().catch(() => named.first().click({force: true}));
+                    clickedAction = true;
+                    log("[2FA] 点了 Change authenticator app 文案");
+                }
+            }
+            if (!clickedAction) {
+                log("[2FA] 已绑定页没点到 Change authenticator app");
+                break;
+            }
+            clickedChange = true;
+            setup = await waitAuthenticatorSetup(page, 25000);
+            continue;
+        }
         const dlg = page.locator('[role="dialog"], [role="alertdialog"]').first();
         const dlgOpen = await dlg.isVisible({timeout: 200}).catch(() => false);
         const dlgText = dlgOpen ? String(await dlg.innerText().catch(() => "")) : "";
-        const qrVisible = await page.locator(
-            "[role='dialog'] img, [role='alertdialog'] img, img[alt*='QR' i], img[src*='qr' i], [role='dialog'] canvas",
-        ).first().isVisible({timeout: 200}).catch(() => false);
+        const qrVisible = dlgOpen && await setupQrInDialog(page).first().isVisible({timeout: 200}).catch(() => false);
         if (dialogLooksLikeLoadingQr(dlgText) || (dlgOpen && /loading/i.test(dlgText))) {
             if (tryChange === 0 || tryChange === 3) log("[2FA] 确认框还在出 QR，继续等");
             setup = await waitAuthenticatorSetup(page, 15000);
@@ -1148,6 +1189,12 @@ export async function change2faOnPage(page, {
         if (["qr", "secret"].includes(setup) && await clickCantScanByDom(page, log)) cantClicked = true;
     }
 
+    if (!cantClicked && await onBoundAuthenticatorOverview(page)) {
+        log("[2FA] 还在已绑定页，补点 Change authenticator app");
+        await clickAuthenticatorChangeByDom(page, log);
+        setup = await waitAuthenticatorSetup(page, 20000);
+        if (["qr", "secret"].includes(setup) && await clickCantScanByDom(page, log)) cantClicked = true;
+    }
     if (!cantClicked && !/otpauth:\/\//i.test(String(await page.innerText("body").catch(() => "")))) {
         log("[2FA] 未找到无法扫描按钮");
         await dumpPage(page, "2fa_no_cant_scan", log, email);
