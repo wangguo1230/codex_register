@@ -719,9 +719,12 @@ export async function allocateMailboxesTo(usage, count, batch = "", sourceGrp = 
         const now = Date.now();
         let alloc = 0;
         for (let i = 0; i < n; i++) {
+            const gptReady = usage === "gpt"
+                ? ` AND (provider <> 'google' OR (COALESCE(google_stage,'')='ready' AND COALESCE(imap_password,'')<>''))`
+                : "";
             const pickSql = sourceGrp == null
-                ? `SELECT id, grp FROM mailboxes WHERE usage='free' AND deleted_at=0 ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED`
-                : `SELECT id, grp FROM mailboxes WHERE usage='free' AND deleted_at=0 AND grp=$1 ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED`;
+                ? `SELECT id, grp FROM mailboxes WHERE usage='free' AND deleted_at=0${gptReady} ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED`
+                : `SELECT id, grp FROM mailboxes WHERE usage='free' AND deleted_at=0 AND grp=$1${gptReady} ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED`;
             const pickParams = sourceGrp == null ? [] : [sourceGrp];
             const { rows: [mb] } = await client.query(pickSql, pickParams);
             if (!mb) break;
@@ -745,18 +748,18 @@ export async function allocateMailboxIdsTo(usage, ids, batch = "") {
     if (!arr.length) return { allocated: 0, skipped: 0 };
     return withTransaction(async (client) => {
         const now = Date.now();
-        let allocated = 0, skipped = 0, skippedImap = 0, skippedSold = 0, skippedBusy = 0;
+        let allocated = 0, skipped = 0, skippedImap = 0, skippedHarden = 0, skippedSold = 0, skippedBusy = 0;
         const newGrp = String(batch || "").trim();
         for (const id of arr) {
             const { rows: [mb] } = await client.query(
-                `SELECT id, grp, provider, imap_password, sold_at, usage FROM mailboxes
+                `SELECT id, grp, provider, imap_password, sold_at, usage, google_stage FROM mailboxes
                  WHERE id=$1 AND deleted_at=0 AND usage IN ('free','hold') FOR UPDATE`, [id]
             );
             if (!mb) { skipped++; continue; }
             if (Number(mb.sold_at) > 0) { skippedSold++; continue; }
-            if (mb.provider === "google" && usage === "gpt" && !String(mb.imap_password || "").trim()) {
-                skippedImap++;
-                continue;
+            if (mb.provider === "google" && usage === "gpt") {
+                if (!String(mb.imap_password || "").trim()) { skippedImap++; continue; }
+                if (String(mb.google_stage || "") !== "ready") { skippedHarden++; continue; }
             }
             if (usage === "gpt") {
                 const { rows: [alive] } = await client.query(
@@ -777,7 +780,7 @@ export async function allocateMailboxIdsTo(usage, ids, batch = "") {
             }
             allocated++;
         }
-        return { allocated, skipped, skippedImap, skippedSold, skippedBusy };
+        return { allocated, skipped, skippedImap, skippedHarden, skippedSold, skippedBusy };
     });
 }
 

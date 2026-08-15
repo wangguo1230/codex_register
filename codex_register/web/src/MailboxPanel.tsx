@@ -423,18 +423,19 @@ export function MailboxPanel({notify}: {notify?: (m: string) => void}) {
     const doBatchAllocGpt = async () => {
         const rows = filtered.filter((m) => selected.has(m.id) && (m.usage === "free" || m.usage === "hold") && !m.sold_at);
         if (!rows.length) { toast("请先勾选未售的独立/待分配邮箱"); return; }
-        const noImap = rows.filter((m) => m.provider === "google" && !String(m.imap_password || "").trim());
-        const ok = rows.filter((m) => !(m.provider === "google" && !String(m.imap_password || "").trim()));
-        if (!ok.length) { toast("选中的 Gmail 都没有 IMAP，不能注册 GPT"); return; }
+        const gmailReady = (m: Mailbox) => m.provider !== "google" || (m.google_stage === "ready" && !!String(m.imap_password || "").trim());
+        const notReady = rows.filter((m) => !gmailReady(m));
+        const ok = rows.filter(gmailReady);
+        if (!ok.length) { toast("选中的 Gmail 都还没整备完（要阶段=可取件且已开 IMAP）"); return; }
         const batch = moveGrp.trim();
-        const bits = [`把 ${ok.length} 个邮箱分配进 GPT 注册队列`];
+        const bits = [`把 ${ok.length} 个已整备邮箱分配进 GPT 注册队列`];
         if (batch) bits.push(`并改到分组「${batch}」`);
-        if (noImap.length) bits.push(`跳过 ${noImap.length} 个没有 IMAP 的 Gmail`);
+        if (notReady.length) bits.push(`跳过 ${notReady.length} 个未整备完的 Gmail`);
         if (!confirm(bits.join("\n") + "？")) return;
         setBusy(true);
         try {
             const r = await api.allocateMailboxIds("gpt", ok.map((m) => m.id), batch);
-            const skip = [r.skippedImap && `无IMAP ${r.skippedImap}`, r.skippedSold && `已售 ${r.skippedSold}`, r.skippedBusy && `已挂GPT ${r.skippedBusy}`, r.skipped && `其它 ${r.skipped}`].filter(Boolean).join("，");
+            const skip = [r.skippedHarden && `未整备 ${r.skippedHarden}`, r.skippedImap && `无IMAP ${r.skippedImap}`, r.skippedSold && `已售 ${r.skippedSold}`, r.skippedBusy && `已挂GPT ${r.skippedBusy}`, r.skipped && `其它 ${r.skipped}`].filter(Boolean).join("，");
             toast(`已分配 ${r.allocated ?? 0} 个进 GPT${skip ? `（跳过 ${skip}）` : ""}。到 GPT 页点「开始」注册`);
             setSelected(new Set());
             load();

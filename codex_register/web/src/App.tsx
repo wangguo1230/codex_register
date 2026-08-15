@@ -406,7 +406,10 @@ export default function App() {
         try {
             const r = await api.allocateMailboxIds("gpt", ids, pickerBatch.trim(), pickerChangePw);
             if (r.changePwFirst) notify(`已启动 ${r.willChange} 个邮箱改密,改完自动分配进注册队列(进度见邮箱改密提示)`);
-            else notify(`已分配 ${r.allocated ?? 0} 个进 GPT 注册队列${r.skipped ? `(跳过 ${r.skipped} 个非待分配)` : ""}`);
+            else {
+                const skip = [r.skippedHarden && `未整备 ${r.skippedHarden}`, r.skippedImap && `无IMAP ${r.skippedImap}`, r.skippedSold && `已售 ${r.skippedSold}`, r.skippedBusy && `已挂GPT ${r.skippedBusy}`, r.skipped && `其它 ${r.skipped}`].filter(Boolean).join("，");
+                notify(`已分配 ${r.allocated ?? 0} 个进 GPT 注册队列${skip ? `（跳过 ${skip}）` : ""}`);
+            }
             setShowPicker(false);
             await api.listAccounts().then(setAccounts);
             api.batches().then(setBatches).catch(() => {});

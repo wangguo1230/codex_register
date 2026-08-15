@@ -360,7 +360,7 @@ export const api = {
     // 按指定邮箱 id 分配给业务域(GPT「从邮箱选号」用)。changePwFirst=先串行改密再分配(改完不论成败都分配)。
     // 返回:直接分配→{allocated,skipped};先改密→{ok,changePwFirst,willChange}(改密+分配在后台跑,进度走 batchPw 事件)。
     allocateMailboxIds: (usage: "gpt" | "claude", ids: number[], batch?: string, changePwFirst?: boolean) =>
-        j<{allocated?: number; skipped?: number; skippedImap?: number; skippedSold?: number; skippedBusy?: number; changePwFirst?: boolean; willChange?: number; error?: string}>(
+        j<{allocated?: number; skipped?: number; skippedImap?: number; skippedHarden?: number; skippedSold?: number; skippedBusy?: number; changePwFirst?: boolean; willChange?: number; error?: string}>(
             "/api/mailboxes/allocate", {method: "POST", body: JSON.stringify({usage, ids, batch: batch || "", changePwFirst: !!changePwFirst})}),
     deleteMailbox: (id: number) => j<{ok: boolean; reason?: string}>(`/api/mailboxes/${id}`, {method: "DELETE"}),
     batchDeleteMailbox: (ids: number[]) => j<{ok: boolean; count: number; skipped: number}>("/api/mailboxes/batch-delete", {method: "POST", body: JSON.stringify({ids})}),
