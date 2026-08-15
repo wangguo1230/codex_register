@@ -288,6 +288,7 @@ async function forceShowLoginLayer(page) {
         try { location.hash = "navlogin"; } catch { /* */ }
         const layer = document.querySelector(".login-layer");
         if (!layer) return;
+        layer.classList.add("open");
         const s = layer.style;
         s.setProperty("display", "block", "important");
         s.setProperty("top", "0px", "important");
