@@ -6,7 +6,7 @@
 import {randomBytes} from "node:crypto";
 import {mkdirSync} from "node:fs";
 import path from "node:path";
-import {generateTotp, waitNextTotpWindow, waitTotpSafeWindow} from "../mfa.js";
+import {generateTotp, totpRemainSec, waitNextTotpWindow, waitTotpSafeWindow} from "../mfa.js";
 import {ensureGoogleLoggedIn, googleReauthPassword, isVerifyItsYouText, submitGoogleTotp, bounceOffSslOrSid, preferEnglishGoogleUi} from "./google-auth.js";
 import {launchGoogleBrowser} from "./google-account.js";
 
@@ -476,7 +476,7 @@ async function typeDialogTotp(el, page, code) {
     await el.click({timeout: 2000}).catch(() => el.click({force: true}));
     await page.waitForTimeout(120);
     await el.fill("").catch(() => {});
-    await el.pressSequentially(String(code), {delay: 70}).catch(() => {});
+    await el.pressSequentially(String(code), {delay: 35}).catch(() => {});
     let got = String(await el.inputValue().catch(() => "")).replace(/\s+/g, "");
     if (got === String(code)) return true;
     await el.click({force: true}).catch(() => {});
@@ -495,27 +495,32 @@ async function fillChangeAuthenticatorCode(page, totpSecret, log) {
         log("[2FA] 更换框要验证码，但没有当前密钥");
         return "missing";
     }
-    await waitTotpSafeWindow(16);
-    const code = generateTotp(secret);
-    if (!code) return "missing";
     const input = await findDialogCodeInput(dlg, page);
     if (!input) {
         log("[2FA] 更换框里没找到可见输入框");
         return "missing";
     }
+    const remain = totpRemainSec();
+    if (remain < 6) {
+        log(`[2FA] 窗口只剩 ${remain}s，等到下一窗再填`);
+        await waitTotpSafeWindow(8);
+    }
+    const code = generateTotp(secret);
+    if (!code) return "missing";
     const typed = await typeDialogTotp(input, page, code);
     const shown = String(await input.inputValue().catch(() => "")).replace(/\s+/g, "");
     if (!typed || shown !== String(code)) {
         log(`[2FA] 更换框没填上 目标=${code} 框内=${shown || "空"}（不点 Verify）`);
         return "missing";
     }
-    log(`[2FA] 更换前验证码已填 ${code} 框内已确认`);
+    log(`[2FA] 更换前验证码已填 ${code} 框内已确认 remain=${totpRemainSec()}s`);
     const WRONG_RE = /wrong code|incorrect code|c[oó]digo (incorrecto|errado)|code incorrect|验证码有误/i;
-    for (let w = 0; w < 10; w++) {
-        await page.waitForTimeout(500);
+    for (let w = 0; w < 6; w++) {
+        await page.waitForTimeout(350);
         const after = String(await page.innerText("body").catch(() => ""));
         if (WRONG_RE.test(after)) {
             log("[2FA] 更换前验证码 Wrong code");
+            await input.fill("").catch(() => {});
             return "wrong";
         }
         if (!await findChangeTotpDialog(page)) return "ok";
@@ -525,15 +530,20 @@ async function fillChangeAuthenticatorCode(page, totpSecret, log) {
         log(`[2FA] 点 Verify 前框又空了 框内=${still || "空"}`);
         return "missing";
     }
+    if (WRONG_RE.test(String(await page.innerText("body").catch(() => "")))) {
+        await input.fill("").catch(() => {});
+        return "wrong";
+    }
     const verify = dlg.getByRole("button", {name: /^(verify|verif|验证|確認|确认)$/i}).first();
     if (await verify.isVisible({timeout: 400}).catch(() => false)) {
         await verify.click().catch(() => verify.click({force: true}));
         log("[2FA] 点了更换前 Verify");
     }
-    await page.waitForTimeout(1800);
+    await page.waitForTimeout(1200);
     const after = String(await page.innerText("body").catch(() => ""));
     if (WRONG_RE.test(after)) {
         log("[2FA] 更换前验证码 Wrong code");
+        await input.fill("").catch(() => {});
         return "wrong";
     }
     return await findChangeTotpDialog(page) ? "pending" : "ok";
@@ -814,11 +824,12 @@ export async function change2faOnPage(page, {
                 if (clickedAction) log("[2FA] 文案兜底点到了更改");
             }
             if (!clickedAction) break;
-            setup = await waitAuthenticatorSetup(page, 8000);
+            setup = await waitAuthenticatorSetup(page, 3500);
         }
         if (setup === "reauth") {
             const filled = await fillChangeAuthenticatorCode(page, totpSecret, log);
             if (filled === "wrong" || filled === "pending") {
+                log("[2FA] 等下一窗换新码再填");
                 await waitNextTotpWindow();
                 setup = "";
                 continue;
@@ -920,7 +931,7 @@ export async function change2faOnPage(page, {
     const WRONG_RE = /wrong code|incorrect code|c[oó]digo (incorrecto|errado)|code incorrect|验证码有误/i;
     for (let attempt = 1; attempt <= 3; attempt++) {
         // 经跳板 Verify 要 8–12s，窗口剩 8s 再填会在提交途中过期。
-        await waitTotpSafeWindow(16);
+        if (totpRemainSec() < 6) await waitTotpSafeWindow(8);
         const code = generateTotp(newSecret);
         const dialog = await findChangeTotpDialog(page) || page.locator('[role="dialog"], [role="alertdialog"]').filter({hasText: /code|验证码/i}).first();
         const foundInput = await findDialogCodeInput(dialog, page);
