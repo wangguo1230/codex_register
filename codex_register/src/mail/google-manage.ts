@@ -866,23 +866,57 @@ async function clickAuthenticatorChangeByDom(page, log) {
     return false;
 }
 
+async function scrollDialogToCantScan(page) {
+    const dlg = page.locator('[role="dialog"], [role="alertdialog"]').first();
+    if (!await dlg.isVisible({timeout: 300}).catch(() => false)) return false;
+    await dlg.evaluate((el) => {
+        const nodes = [el, ...el.querySelectorAll("*")];
+        for (const n of nodes) {
+            if (n.scrollHeight > n.clientHeight + 8) n.scrollTop = n.scrollHeight;
+        }
+    }).catch(() => {});
+    return true;
+}
+
+function dialogShowsSecretKey(text) {
+    const t = String(text || "");
+    return /enter this secret key|this secret key|密钥|kunci rahasia/i.test(t)
+        || extractTotpSecret(t).length >= 16;
+}
+
 async function clickCantScanByDom(page, log) {
     const dlg = page.locator('[role="dialog"], [role="alertdialog"]').first();
-    const scope = await dlg.isVisible({timeout: 300}).catch(() => false) ? dlg : page;
-    const candidates = [
-        scope.getByRole("button", {name: /can.?t scan|cannot scan|无法扫描/i}),
-        scope.locator("button").filter({hasText: /can.?t scan|无法扫描/i}),
-        scope.locator('[jsname="Pr7Yme"]').filter({hasText: /can.?t scan|无法扫描/i}),
-        scope.getByText(/can.?t scan it\??/i),
-    ];
-    for (const loc of candidates) {
-        const el = loc.first();
-        if (!await el.isVisible({timeout: 350}).catch(() => false)) continue;
+    if (!await dlg.isVisible({timeout: 300}).catch(() => false)) return false;
+    await scrollDialogToCantScan(page);
+    const clicked = await dlg.evaluate(() => {
+        const root = document.querySelector('[role="dialog"], [role="alertdialog"]');
+        if (!root) return false;
+        const nodes = [...root.querySelectorAll("button, a, [role='button'], [role='link'], span, div")];
+        const hit = nodes.find((el) => /can.?t scan|cannot scan|无法扫描|não consegue|tidak dapat memindai|no se puede escanear/i.test((el.textContent || "").trim())
+            && (el.textContent || "").trim().length < 80);
+        if (!hit) return false;
+        hit.scrollIntoView({block: "center"});
+        hit.click();
+        return true;
+    }).catch(() => false);
+    if (!clicked) {
+        const el = dlg.getByRole("button", {name: /can.?t scan|cannot scan|无法扫描/i})
+            .or(dlg.getByText(/can.?t scan it\??/i)).first();
+        if (!await el.isVisible({timeout: 600}).catch(() => false)) return false;
         await el.scrollIntoViewIfNeeded().catch(() => {});
         await el.click({timeout: 2000}).catch(() => el.click({force: true, timeout: 1500}));
-        log("[2FA] 点了 Can't scan it?");
-        return true;
     }
+    log("[2FA] 点了 Can't scan it?");
+    const t0 = Date.now();
+    while (Date.now() - t0 < 5000) {
+        const t = String(await dlg.innerText().catch(() => ""));
+        if (dialogShowsSecretKey(t)) {
+            log("[2FA] 已切到密钥文案");
+            return true;
+        }
+        await page.waitForTimeout(300);
+    }
+    log("[2FA] 点了 Can't scan 但仍是 QR，多半没滚到链接");
     return false;
 }
 
@@ -1124,10 +1158,9 @@ export async function change2faOnPage(page, {
             continue;
         }
         if (dialogLooksLikeQrSetup(dlgText) || qrVisible || /can.?t scan|cannot scan|无法扫描/i.test(dlgText)) {
-            log("[2FA] 确认框已出 QR，点 Can't scan it?");
+            log("[2FA] 确认框已出 QR，先滚到 Can't scan it?");
             if (await clickCantScanByDom(page, log)) {
-                setup = await waitAuthenticatorSetup(page, 8000);
-                if (!setup) setup = "secret";
+                setup = "secret";
             } else {
                 log("[2FA] Can't scan 还没出来，再等");
                 setup = await waitAuthenticatorSetup(page, 12000);
