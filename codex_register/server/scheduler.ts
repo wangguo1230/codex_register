@@ -323,7 +323,8 @@ class Scheduler extends EventEmitter {
                     timeoutMs: 20_000,
                     maxPerTemplate: 1,
                 });
-                this.logJob(info, `代理池租到 ${String(info.mailLease.url || "直连").replace(/:[^:@/]+@/, ":***@")}（1 代理 = 1 指纹）`);
+                const jump = this.mailProxyJump || "";
+                this.logJob(info, `代理池租到 ${String(info.mailLease.url || "直连").replace(/:[^:@/]+@/, ":***@")}（1 代理 = 1 指纹${jump ? `，经跳板 ${jump}` : "，无跳板直连网关"}）`);
             } catch (e) {
                 this.running.delete(runId);
                 await db.releaseGptIfRunning(acc.id);
@@ -336,6 +337,7 @@ class Scheduler extends EventEmitter {
         const engine = resolveEngine(domain);
         const {script, env} = engine.buildSpawn(acc, this, tmpFile);
         if (info.mailLease) env.PROXY_URL = info.mailLease.url || "";
+        env.MAIL_PROXY_JUMP = this.mailProxyJump || env.MAIL_PROXY_JUMP || "";
         const child = spawn(TSX_BIN, [script], {cwd: CODEX_ROOT, env: {...process.env, ...env}, shell: IS_WIN});
         info.child = child;
         info.engine = engine;

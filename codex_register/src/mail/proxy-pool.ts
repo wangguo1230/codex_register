@@ -131,7 +131,7 @@ function curlSocksArg(url: string): string {
     return `socks5h://${auth}${u.hostname}:${u.port || 1080}`;
 }
 
-let mailProxyJump = "";
+let mailProxyJump = String(process.env.MAIL_PROXY_JUMP || "").trim();
 
 export function setMailProxyJump(url: string) {
     mailProxyJump = String(url || "").trim();

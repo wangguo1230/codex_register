@@ -76,12 +76,14 @@ async function main() {
             let bitProxy = process.env.PROXY_URL || "";
             let timeZone = "";
             if (bitProxy) {
-                const {pickLiveMailProxy, maskProxyUrl, getMailProxyJump} = await import("./mail/proxy-pool.js");
+                const {pickLiveMailProxy, maskProxyUrl, getMailProxyJump, setMailProxyJump} = await import("./mail/proxy-pool.js");
+                setMailProxyJump(process.env.MAIL_PROXY_JUMP || getMailProxyJump() || "");
+                const jump = getMailProxyJump();
+                emit({type: "progress", stage: "net", message: jump ? `[网络] 经跳板 ${jump} 测出口` : "[网络] 无跳板，直连测出口"});
                 const picked = await pickLiveMailProxy(bitProxy, {tries: 3, log: (m) => emit({type: "progress", stage: "net", message: `[网络] ${m}`})});
                 if (!picked.ok) throw new Error(`代理不通: ${picked.probe.reason || "未知"}`);
                 bitProxy = picked.url;
                 emit({type: "progress", stage: "net", message: `[网络] 通 ${maskProxyUrl(bitProxy)}`});
-                const jump = getMailProxyJump();
                 if (jump) {
                     const {wrapExitThroughJump, timezoneFromExitUrl} = await import("./mail/proxy-chain.js");
                     const wrapped = await wrapExitThroughJump(bitProxy, jump);
