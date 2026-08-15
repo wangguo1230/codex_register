@@ -66,6 +66,9 @@ const COMMON_WORDS = new Set([
     "SKIP", "SAVE", "EDIT", "OPEN", "CLOSE", "CANCEL", "VERIFY",
     "ENGLISH", "PRIVACY", "TERMS", "LEARN", "MORE", "ABOUT",
     "AUTHENTICATOR", "GOOGLE", "ACCOUNT", "SECURITY", "PASSWORD",
+    "MAKE", "SURE", "TIME", "BASE", "THIS", "FROM", "YOUR", "WHEN",
+    "THEN", "THAT", "WITH", "HAVE", "WILL", "ALSO", "ONLY", "JUST",
+    "EVEN", "KEYS", "KEY", "APPS", "PHONE", "TEXT",
 ]);
 
 /** 与原仓库 _generate_password 一致：大小写 + 数字 + !@#$%&* */
@@ -155,25 +158,36 @@ function isLikelySecret(s) {
     return true;
 }
 
-/** 8 组 4 字符(32 位)或 4 组 4 字符(16 位)；空白含换行；优先更长的。 */
+const SECRET_JUNK = new Set([
+    "MAKE", "SURE", "TIME", "BASE", "THIS", "FROM", "YOUR", "WHEN", "THEN",
+    "THAT", "WITH", "HAVE", "WILL", "ALSO", "ONLY", "JUST", "EVEN", "NEXT",
+    "BACK", "DONE", "HELP", "SCAN", "CODE", "KEYS", "APPS", "TEXT", "MORE",
+]);
+
+/** 8 组 4 字符(32 位)；丢掉 Make sure / Time-based 这类相邻英文。 */
 export function extractTotpSecret(text) {
     const src = String(text || "");
     const found = [];
     const otp = src.match(/[?&]secret=([A-Z2-7]{16,64})/i);
     if (otp) {
-        const up = otp[1].toUpperCase();
+        const up = otp[1].toUpperCase().replace(/MAKESURETIMEBASE.*$/i, "");
         if (isLikelySecret(up)) found.push(up);
     }
     const grouped = src.match(/([a-z2-7]{4}(?:[\s]+[a-z2-7]{4}){3,15})/gi) || [];
     for (const c of grouped) {
-        const cleaned = c.replace(/\s+/g, "").toUpperCase();
-        if (cleaned.length >= 16 && isLikelySecret(cleaned)) found.push(cleaned);
+        const parts = c.trim().split(/\s+/).map((p) => p.toUpperCase())
+            .filter((p) => p.length === 4 && !SECRET_JUNK.has(p) && /^[A-Z2-7]+$/.test(p));
+        const sliced = parts.slice(0, 8).join("");
+        if (sliced.length >= 16 && isLikelySecret(sliced)) found.push(sliced);
     }
     const compact = src.match(/\b([a-z2-7]{32,64})\b/gi) || [];
     for (const m of compact) {
-        const up = m.toUpperCase();
+        let up = m.toUpperCase().replace(/MAKESURETIMEBASE.*$/i, "");
+        if (up.length > 32) up = up.slice(0, 32);
         if (isLikelySecret(up)) found.push(up);
     }
+    const exact32 = found.filter((s) => s.length === 32);
+    if (exact32.length) return exact32[0];
     found.sort((a, b) => b.length - a.length);
     return found[0] || "";
 }
@@ -221,6 +235,8 @@ async function leaveSecretPageForVerify(page, log) {
         const secretStill = /enter this secret key|this secret key|can't scan it|cannot scan|无法扫描/i.test(blob)
             && !!extractTotpSecret(blob);
         if (hasCodeInput && (onVerifyCopy || !secretStill)) return true;
+        const verifyBtn = page.getByRole("button", {name: /verify|验证|verificar|verifikasi/i}).first();
+        if (await verifyBtn.isVisible({timeout: 250}).catch(() => false) && hasCodeInput) return true;
         const hit = await clickVisibleButton(page, NEXT_KEYWORDS);
         log(hit ? "[2FA] 密钥页点 Next，去填新码" : "[2FA] 密钥页 Next 没点到，再等");
         await page.waitForTimeout(1800);
