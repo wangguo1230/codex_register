@@ -1582,6 +1582,36 @@ export async function listGoogleHardenGaps(ids = null) {
     return rows.filter((mb) => needsHardenRetry(mb));
 }
 
+/** 和任务条失败数同一口径：最近一批里 status=error 的号。 */
+export async function listNewestBatchErrorJobs(kind = "harden") {
+    const {rows: newest} = await query(
+        `SELECT batch_id FROM mail_jobs
+         WHERE status IN ('pending','running') AND COALESCE(batch_id,'')<>'' AND kind=$1
+         ORDER BY id DESC LIMIT 1`,
+        [kind],
+    );
+    let bid = newest[0]?.batch_id || "";
+    if (!bid) {
+        const {rows: [last]} = await query(
+            `SELECT batch_id FROM mail_jobs WHERE COALESCE(batch_id,'')<>'' AND kind=$1 ORDER BY id DESC LIMIT 1`,
+            [kind],
+        );
+        bid = last?.batch_id || "";
+    }
+    if (!bid) return [];
+    const {rows} = await query(
+        `SELECT DISTINCT ON (mailbox_id) mailbox_id, email, kind, status, error
+         FROM mail_jobs
+         WHERE kind=$1 AND batch_id=$2 AND status='error'
+         ORDER BY mailbox_id, id DESC`,
+        [kind, bid],
+    );
+    return rows.map((r) => ({
+        id: Number(r.mailbox_id), email: r.email || "", kind: r.kind,
+        status: r.status, error: r.error || "",
+    }));
+}
+
 export async function listResumableMailJobs({kinds = ["harden"], onlyError = false, since = 0} = {}) {
     const want = (kinds || ["harden"]).filter(Boolean);
     const cut = Number(since) > 0 ? Number(since) : 0;

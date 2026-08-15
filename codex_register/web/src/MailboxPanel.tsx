@@ -509,7 +509,10 @@ export function MailboxPanel({notify}: {notify?: (m: string) => void}) {
         try {
             let ids: number[] | undefined;
             let scope = "";
-            if (selCount > 0) {
+            if (onlyFailed) {
+                ids = selCount > 0 ? [...selected].filter((id) => filtered.some((m) => m.id === id)) : undefined;
+                scope = selCount > 0 ? `已选 ${ids.length} 个里、任务条这批失败且还缺 2FA/IMAP 的` : "任务条上这批失败（和失败数同一批）";
+            } else if (selCount > 0) {
                 ids = [...selected].filter((id) => filtered.some((m) => m.id === id));
                 scope = `已选 ${ids.length} 个里还缺 2FA/IMAP 的`;
             } else if (fGrp) {

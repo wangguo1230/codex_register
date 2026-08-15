@@ -957,10 +957,12 @@ async function resumeMailJobs({onlyError = false, ids = null} = {}) {
     const dropped = await db.cancelPendingHardenIfAlreadyUsable().catch(() => 0);
     if (dropped) console.log(`[mail-jobs] 继续完成：撤掉 ${dropped} 个已整备（2FA+IMAP）的排队`);
     const scoped = Array.isArray(ids) && ids.length;
-    let left = await db.listResumableMailJobs({
-        kinds: ["harden", "pw", "2fa"], onlyError,
-        since: scoped ? 0 : Date.now() - 3 * 60 * 60 * 1000,
-    }).catch(() => []);
+    let left = onlyError
+        ? await db.listNewestBatchErrorJobs("harden").catch(() => [])
+        : await db.listResumableMailJobs({
+            kinds: ["harden", "pw", "2fa"], onlyError: false,
+            since: scoped ? 0 : Date.now() - 3 * 60 * 60 * 1000,
+        }).catch(() => []);
     if (scoped) {
         const want = new Set(ids.map(Number).filter(Number.isInteger));
         left = left.filter((it) => want.has(it.id));
@@ -992,7 +994,14 @@ async function resumeMailJobs({onlyError = false, ids = null} = {}) {
         }
     }
     if (!harden.length && !pw.length && !twofa.length) {
-        return {ok: true, count: 0, skippedDone, msg: onlyError ? "没有失败可重试" : "没有可续跑的任务"};
+        return {
+            ok: true, count: 0, skippedDone,
+            msg: onlyError
+                ? (skippedDone
+                    ? `任务条上这批失败里有 ${skippedDone} 个 2FA+IMAP 已齐，无需再跑`
+                    : "当前这批没有仍需重跑的失败")
+                : "没有可续跑的任务",
+        };
     }
     let inserted = 0;
     if (harden.length) {
