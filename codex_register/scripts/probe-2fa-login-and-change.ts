@@ -24,13 +24,18 @@ const OUT = path.resolve(process.cwd(), "captures", "probe-2fa");
 mkdirSync(OUT, {recursive: true});
 
 const LOGIN_EMAILS = [
-    "oussbouajaj.abd@gmail.com",
-    "rotichfelix487@gmail.com",
+    "hamedmeshao@gmail.com",
 ];
 const CHANGE_EMAILS = [
-    "hamedmeshao@gmail.com",
     "gabrielchoo728@gmail.com",
+    "buenosmaruchi2@gmail.com",
+    "pigmen7.recovery@gmail.com",
 ];
+const emailsArg = process.argv.find((a) => a.startsWith("--emails="));
+if (emailsArg) {
+    const extra = emailsArg.slice("--emails=".length).split(",").map((s) => s.trim()).filter(Boolean);
+    CHANGE_EMAILS.splice(0, CHANGE_EMAILS.length, ...extra);
+}
 
 function stamp() {
     return new Date().toISOString().replace(/[:.]/g, "-");

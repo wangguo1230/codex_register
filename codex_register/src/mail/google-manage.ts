@@ -7,7 +7,7 @@ import {randomBytes} from "node:crypto";
 import {mkdirSync} from "node:fs";
 import path from "node:path";
 import {generateTotp, totpRemainSec, waitNextTotpWindow, waitTotpSafeWindow} from "../mfa.js";
-import {ensureGoogleLoggedIn, googleReauthPassword, isVerifyItsYouText, submitGoogleTotp, bounceOffSslOrSid, preferEnglishGoogleUi} from "./google-auth.js";
+import {ensureGoogleLoggedIn, googleReauthPassword, isVerifyItsYouText, submitGoogleTotp, bounceOffSslOrSid, preferEnglishGoogleUi, recoverSslOrSlowPage, googleSslDead} from "./google-auth.js";
 import {launchGoogleBrowser} from "./google-account.js";
 
 const PASSWORD_URL = "https://myaccount.google.com/signinoptions/password?hl=en";
@@ -724,21 +724,28 @@ async function openAuthenticatorDetail(page, log) {
         await dismissAccountFlyout(page);
         await page.keyboard.press("Escape").catch(() => {});
     }
-    const already = /myaccount\.google\.com\/.*authenticator/i.test(page.url())
-        && !/accounts\.google\.com/i.test(page.url());
-    if (!already) {
-        try {
-            await page.goto(AUTHENTICATOR_URL, {waitUntil: "domcontentloaded", timeout: 30000});
-            log("[2FA] 直达 authenticator 页");
-        } catch { /* ignore */ }
-    }
-    for (let i = 0; i < 20; i++) {
-        await page.waitForTimeout(300);
-        if (await onAuthenticatorDetail(page)) return true;
-        if (isVerifyItsYouText(String(await page.innerText("body").catch(() => "")))
-            || /accounts\.google\.com\/(v3\/)?signin|challenge\/totp/i.test(page.url())) {
-            log("[2FA] authenticator 页又要二次验证");
-            return false;
+    for (let attempt = 0; attempt < 3; attempt++) {
+        const already = /myaccount\.google\.com\/.*authenticator/i.test(page.url())
+            && !/accounts\.google\.com/i.test(page.url());
+        if (!already || attempt > 0) {
+            try {
+                await page.goto(AUTHENTICATOR_URL, {waitUntil: "domcontentloaded", timeout: 60000});
+                log(attempt === 0 ? "[2FA] 直达 authenticator 页" : `[2FA] 再进 authenticator ${attempt + 1}/3`);
+            } catch (e) {
+                log(`[2FA] 打开 authenticator 超时: ${String(e?.message || e).slice(0, 70)}`);
+            }
+        }
+        await recoverSslOrSlowPage(page, log, AUTHENTICATOR_URL, 2);
+        if (await googleSslDead(page)) continue;
+        for (let i = 0; i < 30; i++) {
+            await page.waitForTimeout(400);
+            if (await onAuthenticatorDetail(page)) return true;
+            if (await googleSslDead(page)) break;
+            if (isVerifyItsYouText(String(await page.innerText("body").catch(() => "")))
+                || /accounts\.google\.com\/(v3\/)?signin|challenge\/totp/i.test(page.url())) {
+                log("[2FA] authenticator 页又要二次验证");
+                return false;
+            }
         }
     }
     return false;
@@ -763,7 +770,8 @@ export async function change2faOnPage(page, {
             return {ok: false, error: "Google 登录失败"};
         }
     }
-    try { await page.goto(AUTHENTICATOR_URL, {waitUntil: "domcontentloaded", timeout: 30000}); } catch { /* ignore */ }
+    try { await page.goto(AUTHENTICATOR_URL, {waitUntil: "domcontentloaded", timeout: 60000}); } catch { /* ignore */ }
+    await recoverSslOrSlowPage(page, log, AUTHENTICATOR_URL, 3);
     await page.waitForTimeout(1200);
     await preferEnglishGoogleUi(page, log, AUTHENTICATOR_URL);
     await googleReauthPassword(page, {password, totpSecret, log});
@@ -828,6 +836,20 @@ export async function change2faOnPage(page, {
             }
             await page.mouse.wheel(0, 300);
             await page.waitForTimeout(1000);
+        }
+    }
+
+    if (!foundAuth) {
+        if (await googleSslDead(page) || /err_ssl|can.?t provide a secure connection|chrome-error|sent an invalid response/i.test(contentLower)) {
+            log("[2FA] 入口页被 SSL 掐了，刷新再进");
+            await recoverSslOrSlowPage(page, log, AUTHENTICATOR_URL, 4);
+            const again = String(await page.innerText("body").catch(() => "")).toLowerCase();
+            foundAuth = !isVerifyItsYouText(again) && (
+                /\/authenticator/i.test(page.url())
+                || await page.locator('a[href*="authenticator"]').first().isVisible({timeout: 800}).catch(() => false)
+                || CHANGE_KEYWORDS.some((kw) => again.includes(kw.toLowerCase()))
+                || /authenticator app|change authenticator|your authenticator/i.test(again)
+            );
         }
     }
 

@@ -269,14 +269,30 @@ async function identifierStillLoading(page) {
     return /^(Loading\b)/i.test(t) || /\bLoading Sign in\b/i.test(t);
 }
 
-async function waitIdentifierUiReady(page, write, ms = 15000) {
+async function pageBodyText(page, timeout = 5000) {
+    try {
+        return String(await page.locator("body").innerText({timeout}) || "");
+    } catch {
+        return "";
+    }
+}
+
+async function waitIdentifierUiReady(page, write, ms = 45000) {
     const deadline = Date.now() + ms;
+    let sslTries = 0;
     while (Date.now() < deadline) {
+        const url = String(page.url());
+        const body = await pageBodyText(page, 2500);
+        if (isSslOrSidDead(url, body) && sslTries < 3) {
+            sslTries += 1;
+            write(`  登录页 SSL/代理中断，刷新 ${sslTries}/3`);
+            await recoverSslOrSlowPage(page, write, identifierEntryUrl(page), 1);
+        }
         const loading = await identifierStillLoading(page);
         const box = await findIdentifierBox(page);
         const ready = await hostNextReady(page, "#identifierNext");
         if (!loading && box && ready) return true;
-        await page.waitForTimeout(400);
+        await page.waitForTimeout(500);
     }
     write("  邮箱页仍在 Loading 或 Next 未就绪");
     return false;
@@ -314,9 +330,15 @@ function identifierEntryUrl(page) {
 
 async function hardReloadIdentifier(page, write) {
     write("  连接被掐，整页重开登录入口");
-    await page.goto(identifierEntryUrl(page), {waitUntil: "domcontentloaded", timeout: 30000}).catch(() => {});
-    await page.waitForTimeout(1200);
-    await waitIdentifierUiReady(page, write, 15000);
+    const dest = identifierEntryUrl(page);
+    try {
+        await page.goto(dest, {waitUntil: "domcontentloaded", timeout: 60000});
+    } catch {
+        /* ignore */
+    }
+    await page.waitForTimeout(1500);
+    await recoverSslOrSlowPage(page, write, dest, 2);
+    await waitIdentifierUiReady(page, write, 45000);
 }
 
 async function waitLeftIdentifier(page, pwdSoon, netWatch) {
@@ -411,12 +433,12 @@ async function checkError(page) {
     try {
         const url = page.url();
         if (/recaptcha|captcha/i.test(url)) return "reCAPTCHA 人机验证";
-        const text = await page.innerText("body");
+        const text = await pageBodyText(page, 5000);
         const lower = String(text || "").toLowerCase();
         if (IMAGE_CAPTCHA_RE.test(lower) || lower.includes("not a robot") || lower.includes("no eres un robot")) {
             return "reCAPTCHA 人机验证";
         }
-        if (/err_ssl_protocol_error|can.?t provide a secure connection|sent an invalid response/i.test(lower)) {
+        if (isSslOrSidDead(url, text) || /err_ssl_protocol_error|can.?t provide a secure connection|sent an invalid response|ERR_CONNECTION|ERR_TUNNEL|ERR_PROXY|ERR_TIMED_OUT/i.test(lower)) {
             return "SSL/代理中断";
         }
         for (const marker of ERROR_MARKERS) {
@@ -501,9 +523,21 @@ export async function googleLogin(page, emailOrOpts, password = "", totpSecret =
         let identNetReloads = 0;
         let passwordNextClicks = 0;
         let tryAnotherClicks = 0;
+        let sslRetries = 0;
+        write("  等登录页就绪（动态代理可能较慢）");
+        await recoverSslOrSlowPage(page, write, identifierEntryUrl(page), 2);
+        await waitIdentifierUiReady(page, write, 45000);
         for (let step = 0; step < 20; step++) {
             const err = await checkError(page);
             if (err) {
+                if (/SSL|代理中断/i.test(err) && sslRetries < 4) {
+                    sslRetries += 1;
+                    write(`  ${err}，刷新重试 ${sslRetries}/4`);
+                    await recoverSslOrSlowPage(page, write, identifierEntryUrl(page), 2);
+                    emailSubmitted = false;
+                    emailNextClicks = 0;
+                    continue;
+                }
                 write(`  登录失败: ${err}`);
                 return false;
             }
@@ -541,8 +575,8 @@ export async function googleLogin(page, emailOrOpts, password = "", totpSecret =
                 const ei = await findIdentifierBox(page) || page.locator('input[name="identifier"], #identifierId').first();
                 if (await ei.isVisible({timeout: 1500}).catch(() => false)) {
                     if (!emailSubmitted) {
-                        await waitIdentifierUiReady(page, write, 15000);
-                        for (let i = 0; i < 24 && !await hostNextReady(page, "#identifierNext"); i++) await page.waitForTimeout(250);
+                        await waitIdentifierUiReady(page, write, 45000);
+                        for (let i = 0; i < 40 && !await hostNextReady(page, "#identifierNext"); i++) await page.waitForTimeout(400);
                         await page.waitForTimeout(400);
                         await typeGoogleInput(ei, email);
                         const shown = String(await ei.inputValue().catch(() => ""));
@@ -565,8 +599,9 @@ export async function googleLogin(page, emailOrOpts, password = "", totpSecret =
                             emailSubmitted = false;
                             emailNextClicks = 0;
                             write("  邮箱页卡住，刷新登录页再试");
-                            await page.reload({waitUntil: "domcontentloaded", timeout: 25000}).catch(() => {});
-                            await waitIdentifierUiReady(page, write, 15000);
+                            await page.reload({waitUntil: "domcontentloaded", timeout: 60000}).catch(() => {});
+                            await recoverSslOrSlowPage(page, write, identifierEntryUrl(page), 2);
+                            await waitIdentifierUiReady(page, write, 45000);
                             continue;
                         }
                         try {
@@ -596,12 +631,12 @@ export async function googleLogin(page, emailOrOpts, password = "", totpSecret =
                     write(`  邮箱页提交 #${emailNextClicks} via=${how || "?"} nextReady=${await hostNextReady(page, "#identifierNext")}`);
                     const wait = await waitLeftIdentifier(page, pwdSoon, netWatch);
                     if (wait.left) await page.waitForTimeout(700);
-                    if (wait.netDrop && identNetReloads < 3) {
+                    if (wait.netDrop && identNetReloads < 4) {
                         identNetReloads += 1;
                         emailSubmitted = false;
                         emailNextClicks = 0;
-                        write(`  邮箱页请求被掐 ${wait.netDrop.err} ${wait.netDrop.url}，重开 ${identNetReloads}/3`);
-                        await page.waitForTimeout(1500);
+                        write(`  邮箱页请求被掐 ${wait.netDrop.err} ${wait.netDrop.url}，重开 ${identNetReloads}/4`);
+                        await page.waitForTimeout(2000);
                         await hardReloadIdentifier(page, write);
                         continue;
                     }
@@ -610,6 +645,14 @@ export async function googleLogin(page, emailOrOpts, password = "", totpSecret =
                     }
                     const e2 = await checkError(page);
                     if (e2) {
+                        if (/SSL|代理中断/i.test(e2) && sslRetries < 4) {
+                            sslRetries += 1;
+                            write(`  邮箱页 ${e2}，刷新重试 ${sslRetries}/4`);
+                            emailSubmitted = false;
+                            emailNextClicks = 0;
+                            await recoverSslOrSlowPage(page, write, identifierEntryUrl(page), 2);
+                            continue;
+                        }
                         write(`  邮箱错误: ${e2}`);
                         return false;
                     }
@@ -619,6 +662,15 @@ export async function googleLogin(page, emailOrOpts, password = "", totpSecret =
                     }
                     continue;
                 }
+                if (await googleSslDead(page) && sslRetries < 4) {
+                    sslRetries += 1;
+                    write(`  邮箱框未出现且 SSL 死了，刷新 ${sslRetries}/4`);
+                    await recoverSslOrSlowPage(page, write, identifierEntryUrl(page), 2);
+                    continue;
+                }
+                write("  邮箱框未就绪，继续等（动态代理较慢）");
+                await waitIdentifierUiReady(page, write, 30000);
+                continue;
             }
 
             // 登录密码：只填真正看得见的大框。隐藏 Passwd 也能 :visible，填了 Google 当没填。
@@ -695,6 +747,13 @@ export async function googleLogin(page, emailOrOpts, password = "", totpSecret =
                     if (!await isOnGoogleLoginPage(page) && looksLikeAccountHome(page.url(), String(await page.innerText("body").catch(() => "")))) break;
                     const e2 = await checkError(page);
                     if (e2) {
+                        if (/SSL|代理中断/i.test(e2) && sslRetries < 4) {
+                            sslRetries += 1;
+                            write(`  密码页 ${e2}，刷新重试 ${sslRetries}/4`);
+                            passwordFilled = false;
+                            await recoverSslOrSlowPage(page, write, identifierEntryUrl(page), 2);
+                            continue;
+                        }
                         write(`  密码错误: ${e2}`);
                         return false;
                     }
@@ -722,6 +781,12 @@ export async function googleLogin(page, emailOrOpts, password = "", totpSecret =
                 }
                 const e2 = await checkError(page);
                 if (e2 && !WRONG_TOTP_RE.test(e2)) {
+                    if (/SSL|代理中断/i.test(e2) && sslRetries < 4) {
+                        sslRetries += 1;
+                        write(`  TOTP 页 ${e2}，刷新重试 ${sslRetries}/4`);
+                        await recoverSslOrSlowPage(page, write, identifierEntryUrl(page), 2);
+                        continue;
+                    }
                     write(`  TOTP 验证失败: ${e2}`);
                     return false;
                 }
@@ -879,8 +944,9 @@ export async function googleLogin(page, emailOrOpts, password = "", totpSecret =
                 continue;
             }
             idleCount += 1;
-            if (idleCount >= 3) break;
-            await page.waitForTimeout(3000);
+            if (idleCount >= 6) break;
+            write(`  登录页还在转 ${idleCount}/6 url=${String(page.url()).slice(0, 80)}`);
+            await page.waitForTimeout(4000);
         }
 
         await page.waitForTimeout(1500);
@@ -1324,18 +1390,20 @@ export async function ensureGoogleLoggedIn(page, targetUrl, creds = {}, log = co
     const recoveryEmail = String(creds.recoveryEmail || "");
     const write = typeof log === "function" ? log : (typeof creds.log === "function" ? creds.log : console.log);
 
-    for (let nav = 0; nav < 3; nav++) {
+    for (let nav = 0; nav < 4; nav++) {
         try {
-            await page.goto(targetUrl, {waitUntil: "domcontentloaded", timeout: 30000});
+            await page.goto(targetUrl, {waitUntil: "domcontentloaded", timeout: 60000});
         } catch (e) {
-            write(`  打开目标页失败(${String(e?.message || e).slice(0, 80)})，重试 ${nav + 1}/3`);
-            await page.waitForTimeout(2500);
+            write(`  打开目标页失败(${String(e?.message || e).slice(0, 80)})，重试 ${nav + 1}/4`);
+            await page.waitForTimeout(3000);
             continue;
         }
         await page.waitForTimeout(2000);
-        const bootTry = String(await page.innerText("body").catch(() => ""));
-        if (/err_ssl_protocol_error|can.?t provide a secure connection|sent an invalid response|ERR_CONNECTION|can.t be reached/i.test(bootTry)) {
-            write("  目标页 SSL/代理中断，重载");
+        const bootTry = await pageBodyText(page, 5000);
+        if (isSslOrSidDead(page.url(), bootTry)) {
+            write("  目标页 SSL/代理中断，刷新再进");
+            const recovered = await recoverSslOrSlowPage(page, write, targetUrl, 2);
+            if (recovered && !isSslOrSidDead(page.url(), await pageBodyText(page, 3000))) break;
             await page.waitForTimeout(3000);
             continue;
         }
@@ -1347,25 +1415,21 @@ export async function ensureGoogleLoggedIn(page, targetUrl, creds = {}, log = co
         try {
             await page.goto(
                 `https://accounts.google.com/ServiceLogin?hl=en&continue=${encodeURIComponent(continueUrl)}`,
-                {waitUntil: "domcontentloaded", timeout: 30000},
+                {waitUntil: "domcontentloaded", timeout: 60000},
             );
         } catch { /* ignore */ }
         await page.waitForTimeout(4000);
     }
 
-    let boot = String(await page.innerText("body").catch(() => ""));
-    if (/can.t be reached|ERR_CONNECTION|unexpectedly closed|err_ssl_protocol_error|can.?t provide a secure connection/i.test(boot)
+    let boot = await pageBodyText(page, 5000);
+    if (isSslOrSidDead(page.url(), boot)
+        || /can.t be reached|ERR_CONNECTION|unexpectedly closed|err_ssl_protocol_error|can.?t provide a secure connection/i.test(boot)
         || /ERR_CONNECTION|ERR_SSL|ERR_TUNNEL/i.test(String(page.url()))) {
-        write("  直达账号中心被代理掐了，改走登录入口");
-        try {
-            await page.goto(
-                `https://accounts.google.com/ServiceLogin?hl=en&continue=${encodeURIComponent(continueUrl)}`,
-                {waitUntil: "domcontentloaded", timeout: 30000},
-            );
-        } catch { /* ignore */ }
-        await page.waitForTimeout(2500);
-        boot = String(await page.innerText("body").catch(() => ""));
-        if (/can.t be reached|ERR_CONNECTION|err_ssl_protocol_error/i.test(boot)) {
+        write("  直达账号中心被代理掐了，刷新后改走登录入口");
+        const loginUrl = `https://accounts.google.com/ServiceLogin?hl=en&continue=${encodeURIComponent(continueUrl)}`;
+        const recovered = await recoverSslOrSlowPage(page, write, loginUrl, 3);
+        boot = await pageBodyText(page, 5000);
+        if (!recovered && isSslOrSidDead(page.url(), boot)) {
             write("  打开目标页失败(网络/代理)");
             return false;
         }
@@ -1383,10 +1447,11 @@ export async function ensureGoogleLoggedIn(page, targetUrl, creds = {}, log = co
         try {
             await page.goto(
                 `https://accounts.google.com/ServiceLogin?hl=en&continue=${encodeURIComponent(continueUrl)}`,
-                {waitUntil: "domcontentloaded", timeout: 30000},
+                {waitUntil: "domcontentloaded", timeout: 60000},
             );
         } catch { /* ignore */ }
         await page.waitForTimeout(4000);
+        await recoverSslOrSlowPage(page, write, `https://accounts.google.com/ServiceLogin?hl=en&continue=${encodeURIComponent(continueUrl)}`, 2);
     }
 
     write("  需要登录");
@@ -1429,10 +1494,11 @@ export async function ensureGoogleLoggedIn(page, targetUrl, creds = {}, log = co
             return false;
         }
         try {
-            await page.goto(targetUrl, {waitUntil: "domcontentloaded", timeout: 30000});
+            await page.goto(targetUrl, {waitUntil: "domcontentloaded", timeout: 60000});
         } catch {
             /* ignore */
         }
+        await bounceOffSslOrSid(page, write, targetUrl);
         await page.waitForTimeout(2500);
         if (await isOnGoogleLoginPage(page)) {
             const again = page.url();
@@ -1508,8 +1574,67 @@ function loginContinueUrl(targetUrl, creds = {}) {
 
 function isSslOrSidDead(url, body = "") {
     const blob = `${url} ${body}`;
-    return /chrome-error:|err_ssl|can.?t provide a secure connection|sent an invalid response|ERR_CONNECTION|ERR_TUNNEL|ERR_PROXY/i.test(blob)
+    return /chrome-error:|err_ssl|can.?t provide a secure connection|sent an invalid response|ERR_CONNECTION|ERR_TUNNEL|ERR_PROXY|ERR_TIMED_OUT|this site can.?t be reached|unexpectedly closed/i.test(blob)
         || /accounts\.youtube\.com|\/accounts\/SetSID/i.test(url);
+}
+
+export async function googleSslDead(page) {
+    return isSslOrSidDead(String(page.url()), await pageBodyText(page, 3000));
+}
+
+async function clickChromeErrorReload(page, write) {
+    const candidates = [
+        page.getByRole("button", {name: /^(reload|refresh|重新加载|刷新)$/i}),
+        page.locator("#reload-button, #reload-button button, button#reload-button"),
+        page.getByText(/^(Reload|Refresh|重新加载)$/i),
+    ];
+    for (const loc of candidates) {
+        const el = loc.first();
+        if (!await el.isVisible({timeout: 400}).catch(() => false)) continue;
+        await el.click({timeout: 2500}).catch(() => el.click({force: true, timeout: 1500}).catch(() => {}));
+        write("  Chrome 错误页点了 Reload");
+        return true;
+    }
+    return false;
+}
+
+/** 动态代理掐 SSL 时点 Reload / 重开目标页，最多 tries 次。 */
+export async function recoverSslOrSlowPage(page, write, destUrl = "", tries = 3) {
+    const dest = destUrl || "https://myaccount.google.com/security?hl=en";
+    let sawDead = false;
+    for (let i = 0; i < tries; i++) {
+        const url = String(page.url());
+        const body = await pageBodyText(page, 3000);
+        if (!isSslOrSidDead(url, body)) return sawDead;
+        sawDead = true;
+        write(`  SSL/代理被掐 ${url.slice(0, 80)} ，刷新 ${i + 1}/${tries}`);
+        const clicked = await clickChromeErrorReload(page, write);
+        if (!clicked) {
+            try {
+                await page.reload({waitUntil: "domcontentloaded", timeout: 60000});
+            } catch (e) {
+                write(`  reload 超时: ${String(e?.message || e).slice(0, 70)}`);
+            }
+        }
+        await page.waitForTimeout(2500);
+        const afterReload = `${page.url()} ${await pageBodyText(page, 3000)}`;
+        if (!isSslOrSidDead(page.url(), afterReload)) {
+            write(`  刷新后页面恢复 ${String(page.url()).slice(0, 70)}`);
+            return true;
+        }
+        write(`  刷新后仍不通，改走 ${dest.slice(0, 70)}`);
+        try {
+            await page.goto(dest, {waitUntil: "domcontentloaded", timeout: 60000});
+        } catch (e) {
+            write(`  重开超时: ${String(e?.message || e).slice(0, 70)}`);
+        }
+        await page.waitForTimeout(2500 + i * 2000);
+        if (!isSslOrSidDead(page.url(), await pageBodyText(page, 3000))) {
+            write(`  重开后恢复 ${String(page.url()).slice(0, 70)}`);
+            return true;
+        }
+    }
+    return sawDead;
 }
 
 export function withGoogleHlEn(url) {
@@ -1578,15 +1703,12 @@ export async function preferEnglishGoogleUi(page, write = () => {}, destUrl = ""
     return true;
 }
 
-export async function bounceOffSslOrSid(page, write) {
+export async function bounceOffSslOrSid(page, write, destUrl = "") {
     const url = String(page.url());
-    const body = String(await page.innerText("body").catch(() => ""));
+    const body = await pageBodyText(page, 3000);
     if (!isSslOrSidDead(url, body)) return false;
-    write(`  跨站 SetSID/SSL 被代理掐了，改回账号中心 ${url.slice(0, 70)}`);
-    try {
-        await page.goto("https://myaccount.google.com/security?hl=en", {waitUntil: "domcontentloaded", timeout: 45000});
-    } catch { /* */ }
-    await page.waitForTimeout(1500);
+    write(`  跨站 SetSID/SSL 被代理掐了，刷新重试 ${url.slice(0, 70)}`);
+    await recoverSslOrSlowPage(page, write, destUrl || "https://myaccount.google.com/security?hl=en", 3);
     return true;
 }
 

@@ -450,6 +450,7 @@ export async function withGoogleBitSession({proxyUrl = "", name = "gmail", remar
         const ctx = browser.contexts()[0] || await browser.newContext();
         const page = ctx.pages()[0] || await ctx.newPage();
         page.setDefaultTimeout(30000);
+        page.setDefaultNavigationTimeout(60000);
         // 登录后 Google 会去 youtube SetSID 同步 Cookie，经跳板常 SSL 掐死。整备不需要 YouTube。
         await page.route(/accounts\.youtube\.com|youtube\.com\/accounts\/SetSID|accounts\.blogger\.com/i, (route) => route.abort()).catch(() => {});
         const {applyGoogleEnglish} = await import("./google-auth.js");
