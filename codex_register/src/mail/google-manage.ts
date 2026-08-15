@@ -428,9 +428,15 @@ async function findChangeTotpDialog(page) {
             if (!await dlg.isVisible({timeout: 150}).catch(() => false)) continue;
             if (dialogLooksLikeChangeTotp(String(await dlg.innerText().catch(() => "")))) return dlg;
         }
+        const enter = scope.getByText(/enter the 6-digit code you see in the app|enter code/i).first();
+        if (await enter.isVisible({timeout: 150}).catch(() => false)) {
+            const box = enter.locator("xpath=ancestor::*[.//input or .//*[@role='textbox'] or @role='dialog'][1]");
+            if (await box.isVisible({timeout: 150}).catch(() => false)) return box;
+            return enter;
+        }
         const heading = scope.getByRole("heading", {name: /change authenticator|更改身份验证/i}).first();
         if (await heading.isVisible({timeout: 150}).catch(() => false)) {
-            const box = heading.locator("xpath=ancestor::*[.//input or .//*[@role='textbox']][1]");
+            const box = heading.locator("xpath=ancestor::*[.//input or .//*[@role='textbox'] or @role='dialog'][1]");
             if (await box.isVisible({timeout: 150}).catch(() => false)) return box;
         }
     }
@@ -439,12 +445,16 @@ async function findChangeTotpDialog(page) {
 
 async function findDialogCodeInput(dlg, page) {
     const lists = [
+        page.getByLabel(/enter code|6-digit|验证码/i),
+        page.getByPlaceholder(/enter code|code|验证码/i),
         dlg.getByRole("textbox"),
+        page.getByRole("dialog").getByRole("textbox"),
         dlg.locator("input:visible"),
+        page.locator('[role="dialog"] input:visible, [role="alertdialog"] input:visible'),
         dlg.locator(
             'input[name="totpPin"], input[autocomplete="one-time-code"], input[type="tel"], '
             + 'input[aria-label*="code" i], input[placeholder*="code" i], input[placeholder*="码" i], '
-            + 'input[inputmode="numeric"]',
+            + 'input[inputmode="numeric"], input[type="text"], input[type="number"]',
         ),
     ];
     for (const loc of lists) {
@@ -493,7 +503,12 @@ async function fillChangeAuthenticatorCode(page, totpSecret, log) {
     }
     const input = await findDialogCodeInput(dlg, page);
     if (!input) {
-        log("[2FA] 更换框里没找到可见输入框");
+        const hint = await page.evaluate(() => [...document.querySelectorAll('[role="dialog"], [role="alertdialog"], [aria-modal="true"]')].map((d) => ({
+            t: String(d.innerText || "").replace(/\s+/g, " ").slice(0, 90),
+            inputs: d.querySelectorAll("input").length,
+            types: [...d.querySelectorAll("input")].map((i) => i.type || i.getAttribute("inputmode") || "?"),
+        })).slice(0, 4)).catch(() => []);
+        log(`[2FA] 更换框里没找到可见输入框 ${JSON.stringify(hint)}`);
         return "missing";
     }
     const remain = totpRemainSec();
@@ -696,7 +711,7 @@ async function clickCantScanByDom(page, log) {
         const href = String(await a.getAttribute("href").catch(() => "") || "");
         if (STORE_HREF_RE.test(href)) continue;
         const txt = String(await a.innerText().catch(() => "")).replace(/\s+/g, " ").trim();
-        if (/play store|app store|google play|privacy|terms|help|learn more/i.test(txt)) continue;
+        if (/play store|app store|google play|privacy|terms|help|learn more|change authenticator|set up authenticator/i.test(txt)) continue;
         const box = await a.boundingBox().catch(() => null);
         if (!box || box.y < 80) continue;
         if (txt.length > 80) continue;
@@ -828,7 +843,7 @@ export async function change2faOnPage(page, {
 
     let setup = "";
     for (let tryChange = 0; tryChange < 6 && !setup; tryChange++) {
-        await dismissAccountFlyout(page);
+        if (await isAccountPickerDialog(page)) await dismissAccountFlyout(page);
         if (await findChangeTotpDialog(page)) {
             setup = "reauth";
         } else {
