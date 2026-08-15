@@ -25,6 +25,7 @@ const SUCCESS_KEYWORDS = [
     "Mot de passe modifié", "Contraseña cambiada", "Na-update ang password",
     "पासवर्ड बदला गया", "berhasil", "successfully", "已更新",
     "We keep your account protected",
+    "You may be signed out of your account on some devices",
 ];
 
 const CHANGE_KEYWORDS = [
@@ -951,7 +952,7 @@ export async function change2faOnPage(page, {
             setup = await waitAuthenticatorSetup(page, 12000);
             continue;
         }
-        if (!clickedChange || tryChange >= 5) {
+        if (!clickedChange) {
             let clickedAction = await clickAuthenticatorChangeByDom(page, log);
             if (!clickedAction) {
                 const named = page.getByRole("button", {name: /change authenticator app/i})
