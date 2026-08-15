@@ -208,6 +208,13 @@ export async function changePasswordOnPage(page, {
     await bounceOffSslOrSid(page, log);
     await page.waitForTimeout(3000);
     await bounceOffSslOrSid(page, log);
+    for (let i = 0; i < 4; i++) {
+        const t = String(await page.innerText("body").catch(() => ""));
+        if (!isVerifyItsYouText(t) && !/accounts\.google\.com\/(v3\/)?signin|challenge\/totp/i.test(page.url())) break;
+        log("[密码] 改密前还在二次验证，再过一次");
+        await googleReauthPassword(page, {password, totpSecret, log});
+        await page.waitForTimeout(800);
+    }
 
     const np = newPassword || generateGooglePassword();
     let pwdInputs = page.locator('input[type="password"]:visible');
@@ -227,7 +234,8 @@ export async function changePasswordOnPage(page, {
         log(`[密码] 新密码已输入: ${np}`);
     } else if (count === 1) {
         const body = String(await page.innerText("body").catch(() => ""));
-        if (/Wrong password|Enter your password|Forgot password/i.test(body)) {
+        if (/Wrong password|Enter your password|Forgot password|Verify it.?s you|To help keep your account secure/i.test(body)
+            || isVerifyItsYouText(body)) {
             log("[密码] 仍在二次验证页，未进入改密表单");
             await dumpPage(page, "pwd_still_reauth", log, email);
             return {ok: false, newPassword: "", detail: "二次验证未过，未改密"};
@@ -573,7 +581,7 @@ async function fillChangeAuthenticatorCode(page, totpSecret, log) {
 async function waitAuthenticatorSetup(page, ms = 9000) {
     const deadline = Date.now() + ms;
     const cant = page.getByText(/can.?t scan it\??|cannot scan|无法扫描/i);
-    const qr = page.locator("canvas, img[alt*='QR' i], img[src*='qr' i], [role='dialog'] img[src^='data:image']");
+    const qr = page.locator("[role='dialog'] img, [role='alertdialog'] img, canvas, img[alt*='QR' i], img[src*='qr' i]");
     const secret = page.getByText(/secret key|setup key|密钥|otpauth:\/\//i);
     while (Date.now() < deadline) {
         if (await isAccountPickerDialog(page)) {
@@ -895,7 +903,7 @@ export async function change2faOnPage(page, {
 
     let setup = "";
     let clickedChange = false;
-    for (let tryChange = 0; tryChange < 8 && !["qr", "secret"].includes(setup); tryChange++) {
+    for (let tryChange = 0; tryChange < 10 && !["qr", "secret"].includes(setup); tryChange++) {
         if (await isAccountPickerDialog(page)) await dismissAccountFlyout(page);
         if (await findChangeTotpDialog(page)) {
             const filled = await fillChangeAuthenticatorCode(page, totpSecret, log);
@@ -908,27 +916,28 @@ export async function change2faOnPage(page, {
                 log("[2FA] 更换前验证码没填上");
                 continue;
             }
-            setup = await waitAuthenticatorSetup(page, 10000);
+            setup = await waitAuthenticatorSetup(page, 15000);
             continue;
         }
         const dlg = page.locator('[role="dialog"], [role="alertdialog"]').first();
         const dlgOpen = await dlg.isVisible({timeout: 200}).catch(() => false);
         const dlgText = dlgOpen ? String(await dlg.innerText().catch(() => "")) : "";
-        if (dialogLooksLikeLoadingQr(dlgText)) {
+        const qrVisible = await page.locator(
+            "[role='dialog'] img, [role='alertdialog'] img, img[alt*='QR' i], img[src*='qr' i], [role='dialog'] canvas",
+        ).first().isVisible({timeout: 200}).catch(() => false);
+        if (dialogLooksLikeLoadingQr(dlgText) || (dlgOpen && /loading/i.test(dlgText))) {
             if (tryChange === 0 || tryChange === 3) log("[2FA] 确认框还在出 QR，继续等");
-            setup = await waitAuthenticatorSetup(page, 12000);
+            setup = await waitAuthenticatorSetup(page, 15000);
             continue;
         }
-        if (dialogLooksLikeQrSetup(dlgText)
-            || /can.?t scan|cannot scan|无法扫描/i.test(dlgText)
-            || await page.locator("img[alt*='QR' i], [role='dialog'] img[src^='data:image']").first().isVisible({timeout: 200}).catch(() => false)) {
+        if (dialogLooksLikeQrSetup(dlgText) || qrVisible || /can.?t scan|cannot scan|无法扫描/i.test(dlgText)) {
             log("[2FA] 确认框已出 QR，点 Can't scan it?");
             if (await clickCantScanByDom(page, log)) {
                 setup = await waitAuthenticatorSetup(page, 8000);
                 if (!setup) setup = "secret";
             } else {
                 log("[2FA] Can't scan 还没出来，再等");
-                setup = await waitAuthenticatorSetup(page, 8000);
+                setup = await waitAuthenticatorSetup(page, 12000);
             }
             continue;
         }
@@ -938,17 +947,18 @@ export async function change2faOnPage(page, {
             setup = await waitAuthenticatorSetup(page, 8000);
             continue;
         }
-        if (["qr", "secret"].includes(setup)) break;
-        if (dlgOpen && /change authenticator|authenticator app/i.test(dlgText)) {
-            setup = await waitAuthenticatorSetup(page, 10000);
+        if (dlgOpen) {
+            setup = await waitAuthenticatorSetup(page, 12000);
             continue;
         }
-        if (!clickedChange || tryChange >= 2) {
+        if (!clickedChange || tryChange >= 5) {
             let clickedAction = await clickAuthenticatorChangeByDom(page, log);
             if (!clickedAction) {
-                const pill = page.getByRole("button", {name: /change authenticator app/i}).first();
-                if (await pill.isVisible({timeout: 600}).catch(() => false)) {
-                    await pill.click().catch(() => pill.click({force: true}));
+                const named = page.getByRole("button", {name: /change authenticator app/i})
+                    .or(page.getByRole("link", {name: /change authenticator app/i}))
+                    .or(page.getByText(/^change authenticator app$/i));
+                if (await named.first().isVisible({timeout: 600}).catch(() => false)) {
+                    await named.first().click().catch(() => named.first().click({force: true}));
                     clickedAction = true;
                     log("[2FA] 点了 Change authenticator app 文案");
                 }
@@ -956,7 +966,9 @@ export async function change2faOnPage(page, {
             if (!clickedAction) break;
             clickedChange = true;
             setup = await waitAuthenticatorSetup(page, 25000);
+            continue;
         }
+        setup = await waitAuthenticatorSetup(page, 8000);
     }
 
     if (!setup && await findChangeTotpDialog(page)) {
