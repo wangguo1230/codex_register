@@ -761,10 +761,19 @@ async function reportMailInstance() {
     lastMailInstances = await db.listMailInstances();
 }
 
+let lastBitBudgetAt = 0;
 async function tickMailJobs() {
     if (mailJobTickBusy || instanceShuttingDown) return;
     mailJobTickBusy = true;
     try {
+        if (Date.now() - lastBitBudgetAt > 45_000) {
+            lastBitBudgetAt = Date.now();
+            const {ensureBitWindowBudget, setExpectedBitTiles} = await import("../src/bitbrowser.js");
+            const snap = scheduler.mailProxyPoolSnap();
+            setExpectedBitTiles(Math.max(1, Math.min(scheduler.pwConcurrency || 1, snap.slots || 1)));
+            const swept = await ensureBitWindowBudget({log: (m) => console.log(m)});
+            if (swept) console.log(`[指纹] 本轮清超额 ${swept} 个`);
+        }
         await db.reclaimStaleMailJobs(3 * 60 * 1000);
         const timed = await db.failTimedOutMailJobs(12 * 60 * 1000);
         for (const t of timed) {

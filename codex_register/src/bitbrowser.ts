@@ -52,6 +52,7 @@ export async function bitSessionReady() {
 
 // 创建随机指纹窗口(proxy 可选,格式 socks5://host:port 或 http://user:pass@host:port)。返回窗口 id。
 export async function createBitWindow({proxy = "", name = "reg", remark = "codex-reg", timeZone = ""} = {}) {
+    await ensureBitWindowBudget({log: () => {}});
     const screen = await getScreenSize();
     const tile = tileLayout(plannedTileCount(), screen);
     const body = {
@@ -350,6 +351,27 @@ export async function sweepClosedGptWindows({log = () => {}} = {}) {
  * 清掉自动化留下的比特指纹。keepIds / 当前登记的 live 窗口会留下。
  * includeClosed: 连已关但没删的配置也删掉（占会员额度）。
  */
+/** 关掉本进程没登记的自动化窗，避免 Windows 强杀后窗越堆越多。 */
+export async function ensureBitWindowBudget({log = () => {}} = {}) {
+    const cap = Math.max(1, expectedBitTiles || 4);
+    let windows = [];
+    try { windows = await listAllBitWindows({force: true}); }
+    catch (e) {
+        log(`[指纹] 清额度列举失败: ${e?.message || e}`);
+        return 0;
+    }
+    const ours = windows.filter(isOurAutomationWindow);
+    const extras = ours.filter((w) => w?.id && !liveBitIds.has(w.id));
+    let n = 0;
+    for (const w of extras) {
+        if (Number(w.status) === 1) await closeBitWindow(w.id);
+        await deleteBitWindow(w.id);
+        n += 1;
+        log(`[指纹] 清超额残留 ${w.name || w.id} status=${w.status} 本机登记=${liveBitIds.size} 上限=${cap}`);
+    }
+    return n;
+}
+
 export async function sweepStaleBitWindows({keepIds = [], includeClosed = true, log = () => {}} = {}) {
     const keep = new Set([...keepIds, ...liveBitIds].filter(Boolean));
     let windows = [];
