@@ -294,6 +294,10 @@ async function waitIdentifierUiReady(page, write, ms = 15000) {
             write(`  登录页 SSL/代理中断，刷新 ${sslTries}/3`);
             await recoverSslOrSlowPage(page, write, identifierEntryUrl(page), 1);
         }
+        if (isGoogleRejectedSignin(url)) {
+            write("  Google 拒绝页 signin/rejected，这个出口已被风控");
+            throw new Error("代理中断 Google 拒绝页 signin/rejected，换 session 重开窗");
+        }
         const box = await findIdentifierBox(page);
         // 框已经出来就填，不等 “Loading Sign in” 消掉，也不等 Next 变蓝。
         if (box) return true;
@@ -344,6 +348,10 @@ function attachGoogleNetWatch(page) {
         },
         detach() { page.off("requestfailed", onFail); },
     };
+}
+
+function isGoogleRejectedSignin(url) {
+    return /accounts\.google\.com\/v3\/signin\/rejected/i.test(String(url || ""));
 }
 
 function identifierEntryUrl(page) {
@@ -636,6 +644,10 @@ export async function googleLogin(page, emailOrOpts, password = "", totpSecret =
                         write("  点 Next 前邮箱框空了，重填");
                         emailSubmitted = false;
                         continue;
+                    }
+                    if (isGoogleRejectedSignin(page.url())) {
+                        write("  邮箱页落到 signin/rejected，不再点 Next");
+                        throw new Error("代理中断 Google 拒绝页 signin/rejected，换 session 重开窗");
                     }
                     if (emailNextClicks >= 3) {
                         const leftover = String(await page.innerText("body").catch(() => "")).replace(/\s+/g, " ").slice(0, 160);

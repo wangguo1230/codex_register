@@ -94,6 +94,7 @@ export async function createBitWindow({proxy = "", name = "reg", remark = "codex
     }
     const d = await bitPost("/browser/update", body);   // 无 id = 新建
     if (d?.id) {
+        trackBitWindow(d.id);
         await bitPost("/browser/update/partial", {
             ids: [d.id],
             browserFingerPrint: {
