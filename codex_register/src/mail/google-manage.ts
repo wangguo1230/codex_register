@@ -370,7 +370,10 @@ async function clickVisibleHref(page, pred, log, tag) {
 }
 
 async function onAuthenticatorDetail(page) {
-    if (/\/authenticator/i.test(page.url())) return true;
+    const ready = page.getByRole("button", {name: /change authenticator|set up authenticator|更改身份验证|设置身份验证/i})
+        .or(page.getByText(/your authenticator|change authenticator app|set up authenticator/i));
+    if (await ready.first().isVisible({timeout: 400}).catch(() => false)) return true;
+    if (!/\/authenticator/i.test(page.url())) return false;
     return page.evaluate(() => {
         const bad = /play\.google|apps\.apple|support\.google|policies\.google|\/TOS|privacy/i;
         const vis = (el) => {
@@ -410,8 +413,9 @@ async function isAccountPickerDialog(page) {
 
 function dialogLooksLikeChangeTotp(text) {
     const t = String(text || "");
-    return /enter the 6-digit|enter code|输入.*6.*位|输入验证码/i.test(t)
-        && /change authenticator|authenticator app|更改身份验证|验证器/i.test(t);
+    if (!/change authenticator|authenticator app|更改身份验证|验证器/i.test(t)) return false;
+    if (/enter the 6-digit|enter code|输入.*6.*位|输入验证码|verify|验证/i.test(t)) return true;
+    return /change authenticator app/i.test(t);
 }
 
 async function findChangeTotpDialog(page) {
@@ -507,12 +511,17 @@ async function fillChangeAuthenticatorCode(page, totpSecret, log) {
     }
     log(`[2FA] 更换前验证码已填 ${code} 框内已确认 remain=${totpRemainSec()}s`);
     const WRONG_RE = /wrong code|incorrect code|c[oó]digo (incorrecto|errado)|code incorrect|验证码有误/i;
-    for (let w = 0; w < 6; w++) {
+    const backOut = async () => {
+        const back = dlg.getByRole("button", {name: /^(back|返回|上一步)$/i}).first();
+        if (await back.isVisible({timeout: 300}).catch(() => false)) await back.click().catch(() => {});
+        else await page.keyboard.press("Escape").catch(() => {});
+    };
+    for (let w = 0; w < 8; w++) {
         await page.waitForTimeout(350);
         const after = String(await page.innerText("body").catch(() => ""));
         if (WRONG_RE.test(after)) {
-            log("[2FA] 更换前验证码 Wrong code");
-            await input.fill("").catch(() => {});
+            log("[2FA] 更换前验证码 Wrong code（自动提交）");
+            await backOut();
             return "wrong";
         }
         if (!await findChangeTotpDialog(page)) return "ok";
@@ -523,7 +532,7 @@ async function fillChangeAuthenticatorCode(page, totpSecret, log) {
         return "missing";
     }
     if (WRONG_RE.test(String(await page.innerText("body").catch(() => "")))) {
-        await input.fill("").catch(() => {});
+        await backOut();
         return "wrong";
     }
     const verify = dlg.getByRole("button", {name: /^(verify|verif|验证|確認|确认)$/i}).first();
@@ -531,11 +540,11 @@ async function fillChangeAuthenticatorCode(page, totpSecret, log) {
         await verify.click().catch(() => verify.click({force: true}));
         log("[2FA] 点了更换前 Verify");
     }
-    await page.waitForTimeout(1200);
+    await page.waitForTimeout(1500);
     const after = String(await page.innerText("body").catch(() => ""));
     if (WRONG_RE.test(after)) {
         log("[2FA] 更换前验证码 Wrong code");
-        await input.fill("").catch(() => {});
+        await backOut();
         return "wrong";
     }
     return await findChangeTotpDialog(page) ? "pending" : "ok";
@@ -553,13 +562,16 @@ async function waitAuthenticatorSetup(page, ms = 9000) {
         const t = String(await page.innerText("body").catch(() => ""));
         if (/otpauth:\/\//i.test(t) || /secret key|setup key|密钥|can't scan it|cannot scan|无法扫描/i.test(t)) return "secret";
         if (await findChangeTotpDialog(page)) return "reauth";
+        const heading = page.getByRole("heading", {name: /change authenticator/i}).first();
+        if (await heading.isVisible({timeout: 150}).catch(() => false)) return "reauth";
         const dlgs = page.locator('[role="dialog"], [role="alertdialog"]');
         const dn = await dlgs.count().catch(() => 0);
         for (let i = 0; i < dn; i++) {
             const dlg = dlgs.nth(i);
             if (!await dlg.isVisible({timeout: 120}).catch(() => false)) continue;
             const dt = String(await dlg.innerText().catch(() => ""));
-            if (/change authenticator|replace|next|continue|更改|替换|下一步/i.test(dt) && !/Manage your Google Account/i.test(dt)) return "confirm";
+            if (/change authenticator app/i.test(dt)) return "reauth";
+            if (/replace authenticator|replace this|更换此|替换/i.test(dt) && !/enter the 6-digit|enter code/i.test(dt)) return "confirm";
         }
         await page.waitForTimeout(350);
     }
@@ -705,7 +717,7 @@ async function openAuthenticatorDetail(page, log) {
             log("[2FA] 直达 authenticator 页");
         } catch { /* ignore */ }
     }
-    for (let i = 0; i < 16; i++) {
+    for (let i = 0; i < 30; i++) {
         await page.waitForTimeout(400);
         if (await onAuthenticatorDetail(page)) return true;
     }
