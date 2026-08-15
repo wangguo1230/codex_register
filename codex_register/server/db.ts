@@ -491,6 +491,46 @@ export async function countFreeGoogleImapMailboxes() {
     return rows[0]?.n || 0;
 }
 
+/** 可换绑 Gmail 池：独立未售、已开 IMAP、未挂 GPT/Claude。 */
+export async function listRebindGmailPool() {
+    const { rows } = await query(`
+        SELECT m.id, m.email, COALESCE(m.grp,'') AS grp
+        FROM mailboxes m
+        WHERE ${FREE_GOOGLE_IMAP_SQL}
+        ORDER BY m.grp, m.id DESC
+    `);
+    const groups = [];
+    const map = new Map();
+    for (const r of rows) {
+        const g = r.grp || "";
+        if (!map.has(g)) {
+            const rec = {grp: g, n: 0};
+            map.set(g, rec);
+            groups.push(rec);
+        }
+        map.get(g).n += 1;
+    }
+    return {list: rows, groups, count: rows.length};
+}
+
+function googleImapClaimWhere({grp, emails, excludeIds} = {}) {
+    const conds = [FREE_GOOGLE_IMAP_SQL];
+    const params = [];
+    if (grp !== undefined && grp !== null && grp !== "__ALL__") {
+        params.push(String(grp));
+        conds.push(`COALESCE(m.grp,'') = $${params.length}`);
+    }
+    if (Array.isArray(emails) && emails.length) {
+        params.push(emails.map((e) => String(e || "").trim().toLowerCase()).filter(Boolean));
+        conds.push(`lower(m.email) = ANY($${params.length})`);
+    }
+    if (Array.isArray(excludeIds) && excludeIds.length) {
+        params.push(excludeIds.map(Number).filter(Number.isInteger));
+        conds.push(`NOT (m.id = ANY($${params.length}))`);
+    }
+    return {sql: conds.join(" AND "), params};
+}
+
 export async function countFreeMailcomMailboxes() {
     const { rows } = await query(`SELECT COUNT(*)::int AS n FROM mailboxes m WHERE ${FREE_MAILCOM_SQL}`);
     return rows[0]?.n || 0;
@@ -508,10 +548,12 @@ export async function claimFreeMailcomMailbox() {
 }
 
 /** 领一个空闲、已开 IMAP、且未被任何 GPT/Claude 占用的 Gmail。不新建 gpt_accounts。 */
-export async function claimFreeGoogleImapMailbox() {
+export async function claimFreeGoogleImapMailbox(opts = {}) {
     return withTransaction(async (client) => {
+        const {sql, params} = googleImapClaimWhere(opts);
         const { rows: [mb] } = await client.query(
-            `SELECT m.* FROM mailboxes m WHERE ${FREE_GOOGLE_IMAP_SQL} ORDER BY m.id DESC LIMIT 1 FOR UPDATE SKIP LOCKED`
+            `SELECT m.* FROM mailboxes m WHERE ${sql} ORDER BY m.id DESC LIMIT 1 FOR UPDATE SKIP LOCKED`,
+            params,
         );
         if (!mb) return null;
         await client.query(`UPDATE mailboxes SET usage='gpt' WHERE id=$1`, [mb.id]);

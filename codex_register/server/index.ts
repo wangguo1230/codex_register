@@ -40,6 +40,7 @@ import {peekSms, buildSmsLink, classifySms} from "../src/sms-broker.js";
 import {probeAt, probePlan, refreshRt, buildProxyDispatcher, decodeJwt} from "../src/token-check.js";
 import {enrollTotp} from "../src/mfa.js";
 import {changeChatgptEmail, needsPwdReauth} from "../src/change-email.js";
+import {testGmailImap} from "../src/mail/google-imap.js";
 import {rememberGoogleCred} from "../src/mail/google-account.js";
 import {rememberMailcomPassword} from "../src/mail/mailcom.js";
 import {startXray, stopXray, xrayStatus} from "./xray-proxy.js";
@@ -2448,6 +2449,9 @@ function normalizeRebindTarget(t) {
 function rebindTargetLabel(t) {
     return t === "mailcom" ? "mail.com" : "Gmail";
 }
+function imapAuthDead(err) {
+    return /invalid credentials|authenticationfailed|login failed|application-specific password|disabled|web login required/i.test(String(err || ""));
+}
 function exportableAccount(r) {
     if (isGoogleMailbox(r) && String(r?.gpt_password || "").trim()) return true;
     return r?.status === "success" && !r?.dead_at;
@@ -2616,6 +2620,7 @@ const gmailRebindIds: number[] = [];
 const gmailRebindQueued = new Set();
 const gmailRebindCancelled = new Set();
 const gmailRebindTargets = new Map();
+const gmailRebindPool = new Map();
 let gmailRebindRunning = false;
 let gmailRebindCurrentId = 0;
 
@@ -2633,7 +2638,22 @@ function resolveRebindTarget(q, {force = false, target} = {}) {
     return force ? "gmail" : "";
 }
 
-function enqueueGmailRebind(q, {force = false, target} = {}) {
+function normalizeRebindPool(raw = {}) {
+    const emails = [...new Set(
+        (Array.isArray(raw.emails) ? raw.emails : [])
+            .map((s) => String(s || "").trim().toLowerCase())
+            .filter((s) => s.includes("@")),
+    )];
+    const fromText = extractEmailsFromText(String(raw.text || ""));
+    for (const e of fromText) if (!emails.includes(e)) emails.push(e);
+    const hasGrp = Object.prototype.hasOwnProperty.call(raw, "grp") && raw.grp !== null && raw.grp !== "__ALL__";
+    return {
+        emails: emails.length ? emails : undefined,
+        grp: hasGrp ? String(raw.grp) : undefined,
+    };
+}
+
+function enqueueGmailRebind(q, {force = false, target, pool} = {}) {
     const dest = resolveRebindTarget(q, {force, target});
     if (!dest) return false;
     const id = Number(q?.id);
@@ -2647,6 +2667,9 @@ function enqueueGmailRebind(q, {force = false, target} = {}) {
     gmailRebindCancelled.delete(id);
     gmailRebindQueued.add(id);
     gmailRebindTargets.set(id, dest);
+    const p = dest === "gmail" ? normalizeRebindPool(pool) : {};
+    if (p.emails || p.grp !== undefined) gmailRebindPool.set(id, p);
+    else gmailRebindPool.delete(id);
     gmailRebindIds.push(id);
     const ahead = gmailRebindRunning && gmailRebindCurrentId && gmailRebindCurrentId !== id;
     db.updateQueueItem(id, {rebind_status: "pending", rebind_error: "", rebind_target: dest}).then(() => queueSync()).catch(() => {});
@@ -2669,6 +2692,7 @@ function pumpGmailRebind() {
                     gmailRebindQueued.delete(id);
                     gmailRebindCancelled.delete(id);
                     gmailRebindTargets.delete(id);
+                    gmailRebindPool.delete(id);
                     gmailRebindCurrentId = 0;
                 }
             }
@@ -2754,16 +2778,39 @@ async function runGmailRebind(queueId) {
             rechargeLog(`换绑 ${acc.email}: session 还在，但换绑接口要 5 分钟内的密码验证，先直接试，不够新再重登`);
         }
 
-        for (let attempt = 1; attempt <= 5; attempt++) {
+        const pool = dest === "gmail" ? (gmailRebindPool.get(queueId) || {}) : {};
+        const excludeIds = [];
+        const poolHint = dest === "gmail" && (pool.emails || pool.grp !== undefined)
+            ? `，范围=${pool.grp !== undefined ? `分组「${pool.grp || "无分组"}」` : ""}${pool.emails ? `${pool.emails.length} 个指定邮箱` : ""}`
+            : "";
+        for (let attempt = 1; attempt <= 8; attempt++) {
             if (isGmailRebindCancelled(queueId)) {
                 rechargeLog(`换绑 ⏭ ${acc.email}: 已取消`);
                 return;
             }
             claimed = dest === "mailcom"
                 ? await db.claimFreeMailcomMailbox()
-                : await db.claimFreeGoogleImapMailbox();
-            if (!claimed) return fail(miss, false);
+                : await db.claimFreeGoogleImapMailbox({grp: pool.grp, emails: pool.emails, excludeIds});
+            if (!claimed) return fail(attempt === 1 ? `${miss}${poolHint}` : `范围内已无可用 ${destLabel}${poolHint}`, false);
             rememberClaimed(claimed);
+            if (dest === "gmail") {
+                rechargeLog(`换绑 ${acc.email} → ${claimed.email}：先探 IMAP（第 ${attempt} 个${poolHint}）`);
+                const probe = await testGmailImap(claimed.email, claimed.imap_password);
+                if (!probe.ok) {
+                    const dead = imapAuthDead(probe.error);
+                    rechargeLog(`换绑 ${claimed.email} IMAP 不通 (${probe.error})，${dead ? "标废号" : "放回"}换下一个`);
+                    if (dead) {
+                        await db.quarantineMailbox(claimed.id, "IMAP不通");
+                        try { await db.refreshMailboxGoogleState(claimed.id, {imap: "fail", last_error: String(probe.error || "").slice(0, 120)}); } catch { /* */ }
+                    } else {
+                        await db.releaseMailboxToFree(claimed.id);
+                        excludeIds.push(claimed.id);
+                    }
+                    claimed = null;
+                    continue;
+                }
+                rechargeLog(`换绑 ${claimed.email} IMAP 通（收件箱 ${probe.messages ?? 0} 封）`);
+            }
             rechargeLog(`换绑 ${acc.email} → ${claimed.email} (独立未使用 ${destLabel}，第 ${attempt} 个；先预检目标邮箱)`);
 
             let r = await doChange(at, tok, claimed);
@@ -2845,7 +2892,7 @@ async function runGmailRebind(queueId) {
             }
             return fail(r.reason || "换绑失败");
         }
-        return fail("连续 5 个目标邮箱都不可用", false);
+        return fail("连续多个目标邮箱都不可用（含 IMAP 不通已换号）", false);
     } catch (e: any) {
         await fail(e?.message || e);
     }
@@ -3461,10 +3508,20 @@ app.post("/api/recharge/poll", async (req, res) => {
     res.json({ok: true, updated});
 });
 
+app.get("/api/recharge/rebind-gmail/pool", async (req, res) => {
+    try {
+        const pool = await db.listRebindGmailPool();
+        res.json({ok: true, ...pool});
+    } catch (e: any) {
+        res.status(500).json({error: String(e?.message || e)});
+    }
+});
+
 app.post("/api/recharge/rebind-gmail", async (req, res) => {
     const ids = (req.body?.ids || []).map(Number).filter(Number.isInteger);
     if (!ids.length) return res.status(400).json({error: "未选择队列项"});
     const target = normalizeRebindTarget(req.body?.target);
+    const pool = normalizeRebindPool(req.body || {});
     const skipped: {email: string; reason: string}[] = [];
     let queued = 0;
     for (const id of ids) {
@@ -3476,9 +3533,12 @@ app.post("/api/recharge/rebind-gmail", async (req, res) => {
             continue;
         }
         const dest = resolveRebindTarget(q, {force: true, target});
-        if (enqueueGmailRebind(q, {force: true, target: dest})) {
+        if (enqueueGmailRebind(q, {force: true, target: dest, pool})) {
             queued++;
-            rechargeLog(`换绑排队 ${q.email} → ${rebindTargetLabel(dest)}`);
+            const scope = dest === "gmail" && (pool.emails || pool.grp !== undefined)
+                ? `（${pool.grp !== undefined ? `分组「${pool.grp || "无分组"}」` : ""}${pool.emails ? `${pool.emails.length} 个指定邮箱` : ""}）`
+                : "";
+            rechargeLog(`换绑排队 ${q.email} → ${rebindTargetLabel(dest)}${scope}`);
         } else {
             skipped.push({email: q.email, reason: "已在换绑"});
         }

@@ -72,6 +72,14 @@ export function RechargePanel({notify}: {notify?: (m: string) => void}) {
     const [busy, setBusy] = useState(false);
     const [logs, setLogs] = useState<{ts: number; line: string}[]>([]);
     const logBoxRef = useRef<HTMLDivElement>(null);
+    const [showRebindGmail, setShowRebindGmail] = useState(false);
+    const [rebindIds, setRebindIds] = useState<number[]>([]);
+    const [rebindMode, setRebindMode] = useState<"auto" | "grp" | "emails">("auto");
+    const [rebindGrp, setRebindGrp] = useState("");
+    const [rebindText, setRebindText] = useState("");
+    const [rebindPick, setRebindPick] = useState<Set<string>>(new Set());
+    const [rebindPool, setRebindPool] = useState<{list: {id: number; email: string; grp: string}[]; groups: {grp: string; n: number}[]; count: number}>({list: [], groups: [], count: 0});
+    const [rebindSearch, setRebindSearch] = useState("");
 
     const toast = (m: string) => notify?.(m);
 
@@ -292,23 +300,67 @@ export function RechargePanel({notify}: {notify?: (m: string) => void}) {
             toast("换绑选项保存失败: " + e.message);
         }
     };
-    const doRebind = async (target: "gmail" | "mailcom") => {
-        const ids = selQIds();
+    const openRebindGmail = async (ids?: number[]) => {
+        const pick = ids && ids.length ? ids : selQIds();
+        if (!pick.length) { toast("请先选择已付费的队列项"); return; }
+        setRebindIds(pick);
+        setRebindMode("auto");
+        setRebindGrp("__PICK__");
+        setRebindText("");
+        setRebindPick(new Set());
+        setRebindSearch("");
+        setShowRebindGmail(true);
+        try {
+            const r = await api.rebindGmailPool();
+            setRebindPool({list: r.list || [], groups: r.groups || [], count: r.count || 0});
+        } catch (e: any) {
+            toast("加载可换绑 Gmail 失败: " + e.message);
+        }
+    };
+    const submitRebind = async (target: "gmail" | "mailcom", opts?: {emails?: string[]; grp?: string; text?: string}) => {
+        const ids = target === "gmail" && rebindIds.length ? rebindIds : selQIds();
         if (!ids.length) { toast("请先选择已付费的队列项"); return; }
         const label = target === "mailcom" ? "mail.com" : "Gmail";
-        const extra = target === "mailcom"
-            ? "只处理已付费(paid)的号，自动领取空闲 mail.com。换完旧邮箱标已售，不返还。"
-            : "只处理已付费(paid)的号，自动领取空闲已开 IMAP 的 Gmail。换完旧邮箱标已售，不返还。";
-        if (!confirm(`对选中的 ${ids.length} 项换绑 ${label}？\n${extra}`)) return;
         setBusy(true);
         try {
-            const r = await api.rebindGmail(ids, target);
+            const r = await api.rebindGmail(ids, target, opts);
             applyRebindCounts(r);
             const skip = (r.skipped || []).map((s) => `${s.email}: ${s.reason}`).join("；");
             toast(`换绑 ${label} 已排队 ${r.queued} 个${skip ? `，跳过 ${r.skipped.length}（${skip}）` : ""}`);
             loadQueue();
+            setShowRebindGmail(false);
         } catch (e: any) { toast(e.message); } finally { setBusy(false); }
     };
+    const doRebind = async (target: "gmail" | "mailcom") => {
+        if (target === "gmail") return openRebindGmail();
+        const ids = selQIds();
+        if (!ids.length) { toast("请先选择已付费的队列项"); return; }
+        if (!confirm(`对选中的 ${ids.length} 项换绑 mail.com？\n只处理已付费(paid)的号，自动领取空闲 mail.com。换完旧邮箱标已售，不返还。`)) return;
+        await submitRebind("mailcom");
+    };
+    const doConfirmRebindGmail = async () => {
+        if (rebindMode === "grp") {
+            if (rebindGrp === "__PICK__") { toast("请选择分组"); return; }
+            await submitRebind("gmail", {grp: rebindGrp});
+            return;
+        }
+        if (rebindMode === "emails") {
+            const fromPick = [...rebindPick];
+            const text = rebindText.trim();
+            if (!fromPick.length && !text) { toast("请勾选或粘贴要换绑的 Gmail"); return; }
+            await submitRebind("gmail", {emails: fromPick, text});
+            return;
+        }
+        await submitRebind("gmail");
+    };
+    const rebindVisible = useMemo(() => {
+        const q = rebindSearch.trim().toLowerCase();
+        return rebindPool.list.filter((m) => {
+            if (rebindMode === "grp" && rebindGrp !== "__PICK__" && (m.grp || "") !== rebindGrp) return false;
+            if (q && !m.email.toLowerCase().includes(q) && !(m.grp || "").toLowerCase().includes(q)) return false;
+            return true;
+        });
+    }, [rebindPool.list, rebindMode, rebindGrp, rebindSearch]);
 
     // 导出
     const downloadText = (text: string, filename: string) => {
@@ -456,7 +508,7 @@ export function RechargePanel({notify}: {notify?: (m: string) => void}) {
                     <Btn onClick={() => doSubmit(selQIds())} disabled={!hasKey || cStats.unused === 0} className="bg-green-600 text-white border-green-600 hover:bg-green-700">提交选中</Btn>
                     <Btn onClick={() => doSubmit(filteredQueue.filter((q) => q.status === "pending").map((q) => q.id))} disabled={!hasKey || cStats.unused === 0}>全部提交</Btn>
                     <Btn onClick={doPoll}>刷新状态</Btn>
-                    <Btn onClick={() => doRebind("gmail")} title="对已付费项手动换绑 Gmail；旧邮箱标已售">换绑 Gmail</Btn>
+                    <Btn onClick={() => doRebind("gmail")} title="对已付费项换绑 Gmail：可选分组或指定邮箱，换绑前探 IMAP">换绑 Gmail</Btn>
                     <Btn onClick={() => doRebind("mailcom")} title="对已付费项手动换绑 mail.com；旧邮箱标已售">换绑 mail.com</Btn>
                     <Btn onClick={doStop} className="bg-white border-red-200 text-red-600 hover:bg-red-50">停止</Btn>
                     <Btn onClick={doRelogin} title="重登取 session → 验卡 → 重置 → 用原卡密重提(卡密已消费则跳过)" className="bg-amber-500 text-white border-amber-500 hover:bg-amber-600">重登并提交</Btn>
@@ -560,7 +612,7 @@ export function RechargePanel({notify}: {notify?: (m: string) => void}) {
                                         )}
                                         {(q.status === "done" || q.task_status === "paid") && q.rebind_status !== "pending" && (
                                             <>
-                                                <button onClick={() => { api.rebindGmail([q.id], "gmail").then((r) => { toast(r.queued ? "已排队换绑 Gmail" : (r.skipped[0]?.reason || "已跳过")); loadQueue(); loadConfig(); }).catch((e: any) => toast(e.message)); }}
+                                                <button onClick={() => openRebindGmail([q.id])}
                                                         className="text-blue-500 hover:text-blue-700 text-xs hover:underline ml-2">换绑Gmail</button>
                                                 <button onClick={() => { api.rebindGmail([q.id], "mailcom").then((r) => { toast(r.queued ? "已排队换绑 mail.com" : (r.skipped[0]?.reason || "已跳过")); loadQueue(); loadConfig(); }).catch((e: any) => toast(e.message)); }}
                                                         className="text-blue-500 hover:text-blue-700 text-xs hover:underline ml-2">换绑mail</button>
@@ -733,6 +785,75 @@ export function RechargePanel({notify}: {notify?: (m: string) => void}) {
                                     确认入队 ({pickerSel.size})
                                 </Btn>
                             </div>
+                        </div>
+                    </div>
+                </div>
+            )}
+
+            {/* ====== 换绑 Gmail：选分组 / 选邮箱 ====== */}
+            {showRebindGmail && (
+                <div className="fixed inset-0 bg-black/30 flex items-center justify-center z-50" onClick={() => setShowRebindGmail(false)}>
+                    <div className="bg-white rounded-xl shadow-xl w-[560px] max-h-[85vh] flex flex-col" onClick={(e) => e.stopPropagation()}>
+                        <div className="px-5 py-3 border-b font-semibold text-sm">
+                            换绑 Gmail
+                            <div className="text-xs text-gray-400 font-normal mt-0.5">
+                                对 {rebindIds.length} 个已付费号。换绑前会探 IMAP，不通自动换下一个。旧邮箱标已售。
+                            </div>
+                        </div>
+                        <div className="px-5 py-3 space-y-3 text-xs overflow-auto">
+                            <div className="flex items-center gap-3 flex-wrap">
+                                {([
+                                    ["auto", "自动领取"],
+                                    ["grp", "指定分组"],
+                                    ["emails", "指定邮箱"],
+                                ] as const).map(([k, l]) => (
+                                    <label key={k} className="inline-flex items-center gap-1.5 cursor-pointer">
+                                        <input type="radio" name="rebind-src" checked={rebindMode === k} onChange={() => setRebindMode(k)}/>
+                                        {l}
+                                    </label>
+                                ))}
+                                <span className="text-gray-400 ml-auto">可换绑 {rebindPool.count}</span>
+                            </div>
+                            {rebindMode === "grp" && (
+                                <select value={rebindGrp} onChange={(e) => setRebindGrp(e.target.value)}
+                                        className="w-full px-2 py-1.5 border rounded outline-none">
+                                    <option value="__PICK__">选择分组</option>
+                                    {rebindPool.groups.map((g) => (
+                                        <option key={g.grp || "__EMPTY__"} value={g.grp}>{g.grp || "(无分组)"} ({g.n})</option>
+                                    ))}
+                                </select>
+                            )}
+                            {rebindMode === "emails" && (
+                                <textarea value={rebindText} onChange={(e) => setRebindText(e.target.value)}
+                                          placeholder={"粘贴 Gmail，每行一个，或 email----密码\n也可在下方列表勾选"}
+                                          className="w-full h-20 px-2 py-1.5 border rounded font-mono outline-none resize-y"/>
+                            )}
+                            <input value={rebindSearch} onChange={(e) => setRebindSearch(e.target.value)}
+                                   placeholder="搜索邮箱 / 分组"
+                                   className="w-full px-2 py-1.5 border rounded outline-none"/>
+                            <div className="border rounded max-h-[240px] overflow-auto">
+                                {rebindVisible.map((m) => (
+                                    <label key={m.id} className="flex items-center gap-2 px-2 py-1 border-b last:border-0 hover:bg-blue-50 cursor-pointer">
+                                        <input type="checkbox" checked={rebindPick.has(m.email)}
+                                               onChange={() => {
+                                                   setRebindMode("emails");
+                                                   setRebindPick((prev) => {
+                                                       const n = new Set(prev);
+                                                       if (n.has(m.email)) n.delete(m.email); else n.add(m.email);
+                                                       return n;
+                                                   });
+                                               }}/>
+                                        <span className="flex-1 font-mono text-gray-700 truncate">{m.email}</span>
+                                        <span className="text-gray-400">{m.grp || "无分组"}</span>
+                                    </label>
+                                ))}
+                                {!rebindVisible.length && <div className="px-3 py-6 text-center text-gray-400">没有可换绑的独立 Gmail</div>}
+                            </div>
+                            {rebindMode === "emails" && <div className="text-gray-400">已勾选 {rebindPick.size} 个</div>}
+                        </div>
+                        <div className="px-5 py-3 border-t flex justify-end gap-2">
+                            <Btn onClick={() => setShowRebindGmail(false)}>取消</Btn>
+                            <Btn onClick={doConfirmRebindGmail} className="bg-blue-600 text-white border-blue-600 hover:bg-blue-700">确认换绑</Btn>
                         </div>
                     </div>
                 </div>

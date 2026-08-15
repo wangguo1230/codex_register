@@ -454,8 +454,10 @@ export const api = {
         j<{ok: boolean; paired: number}>("/api/recharge/submit", {method: "POST", body: JSON.stringify({queueIds})}),
     stopRecharge: () => j<{ok: boolean}>("/api/recharge/stop", {method: "POST"}),
     pollRecharge: (ids?: number[]) => j<{ok: boolean; updated: number}>("/api/recharge/poll", {method: "POST", body: JSON.stringify({ids})}),
-    rebindGmail: (ids: number[], target?: "gmail" | "mailcom") =>
-        j<{ok: boolean; queued: number; skipped: {email: string; reason: string}[]; gmailFreeImap?: number; mailcomFree?: number}>("/api/recharge/rebind-gmail", {method: "POST", body: JSON.stringify({ids, target})}),
+    rebindGmailPool: () =>
+        j<{ok: boolean; list: {id: number; email: string; grp: string}[]; groups: {grp: string; n: number}[]; count: number}>("/api/recharge/rebind-gmail/pool"),
+    rebindGmail: (ids: number[], target?: "gmail" | "mailcom", opts?: {emails?: string[]; grp?: string; text?: string}) =>
+        j<{ok: boolean; queued: number; skipped: {email: string; reason: string}[]; gmailFreeImap?: number; mailcomFree?: number}>("/api/recharge/rebind-gmail", {method: "POST", body: JSON.stringify({ids, target, ...(opts || {})})}),
     cancelRebindGmail: (ids: number[]) =>
         j<{ok: boolean; count: number}>("/api/recharge/rebind-gmail/cancel", {method: "POST", body: JSON.stringify({ids})}),
     rechargeLogs: () => j<{ts: number; line: string}[]>("/api/recharge/logs"),
