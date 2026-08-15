@@ -3,14 +3,18 @@ import {api, connectStream} from "./api";
 
 export type ProxyPoolMeta = {total: number; slots: number; leased: number; free: number; jump: string};
 
-/** 邮箱整备 / GPT 注册共用：跳板 + 导入代理池。 */
+/** 跳板 + 导入代理池。kind=mail 邮箱管理，kind=gpt GPT 注册，两套配置互不影响。 */
 export function ProxyPoolPanel({
     notify,
     title = "代理池",
+    kind = "mail",
+    hint,
     onMeta,
 }: {
     notify?: (m: string) => void;
     title?: string;
+    kind?: "mail" | "gpt";
+    hint?: string;
     onMeta?: (m: ProxyPoolMeta) => void;
 }) {
     const [poolText, setPoolText] = useState("");
@@ -33,43 +37,51 @@ export function ProxyPoolPanel({
         onMeta?.({...next, jump: typeof jump === "string" ? jump : jumpText});
     };
 
+    const isGpt = kind === "gpt";
     useEffect(() => {
         api.state().then((s) => {
             const st = s.state as any;
-            const lines = st.mailProxyPoolLines || st.mailProxyPool;
+            const lines = isGpt ? (st.gptProxyPoolLines || st.gptProxyPool) : (st.mailProxyPoolLines || st.mailProxyPool);
             if (Array.isArray(lines)) setPoolText(lines.join("\n"));
-            const snap = st.mailProxyPoolSnap;
-            if (snap) emit(snap, typeof st.mailProxyJump === "string" ? st.mailProxyJump : undefined);
-            else if (typeof st.mailProxyJump === "string") setJumpText(st.mailProxyJump);
+            const snap = isGpt ? st.gptProxyPoolSnap : st.mailProxyPoolSnap;
+            const jump = isGpt ? st.gptProxyJump : st.mailProxyJump;
+            if (snap) emit(snap, typeof jump === "string" ? jump : undefined);
+            else if (typeof jump === "string") setJumpText(jump);
             if (st.regProxy) setJumpHint(st.regProxy);
         }).catch(() => {});
-        api.mailProxyPool().then((r) => {
+        const load = isGpt ? api.gptProxyPool() : api.mailProxyPool();
+        load.then((r) => {
             const lines = r.lines || r.urls || [];
             if (lines.length) setPoolText(lines.join("\n"));
             emit(r, r.jump);
         }).catch(() => {});
         const off = connectStream((ev, data) => {
-            if (ev === "mailboxes" && data?.proxyPool) emit(data.proxyPool);
-            else if ((ev === "batchPw" || ev === "batchHarden") && data?.proxyPool) emit(data.proxyPool);
+            if (!isGpt && ev === "mailboxes" && data?.proxyPool) emit(data.proxyPool);
+            else if (!isGpt && (ev === "batchPw" || ev === "batchHarden") && data?.proxyPool) emit(data.proxyPool);
             else if (ev === "hello" && data?.state) {
                 const st = data.state;
-                if (Array.isArray(st.mailProxyPoolLines)) setPoolText(st.mailProxyPoolLines.join("\n"));
-                else if (Array.isArray(st.mailProxyPool)) setPoolText(st.mailProxyPool.join("\n"));
-                if (st.mailProxyPoolSnap) emit(st.mailProxyPoolSnap, typeof st.mailProxyJump === "string" ? st.mailProxyJump : undefined);
-                else if (typeof st.mailProxyJump === "string") setJumpText(st.mailProxyJump);
+                const lines = isGpt ? (st.gptProxyPoolLines || st.gptProxyPool) : (st.mailProxyPoolLines || st.mailProxyPool);
+                if (Array.isArray(lines)) setPoolText(lines.join("\n"));
+                const snap = isGpt ? st.gptProxyPoolSnap : st.mailProxyPoolSnap;
+                const jump = isGpt ? st.gptProxyJump : st.mailProxyJump;
+                if (snap) emit(snap, typeof jump === "string" ? jump : undefined);
+                else if (typeof jump === "string") setJumpText(jump);
             }
         });
         return off;
         // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, []);
+    }, [kind]);
 
     const applyResult = (r: {lines?: string[]; urls?: string[]; total?: number; slots?: number; leased?: number; free?: number; jump?: string}) => {
         setPoolText((r.lines && r.lines.length ? r.lines : r.urls || []).join("\n"));
         emit(r, r.jump);
     };
+    const setPool = isGpt ? api.setGptProxyPool : api.setMailProxyPool;
+    const setJump = isGpt ? api.setGptProxyJump : api.setMailProxyJump;
+    const testJump = isGpt ? api.testGptProxyJump : api.testMailProxyJump;
     const doSavePool = async () => {
         try {
-            const r = await api.setMailProxyPool(poolText, {append: false, copies: 1});
+            const r = await setPool(poolText, {append: false, copies: 1});
             applyResult(r);
             toast(r.total ? `代理池已覆盖保存 ${r.total} 条（1 代理 = 1 指纹）` : "代理池已清空，未配池时同时只跑 1 个指纹");
         } catch (e: any) { toast("保存代理池失败: " + e.message); }
@@ -77,7 +89,7 @@ export function ProxyPoolPanel({
     const doImportPool = async () => {
         if (!poolText.trim()) { toast("先粘贴代理，一行一个"); return; }
         try {
-            const r = await api.setMailProxyPool(poolText, {append: true, copies: poolCopies});
+            const r = await setPool(poolText, {append: true, copies: poolCopies});
             applyResult(r);
             toast(`导入完成：新增 ${r.inserted ?? 0} / 跳过 ${r.skipped ?? 0} / 池内共 ${r.total} 条`);
         } catch (e: any) { toast("导入代理失败: " + e.message); }
@@ -90,7 +102,9 @@ export function ProxyPoolPanel({
         <div style={card}>
             <div style={{display: "flex", alignItems: "baseline", gap: 8, flexWrap: "wrap", marginBottom: 8}}>
                 <span style={{fontSize: 13, fontWeight: 600, color: "#111827"}}>{title}</span>
-                <span style={{fontSize: 11, color: "#9ca3af"}}>整备 / 换 2FA / 改密 / GPT 注册共用。先填跳板，再导入出口代理。1 个代理 = 1 个比特指纹，占用中的不会给第二扇窗。</span>
+                <span style={{fontSize: 11, color: "#9ca3af"}}>{hint || (isGpt
+                    ? "GPT 注册专用。和邮箱管理池分开租、分开停。先填跳板，再导入出口。1 个代理 = 1 个比特指纹。"
+                    : "邮箱整备 / 换 2FA / 改密专用。和 GPT 注册池分开。先填跳板，再导入出口。1 个代理 = 1 个比特指纹。")}</span>
             </div>
             <textarea value={poolText} onChange={(e) => setPoolText(e.target.value)}
                       placeholder={"一行一个，支持：\ngate-hk.kookeey.info:1000:user:pass-US-session-5m\nip:port:user:pass\nsocks5://user:pass@host:port"}
@@ -103,14 +117,14 @@ export function ProxyPoolPanel({
                 <button onClick={async () => {
                     const next = "socks5://127.0.0.1:10808";
                     setJumpText(next);
-                    try { await api.setMailProxyJump(next); toast("已用系统代理 10808 当跳板"); onMeta?.({...poolSnap, jump: next}); }
+                    try { await setJump(next); toast("已用系统代理 10808 当跳板"); onMeta?.({...poolSnap, jump: next}); }
                     catch (e: any) { toast(e.message); }
                 }} style={{height: 32, padding: "0 10px", border: "1px solid #c7d2fe", background: "#eef2ff", borderRadius: 8, fontSize: 12, cursor: "pointer", color: "#3730a3"}}>用系统代理 10808</button>
                 <button onClick={async () => {
                     setJumpBusy(true);
                     try {
-                        await api.setMailProxyJump(jumpText.trim());
-                        const r = await api.testMailProxyJump(jumpText.trim());
+                        await setJump(jumpText.trim());
+                        const r = await testJump(jumpText.trim());
                         onMeta?.({...poolSnap, jump: jumpText.trim()});
                         toast(r.ok ? `跳板可用 出口 ${r.ip || "?"} Google=${r.google} ${r.ms}ms` : `跳板测不通: ${r.reason || r.error || ""}`);
                     } catch (e: any) { toast("测跳板失败: " + e.message); }
@@ -118,7 +132,7 @@ export function ProxyPoolPanel({
                 }} disabled={jumpBusy} style={{height: 32, padding: "0 10px", border: "1px solid #d1d5db", background: "#fff", borderRadius: 8, fontSize: 12, cursor: jumpBusy ? "wait" : "pointer"}}>{jumpBusy ? "在测…" : "测链式"}</button>
                 <button onClick={async () => {
                     setJumpText("");
-                    try { await api.setMailProxyJump(""); toast("已关掉跳板，改回直连网关"); onMeta?.({...poolSnap, jump: ""}); }
+                    try { await setJump(""); toast("已关掉跳板，改回直连网关"); onMeta?.({...poolSnap, jump: ""}); }
                     catch (e: any) { toast(e.message); }
                 }} style={{height: 32, padding: "0 10px", border: "none", background: "transparent", fontSize: 12, color: "#9ca3af", cursor: "pointer"}}>关掉</button>
             </div>

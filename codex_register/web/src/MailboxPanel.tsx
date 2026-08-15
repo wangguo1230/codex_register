@@ -689,7 +689,8 @@ export function MailboxPanel({notify}: {notify?: (m: string) => void}) {
             {showPool && (
                 <ProxyPoolPanel
                     notify={toast}
-                    title="代理池"
+                    kind="mail"
+                    title="邮箱代理池"
                     onMeta={(m) => {
                         setPoolSnap({total: m.total, slots: m.slots, leased: m.leased, free: m.free});
                         setJumpText(m.jump);

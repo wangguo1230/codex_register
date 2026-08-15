@@ -30,7 +30,7 @@ import {appConfig} from "../src/config.js";
 import {fetchInboxList, fetchMailBodyFor, setMailProxy, changeMailcomPassword, verifyMailcomLogin, scanClaudeDisabledMail} from "./domain/mailbox-service.js";
 import {changePasswordOnPage, change2faOnPage} from "../src/mail/google-manage.js";
 import {runGoogleHardenWithBit, withGoogleBitSession} from "../src/mail/google-secure.js";
-import {mailProxyPool, maskProxyUrl, toProxyImportLine, kookeeySessionOf, probeMailProxy, getMailProxyJump} from "../src/mail/proxy-pool.js";
+import {mailProxyPool, maskProxyUrl, toProxyImportLine, kookeeySessionOf, probeMailProxy} from "../src/mail/proxy-pool.js";
 import {randomPassword} from "../src/utils.js";
 import {straightenImportRow, looksLikeEmail} from "../src/mfa.js";
 import {openBrowserWithAuth} from "../src/simulate-chat.js";
@@ -474,9 +474,38 @@ app.post("/api/mailboxes/proxy-jump/test", async (req, res) => {
     const urls = scheduler.mailProxyPool || [];
     const sample = urls[0] || "";
     if (!sample) return res.status(400).json({ok: false, error: "代理池是空的"});
-    const probe = await probeMailProxy(sample, {timeoutSec: 14});
+    const probe = await probeMailProxy(sample, {timeoutSec: 14, jump: scheduler.mailProxyJump || ""});
     res.json({
-        ok: !!probe.ok, jump: getMailProxyJump(), sample: maskProxyUrl(sample),
+        ok: !!probe.ok, jump: scheduler.mailProxyJump || "", sample: maskProxyUrl(sample),
+        ip: probe.ip, google: probe.google, ms: probe.ms, reason: probe.reason || "",
+    });
+});
+
+app.get("/api/gpt/proxy-pool", (req, res) => {
+    const urls = scheduler.gptProxyPool || [];
+    res.json({ok: true, urls, lines: urls.map((u) => toProxyImportLine(u)), jump: scheduler.gptProxyJump || "", ...scheduler.gptProxyPoolSnap()});
+});
+app.post("/api/gpt/proxy-pool", (req, res) => {
+    const text = req.body?.text != null ? String(req.body.text) : Array.isArray(req.body?.urls) ? req.body.urls.join("\n") : "";
+    const append = req.body?.append === true;
+    const copies = req.body?.copies;
+    if (req.body?.jump != null) scheduler.setGptProxyJump(String(req.body.jump || ""));
+    const snap = scheduler.setGptProxyPool(text, {append, copies});
+    res.json({ok: true, urls: scheduler.gptProxyPool || [], jump: scheduler.gptProxyJump || "", ...snap});
+});
+app.post("/api/gpt/proxy-jump", (req, res) => {
+    const jump = scheduler.setGptProxyJump(String(req.body?.jump ?? ""));
+    res.json({ok: true, jump});
+});
+app.post("/api/gpt/proxy-jump/test", async (req, res) => {
+    const jump = String(req.body?.jump ?? scheduler.gptProxyJump ?? "").trim();
+    if (req.body?.jump != null) scheduler.setGptProxyJump(jump);
+    const urls = scheduler.gptProxyPool || [];
+    const sample = urls[0] || "";
+    if (!sample) return res.status(400).json({ok: false, error: "代理池是空的"});
+    const probe = await probeMailProxy(sample, {timeoutSec: 14, jump: scheduler.gptProxyJump || ""});
+    res.json({
+        ok: !!probe.ok, jump: scheduler.gptProxyJump || "", sample: maskProxyUrl(sample),
         ip: probe.ip, google: probe.google, ms: probe.ms, reason: probe.reason || "",
     });
 });
@@ -1203,10 +1232,6 @@ async function startPwQueueWorker() {
     scheduler.acquireLock("batch-pw");
     await broadcastPwProgress();
     (async () => {
-        if (scheduler.running.size > 0) {
-            broadcast("log", {id: 0, line: `[队列改密] 等待 ${scheduler.running.size} 个注册任务完成…`, ts: Date.now()});
-            await waitRegIdle();
-        }
         const conc = scheduler.pwConcurrency || 1;
         while (!pwQueueStop) {
             const tasks = await db.claimPwTasks(db.instanceId, conc);
@@ -1262,10 +1287,6 @@ function startBatchPasswd(items, apply, tag = "批量改密", onDone) {
     Object.assign(batchPwProg, {running: true, done: 0, total: items.length, ok: 0, stopped: false});
     broadcast("batchPw", {...batchPwProg});
     (async () => {
-        if (scheduler.running.size > 0) {
-            broadcast("log", {id: 0, line: `[${tag}] 等待 ${scheduler.running.size} 个注册任务完成…`, ts: Date.now()});
-            await waitRegIdle();
-        }
         let done = 0, okc = 0;
         const conc = scheduler.pwConcurrency || 1;
         await runPool(items, async (it) => {

@@ -174,7 +174,7 @@ export default function App() {
 
     // 初次加载 + SSE
     useEffect(() => {
-        api.state().then((s) => { setPaused(s.state.paused); setInstanceId(s.state.instanceId || ""); setConcurrency(s.state.concurrency); setOtpSingle(s.state.otpSingle); setChatSim(s.state.simulateChat); setSmsEnabled(s.state.smsEnabled); setRtEnabled(s.state.rtEnabled); setMfaEnabled(s.state.mfaEnabled !== false); setDaily(s.state.daily); setRegEngine(s.state.regEngine || "http"); setBitBrowser(!!s.state.bitBrowser); setSmsLinkTemplate(s.state.smsLinkTemplate || ""); setSmsMaxBind(s.state.smsMaxBind ?? 3); if (s.state.defaultPassword) setDefaultGptPw(s.state.defaultPassword); setStats(s.stats); const snap = (s.state as any).mailProxyPoolSnap; if (snap) setPoolMeta({total: snap.total || 0, leased: snap.leased || 0, jump: String((s.state as any).mailProxyJump || "")}); }).catch(() => {});
+        api.state().then((s) => { setPaused(s.state.paused); setInstanceId(s.state.instanceId || ""); setConcurrency(s.state.concurrency); setOtpSingle(s.state.otpSingle); setChatSim(s.state.simulateChat); setSmsEnabled(s.state.smsEnabled); setRtEnabled(s.state.rtEnabled); setMfaEnabled(s.state.mfaEnabled !== false); setDaily(s.state.daily); setRegEngine(s.state.regEngine || "http"); setBitBrowser(!!s.state.bitBrowser); setSmsLinkTemplate(s.state.smsLinkTemplate || ""); setSmsMaxBind(s.state.smsMaxBind ?? 3); if (s.state.defaultPassword) setDefaultGptPw(s.state.defaultPassword); setStats(s.stats); const snap = (s.state as any).gptProxyPoolSnap; if (snap) setPoolMeta({total: snap.total || 0, leased: snap.leased || 0, jump: String((s.state as any).gptProxyJump || "")}); }).catch(() => {});
         api.listAccounts().then(setAccounts).catch(() => {});
         // 批次数据来自数据库(筛选/导出用;导入已迁至邮箱管理)
         api.batches().then(setBatches).catch(() => {});
@@ -200,7 +200,7 @@ export default function App() {
             else if (event === "snapshot") { if (!showDeletedRef.current) setAccounts(data); }
             else if (event === "hello") {
                 setStats(data.stats); setPaused(data.state.paused); setConcurrency(data.state.concurrency); setOtpSingle(data.state.otpSingle); setChatSim(data.state.simulateChat);
-                if (data.state?.mailProxyPoolSnap) setPoolMeta({total: data.state.mailProxyPoolSnap.total || 0, leased: data.state.mailProxyPoolSnap.leased || 0, jump: String(data.state.mailProxyJump || "")});
+                if (data.state?.gptProxyPoolSnap) setPoolMeta({total: data.state.gptProxyPoolSnap.total || 0, leased: data.state.gptProxyPoolSnap.leased || 0, jump: String(data.state.gptProxyJump || "")});
                 if (data.state?.mfaEnabled !== undefined) setMfaEnabled(data.state.mfaEnabled !== false);
                 if (data.state?.defaultPassword) setDefaultGptPw(data.state.defaultPassword);
                 const bh = data.state?.batchHarden;
@@ -670,7 +670,8 @@ export default function App() {
                     <div className="mt-2">
                         <ProxyPoolPanel
                             notify={notify}
-                            title="注册代理池"
+                            kind="gpt"
+                            title="GPT 注册代理池"
                             onMeta={(m) => setPoolMeta({total: m.total, leased: m.leased, jump: m.jump})}
                         />
                     </div>

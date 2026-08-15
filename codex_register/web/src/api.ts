@@ -387,6 +387,14 @@ export const api = {
     testMailProxyJump: (jump?: string) =>
         j<{ok: boolean; jump?: string; sample?: string; ip?: string; google?: number; ms?: number; reason?: string; error?: string}>(
             "/api/mailboxes/proxy-jump/test", {method: "POST", body: JSON.stringify({jump: jump || ""})}),
+    gptProxyPool: () => j<{ok: boolean; urls: string[]; lines?: string[]; jump?: string; total: number; slots: number; leased: number; free: number; items: {url: string; masked: string; leased: boolean; owner: string}[]}>("/api/gpt/proxy-pool"),
+    setGptProxyPool: (text: string, opts?: {append?: boolean; copies?: number}) =>
+        j<{ok: boolean; urls: string[]; lines?: string[]; jump?: string; total: number; slots: number; leased: number; free: number; inserted?: number; skipped?: number}>(
+            "/api/gpt/proxy-pool", {method: "POST", body: JSON.stringify({text, append: !!opts?.append, copies: opts?.copies || 1})}),
+    setGptProxyJump: (jump: string) => j<{ok: boolean; jump: string}>("/api/gpt/proxy-jump", {method: "POST", body: JSON.stringify({jump})}),
+    testGptProxyJump: (jump?: string) =>
+        j<{ok: boolean; jump?: string; sample?: string; ip?: string; google?: number; ms?: number; reason?: string; error?: string}>(
+            "/api/gpt/proxy-jump/test", {method: "POST", body: JSON.stringify({jump: jump || ""})}),
     // ---- Claude 域(架构 v2:与 GPT 对称命名空间 /api/claude/*)。magic-link 注册,比特浏览器+代理过 CF ----
     listClaudeAccounts: () => j<{list: ClaudeAccount[]; stats: Stats}>("/api/claude/accounts"),
     registerClaude: () => j<{ok: boolean}>("/api/claude/register", {method: "POST"}), // 开始(解除 Claude 暂停+tick)

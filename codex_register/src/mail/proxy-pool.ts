@@ -155,10 +155,10 @@ function tcpReach(host: string, port: number, timeoutMs = 5000): Promise<{ok: bo
     });
 }
 
-async function tcpReachMaybeJump(host: string, port: number, timeoutMs = 8000) {
-    if (!mailProxyJump) return tcpReach(host, port, timeoutMs);
+async function tcpReachMaybeJump(host: string, port: number, timeoutMs = 8000, jump = mailProxyJump) {
+    if (!jump) return tcpReach(host, port, timeoutMs);
     const {probeJumpTo} = await import("./proxy-chain.js");
-    const r = await probeJumpTo(mailProxyJump, host, port, timeoutMs);
+    const r = await probeJumpTo(jump, host, port, timeoutMs);
     return r.ok ? {ok: true} : {ok: false, reason: `跳板连不上 ${host}:${port} (${r.reason})`};
 }
 
@@ -178,7 +178,7 @@ async function curlVia(proxyUrl: string, target: string, extra: string[] = [], t
 }
 
 /** 开指纹前先测 SOCKS：端口、出口 IP、Google。不通就别去登。 */
-export async function probeMailProxy(rawUrl: string, {timeoutSec = 12} = {}): Promise<{
+export async function probeMailProxy(rawUrl: string, {timeoutSec = 12, jump}: {timeoutSec?: number; jump?: string} = {}): Promise<{
     ok: boolean; ip: string; google: number; accounts: number; ms: number; reason?: string;
 }> {
     const url = normalizeProxyUrl(rawUrl) || String(rawUrl || "").trim();
@@ -192,16 +192,17 @@ export async function probeMailProxy(rawUrl: string, {timeoutSec = 12} = {}): Pr
     } catch {
         return {ok: false, ip: "", google: 0, accounts: 0, ms: Date.now() - started, reason: "代理 URL 无效"};
     }
-    const tcp = await tcpReachMaybeJump(host, port, 8000);
+    const viaJump = jump !== undefined ? String(jump || "").trim() : mailProxyJump;
+    const tcp = await tcpReachMaybeJump(host, port, 8000, viaJump);
     if (!tcp.ok) {
-        const via = mailProxyJump ? "经跳板" : "";
+        const via = viaJump ? "经跳板" : "";
         return {ok: false, ip: "", google: 0, accounts: 0, ms: Date.now() - started, reason: `端口不通${via} ${host}:${port} (${tcp.reason})`};
     }
     let curlUrl = url;
     let relayClose = () => {};
-    if (mailProxyJump) {
+    if (viaJump) {
         const {wrapExitThroughJump} = await import("./proxy-chain.js");
-        const wrapped = await wrapExitThroughJump(url, mailProxyJump);
+        const wrapped = await wrapExitThroughJump(url, viaJump);
         curlUrl = wrapped.url;
         relayClose = wrapped.close;
     }
@@ -227,16 +228,16 @@ export async function probeMailProxy(rawUrl: string, {timeoutSec = 12} = {}): Pr
     return {ok: true, ip: ip || "?", google: google || accounts, accounts, ms};
 }
 
-export async function pickLiveMailProxy(rawUrl: string, {tries = 3, log = (_m: string) => {}} = {}) {
+export async function pickLiveMailProxy(rawUrl: string, {tries = 3, log = (_m: string) => {}, jump}: {tries?: number; log?: (m: string) => void; jump?: string} = {}) {
     let url = normalizeProxyUrl(rawUrl) || String(rawUrl || "").trim();
-    if (!url) return {ok: false, url: "", probe: await probeMailProxy("")};
-    let probe = await probeMailProxy(url);
+    if (!url) return {ok: false, url: "", probe: await probeMailProxy("", {jump})};
+    let probe = await probeMailProxy(url, {jump});
     for (let i = 1; i < tries && !probe.ok; i++) {
         const next = rotateKookeeySession(url);
         if (!next || next === url) break;
         log(`不通: ${probe.reason}，换 session 再测 (${i + 1}/${tries})`);
         url = next;
-        probe = await probeMailProxy(url);
+        probe = await probeMailProxy(url, {jump});
     }
     return {ok: probe.ok, url, probe};
 }
@@ -329,3 +330,4 @@ export class MailProxyPool {
 }
 
 export const mailProxyPool = new MailProxyPool();
+export const gptProxyPool = new MailProxyPool();

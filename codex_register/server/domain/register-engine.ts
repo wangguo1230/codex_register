@@ -61,7 +61,7 @@ export const GptRegisterEngine = {
             SMS_MAX_BIND: String(cfg.smsMaxBind ?? 0), // 每号绑定上限，broker 复用号时用
             // PG 迁移后 worker 通过 process.env.DATABASE_URL 继承连接(无需 REG_DB_PATH)
             PROXY_URL: cfg.regProxy || "",
-            MAIL_PROXY_JUMP: cfg.mailProxyJump || "",
+            MAIL_PROXY_JUMP: cfg.gptProxyJump || "",
             MAILCOM_PROXY: cfg.mailProxy || "",
             BITBROWSER: (cfg.bitBrowser || isGoogle) ? "1" : "", // Gmail 老号强制比特窗口
             REG_GOOGLE_PREP: "0",
