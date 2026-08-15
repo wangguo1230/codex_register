@@ -615,19 +615,15 @@ async function clickDialogNext(page, log) {
             if (n.scrollHeight - n.clientHeight > 20) n.scrollTop = n.scrollHeight;
         }
     }).catch(() => {});
-    const clicked = await dlg.evaluate((root) => {
-        const btns = [...root.querySelectorAll("button, [role='button']")];
-        const next = btns.reverse().find((b) => {
-            if (!b.getClientRects().length) return false;
-            if (b.disabled) return false;
-            return /^(next|continue|下一步|继续)$/i.test((b.textContent || "").replace(/\s+/g, " ").trim());
-        });
-        if (!next) return false;
-        next.click();
-        return true;
-    }).catch(() => false);
-    if (clicked) {
-        log("[2FA] 点了确认框 Next（DOM）");
+    const nextBtn = dlg.getByRole("button", {name: "Next", exact: true})
+        .or(dlg.getByRole("button", {name: /^(next|continue|下一步|继续)$/i}))
+        .last();
+    if (await nextBtn.isVisible({timeout: 400}).catch(() => false)) {
+        await nextBtn.scrollIntoViewIfNeeded().catch(() => {});
+        await nextBtn.focus().catch(() => {});
+        await nextBtn.click({timeout: 2000}).catch(() => {});
+        await page.keyboard.press("Enter").catch(() => {});
+        log("[2FA] 点了确认框 Next + Enter");
         return true;
     }
     const nexts = dlg.getByRole("button", {name: /^(next|continue|下一步|继续)$/i});
