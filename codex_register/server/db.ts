@@ -577,6 +577,17 @@ export async function claimFreeMailcomMailbox() {
     });
 }
 
+/** 可换绑候选：仍是独立未售，只读，不预占。 */
+export async function listRebindGmailCandidates(opts = {}) {
+    const {sql, params} = googleImapClaimWhere(opts);
+    const { rows } = await query(
+        `SELECT m.id, m.email, m.password, m.totp_secret, m.recovery_email, m.imap_password, COALESCE(m.grp,'') AS grp
+         FROM mailboxes m WHERE ${sql} ORDER BY m.id DESC`,
+        params,
+    );
+    return rows;
+}
+
 /** 领一个空闲、已开 IMAP、且未被任何 GPT/Claude 占用的 Gmail。不新建 gpt_accounts。 */
 export async function claimFreeGoogleImapMailbox(opts = {}) {
     return withTransaction(async (client) => {
@@ -589,6 +600,36 @@ export async function claimFreeGoogleImapMailbox(opts = {}) {
         await client.query(`UPDATE mailboxes SET usage='gpt' WHERE id=$1`, [mb.id]);
         return { ...mb, usage: "gpt" };
     });
+}
+
+/** 探活通过后再预占这一号。仍必须是独立未售，失败则别人可能已领走。 */
+export async function claimMailboxForRebind(id) {
+    const mailboxId = Number(id);
+    if (!Number.isInteger(mailboxId)) return null;
+    return withTransaction(async (client) => {
+        const { rows: [mb] } = await client.query(
+            `SELECT m.* FROM mailboxes m WHERE m.id=$1 AND ${FREE_GOOGLE_IMAP_SQL} FOR UPDATE`,
+            [mailboxId],
+        );
+        if (!mb) return null;
+        await client.query(`UPDATE mailboxes SET usage='gpt' WHERE id=$1`, [mailboxId]);
+        return { ...mb, usage: "gpt" };
+    });
+}
+
+export async function markMailboxSold(id, note = "") {
+    const mailboxId = Number(id);
+    if (!Number.isInteger(mailboxId)) return 0;
+    const now = Date.now();
+    const tip = String(note || "").slice(0, 80);
+    const { rowCount } = await query(
+        `UPDATE mailboxes
+         SET sold_at=CASE WHEN sold_at>0 THEN sold_at ELSE $1 END,
+             note=CASE WHEN $3='' THEN note ELSE $3 END
+         WHERE id=$2 AND deleted_at=0`,
+        [now, mailboxId, tip],
+    );
+    return rowCount || 0;
 }
 
 /** 官方已占用/不可再用：标已售+独立，不再进空闲池。 */
@@ -615,7 +656,7 @@ export async function releaseMailboxToFree(id) {
     return rowCount || 0;
 }
 
-/** 把已有 GPT 号指到新邮箱；旧邮箱标已售、不退回空闲池。 */
+/** 官方换绑已成功后改指针：新邮箱 usage=gpt 且已售，旧邮箱已售不回池。 */
 export async function rebindGptMailbox(gptId, newMailboxId) {
     return withTransaction(async (client) => {
         const { rows: [gpt] } = await client.query(

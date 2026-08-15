@@ -797,7 +797,7 @@ export function RechargePanel({notify}: {notify?: (m: string) => void}) {
                         <div className="px-5 py-3 border-b font-semibold text-sm">
                             换绑 Gmail
                             <div className="text-xs text-gray-400 font-normal mt-0.5">
-                                对 {rebindIds.length} 个已付费号。换绑前会探 IMAP，不通自动换下一个。旧邮箱标已售。
+                                对 {rebindIds.length} 个已付费号。只领独立、未售、IMAP 通的可用 Gmail；不通换号。成功后新旧邮箱都标已售。
                             </div>
                         </div>
                         <div className="px-5 py-3 space-y-3 text-xs overflow-auto">

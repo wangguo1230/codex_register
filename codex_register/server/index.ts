@@ -2790,42 +2790,57 @@ async function runGmailRebind(queueId) {
         const pool = dest === "gmail" ? (gmailRebindPool.get(queueId) || {}) : {};
         const excludeIds = [];
         const poolHint = dest === "gmail" ? rebindPoolHint(pool) : "";
+        const gmailQueue = dest === "gmail"
+            ? await db.listRebindGmailCandidates({grp: pool.grp, emails: pool.emails})
+            : [];
+        let gmailCursor = 0;
         for (let attempt = 1; attempt <= 8; attempt++) {
             if (isGmailRebindCancelled(queueId)) {
+                if (claimed?.id) await db.releaseMailboxToFree(claimed.id);
                 rechargeLog(`换绑 ⏭ ${acc.email}: 已取消`);
                 return;
             }
-            claimed = dest === "mailcom"
-                ? await db.claimFreeMailcomMailbox()
-                : await db.claimFreeGoogleImapMailbox({grp: pool.grp, emails: pool.emails, excludeIds});
-            if (!claimed) {
-                let why = attempt === 1 ? `${miss}${poolHint}` : `范围内已无可用 ${destLabel}${poolHint}`;
-                if (dest === "gmail" && pool.emails?.length && attempt === 1) {
-                    const detail = await db.explainRebindGmailMiss(pool.emails).catch(() => "");
-                    if (detail) why = `${why}；${detail}`;
+            if (dest === "mailcom") {
+                claimed = await db.claimFreeMailcomMailbox();
+                if (!claimed) return fail(attempt === 1 ? `${miss}${poolHint}` : `范围内已无可用 ${destLabel}${poolHint}`, false);
+            } else {
+                let picked = null;
+                while (gmailCursor < gmailQueue.length) {
+                    const cand = gmailQueue[gmailCursor++];
+                    if (excludeIds.includes(cand.id)) continue;
+                    rechargeLog(`换绑 ${acc.email} → ${cand.email}：换绑前探 IMAP（仍未售，第 ${attempt} 个${poolHint}）`);
+                    const probe = await testGmailImap(cand.email, cand.imap_password);
+                    if (!probe.ok) {
+                        const dead = imapAuthDead(probe.error);
+                        rechargeLog(`换绑 ${cand.email} 不可用 IMAP 不通 (${probe.error})，${dead ? "标已售废号" : "仍可用、本轮跳过"}`);
+                        if (dead) {
+                            await db.quarantineMailbox(cand.id, "IMAP不通");
+                            try { await db.refreshMailboxGoogleState(cand.id, {imap: "fail", last_error: String(probe.error || "").slice(0, 120)}); } catch { /* */ }
+                        } else {
+                            excludeIds.push(cand.id);
+                        }
+                        continue;
+                    }
+                    rechargeLog(`换绑 ${cand.email} 可用 IMAP 通（收件箱 ${probe.messages ?? 0} 封），再预占`);
+                    picked = await db.claimMailboxForRebind(cand.id);
+                    if (!picked) {
+                        rechargeLog(`换绑 ${cand.email} 探活后被别人领走，换下一个`);
+                        continue;
+                    }
+                    break;
                 }
-                return fail(why, false);
+                if (!picked) {
+                    let why = attempt === 1 ? `${miss}${poolHint}` : `范围内已无可用 ${destLabel}${poolHint}`;
+                    if (pool.emails?.length && attempt === 1) {
+                        const detail = await db.explainRebindGmailMiss(pool.emails).catch(() => "");
+                        if (detail) why = `${why}；${detail}`;
+                    }
+                    return fail(why, false);
+                }
+                claimed = picked;
             }
             rememberClaimed(claimed);
-            if (dest === "gmail") {
-                rechargeLog(`换绑 ${acc.email} → ${claimed.email}：先探 IMAP（第 ${attempt} 个${poolHint}）`);
-                const probe = await testGmailImap(claimed.email, claimed.imap_password);
-                if (!probe.ok) {
-                    const dead = imapAuthDead(probe.error);
-                    rechargeLog(`换绑 ${claimed.email} IMAP 不通 (${probe.error})，${dead ? "标废号" : "放回"}换下一个`);
-                    if (dead) {
-                        await db.quarantineMailbox(claimed.id, "IMAP不通");
-                        try { await db.refreshMailboxGoogleState(claimed.id, {imap: "fail", last_error: String(probe.error || "").slice(0, 120)}); } catch { /* */ }
-                    } else {
-                        await db.releaseMailboxToFree(claimed.id);
-                        excludeIds.push(claimed.id);
-                    }
-                    claimed = null;
-                    continue;
-                }
-                rechargeLog(`换绑 ${claimed.email} IMAP 通（收件箱 ${probe.messages ?? 0} 封）`);
-            }
-            rechargeLog(`换绑 ${acc.email} → ${claimed.email} (独立未使用 ${destLabel}，第 ${attempt} 个；先预检目标邮箱)`);
+            rechargeLog(`换绑 ${acc.email} → ${claimed.email} (独立未售 ${destLabel}，第 ${attempt} 个)`);
 
             let r = await doChange(at, tok, claimed);
             if (!r.ok && r.rateLimited) {
@@ -2868,13 +2883,14 @@ async function runGmailRebind(queueId) {
                 try {
                     await db.rebindGptMailbox(acc.id, claimed.id);
                 } catch (e: any) {
+                    await db.markMailboxSold(claimed.id, "换绑成功回写失败").catch(() => {});
                     await db.updateQueueItem(queueId, {
                         email: claimed.email,
                         rebind_status: "fail",
                         rebind_email: claimed.email,
                         rebind_error: `平台已换绑，回写失败: ${String(e?.message || e).slice(0, 120)}`,
                     });
-                    rechargeLog(`换绑 ✗ ${acc.email} → ${claimed.email}: 平台已换绑，回写失败 ${e?.message || e}`);
+                    rechargeLog(`换绑 ✗ ${acc.email} → ${claimed.email}: 平台已换绑，回写失败 ${e?.message || e}（新邮箱已标已售）`);
                     await queueSync();
                     return;
                 }
@@ -2888,7 +2904,7 @@ async function runGmailRebind(queueId) {
                 if (dest === "gmail") {
                     try { await db.refreshMailboxGoogleState(claimed.id, {gpt: "ok"}); } catch { /* 阶段标记失败不影响换绑 */ }
                 }
-                rechargeLog(`换绑 ✓ ${acc.email} → ${claimed.email}（旧邮箱已标已售，不返还）`);
+                rechargeLog(`换绑 ✓ ${acc.email} → ${claimed.email}（新邮箱已售，旧邮箱已售，都不回池）`);
                 await queueSync();
                 try {
                     broadcast("snapshot", await db.listAccounts());
