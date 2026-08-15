@@ -143,7 +143,8 @@ console.log("清残留窗", swept);
 
 const changeOnly = process.argv.includes("--change-only");
 const loginResults = changeOnly ? [] : await Promise.all(LOGIN_EMAILS.map((e, i) => runOne("login", e, i)));
-const changeResults = await Promise.all(CHANGE_EMAILS.map((e, i) => runOne("change", e, i + 2)));
+const changeResults = [];
+for (const [i, e] of CHANGE_EMAILS.entries()) changeResults.push(await runOne("change", e, i + 2));
 
 const summary = {at: stamp(), login: loginResults, change: changeResults};
 console.log("=== 抽检结果 ===");

@@ -607,10 +607,18 @@ async function clickDialogNext(page, log) {
     if (!dlg) return false;
     const codeBox = dlg.locator('input[placeholder*="code" i], input[name="totpPin"], input[autocomplete="one-time-code"]').first();
     if (await codeBox.isVisible({timeout: 200}).catch(() => false)) return false;
-    const btn = dlg.getByRole("button", {name: /^(next|continue|replace|change|ok|下一步|继续|更换|确定)$/i}).last();
+    const names = await dlg.evaluate((el) => [...el.querySelectorAll("button, [role='button'], a")].map((b) => (b.textContent || "").replace(/\s+/g, " ").trim()).filter(Boolean).slice(0, 8)).catch(() => []);
+    log(`[2FA] 确认框按钮 ${JSON.stringify(names)}`);
+    const btn = dlg.getByRole("button", {name: /^(next|continue|下一步|继续)$/i}).first();
     if (await btn.isVisible({timeout: 600}).catch(() => false)) {
-        await btn.click({force: true}).catch(() => btn.click());
+        await btn.click().catch(() => btn.click({force: true}));
         log("[2FA] 点了确认框 Next");
+        return true;
+    }
+    const txtNext = dlg.getByText(/^(next|continue|下一步|继续)$/i).first();
+    if (await txtNext.isVisible({timeout: 400}).catch(() => false)) {
+        await txtNext.click().catch(() => txtNext.click({force: true}));
+        log("[2FA] 点了确认框 Next 文案");
         return true;
     }
     const any = dlg.locator("button").last();
@@ -710,7 +718,7 @@ async function clickCantScanByDom(page, log) {
         const href = String(await a.getAttribute("href").catch(() => "") || "");
         if (STORE_HREF_RE.test(href)) continue;
         const txt = String(await a.innerText().catch(() => "")).replace(/\s+/g, " ").trim();
-        if (/play store|app store|google play|privacy|terms|help|learn more|change authenticator|set up authenticator/i.test(txt)) continue;
+        if (/play store|app store|google play|privacy|terms|help|learn more|change authenticator|set up authenticator|cancel|back|关闭|取消|返回/i.test(txt)) continue;
         const box = await a.boundingBox().catch(() => null);
         if (!box || box.y < 80) continue;
         if (txt.length > 80) continue;
@@ -892,12 +900,11 @@ export async function change2faOnPage(page, {
         const filled = await fillChangeAuthenticatorCode(page, totpSecret, log);
         if (filled === "ok") setup = await waitAuthenticatorSetup(page, 9000);
     }
-    if (!setup && !(await clickAuthenticatorChangeByDom(page, log))) {
-        log("[2FA] 未找到更改/设置按钮");
-        await dumpPage(page, "2fa_no_action_btn", log, email);
-        return {ok: false, error: "未找到更改/设置按钮"};
+    if (!["qr", "secret"].includes(setup) && !await findChangeTotpDialog(page)) {
+        log("[2FA] 确认后没有出现填码框或密钥");
+        await dumpPage(page, "2fa_no_setup_after_confirm", log, email);
+        return {ok: false, error: "确认后没有出现填码框或密钥"};
     }
-    if (!setup) setup = await waitAuthenticatorSetup(page, 6000);
 
     let cantClicked = setup === "secret";
     const canSeeCantScan = await page.getByText(/can.?t scan|cannot scan|无法扫描/i).first().isVisible({timeout: 500}).catch(() => false);
@@ -937,11 +944,7 @@ export async function change2faOnPage(page, {
             }
         }
     }
-    if (!cantClicked && await clickCantScanByDom(page, log)) cantClicked = true;
-    if (!cantClicked && await clickText(page, CANT_SCAN_KEYWORDS, 2000)) {
-        cantClicked = true;
-        log("[2FA] 通过关键词点击无法扫描");
-    }
+    if (!cantClicked && canSeeCantScan && await clickCantScanByDom(page, log)) cantClicked = true;
 
     if (!cantClicked && !/otpauth:\/\//i.test(String(await page.innerText("body").catch(() => "")))) {
         log("[2FA] 未找到无法扫描按钮");
