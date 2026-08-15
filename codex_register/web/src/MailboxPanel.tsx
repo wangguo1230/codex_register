@@ -1016,7 +1016,10 @@ export function MailboxPanel({notify}: {notify?: (m: string) => void}) {
                                     return "#9ca3af";
                                 })()}} title={m.provider === "google" ? (formatHardenListReason(m) || m.google_state?.last_error || m.pw_status || "") : (m.pw_status || "")}>
                                     {m.provider === "google"
-                                        ? (formatHardenListReason(m) || (["ready", "gpt_ok"].includes(m.google_stage || "") ? (m.pw_status || "已齐") : (m.pw_status || "—")))
+                                        ? (formatHardenListReason(m)
+                                            || (["ready", "gpt_ok"].includes(m.google_stage || "")
+                                                ? (/^⚠/.test(m.pw_status || "") ? "✅整备" : (m.pw_status || "已齐"))
+                                                : (m.pw_status || "—")))
                                         : (m.pw_status || "—")}
                                 </td>
                                 <td style={{padding: "6px 10px", color: "#6b7280"}}>{m.grp || "—"}</td>

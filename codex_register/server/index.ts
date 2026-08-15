@@ -464,7 +464,7 @@ async function applyGoogleHardenResult(id, mb, r) {
         phone: r.phoneCleared ? "ok" : undefined,
         devices: r.devicesDone ? "ok" : undefined,
         imap: r.imapPassword ? "ok" : (r.errors || []).some((x) => /IMAP|应用密码/i.test(String(x))) ? "fail" : undefined,
-        last_error: classifyHardenIssue(brief) || brief,
+        last_error: (r.ok || (r.imapPassword && (r.totpRotated || alreadyUsable))) ? "" : (classifyHardenIssue(brief) || brief),
         imap_gen_fail: refuseImap ? genFail : undefined,
         imap_next_try: refuseImap ? Date.now() + 45 * 60 * 1000 * Number(genFail || 1) : undefined,
     }).catch(() => {});
@@ -479,7 +479,7 @@ async function runOneGoogleHarden(id, opts = {}) {
     const skip = planHardenSkip(mb);
     if (skip.all || skip.usable) {
         logMailbox(id, skip.all ? "[整备] 缺口已齐，不再开窗" : "[整备] 2FA+IMAP 已齐，不再开窗补加分项");
-        await db.refreshMailboxGoogleState(id, {login: "ok", last_error: ""}).catch(() => {});
+        await db.refreshMailboxGoogleState(id, {login: "ok", last_error: "", imap: "ok", totp_rotated: true}).catch(() => {});
         return {
             ok: true, skipped: true, password: mb.password, totpSecret: mb.totp_secret,
             totpRotated: true,

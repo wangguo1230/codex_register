@@ -93,7 +93,7 @@ export function MailboxDetail({mailbox, onClose}: {mailbox: Mailbox; onClose: ()
                                 : mailbox.google_stage === "login_ok" ? "能登录"
                                 : mailbox.google_stage === "imported" ? "刚导入"
                                 : "未记录"}
-                            {formatHardenListReason(mailbox) ? ` · ${formatHardenListReason(mailbox)}` : (mailbox.google_state?.last_error ? ` · ${mailbox.google_state.last_error}` : "")}
+                            {formatHardenListReason(mailbox) ? ` · ${formatHardenListReason(mailbox)}` : ""}
                         </span>
                     </> : null}
                     <span className="text-gray-400">归属</span>
