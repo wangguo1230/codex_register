@@ -420,8 +420,9 @@ function dialogLooksLikeChangeTotp(text) {
 function dialogLooksLikeReplaceConfirm(text) {
     const t = String(text || "");
     if (/enter the 6-digit|enter code|输入.*6.*位|输入验证码/i.test(t)) return false;
+    if (/can.?t scan|cannot scan|无法扫描/i.test(t)) return false;
     return /won.t be able to use your old|you will no longer|old authenticator|无法再使用|旧的身份验证|replace this authenticator/i.test(t)
-        || (/change authenticator app/i.test(t) && /next|continue|change|replace|下一步|继续|更换/i.test(t));
+        && !/scan a qr|qr code/i.test(t);
 }
 
 async function findChangeTotpDialog(page) {
@@ -576,7 +577,7 @@ async function waitAuthenticatorSetup(page, ms = 9000) {
         }
         if (await page.locator("canvas, img[alt*='QR' i], img[src*='qr']").first().isVisible({timeout: 180}).catch(() => false)) return "qr";
         const t = String(await page.innerText("body").catch(() => ""));
-        if (/otpauth:\/\//i.test(t) || /secret key|setup key|密钥|can't scan it|cannot scan|无法扫描/i.test(t)) return "secret";
+        if (/otpauth:\/\//i.test(t) || /secret key|setup key|密钥|can.?t scan|cannot scan|无法扫描/i.test(t)) return "secret";
         if (await findChangeTotpDialog(page)) return "reauth";
         const dlgs = page.locator('[role="dialog"], [role="alertdialog"]');
         const dn = await dlgs.count().catch(() => 0);
@@ -698,38 +699,20 @@ async function clickAuthenticatorChangeByDom(page, log) {
 }
 
 async function clickCantScanByDom(page, log) {
-    const named = page.getByRole("button", {name: /can.?t scan|cannot scan|无法扫描/i}).first();
-    const namedLink = page.getByRole("link", {name: /can.?t scan|cannot scan|无法扫描/i}).first();
-    if (await named.isVisible({timeout: 400}).catch(() => false)) {
-        await named.click({force: true}).catch(() => named.click());
-        log("[2FA] 点了 Can't scan 按钮");
-        return true;
-    }
-    if (await namedLink.isVisible({timeout: 300}).catch(() => false)) {
-        await namedLink.click({force: true}).catch(() => namedLink.click());
-        log("[2FA] 点了 Can't scan 链接");
-        return true;
-    }
-    const dialog = page.locator('[role="dialog"], [role="alertdialog"]').first();
-    if (await isAccountPickerDialog(page)) {
-        await dismissAccountFlyout(page);
-        return false;
-    }
-    const scope = await dialog.isVisible({timeout: 400}).catch(() => false) ? dialog : page;
-    const links = scope.locator("a[href], button, [role='link'], [role='button']");
-    const n = await links.count().catch(() => 0);
-    for (let i = 0; i < n; i++) {
-        const a = links.nth(i);
-        if (!await a.isVisible({timeout: 120}).catch(() => false)) continue;
-        const href = String(await a.getAttribute("href").catch(() => "") || "");
-        if (STORE_HREF_RE.test(href)) continue;
-        const txt = String(await a.innerText().catch(() => "")).replace(/\s+/g, " ").trim();
-        if (/play store|app store|google play|privacy|terms|help|learn more|change authenticator|set up authenticator|cancel|back|关闭|取消|返回/i.test(txt)) continue;
-        const box = await a.boundingBox().catch(() => null);
-        if (!box || box.y < 80) continue;
-        if (txt.length > 80) continue;
-        await a.click({force: true}).catch(() => a.click());
-        log(`[2FA] 点无法扫描候选 ${txt.slice(0, 40) || href.slice(0, 40)}`);
+    const dlg = page.locator('[role="dialog"], [role="alertdialog"]').first();
+    const scope = await dlg.isVisible({timeout: 300}).catch(() => false) ? dlg : page;
+    const candidates = [
+        scope.locator('[jsname="Pr7Yme"]'),
+        scope.getByRole("button", {name: /can.?t scan|cannot scan|无法扫描/i}),
+        scope.getByText(/can.?t scan it\??/i),
+        scope.locator("button").filter({hasText: /can.?t scan|无法扫描/i}),
+    ];
+    for (const loc of candidates) {
+        const el = loc.first();
+        if (!await el.isVisible({timeout: 350}).catch(() => false)) continue;
+        await el.scrollIntoViewIfNeeded().catch(() => {});
+        await el.click({timeout: 2000}).catch(() => el.click({force: true, timeout: 1500}));
+        log("[2FA] 点了 Can't scan it?");
         return true;
     }
     return false;
@@ -885,14 +868,17 @@ export async function change2faOnPage(page, {
             setup = await waitAuthenticatorSetup(page, 10000);
             continue;
         }
-        const confirmOpen = await page.evaluate(() => {
-            const t = [...document.querySelectorAll('[role="dialog"], [role="alertdialog"]')]
-                .filter((el) => el.getClientRects().length)
-                .map((el) => el.innerText || "")
-                .join("\n");
-            return /won.t be able to use your old|old authenticator|无法再使用/i.test(t);
-        }).catch(() => false);
-        if (confirmOpen) {
+        const dlgText = String(await page.locator('[role="dialog"], [role="alertdialog"]').first().innerText().catch(() => ""));
+        if (/can.?t scan|cannot scan|无法扫描/i.test(dlgText)
+            || await page.locator("img[alt*='QR' i]").first().isVisible({timeout: 200}).catch(() => false)) {
+            log("[2FA] 确认框已出 QR，点 Can't scan it?");
+            if (await clickCantScanByDom(page, log)) {
+                setup = await waitAuthenticatorSetup(page, 6000);
+                if (!setup) setup = "secret";
+            }
+            continue;
+        }
+        if (dialogLooksLikeReplaceConfirm(dlgText)) {
             const hit = await clickDialogNext(page, log);
             log(hit ? "[2FA] 确认框已点 Next，等填码/QR" : "[2FA] 确认框 Next 没点到");
             setup = await waitAuthenticatorSetup(page, 4000);
