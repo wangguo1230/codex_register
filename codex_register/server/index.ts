@@ -32,7 +32,7 @@ import {changePasswordOnPage, change2faOnPage} from "../src/mail/google-manage.j
 import {runGoogleHardenWithBit, withGoogleBitSession} from "../src/mail/google-secure.js";
 import {mailProxyPool, maskProxyUrl, toProxyImportLine, kookeeySessionOf, probeMailProxy, getMailProxyJump} from "../src/mail/proxy-pool.js";
 import {randomPassword} from "../src/utils.js";
-import {straightenImportRow} from "../src/mfa.js";
+import {straightenImportRow, looksLikeEmail} from "../src/mfa.js";
 import {openBrowserWithAuth} from "../src/simulate-chat.js";
 import {bitHealth, closeTrackedBitWindows, listAutomationBitWindows, stopAutomationBitWindows} from "../src/bitbrowser.js";
 import {clearMailboxJobStop, isMailboxJobStopped, requestMailboxJobStop} from "../src/mail/mailbox-job-stop.js";
@@ -122,13 +122,22 @@ function parseEmailPasswordLines(text) {
     for (const raw of String(text || "").split(/\r?\n/)) {
         const line = raw.trim();
         if (!line) continue;
-        let parts = line.includes(sep) ? line.split(sepRe).map((s) => s.trim()).filter(Boolean) : [];
-        if (parts.length < 2 && line.includes("----")) parts = line.split("----").map((s) => s.trim()).filter(Boolean);
-        if (parts.length < 2) parts = line.split(/[\s,;:|\t]+/).filter(Boolean);
+        let parts = line.includes(sep) ? line.split(sepRe).map((s) => s.trim()) : [];
+        if (parts.filter(Boolean).length < 2 && line.includes("----")) parts = line.split("----").map((s) => s.trim());
+        if (parts.filter(Boolean).length < 2) parts = line.split(/[\s,;|\t]+/).map((s) => s.trim()).filter(Boolean);
         const email = (parts[0] || "").toLowerCase();
         const password = parts[1] || "";
         if (/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) {
-            const straight = straightenImportRow({totp_secret: parts[2] || "", recovery_email: parts[3] || ""});
+            // 卖家常见: 邮箱----密码----辅助邮箱----密钥；也兼容 邮箱----密码----密钥----辅助邮箱
+            let rec = "", totp = "";
+            if (parts.length >= 4) {
+                rec = parts[2] || "";
+                totp = parts[3] || "";
+            } else if (parts.length === 3) {
+                if (looksLikeEmail(parts[2])) rec = parts[2];
+                else totp = parts[2] || "";
+            }
+            const straight = straightenImportRow({totp_secret: totp, recovery_email: rec});
             rows.push({email, password, totp_secret: straight.totp_secret, recovery_email: straight.recovery_email});
         }
     }

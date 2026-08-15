@@ -1,3 +1,5 @@
+import {looksLikeTotpSecret} from "../mfa.js";
+
 /**
  * Gmail 老号管理状态。
  * 目标：每号都留下「现在卡在哪、缺哪一步」，后面整备/取件/注册按缺口跑，而不是一套流程打天下。
@@ -73,7 +75,7 @@ export function deriveGoogleState(facts = {}, overlay = {}) {
     const s = {...emptyGoogleState(), ...prev};
 
     s.totp_rotated = !!(prev.totp_rotated || overlay.totp_rotated);
-    s.totp = hasText(facts.totp_secret) ? "ok" : "none";
+    s.totp = looksLikeTotpSecret(facts.totp_secret) ? "ok" : "none";
     s.imap = hasText(facts.imap_password) ? "ok" : (s.imap === "fail" ? "fail" : "none");
     s.recovery = hasText(facts.recovery_email) ? "fail" : "ok";
     if (String(facts.pw_status || "").startsWith("✅") || /整备/.test(String(facts.pw_status || ""))) s.password = "ok";
