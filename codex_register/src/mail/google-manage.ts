@@ -745,13 +745,22 @@ async function openAuthenticatorDetail(page, log) {
         await dismissAccountFlyout(page);
         await page.keyboard.press("Escape").catch(() => {});
     }
-    try {
-        await page.goto(AUTHENTICATOR_URL, {waitUntil: "domcontentloaded", timeout: 30000});
-        log("[2FA] 直达 authenticator 页");
-    } catch { /* ignore */ }
-    for (let i = 0; i < 30; i++) {
-        await page.waitForTimeout(400);
+    const already = /myaccount\.google\.com\/.*authenticator/i.test(page.url())
+        && !/accounts\.google\.com/i.test(page.url());
+    if (!already) {
+        try {
+            await page.goto(AUTHENTICATOR_URL, {waitUntil: "domcontentloaded", timeout: 30000});
+            log("[2FA] 直达 authenticator 页");
+        } catch { /* ignore */ }
+    }
+    for (let i = 0; i < 20; i++) {
+        await page.waitForTimeout(300);
         if (await onAuthenticatorDetail(page)) return true;
+        if (isVerifyItsYouText(String(await page.innerText("body").catch(() => "")))
+            || /accounts\.google\.com\/(v3\/)?signin|challenge\/totp/i.test(page.url())) {
+            log("[2FA] authenticator 页又要二次验证");
+            return false;
+        }
     }
     return false;
 }
@@ -849,7 +858,11 @@ export async function change2faOnPage(page, {
         return {ok: false, error: "未找到 Authenticator 入口"};
     }
 
-    const opened = await openAuthenticatorDetail(page, log);
+    let opened = await openAuthenticatorDetail(page, log);
+    if (!opened) {
+        await googleReauthPassword(page, {password, totpSecret, log});
+        opened = await openAuthenticatorDetail(page, log);
+    }
     if (!opened) {
         log("[2FA] 点了 Authenticator 但还在总览页");
         await dumpPage(page, "2fa_no_action_btn", log, email);
