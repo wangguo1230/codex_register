@@ -925,8 +925,7 @@ app.post("/api/control/proxy-ports", (req, res) => {
     const nextReg = valid(rp) ? rp : scheduler.regProxyPort, nextClaude = valid(cp) ? cp : scheduler.claudeProxyPort;
     if (nextReg === nextClaude) return res.status(400).json({error: "reg 与 claude 端口不能相同"});
     scheduler.regProxyPort = nextReg; scheduler.claudeProxyPort = nextClaude; scheduler.saveSettings();
-    // 端口变了→对应 xray 若在跑则用新端口重启(regProxy/claudeProxy 自动跟随 r.port);startXray 只清理"自己这个端口",不碰其他进程
-    try { if (scheduler.xrayVless) { const r = startXray(scheduler.xrayVless, {localPort: scheduler.regProxyPort, binPath: scheduler.xrayBinPath || undefined}); scheduler.regProxy = `socks5://127.0.0.1:${r.port}`; } } catch { /* 起失败保留旧代理 */ }
+    // GPT 不再起独立 vless。Claude 端口变了且还在跑则用新端口重启。
     try { if (scheduler.claudeXrayVless) { const r = startXray(scheduler.claudeXrayVless, {name: "claude", localPort: scheduler.claudeProxyPort, binPath: scheduler.xrayBinPath || undefined}); scheduler.claudeProxy = `socks5://127.0.0.1:${r.port}`; } } catch { /* */ }
     scheduler.saveSettings();
     res.json({ok: true, regProxyPort: scheduler.regProxyPort, claudeProxyPort: scheduler.claudeProxyPort, regProxy: scheduler.regProxy, claudeProxy: scheduler.claudeProxy});
@@ -1955,17 +1954,7 @@ app.post("/api/control/xray-bin", (req, res) => {
     res.json({ok: true, xrayBinPath: p});
 });
 app.post("/api/control/xray", (req, res) => {
-    const vlessUrl = String(req.body?.vlessUrl || "").trim();
-    if (!vlessUrl) return res.status(400).json({error: "缺少 vless 链接"});
-    try {
-        const r = startXray(vlessUrl, {localPort: scheduler.regProxyPort, binPath: scheduler.xrayBinPath || undefined});
-        scheduler.regProxy = `socks5://127.0.0.1:${r.port}`;
-        scheduler.xrayVless = vlessUrl;
-        scheduler.saveSettings();
-        res.json({ok: true, xray: xrayStatus(), regProxy: scheduler.regProxy});
-    } catch (e: any) {
-        res.status(400).json({error: String(e?.message ?? e)});
-    }
+    res.status(410).json({error: "GPT 独立 vless 已下线，注册走邮箱代理池：先设跳板，再导入出口代理"});
 });
 app.post("/api/control/xray/stop", (req, res) => {
     stopXray();
@@ -3832,16 +3821,20 @@ if (existsSync(WEB_DIST)) {
 }
 
 setMailProxy(scheduler.mailProxyEnabled !== false ? (scheduler.mailProxy || "") : ""); // 收件箱初始用邮箱代理(受开关控制)
-// 重启自启:若持久化了 vless，自动重新起独立 xray 并把 regProxy 指向它(失败不阻塞服务启动)
+// GPT 注册不再走独立 vless/xray，统一用邮箱代理池（跳板 + 导入出口）。清掉旧自启。
+try { stopXray(); } catch { /* */ }
 if (scheduler.xrayVless) {
-    try {
-        const r = startXray(scheduler.xrayVless, {localPort: scheduler.regProxyPort, binPath: scheduler.xrayBinPath || undefined});
-        scheduler.regProxy = `socks5://127.0.0.1:${r.port}`;
-        console.log(`[server] 独立 xray 已自启: ${r.node} @ 127.0.0.1:${r.port}`);
-    } catch (e: any) {
-        console.warn(`[server] 独立 xray 自启失败(不影响服务): ${e?.message ?? e}`);
+    console.log("[server] 已停用 GPT 独立 vless，改走代理池");
+    scheduler.xrayVless = "";
+}
+{
+    const localXray = new RegExp(`^socks5h?://127\\.0\\.0\\.1:${Number(scheduler.regProxyPort) || 10809}$`, "i");
+    if (localXray.test(String(scheduler.regProxy || "").trim())) {
+        scheduler.regProxy = "";
+        console.log("[server] 已清空指向独立 xray 的 regProxy，注册改租代理池");
     }
 }
+scheduler.saveSettings();
 if (scheduler.claudeXrayVless) {
     try {
         const r = startXray(scheduler.claudeXrayVless, {name: "claude", localPort: scheduler.claudeProxyPort, binPath: scheduler.xrayBinPath || undefined});

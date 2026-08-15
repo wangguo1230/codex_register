@@ -54,7 +54,7 @@ class Scheduler extends EventEmitter {
         this.rtEnabled = false;        // 注册成功后是否额外走 codex OAuth 拿可续期 rt(强制 add-phone，接码有成本，默认关)
         this.mfaEnabled = true;        // 注册成功后绑 TOTP,后续登录走密码+验证器,少靠邮箱
         this.smsMaxBind = 3;           // 每个接码号最多绑定几个账号(0=不限，直到被 OpenAI 拒)
-        this.xrayVless = "";           // 独立注册代理的 vless 链接(启用则 index 起独立 xray 并把 regProxy 指向它)
+        this.xrayVless = "";           // 已废弃：GPT 不再起独立 xray，注册走 mailProxyPool + jump
         this.regEngine = "http";       // 注册引擎:http(sentinel HTTP 模拟) / browser(真 Chrome 过 CF)
         this.bitBrowser = false;       // 浏览器引擎用比特浏览器:每号独立指纹窗口(需本地比特客户端开着 Local API)
         // deleteMailboxWithAccount 已废弃，所有删除一律软删邮箱
@@ -79,7 +79,7 @@ class Scheduler extends EventEmitter {
         this.rtConcurrency = 4;        // 导出含RT时并发获取数
         this.rebindAfterPaid = "gmail";   // 充值平台回 paid 后换绑目标: off | gmail | mailcom
         this.rebindGmailAfterPaid = true; // 兼容旧配置(true=gmail)
-        this.mailProxyPool = [];          // 邮箱整备/换2FA/改密代理池(一行一个,1代理=1指纹)
+        this.mailProxyPool = [];          // 邮箱整备/换2FA/改密/GPT注册共用代理池(一行一个,1代理=1指纹)
         this.mailProxyJump = "";          // 跳板：本机先走它再连代理池网关(直连 kookeey 不通时用)
         this.running = new Map();      // runId(`${domain}:${id}`) -> { child, tmpFile, gotResult, domain, id, mailboxId, engine }
         this.maintLock = null; // 浏览器维护互斥锁:null=空闲, string=持有者标识(如 "batch-at-relogin")
@@ -285,8 +285,7 @@ class Scheduler extends EventEmitter {
             if (!this.paused) acc = await db.claimNext();
             if (!acc && !this.pausedClaude) acc = await db.claimNextClaude();
             if (!acc) break;
-            const isGoogle = acc.provider === "google" || /@(gmail|googlemail)\.com$/i.test(String(acc.email || ""));
-            if (isGoogle && (acc.domain || "gpt") === "gpt") {
+            if ((acc.domain || "gpt") === "gpt") {
                 const snap = this.mailProxyPoolSnap();
                 const busy = [...this.running.values()].filter((i) => i.wantMailPool).length;
                 if (busy >= Math.max(1, snap.slots || 1)) {
@@ -315,8 +314,7 @@ class Scheduler extends EventEmitter {
         const runId = `${domain}:${acc.id}`;
         const tmpFile = path.join(this.tmpDir, `mc-${domain}-${acc.id}.txt`);
         writeFileSync(tmpFile, [acc.email, acc.password, acc.mailbox_totp || "", acc.recovery_email || "", acc.mailbox_imap || ""].join("----") + "\n", "utf8");
-        const isGoogle = acc.provider === "google" || /@(gmail|googlemail)\.com$/i.test(String(acc.email || ""));
-        const info = {child: null, tmpFile, gotResult: false, engine: null, domain, id: acc.id, mailboxId: acc.mailbox_id, releasing: false, wantMailPool: isGoogle && domain === "gpt", mailLease: null};
+        const info = {child: null, tmpFile, gotResult: false, engine: null, domain, id: acc.id, mailboxId: acc.mailbox_id, releasing: false, wantMailPool: domain === "gpt", mailLease: null};
         this.running.set(runId, info);
         if (info.wantMailPool) {
             try {

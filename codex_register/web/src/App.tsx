@@ -1,8 +1,9 @@
 import React, {useEffect, useMemo, useRef, useState} from "react";
-import {api, connectStream, type Account, type Stats, type Daily, type XrayStatus, type Mailbox} from "./api";
+import {api, connectStream, type Account, type Stats, type Daily, type Mailbox} from "./api";
 import {MailboxPanel} from "./MailboxPanel";
 import {ClaudePanel} from "./ClaudePanel";
 import {RechargePanel} from "./RechargePanel";
+import {ProxyPoolPanel} from "./ProxyPoolPanel";
 import {generateTotp, totpRemain} from "./totp";
 
 const STATUS_STYLE: Record<string, string> = {
@@ -86,10 +87,8 @@ export default function App() {
     const [expDays, setExpDays] = useState(10); // 过期阈值:注册满 N 天视为过期(网页 token 约 10 天)
     const [otpSingle, setOtpSingle] = useState(true);
     const [chatSim, setChatSim] = useState(true);
-    const [regProxy, setRegProxy] = useState("");
-    const [mailProxy, setMailProxy] = useState("");
-    const [mailProxyEnabled, setMailProxyEnabled] = useState(true);
     const [showProxy, setShowProxy] = useState(false);
+    const [poolMeta, setPoolMeta] = useState({total: 0, leased: 0, jump: ""});
     const [showSms, setShowSms] = useState(false);
     const [smsText, setSmsText] = useState("");
     const [smsData, setSmsData] = useState<{list: any[]; stats: {free: number; used: number; bad: number; claimed: number; total: number}}>({list: [], stats: {free: 0, used: 0, bad: 0, claimed: 0, total: 0}});
@@ -99,12 +98,6 @@ export default function App() {
     const [bitBrowser, setBitBrowser] = useState(false); // 比特浏览器:每号独立指纹窗口
     const [daily, setDaily] = useState<Daily | null>(null);
     const [showDaily, setShowDaily] = useState(false);
-    const [xray, setXray] = useState<XrayStatus | null>(null);
-    const [regPortInput, setRegPortInput] = useState("10809");   // 独立 xray 本地端口(可配置持久化)
-    const [claudePortInput, setClaudePortInput] = useState("10810");
-    const [showXray, setShowXray] = useState(false);
-    const [xrayBinPath, setXrayBinPath] = useState("");
-    const [vlessInput, setVlessInput] = useState("");
     const [smsLinkTemplate, setSmsLinkTemplate] = useState("");
     const [smsMaxBind, setSmsMaxBind] = useState(3);
     const [batchFilter, setBatchFilter] = useState(""); // 按批次筛选("" =全部)
@@ -181,7 +174,7 @@ export default function App() {
 
     // 初次加载 + SSE
     useEffect(() => {
-        api.state().then((s) => { setPaused(s.state.paused); setInstanceId(s.state.instanceId || ""); setConcurrency(s.state.concurrency); setOtpSingle(s.state.otpSingle); setChatSim(s.state.simulateChat); setSmsEnabled(s.state.smsEnabled); setRtEnabled(s.state.rtEnabled); setMfaEnabled(s.state.mfaEnabled !== false); setDaily(s.state.daily); setXray(s.state.xray); setRegEngine(s.state.regEngine || "http"); setBitBrowser(!!s.state.bitBrowser); setSmsLinkTemplate(s.state.smsLinkTemplate || ""); setSmsMaxBind(s.state.smsMaxBind ?? 3); setRegProxy(s.state.regProxy || ""); setMailProxy(s.state.mailProxy || ""); setMailProxyEnabled(s.state.mailProxyEnabled !== false); setRegPortInput(String(s.state.regProxyPort ?? 10809)); setClaudePortInput(String(s.state.claudeProxyPort ?? 10810)); setXrayBinPath(s.state.xrayBinPath || ""); if (s.state.xrayVless) setVlessInput(s.state.xrayVless); if (s.state.defaultPassword) setDefaultGptPw(s.state.defaultPassword); setStats(s.stats); }).catch(() => {});
+        api.state().then((s) => { setPaused(s.state.paused); setInstanceId(s.state.instanceId || ""); setConcurrency(s.state.concurrency); setOtpSingle(s.state.otpSingle); setChatSim(s.state.simulateChat); setSmsEnabled(s.state.smsEnabled); setRtEnabled(s.state.rtEnabled); setMfaEnabled(s.state.mfaEnabled !== false); setDaily(s.state.daily); setRegEngine(s.state.regEngine || "http"); setBitBrowser(!!s.state.bitBrowser); setSmsLinkTemplate(s.state.smsLinkTemplate || ""); setSmsMaxBind(s.state.smsMaxBind ?? 3); if (s.state.defaultPassword) setDefaultGptPw(s.state.defaultPassword); setStats(s.stats); const snap = (s.state as any).mailProxyPoolSnap; if (snap) setPoolMeta({total: snap.total || 0, leased: snap.leased || 0, jump: String((s.state as any).mailProxyJump || "")}); }).catch(() => {});
         api.listAccounts().then(setAccounts).catch(() => {});
         // 批次数据来自数据库(筛选/导出用;导入已迁至邮箱管理)
         api.batches().then(setBatches).catch(() => {});
@@ -206,7 +199,8 @@ export default function App() {
             if (event === "stats") setStats(data);
             else if (event === "snapshot") { if (!showDeletedRef.current) setAccounts(data); }
             else if (event === "hello") {
-                setStats(data.stats); setPaused(data.state.paused); setConcurrency(data.state.concurrency); setOtpSingle(data.state.otpSingle); setChatSim(data.state.simulateChat); setRegProxy(data.state.regProxy || ""); setMailProxy(data.state.mailProxy || ""); setMailProxyEnabled(data.state.mailProxyEnabled !== false);
+                setStats(data.stats); setPaused(data.state.paused); setConcurrency(data.state.concurrency); setOtpSingle(data.state.otpSingle); setChatSim(data.state.simulateChat);
+                if (data.state?.mailProxyPoolSnap) setPoolMeta({total: data.state.mailProxyPoolSnap.total || 0, leased: data.state.mailProxyPoolSnap.leased || 0, jump: String(data.state.mailProxyJump || "")});
                 if (data.state?.mfaEnabled !== undefined) setMfaEnabled(data.state.mfaEnabled !== false);
                 if (data.state?.defaultPassword) setDefaultGptPw(data.state.defaultPassword);
                 const bh = data.state?.batchHarden;
@@ -614,7 +608,7 @@ export default function App() {
                         : <button onClick={pause} className="px-4 py-1.5 bg-amber-500 text-white rounded-lg text-sm font-medium hover:bg-amber-600">⏸ 暂停</button>}
                     <button onClick={ctrl(api.stop, "已停止本实例注册，未完成任务退回队列（其他实例可接着跑）")} className="px-3 py-1.5 bg-red-500 text-white rounded-lg text-sm hover:bg-red-600" title="只停本机。正在跑的号退回等待，其他实例会认领">⏹ 停止</button>
                     <button onClick={ctrl(api.retryFailed, "已把失败项重置为等待")} className="px-3 py-1.5 bg-gray-200 rounded-lg text-sm hover:bg-gray-300">↻ 重试失败</button>
-                    <button onClick={() => { setShowProxy(true); notify("代理设置已在下方展开"); }} className="px-3 py-1.5 bg-gray-200 rounded-lg text-sm hover:bg-gray-300">⚙ 代理</button>
+                    <button onClick={() => { setShowProxy(true); notify("代理池已在下方展开"); }} className="px-3 py-1.5 bg-gray-200 rounded-lg text-sm hover:bg-gray-300">⚙ 代理池</button>
                     {/* 从待分配邮箱选号 → 设批次 → 可选先改密 → 进注册队列(补邮箱管理按数量盲分、无法设批次的缺口) */}
                     <button onClick={openPicker} title="从待分配(free)邮箱里勾选具体账号,设批次、可选先改密后分配进 GPT 注册队列" className="px-3 py-1.5 bg-emerald-600 text-white rounded-lg text-sm hover:bg-emerald-700">📥 从邮箱选号</button>
                     {/* ★唯一导出入口:范围×格式×标记已售出全在弹窗里。打开时按 选中>批次筛选>全部 智能预选范围 */}
@@ -627,7 +621,7 @@ export default function App() {
             {/* 导入区 */}
             <div className="bg-white border-b px-6 py-2">
                 <button onClick={() => setShowProxy((v) => !v)} className="text-sm text-indigo-600 font-medium mr-4">
-                    {showProxy ? "▾ 收起代理设置" : "⚙ 代理设置"}
+                    {showProxy ? "▾ 收起代理池" : `⚙ 代理池${poolMeta.total ? `(${poolMeta.total}条${poolMeta.leased ? ` · 占用${poolMeta.leased}` : ""}${poolMeta.jump ? " · 链式" : ""})` : ""}`}
                 </button>
                 <button onClick={() => { setShowSms((v) => !v); refreshSms(); }} className="text-sm text-indigo-600 font-medium mr-4">
                     {showSms ? "▾ 收起接码池" : `📱 接码池(可用 ${smsData.stats.free})`}
@@ -635,46 +629,8 @@ export default function App() {
                 <button onClick={() => setShowDaily((v) => !v)} className="text-sm text-indigo-600 font-medium mr-4">
                     {showDaily ? "▾ 收起定时任务" : `⏰ 定时任务${daily?.enabled ? "(已开)" : ""}`}
                 </button>
-                <button onClick={() => setShowXray((v) => !v)} className="text-sm text-indigo-600 font-medium mr-4">
-                    {showXray ? "▾ 收起独立代理" : `🌐 独立代理${xray?.running ? "(运行中)" : ""}`}
-                </button>
-                <button onClick={() => { setShowProxy(false); setShowSms(false); setShowDaily(false); setShowXray(false); }}
+                <button onClick={() => { setShowProxy(false); setShowSms(false); setShowDaily(false); }}
                         className="text-sm text-gray-400 hover:text-gray-600 font-medium" title="收起上方所有展开的面板">⊟ 全部收起</button>
-                {showXray && (
-                    <div className="mt-2 flex flex-col gap-2 bg-cyan-50 p-3 rounded-lg text-sm">
-                        <div className="text-xs text-gray-600">粘贴 <span className="font-mono">vless://…</span> 链接，一键起独立 xray 进程做注册代理（独立端口，不影响你自己的 v2rayN/其它代理）。注册代理会自动指向它。</div>
-                        <div className="flex gap-2 items-center flex-wrap text-xs bg-white/70 px-2 py-1.5 rounded border border-cyan-200">
-                            <span className="text-gray-600 font-medium">本地端口(专属，避免与系统 v2rayN 等冲突/清理误杀):</span>
-                            <label className="flex items-center gap-1">GPT/reg <input value={regPortInput} onChange={(e) => setRegPortInput(e.target.value)} className="w-20 px-1 py-0.5 border rounded font-mono"/></label>
-                            <label className="flex items-center gap-1">Claude <input value={claudePortInput} onChange={(e) => setClaudePortInput(e.target.value)} className="w-20 px-1 py-0.5 border rounded font-mono"/></label>
-                            <button onClick={() => { const rp = Number(regPortInput), cp = Number(claudePortInput); if (!(rp >= 1024 && rp <= 65535) || !(cp >= 1024 && cp <= 65535)) { notify("端口需为 1024-65535"); return; } if (rp === cp) { notify("两个端口不能相同"); return; } api.setProxyPorts(rp, cp).then((r) => { setRegProxy(r.regProxy || regProxy); notify(`端口已保存 reg=${r.regProxyPort} claude=${r.claudeProxyPort}${r.regProxy ? `，代理→${r.regProxy}` : "（重启或起 vless 后生效）"}`); }).catch((e: any) => notify(e.message)); }}
-                                    className="px-2 py-1 bg-cyan-700 text-white rounded">保存端口</button>
-                        </div>
-                        <div className="flex gap-2 items-center flex-wrap text-xs bg-white/70 px-2 py-1.5 rounded border border-cyan-200">
-                            <span className="text-gray-600 font-medium">xray 路径(空=自动探测):</span>
-                            <input value={xrayBinPath} onChange={(e) => setXrayBinPath(e.target.value)}
-                                   placeholder="D:\v2rayN-windows-64\bin\xray\xray.exe"
-                                   className="flex-1 min-w-[320px] px-1 py-0.5 border rounded font-mono"/>
-                            <button onClick={() => { api.setXrayBin(xrayBinPath.trim()).then(() => notify("xray 路径已保存")).catch((e: any) => notify(e.message)); }}
-                                    className="px-2 py-1 bg-cyan-700 text-white rounded">保存路径</button>
-                        </div>
-                        <div className="flex gap-2 items-start flex-wrap">
-                            <textarea value={vlessInput} onChange={(e) => setVlessInput(e.target.value)} placeholder="vless://uuid@host:port?security=reality&pbk=…&sid=…&sni=…&flow=…&type=tcp#name"
-                                      className="flex-1 min-w-[360px] h-14 px-2 py-1 border rounded text-xs font-mono"/>
-                            <button onClick={() => { const v = vlessInput.trim(); if (!v) { notify("请粘贴 vless 链接"); return; } api.startXray(v).then((r) => { setXray(r.xray); setRegProxy(r.regProxy); notify(`独立代理已启动: ${r.xray.node} @ 端口${r.xray.port}`); }).catch((err: any) => notify(err.message)); }}
-                                    className="px-4 py-2 bg-cyan-600 text-white rounded text-sm font-medium">▶ 启动</button>
-                            <button onClick={() => api.stopXray().then((r) => { setXray(r.xray); notify("独立代理已停止"); }).catch((err: any) => notify(err.message))}
-                                    className="px-3 py-2 bg-gray-500 text-white rounded text-sm">■ 停止</button>
-                            <button onClick={() => { notify("正在经代理测出口…", 30000); api.xrayProbe().then((r) => notify(r.ok ? `出口 ${r.ip} · chatgpt ${r.chatgpt} ${r.pass ? "✅可用" : "⚠️异常"}` : `❌${r.reason}`, 8000)).catch((err: any) => notify(err.message, 8000)); }}
-                                    className="px-3 py-2 bg-indigo-600 text-white rounded text-sm">测出口</button>
-                        </div>
-                        <div className="text-xs">
-                            {xray?.running
-                                ? <span className="text-green-700">● 运行中：<span className="font-mono">{xray.node}</span> → 本地端口 <span className="font-mono">socks5://127.0.0.1:{xray.port}</span></span>
-                                : <span className="text-gray-400">○ 未运行{xray?.error ? <span className="text-red-500 ml-2">（{xray.error}）</span> : null}</span>}
-                        </div>
-                    </div>
-                )}
                 {showDaily && daily && (
                     <div className="mt-2 flex flex-col gap-2 bg-amber-50 p-3 rounded-lg text-sm">
                         <div className="flex items-center gap-3 flex-wrap">
@@ -711,25 +667,12 @@ export default function App() {
                     </div>
                 )}
                 {showProxy && (
-                    <div className="mt-2 flex gap-3 items-end flex-wrap bg-indigo-50 p-3 rounded-lg">
-                        <div className="flex flex-col">
-                            <label className="text-xs text-gray-500 mb-1">注册 GPT 代理(建议住宅/池, 降低封号)</label>
-                            <input value={regProxy} onChange={(e) => setRegProxy(e.target.value)}
-                                   placeholder="socks5://user:pass@host:port / http://... / 留空=直连"
-                                   className="w-96 px-2 py-1.5 border rounded text-sm font-mono"/>
-                        </div>
-                        <div className="flex flex-col">
-                            <label className="text-xs text-gray-500 mb-1 flex items-center gap-1">
-                                <input type="checkbox" checked={mailProxyEnabled} onChange={(e) => setMailProxyEnabled(e.target.checked)} />
-                                邮箱登录代理{mailProxyEnabled ? "" : "(已关闭)"}
-                            </label>
-                            <input value={mailProxy} onChange={(e) => setMailProxy(e.target.value)}
-                                   placeholder="留空=直连"
-                                   disabled={!mailProxyEnabled}
-                                   className={`w-72 px-2 py-1.5 border rounded text-sm font-mono ${!mailProxyEnabled ? "opacity-50" : ""}`}/>
-                        </div>
-                        <button onClick={() => api.setProxy(regProxy, mailProxy, mailProxyEnabled).then(() => notify("代理已保存(影响之后启动的任务)")).catch((e) => notify(e.message))}
-                                className="px-4 py-2 bg-indigo-600 text-white rounded text-sm font-medium">保存代理</button>
+                    <div className="mt-2">
+                        <ProxyPoolPanel
+                            notify={notify}
+                            title="注册代理池"
+                            onMeta={(m) => setPoolMeta({total: m.total, leased: m.leased, jump: m.jump})}
+                        />
                     </div>
                 )}
                 {showSms && (
