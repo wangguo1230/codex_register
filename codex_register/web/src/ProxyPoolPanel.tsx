@@ -101,17 +101,15 @@ export function ProxyPoolPanel({
             <div style={{display: "flex", alignItems: "baseline", gap: 8, flexWrap: "wrap", marginBottom: 8}}>
                 <span style={{fontSize: 13, fontWeight: 600, color: "#111827"}}>{title}</span>
                 <span style={{fontSize: 11, color: "#9ca3af"}}>{hint || (isGpt
-                    ? "GPT 注册专用。跳板贴 vless，保存后自动起 xray。1 个跳板最多带 2 条出口。"
-                    : "邮箱整备专用。跳板贴 vless，保存后自动起 xray。1 个跳板最多带 2 条出口。")}</span>
+                    ? "GPT 注册专用。先贴跳板 vless，再导入出口代理。"
+                    : "邮箱整备专用。先贴跳板 vless，再导入出口代理。")}</span>
             </div>
-            <textarea value={poolText} onChange={(e) => setPoolText(e.target.value)}
-                      placeholder={"一行一个，支持：\ngate-hk.kookeey.info:1000:user:pass-US-session-5m\nip:port:user:pass\nsocks5://user:pass@host:port"}
-                      style={{width: "100%", height: 140, resize: "vertical", padding: 10, fontFamily: "monospace", fontSize: 12, border: "1px solid #e5e7eb", borderRadius: 8, outline: "none", boxSizing: "border-box"}}/>
-            <div style={{marginTop: 10}}>
-                <div style={{fontSize: 12, color: "#374151", marginBottom: 4}}>跳板池（一行一个 vless:// ，保存后自动起 xray，1 个跳板最多带 2 条出口。不占 10808）</div>
+            <div style={{marginBottom: 14, padding: 12, background: "#eef2ff", border: "1px solid #c7d2fe", borderRadius: 10}}>
+                <div style={{fontSize: 13, fontWeight: 700, color: "#312e81", marginBottom: 4}}>跳板 vless</div>
+                <div style={{fontSize: 11, color: "#4338ca", marginBottom: 8}}>把 vless:// 链接贴在这里，一行一条。点「保存并起 xray」我会自己起本地端口（10811 起），不占你的 10808。1 个跳板最多带 2 条出口。</div>
                 <textarea value={jumpText} onChange={(e) => setJumpText(e.target.value)}
                           placeholder={"vless://uuid@host:port?type=tcp&security=reality&pbk=…#name\nvless://另一条…"}
-                          style={{width: "100%", height: 88, resize: "vertical", padding: 8, fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace", fontSize: 12, border: "1px solid #e5e7eb", borderRadius: 8, outline: "none", boxSizing: "border-box"}}/>
+                          style={{width: "100%", height: 96, resize: "vertical", padding: 8, fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace", fontSize: 12, border: "1px solid #a5b4fc", borderRadius: 8, outline: "none", boxSizing: "border-box", background: "#fff"}}/>
                 <div style={{display: "flex", gap: 8, alignItems: "center", marginTop: 6, flexWrap: "wrap"}}>
                     <button onClick={async () => {
                         setJumpBusy(true);
@@ -160,12 +158,16 @@ export function ProxyPoolPanel({
                         ))}
                     </div>
                 )}
+                <div style={{fontSize: 11, color: jumpItems.some((x) => x.xray === false || x.ok === false) ? "#b91c1c" : "#4338ca", marginTop: 8}}>
+                    {jumpText.trim()
+                        ? "保存后每条 vless 起一个独立 xray（10811 起往上排）。10808 是你自己的，任务不占用。"
+                        : "还没贴跳板。把机场/节点的 vless:// 整行复制进来，点「保存并起 xray」。"}
+                </div>
             </div>
-            <div style={{fontSize: 11, color: jumpItems.some((x) => x.xray === false || x.ok === false) ? "#dc2626" : (jumpText.trim() ? "#4338ca" : "#9ca3af"), marginTop: 4}}>
-                {jumpText.trim()
-                    ? "保存后每条 vless 起一个独立 xray（10811 起往上排）。10808 是你自己的，任务不占用。"
-                    : "未开跳板：本机直连代理池网关。把跳板 vless 贴进上面的框，点「保存并起 xray」。"}
-            </div>
+            <div style={{fontSize: 12, color: "#374151", marginBottom: 4}}>出口代理（kookeey / socks5，一行一个）</div>
+            <textarea value={poolText} onChange={(e) => setPoolText(e.target.value)}
+                      placeholder={"一行一个，支持：\ngate-hk.kookeey.info:1000:user:pass-US-session-5m\nip:port:user:pass\nsocks5://user:pass@host:port"}
+                      style={{width: "100%", height: 140, resize: "vertical", padding: 10, fontFamily: "monospace", fontSize: 12, border: "1px solid #e5e7eb", borderRadius: 8, outline: "none", boxSizing: "border-box"}}/>
             <div style={{display: "flex", gap: 10, alignItems: "center", marginTop: 8, flexWrap: "wrap"}}>
                 <button onClick={doImportPool} style={{padding: "6px 14px", background: "#0d9488", color: "#fff", border: "none", borderRadius: 8, cursor: "pointer", fontSize: 13}}>批量导入追加</button>
                 <button onClick={doSavePool} style={{padding: "6px 14px", background: "#4f46e5", color: "#fff", border: "none", borderRadius: 8, cursor: "pointer", fontSize: 13}}>覆盖保存</button>
