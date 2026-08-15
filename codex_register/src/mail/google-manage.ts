@@ -423,14 +423,70 @@ function dialogLooksLikeChangeTotp(text) {
 }
 
 async function findChangeTotpDialog(page) {
-    const dlg = page.locator('[role="dialog"], [role="alertdialog"]').first();
-    if (!await dlg.isVisible({timeout: 200}).catch(() => false)) return null;
-    const t = String(await dlg.innerText().catch(() => ""));
-    if (dialogLooksLikeChangeTotp(t)) return dlg;
+    const scopes = [page, ...page.frames().filter((f) => f !== page.mainFrame())];
+    for (const scope of scopes) {
+        const loc = scope.locator('[role="dialog"], [role="alertdialog"]');
+        const n = await loc.count().catch(() => 0);
+        for (let i = 0; i < n; i++) {
+            const dlg = loc.nth(i);
+            if (!await dlg.isVisible({timeout: 150}).catch(() => false)) continue;
+            if (dialogLooksLikeChangeTotp(String(await dlg.innerText().catch(() => "")))) return dlg;
+        }
+        const heading = scope.getByRole("heading", {name: /change authenticator|更改身份验证/i}).first();
+        if (await heading.isVisible({timeout: 150}).catch(() => false)) {
+            const box = heading.locator("xpath=ancestor::*[.//input or .//*[@role='textbox']][1]");
+            if (await box.isVisible({timeout: 150}).catch(() => false)) return box;
+        }
+    }
     return null;
 }
 
-/** 换验证器前要先用当前 TOTP 过一道。空点 Verify 会停在这个框里，被误报成「未找到更改」。 */
+async function findDialogCodeInput(dlg, page) {
+    const lists = [
+        dlg.getByRole("textbox"),
+        dlg.locator("input:visible"),
+        dlg.locator(
+            'input[name="totpPin"], input[autocomplete="one-time-code"], input[type="tel"], '
+            + 'input[aria-label*="code" i], input[placeholder*="code" i], input[placeholder*="码" i], '
+            + 'input[inputmode="numeric"]',
+        ),
+    ];
+    for (const loc of lists) {
+        const n = await loc.count().catch(() => 0);
+        for (let i = 0; i < n; i++) {
+            const el = loc.nth(i);
+            if (!await el.isVisible({timeout: 200}).catch(() => false)) continue;
+            const typ = String(await el.getAttribute("type").catch(() => "") || "").toLowerCase();
+            if (typ === "hidden" || typ === "checkbox" || typ === "password" || typ === "email") continue;
+            return el;
+        }
+    }
+    const label = dlg.getByText(/enter code|enter the 6-digit|输入验证码/i).first();
+    if (await label.isVisible({timeout: 250}).catch(() => false)) {
+        const box = await label.boundingBox().catch(() => null);
+        if (box) await page.mouse.click(box.x + box.width / 2, box.y + Math.min(box.height / 2 + 18, box.height - 4));
+        const focused = page.locator("input:focus, [role='textbox']:focus").first();
+        if (await focused.isVisible({timeout: 250}).catch(() => false)) return focused;
+    }
+    return null;
+}
+
+async function typeDialogTotp(el, page, code) {
+    await el.scrollIntoViewIfNeeded().catch(() => {});
+    await el.click({timeout: 2000}).catch(() => el.click({force: true}));
+    await page.waitForTimeout(120);
+    await el.fill("").catch(() => {});
+    await el.pressSequentially(String(code), {delay: 70}).catch(() => {});
+    let got = String(await el.inputValue().catch(() => "")).replace(/\s+/g, "");
+    if (got === String(code)) return true;
+    await el.click({force: true}).catch(() => {});
+    await el.fill(String(code)).catch(() => {});
+    got = String(await el.inputValue().catch(() => "")).replace(/\s+/g, "");
+    if (got === String(code)) return true;
+    return false;
+}
+
+/** 换验证器前要先用当前 TOTP 过一道。必须写进对话框可见输入框，空点 Verify 会停在这个框里。 */
 async function fillChangeAuthenticatorCode(page, totpSecret, log) {
     const dlg = await findChangeTotpDialog(page);
     if (!dlg) return "missing";
@@ -442,20 +498,18 @@ async function fillChangeAuthenticatorCode(page, totpSecret, log) {
     await waitTotpSafeWindow(16);
     const code = generateTotp(secret);
     if (!code) return "missing";
-    const input = dlg.locator(
-        'input[name="totpPin"], input[autocomplete="one-time-code"], input[type="tel"], '
-        + 'input[aria-label*="code" i], input[placeholder*="code" i], input[placeholder*="码" i], '
-        + 'input[inputmode="numeric"]',
-    ).first();
-    if (!await input.isVisible({timeout: 800}).catch(() => false)) return "missing";
-    await input.click({force: true}).catch(() => {});
-    await input.press("Meta+A").catch(() => {});
-    await input.press("Control+A").catch(() => {});
-    await input.press("Backspace").catch(() => {});
-    await input.pressSequentially(code, {delay: 80}).catch(async () => {
-        await input.fill(code);
-    });
-    log(`[2FA] 更换前验证码已填 ${code}`);
+    const input = await findDialogCodeInput(dlg, page);
+    if (!input) {
+        log("[2FA] 更换框里没找到可见输入框");
+        return "missing";
+    }
+    const typed = await typeDialogTotp(input, page, code);
+    const shown = String(await input.inputValue().catch(() => "")).replace(/\s+/g, "");
+    if (!typed || shown !== String(code)) {
+        log(`[2FA] 更换框没填上 目标=${code} 框内=${shown || "空"}（不点 Verify）`);
+        return "missing";
+    }
+    log(`[2FA] 更换前验证码已填 ${code} 框内已确认`);
     const WRONG_RE = /wrong code|incorrect code|c[oó]digo (incorrecto|errado)|code incorrect|验证码有误/i;
     for (let w = 0; w < 10; w++) {
         await page.waitForTimeout(500);
@@ -466,9 +520,14 @@ async function fillChangeAuthenticatorCode(page, totpSecret, log) {
         }
         if (!await findChangeTotpDialog(page)) return "ok";
     }
+    const still = String(await input.inputValue().catch(() => "")).replace(/\s+/g, "");
+    if (still !== String(code)) {
+        log(`[2FA] 点 Verify 前框又空了 框内=${still || "空"}`);
+        return "missing";
+    }
     const verify = dlg.getByRole("button", {name: /^(verify|verif|验证|確認|确认)$/i}).first();
     if (await verify.isVisible({timeout: 400}).catch(() => false)) {
-        await verify.click({force: true}).catch(() => verify.click());
+        await verify.click().catch(() => verify.click({force: true}));
         log("[2FA] 点了更换前 Verify");
     }
     await page.waitForTimeout(1800);
@@ -491,10 +550,13 @@ async function waitAuthenticatorSetup(page, ms = 9000) {
         if (await page.locator("canvas, img[alt*='QR' i], img[src*='qr']").first().isVisible({timeout: 180}).catch(() => false)) return "qr";
         const t = String(await page.innerText("body").catch(() => ""));
         if (/otpauth:\/\//i.test(t) || /secret key|setup key|密钥|can't scan it|cannot scan|无法扫描/i.test(t)) return "secret";
-        const dlg = page.locator('[role="dialog"], [role="alertdialog"]').first();
-        if (await dlg.isVisible({timeout: 180}).catch(() => false)) {
+        if (await findChangeTotpDialog(page)) return "reauth";
+        const dlgs = page.locator('[role="dialog"], [role="alertdialog"]');
+        const dn = await dlgs.count().catch(() => 0);
+        for (let i = 0; i < dn; i++) {
+            const dlg = dlgs.nth(i);
+            if (!await dlg.isVisible({timeout: 120}).catch(() => false)) continue;
             const dt = String(await dlg.innerText().catch(() => ""));
-            if (dialogLooksLikeChangeTotp(dt)) return "reauth";
             if (/change authenticator|replace|next|continue|更改|替换|下一步/i.test(dt) && !/Manage your Google Account/i.test(dt)) return "confirm";
         }
         await page.waitForTimeout(350);
@@ -503,9 +565,18 @@ async function waitAuthenticatorSetup(page, ms = 9000) {
 }
 
 async function clickDialogNext(page, log) {
-    const dlg = page.locator('[role="dialog"], [role="alertdialog"]').first();
-    if (!await dlg.isVisible({timeout: 400}).catch(() => false)) return false;
-    if (dialogLooksLikeChangeTotp(String(await dlg.innerText().catch(() => "")))) return false;
+    if (await findChangeTotpDialog(page)) return false;
+    const loc = page.locator('[role="dialog"], [role="alertdialog"]');
+    const n = await loc.count().catch(() => 0);
+    let dlg = null;
+    for (let i = 0; i < n; i++) {
+        const cand = loc.nth(i);
+        if (!await cand.isVisible({timeout: 150}).catch(() => false)) continue;
+        if (dialogLooksLikeChangeTotp(String(await cand.innerText().catch(() => "")))) continue;
+        dlg = cand;
+        break;
+    }
+    if (!dlg) return false;
     const codeBox = dlg.locator('input[placeholder*="code" i], input[name="totpPin"], input[autocomplete="one-time-code"]').first();
     if (await codeBox.isVisible({timeout: 200}).catch(() => false)) return false;
     const btn = dlg.getByRole("button", {name: /^(next|continue|replace|change|ok|下一步|继续|更换|确定)$/i}).last();
@@ -732,7 +803,7 @@ export async function change2faOnPage(page, {
     await dismissAccountFlyout(page);
 
     let setup = "";
-    for (let tryChange = 0; tryChange < 4 && !setup; tryChange++) {
+    for (let tryChange = 0; tryChange < 6 && !setup; tryChange++) {
         await dismissAccountFlyout(page);
         if (await findChangeTotpDialog(page)) {
             setup = "reauth";
@@ -851,24 +922,8 @@ export async function change2faOnPage(page, {
         // 经跳板 Verify 要 8–12s，窗口剩 8s 再填会在提交途中过期。
         await waitTotpSafeWindow(16);
         const code = generateTotp(newSecret);
-        const dialog = page.locator('[role="dialog"], [role="alertdialog"]').first();
-        const scoped = (await dialog.isVisible({timeout: 400}).catch(() => false)) ? dialog : page;
-        const codeInput = scoped.locator(
-            'input[name="totpPin"], input[autocomplete="one-time-code"], input[type="tel"], '
-            + 'input[name*="code" i], input[name*="pin" i], input[aria-label*="code" i]',
-        );
-        let foundInput = null;
-        const inputCount = await codeInput.count();
-        for (let i = 0; i < inputCount; i++) {
-            const inp = codeInput.nth(i);
-            if (await inp.isVisible({timeout: 500}).catch(() => false)) {
-                const atype = (await inp.getAttribute("autocomplete")) || "";
-                if (!String(atype).includes("search")) {
-                    foundInput = inp;
-                    break;
-                }
-            }
-        }
+        const dialog = await findChangeTotpDialog(page) || page.locator('[role="dialog"], [role="alertdialog"]').filter({hasText: /code|验证码/i}).first();
+        const foundInput = await findDialogCodeInput(dialog, page);
         if (!foundInput) {
             const via = await submitGoogleTotp(page, newSecret, (m) => log(`[2FA] ${m}`), attempt);
             if (via === "missing") break;
@@ -878,14 +933,14 @@ export async function change2faOnPage(page, {
             await waitNextTotpWindow();
             continue;
         }
-        await foundInput.click({force: true}).catch(() => {});
-        await foundInput.press("Meta+A").catch(() => {});
-        await foundInput.press("Control+A").catch(() => {});
-        await foundInput.press("Backspace").catch(() => {});
-        await foundInput.pressSequentially(code, {delay: 80}).catch(async () => {
-            await foundInput.fill(code);
-        });
-        log(`[2FA] 验证码已逐位输入(${attempt}): ${code}`);
+        const typed = await typeDialogTotp(foundInput, page, code);
+        const shown = String(await foundInput.inputValue().catch(() => "")).replace(/\s+/g, "");
+        if (!typed || shown !== String(code)) {
+            log(`[2FA] 新密钥验证码没填上 目标=${code} 框内=${shown || "空"}`);
+            await waitNextTotpWindow();
+            continue;
+        }
+        log(`[2FA] 验证码已逐位输入(${attempt}): ${code} 框内已确认`);
         // Google 满 6 位常自动提交。立刻再点 Verify 会把同一码再送一次 → Wrong code。
         let after = "";
         let autoDone = false;
