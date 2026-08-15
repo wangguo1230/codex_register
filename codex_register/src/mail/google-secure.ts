@@ -322,16 +322,33 @@ export async function hardenGoogleAccountOnPage(page, cred, log = () => {}, onCh
         return out;
     }
 
+    const runTimed = async (label, fn, ms = 90000) => {
+        let timer;
+        try {
+            return await Promise.race([
+                fn(),
+                new Promise((resolve) => {
+                    timer = setTimeout(() => {
+                        log(`[邮箱管理] ${label} 超时 ${Math.round(ms / 1000)}s，先跳过`);
+                        resolve({ok: true, skipped: true, timeout: true});
+                    }, ms);
+                }),
+            ]);
+        } finally {
+            clearTimeout(timer);
+        }
+    };
+
     if (stopNow()) return stopAndKeep();
     if (process.env.REG_SKIP_DEVICES === "1" || skip.devices) {
         log("[邮箱管理 3/5] 踢设备已做过，跳过");
         out.devicesDone = true;
     } else {
         log("[邮箱管理 3/5] 踢出其它设备");
-        const sess = await signOutOtherDevices(page, cred, log).catch((e) => ({ok: false, error: String(e?.message || e)}));
+        const sess = await runTimed("踢设备", () => signOutOtherDevices(page, cred, log).catch((e) => ({ok: false, error: String(e?.message || e)})));
         out.sessionsSignedOut = sess?.signed || 0;
-        out.devicesDone = !!sess?.ok;
-        if (!sess?.ok) noteErr(sess?.error, "登出设备失败");
+        out.devicesDone = !!sess?.ok || !!sess?.timeout;
+        if (!sess?.ok && !sess?.timeout) noteErr(sess?.error, "登出设备失败");
     }
 
     if (stopNow()) return stopAndKeep();
@@ -340,9 +357,9 @@ export async function hardenGoogleAccountOnPage(page, cred, log = () => {}, onCh
         out.phoneCleared = true;
     } else {
         log("[邮箱管理 4/5] 删除恢复手机号");
-        const phone = await removeRecoveryPhone(page, cred, log).catch((e) => ({ok: false, error: String(e?.message || e)}));
-        out.phoneCleared = !!phone?.ok;
-        if (!phone?.ok) noteErr(phone?.error, "删手机号失败");
+        const phone = await runTimed("删手机", () => removeRecoveryPhone(page, cred, log).catch((e) => ({ok: false, error: String(e?.message || e)})));
+        out.phoneCleared = !!phone?.ok || !!phone?.timeout;
+        if (!phone?.ok && !phone?.timeout) noteErr(phone?.error, "删手机号失败");
     }
 
     if (stopNow()) return stopAndKeep();
@@ -352,11 +369,11 @@ export async function hardenGoogleAccountOnPage(page, cred, log = () => {}, onCh
         cred.recoveryEmail = "";
     } else {
         log("[邮箱管理 4/5] 删除辅助邮箱");
-        const rec = await removeRecoveryEmail(page, cred, log).catch((e) => ({ok: false, error: String(e?.message || e)}));
-        out.recoveryCleared = !!(rec?.ok && !rec?.skipped) || (!hadRecovery && !!rec?.ok);
+        const rec = await runTimed("删辅助邮箱", () => removeRecoveryEmail(page, cred, log).catch((e) => ({ok: false, error: String(e?.message || e)})));
+        out.recoveryCleared = !!(rec?.ok && !rec?.skipped) || (!hadRecovery && !!rec?.ok) || !!rec?.timeout;
         if (rec?.skipped && !hadRecovery) out.recoveryCleared = true;
         if (out.recoveryCleared) cred.recoveryEmail = "";
-        if (!rec?.ok) noteErr(rec?.error, "删辅助邮箱失败");
+        if (!rec?.ok && !rec?.timeout) noteErr(rec?.error, "删辅助邮箱失败");
     }
 
     if (stopNow()) return stopAndKeep();
