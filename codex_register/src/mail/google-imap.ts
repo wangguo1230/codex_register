@@ -63,14 +63,14 @@ export async function enableGmailImap(page, log = () => {}) {
 
 /** 生成一枚应用专用密码，返回 16 位（无空格）。 */
 export async function createGmailAppPassword(page, {
-    password = "", totpSecret = "", appName = "mail-fetch", log = () => {},
+    password = "", totpSecret = "", totpFallback = "", appName = "mail-fetch", log = () => {},
 } = {}) {
     log("[取件] 打开应用专用密码页");
     try {
         await page.goto(APP_PASSWORD_URL, {waitUntil: "domcontentloaded", timeout: 60000});
     } catch { /* ignore */ }
     await page.waitForTimeout(3000);
-    await googleReauthPassword(page, {password, totpSecret, log});
+    await googleReauthPassword(page, {password, totpSecret, totpFallback, log});
     await page.waitForTimeout(2500);
 
     const blocked = await page.innerText("body").catch(() => "");
@@ -170,10 +170,10 @@ export async function testGmailImap(email, imapPassword, {proxy = ""} = {}) {
 
 /** 开 IMAP + 生成应用专用密码，并立刻用 IMAP 探活。 */
 export async function enableGmailFetch(page, {
-    email, password = "", totpSecret = "", log = () => {},
+    email, password = "", totpSecret = "", totpFallback = "", log = () => {},
 } = {}) {
     await enableGmailImap(page, log).catch((e) => log(`[取件] IMAP 设置跳过: ${e?.message || e}`));
-    const imapPassword = await createGmailAppPassword(page, {password, totpSecret, log});
+    const imapPassword = await createGmailAppPassword(page, {password, totpSecret, totpFallback, log});
     const probe = await testGmailImap(email, imapPassword);
     if (!probe.ok) {
         // 本机直连/探活失败不否掉已生成的应用密码，否则会空等 90 秒再整单失败。

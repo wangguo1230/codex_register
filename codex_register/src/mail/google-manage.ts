@@ -155,20 +155,80 @@ function isLikelySecret(s) {
     return true;
 }
 
-/** 8 组 4 字符(32 位)或 4 组 4 字符(16 位)；过滤常见单词。 */
+/** 8 组 4 字符(32 位)或 4 组 4 字符(16 位)；空白含换行；优先更长的。 */
 export function extractTotpSecret(text) {
     const src = String(text || "");
-    const grouped = src.match(/([a-z2-7]{4}(?:[ ]+[a-z2-7]{4}){3,15})/gi) || [];
+    const found = [];
+    const otp = src.match(/[?&]secret=([A-Z2-7]{16,64})/i);
+    if (otp) {
+        const up = otp[1].toUpperCase();
+        if (isLikelySecret(up)) found.push(up);
+    }
+    const grouped = src.match(/([a-z2-7]{4}(?:[\s]+[a-z2-7]{4}){3,15})/gi) || [];
     for (const c of grouped) {
-        const cleaned = c.replace(/ /g, "").toUpperCase();
-        if (cleaned.length >= 16 && isLikelySecret(cleaned)) return cleaned;
+        const cleaned = c.replace(/\s+/g, "").toUpperCase();
+        if (cleaned.length >= 16 && isLikelySecret(cleaned)) found.push(cleaned);
     }
     const compact = src.match(/\b([a-z2-7]{32,64})\b/gi) || [];
     for (const m of compact) {
         const up = m.toUpperCase();
-        if (isLikelySecret(up)) return up;
+        if (isLikelySecret(up)) found.push(up);
     }
-    return "";
+    found.sort((a, b) => b.length - a.length);
+    return found[0] || "";
+}
+
+async function extractSecretFromPage(page) {
+    const html = String(await page.content().catch(() => ""));
+    const otp = html.match(/[?&]secret=([A-Z2-7]{16,64})/i);
+    const otpSecret = otp ? otp[1].toUpperCase() : "";
+    if (otpSecret.length >= 32 && isLikelySecret(otpSecret)) return otpSecret;
+
+    const dlg = page.locator('[role="dialog"], [role="alertdialog"]').first();
+    const dlgOpen = await dlg.isVisible({timeout: 300}).catch(() => false);
+    const dlgText = dlgOpen ? String(await dlg.innerText().catch(() => "")) : "";
+    const fromDlg = extractTotpSecret(dlgText);
+    if (fromDlg.length >= 32) return fromDlg;
+
+    const fromDom = await page.evaluate(() => {
+        const root = document.querySelector('[role="dialog"], [role="alertdialog"]') || document.body;
+        const chunks = [];
+        const walk = (el) => {
+            if (!el) return;
+            if (el.children && el.children.length) {
+                for (const c of el.children) walk(c);
+                return;
+            }
+            const t = String(el.textContent || "").trim();
+            if (/^[A-Za-z2-7]{4}$/.test(t)) chunks.push(t.toUpperCase());
+        };
+        walk(root);
+        return chunks.join("");
+    }).catch(() => "");
+    if (fromDom.length >= 16 && isLikelySecret(fromDom)) return fromDom;
+    if (fromDlg.length >= 16) return fromDlg;
+    if (otpSecret.length >= 16 && isLikelySecret(otpSecret)) return otpSecret;
+    return extractTotpSecret(String(await page.innerText("body").catch(() => "")));
+}
+
+async function leaveSecretPageForVerify(page, log) {
+    for (let i = 0; i < 4; i++) {
+        const hasCodeInput = await page.locator(
+            '[role="dialog"] input[type="tel"], [role="dialog"] input[autocomplete="one-time-code"], [role="dialog"] input[maxlength="6"], [role="alertdialog"] input[type="tel"], [role="alertdialog"] input[placeholder*="code" i]',
+        ).first().isVisible({timeout: 400}).catch(() => false);
+        const blob = String(await page.innerText("body").catch(() => ""));
+        const onVerifyCopy = /enter the 6-digit|输入.*6.*位/i.test(blob);
+        const secretStill = /enter this secret key|this secret key|can't scan it|cannot scan|无法扫描/i.test(blob)
+            && !!extractTotpSecret(blob);
+        if (hasCodeInput && (onVerifyCopy || !secretStill)) return true;
+        const hit = await clickVisibleButton(page, NEXT_KEYWORDS);
+        log(hit ? "[2FA] 密钥页点 Next，去填新码" : "[2FA] 密钥页 Next 没点到，再等");
+        await page.waitForTimeout(1800);
+        if (hasCodeInput) return true;
+    }
+    return page.locator(
+        '[role="dialog"] input[type="tel"], [role="dialog"] input[autocomplete="one-time-code"], [role="dialog"] input[maxlength="6"]',
+    ).first().isVisible({timeout: 400}).catch(() => false);
 }
 
 async function withGooglePage(fn) {
@@ -188,12 +248,12 @@ async function withGooglePage(fn) {
  * 登录失败 / 无输入框返回 {ok:false}；提交后返回新密码（verified 看成功文案）。
  */
 export async function changePasswordOnPage(page, {
-    email, password, totpSecret = "", recoveryEmail = "", newPassword = "", log = () => {}, onPersist,
+    email, password, totpSecret = "", totpFallback = "", recoveryEmail = "", newPassword = "", log = () => {}, onPersist,
 } = {}) {
     log("[密码] 开始修改密码");
     const ok = await ensureGoogleLoggedIn(
         page, PASSWORD_URL,
-        {email, password, totpSecret, recoveryEmail, requireInbox: false},
+        {email, password, totpSecret, totpFallback, recoveryEmail, requireInbox: false},
         log,
     );
     if (!ok) {
@@ -205,7 +265,7 @@ export async function changePasswordOnPage(page, {
     await page.waitForTimeout(1500);
     await preferEnglishGoogleUi(page, log, PASSWORD_URL);
 
-    await googleReauthPassword(page, {password, totpSecret, log});
+    await googleReauthPassword(page, {password, totpSecret, totpFallback, log});
     await bounceOffSslOrSid(page, log);
     await page.waitForTimeout(3000);
     await bounceOffSslOrSid(page, log);
@@ -213,7 +273,7 @@ export async function changePasswordOnPage(page, {
         const t = String(await page.innerText("body").catch(() => ""));
         if (!isVerifyItsYouText(t) && !/accounts\.google\.com\/(v3\/)?signin|challenge\/totp/i.test(page.url())) break;
         log("[密码] 改密前还在二次验证，再过一次");
-        await googleReauthPassword(page, {password, totpSecret, log});
+        await googleReauthPassword(page, {password, totpSecret, totpFallback, log});
         await page.waitForTimeout(800);
     }
 
@@ -310,6 +370,32 @@ export async function changePasswordOnPage(page, {
     if (!verified) {
         const started = page.getByRole("button", {name: /get started|开始|empezar|começar/i}).first();
         if (await started.isVisible({timeout: 1500}).catch(() => false)) verified = true;
+    }
+    if (!verified && (isVerifyItsYouText(text) || /verify it.?s you|enter your password|to continue, first verify/i.test(String(text)))) {
+        log("[密码] 提交后要二次验证，先过验证再确认是否改成功");
+        await googleReauthPassword(page, {password, totpSecret, totpFallback, log});
+        await page.waitForTimeout(2500);
+        text = await page.innerText("body");
+        verified = looksChanged(text);
+        if (!verified) {
+            const again = page.locator('input[type="password"]:visible');
+            const n = await again.count().catch(() => 0);
+            if (n >= 2) {
+                await again.nth(0).fill(np);
+                await page.waitForTimeout(400);
+                await again.nth(1).fill(np);
+                log("[密码] 二次验证后重新提交新密码");
+                const retrySubmit = page.locator('form button[type="submit"], #passwordNext button, c-wiz form button').last();
+                if (await retrySubmit.isVisible({timeout: 1200}).catch(() => false)) {
+                    await retrySubmit.click().catch(() => retrySubmit.click({force: true}));
+                } else {
+                    await page.keyboard.press("Enter").catch(() => {});
+                }
+                await page.waitForTimeout(5000);
+                text = await page.innerText("body");
+                verified = looksChanged(text);
+            }
+        }
     }
     if (!verified) {
         log("[密码] 未见改密成功文案，不保存新密码");
@@ -1034,28 +1120,24 @@ export async function change2faOnPage(page, {
     }
     await page.waitForTimeout(3000);
 
-    const bodyText = await page.innerText("body");
-    const newSecret = extractTotpSecret(bodyText);
+    let newSecret = await extractSecretFromPage(page);
     if (!newSecret) {
         log("[2FA] 未能提取 secret");
         await dumpPage(page, "2fa_no_secret", log, email);
         return {ok: false, error: "未能提取 TOTP secret"};
     }
-    log(`[2FA] 新 TOTP secret: ${newSecret}`);
-
-    const codeAlreadyVisible = await page.locator(
-        'input[placeholder*="code" i], input[name="totpPin"], input[type="tel"], input[autocomplete="one-time-code"]',
-    ).first().isVisible({timeout: 800}).catch(() => false);
-    if (!codeAlreadyVisible) {
-        await clickVisibleButton(page, NEXT_KEYWORDS);
-        await page.waitForTimeout(2500);
+    log(`[2FA] 新 TOTP secret: ${newSecret} len=${newSecret.length}`);
+    if (!await leaveSecretPageForVerify(page, log)) {
+        log("[2FA] 密钥页之后没出现新码输入框");
+        await dumpPage(page, "2fa_no_new_code_box", log, email);
+        return {ok: false, error: "密钥页之后没出现新码输入框"};
     }
 
     let verified = false;
     const WRONG_RE = /wrong code|incorrect code|c[oó]digo (incorrecto|errado)|code incorrect|验证码有误/i;
     for (let attempt = 1; attempt <= 3; attempt++) {
         // 经跳板 Verify 要 8–12s，窗口剩 8s 再填会在提交途中过期。
-        if (totpRemainSec() < 6) await waitTotpSafeWindow(8);
+        if (totpRemainSec() < 8) await waitTotpSafeWindow(10);
         const code = generateTotp(newSecret);
         const dialog = await findChangeTotpDialog(page) || page.locator('[role="dialog"], [role="alertdialog"]').filter({hasText: /code|验证码/i}).first();
         const foundInput = await findDialogCodeInput(dialog, page);
@@ -1077,17 +1159,32 @@ export async function change2faOnPage(page, {
         }
         log(`[2FA] 验证码已逐位输入(${attempt}): ${code} 框内已确认`);
         // Google 满 6 位常自动提交。立刻再点 Verify 会把同一码再送一次 → Wrong code。
+        // 标题「Change authenticator」整段向导都在，不能当对话框还开着/关了的依据。
         let after = "";
         let autoDone = false;
-        for (let w = 0; w < 10; w++) {
+        for (let w = 0; w < 16; w++) {
             await page.waitForTimeout(500);
             after = String(await page.innerText("body").catch(() => ""));
             if (WRONG_RE.test(after)) break;
-            const stillDialog = await page.getByText(/change authenticator|enter the 6-digit|输入.*6.*位/i).first().isVisible({timeout: 200}).catch(() => false);
-            if (!stillDialog) { autoDone = true; break; }
+            const dlg = page.locator('[role="dialog"], [role="alertdialog"]').first();
+            const dlgOpen = await dlg.isVisible({timeout: 250}).catch(() => false);
+            if (!dlgOpen) { autoDone = true; break; }
+            const dlgText = String(await dlg.innerText().catch(() => ""));
+            if (/updated|changed successfully|has been changed|已更新|berhasil|foi alterado/i.test(dlgText)
+                && !/enter the 6-digit|enter this secret key/i.test(dlgText)) {
+                autoDone = true;
+                break;
+            }
         }
         if (WRONG_RE.test(after)) {
             log("[2FA] Google 报 Wrong code，等下一窗再填（不连点 Verify）");
+            if (attempt === 1) {
+                const again = await extractSecretFromPage(page);
+                if (again && again !== newSecret) {
+                    log(`[2FA] 密钥重抽 ${again} (原 ${newSecret})`);
+                    newSecret = again;
+                }
+            }
             await waitNextTotpWindow();
             continue;
         }
@@ -1098,6 +1195,13 @@ export async function change2faOnPage(page, {
         }
         if (WRONG_RE.test(after)) {
             log("[2FA] Google 报 Wrong code，等下一窗再填");
+            if (attempt === 1) {
+                const again = await extractSecretFromPage(page);
+                if (again && again !== newSecret) {
+                    log(`[2FA] 密钥重抽 ${again} (原 ${newSecret})`);
+                    newSecret = again;
+                }
+            }
             await waitNextTotpWindow();
             continue;
         }

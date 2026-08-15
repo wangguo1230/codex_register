@@ -532,7 +532,8 @@ export async function googleLogin(page, emailOrOpts, password = "", totpSecret =
     const pwd = String(opts.password || "");
     const write = typeof opts.log === "function" ? opts.log : console.log;
     const straight = straightenGoogleCreds(opts);
-    const totp = straight.totpSecret;
+    let totp = straight.totpSecret;
+    const totpFallback = String(opts.totpFallback || opts.totp_prev || "").replace(/\s+/g, "").toUpperCase();
     const recovery = straight.recoveryEmail;
     if (straight.swapped) write("  导入字段对调：totp/辅助邮箱已纠正");
     if (!totp && String(opts.totpSecret || opts.totp_secret || "")) write("  totp 字段不是合法密钥，改走其它验证");
@@ -789,6 +790,12 @@ export async function googleLogin(page, emailOrOpts, password = "", totpSecret =
 
             // TOTP：窗口够用再填；Google 常自动提交，先等，再视情况点 Next。Wrong code 换下一窗重试。
             if (totpAttempts >= 3 && totp && await totpFieldVisible(page) && await pageHasWrongTotp(page)) {
+                if (totpFallback && totpFallback !== totp) {
+                    write("  当前密钥连错 3 次，改用更换前的密钥再试");
+                    totp = totpFallback;
+                    totpAttempts = 0;
+                    continue;
+                }
                 write("  TOTP 连续 Wrong code，当密钥无效，不再死磕");
                 return false;
             }
@@ -1327,8 +1334,10 @@ export async function googleReauthPassword(page, passwordOrOpts, totpSecret = ""
         ? passwordOrOpts
         : {password: passwordOrOpts, totpSecret, log};
     const pwd = String(opts.password || "");
-    const totp = String(opts.totpSecret || "");
+    let totp = String(opts.totpSecret || "");
+    const totpFallback = String(opts.totpFallback || opts.totp_prev || "").replace(/\s+/g, "").toUpperCase();
     const write = typeof opts.log === "function" ? opts.log : console.log;
+    let totpWrong = 0;
 
     for (let i = 0; i < 8; i++) {
         const url = page.url();
@@ -1366,7 +1375,15 @@ export async function googleReauthPassword(page, passwordOrOpts, totpSecret = ""
             }
             write(r === "wrong" ? "  TOTP 二次验证 Wrong code，再试" : "  TOTP 二次验证");
             if (r === "left" || !isVerifyItsYouText(String(await page.innerText("body").catch(() => "")))) return true;
-            if (r === "wrong") await waitNextTotpWindow();
+            if (r === "wrong") {
+                totpWrong += 1;
+                if (totpWrong >= 3 && totpFallback && totpFallback !== totp) {
+                    write("  二次验证当前密钥连错，改用更换前的密钥");
+                    totp = totpFallback;
+                    totpWrong = 0;
+                }
+                await waitNextTotpWindow();
+            }
             continue;
         }
 
@@ -1424,6 +1441,7 @@ export async function ensureGoogleLoggedIn(page, targetUrl, creds = {}, log = co
     const email = String(creds.email || "");
     const password = String(creds.password || "");
     const totpSecret = String(creds.totpSecret || "");
+    const totpFallback = String(creds.totpFallback || creds.totp_prev || "");
     const recoveryEmail = String(creds.recoveryEmail || "");
     const write = typeof log === "function" ? log : (typeof creds.log === "function" ? creds.log : console.log);
 
@@ -1492,7 +1510,7 @@ export async function ensureGoogleLoggedIn(page, targetUrl, creds = {}, log = co
     }
 
     write("  需要登录");
-    const ok = await googleLogin(page, {email, password, totpSecret, recoveryEmail, log: write});
+    const ok = await googleLogin(page, {email, password, totpSecret, totpFallback, recoveryEmail, log: write});
     if (!ok) return false;
 
     // 等 Google SPA 完成跳转 + 处理可能的二次验证

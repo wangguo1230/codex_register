@@ -81,7 +81,7 @@ async function gotoReauth(page, url, cred, log) {
         return false;
     }
     await googleReauthPassword(page, {
-        password: cred.password, totpSecret: cred.totpSecret, log,
+        password: cred.password, totpSecret: cred.totpSecret, totpFallback: cred.totpPrev || "", log,
     });
     await page.waitForTimeout(2500);
     return true;
@@ -283,12 +283,14 @@ export async function hardenGoogleAccountOnPage(page, cred, log = () => {}, onCh
     } else {
         log("[邮箱管理 1/5] 更换 Google 2FA");
         if (stopNow()) return stopAndKeep();
+        const oldTotp = cred.totpSecret;
         const t = await runTimed("换2FA", () => change2faOnPage(page, {
             email: cred.email, password: cred.password,
             totpSecret: cred.totpSecret, recoveryEmail: cred.recoveryEmail, log,
             onPersist: onCheckpoint,
         }).catch((e) => ({ok: false, error: String(e?.message || e)})), 180000, true);
         if (t?.ok && t.totpSecret) {
+            cred.totpPrev = oldTotp && oldTotp !== t.totpSecret ? oldTotp : cred.totpPrev;
             cred.totpSecret = t.totpSecret;
             out.totpSecret = t.totpSecret;
             out.totpRotated = true;
@@ -316,7 +318,8 @@ export async function hardenGoogleAccountOnPage(page, cred, log = () => {}, onCh
         log("[邮箱管理 2/5] 修改 Google 密码");
         const pw = await changePasswordOnPage(page, {
             email: cred.email, password: cred.password,
-            totpSecret: cred.totpSecret, recoveryEmail: cred.recoveryEmail, log,
+            totpSecret: cred.totpSecret, totpFallback: cred.totpPrev || "",
+            recoveryEmail: cred.recoveryEmail, log,
             onPersist: async (np) => { await onCheckpoint({password: np, passwordChanged: true, verified: true}); },
         }).catch((e) => ({ok: false, error: String(e?.message || e)}));
         if (pw?.ok && pw.newPassword && pw.verified !== false) {
@@ -386,7 +389,8 @@ export async function hardenGoogleAccountOnPage(page, cred, log = () => {}, onCh
         log("[邮箱管理 5/5] 开通 IMAP");
         try {
             const fetchR = await enableGmailFetch(page, {
-                email: cred.email, password: cred.password, totpSecret: cred.totpSecret, log,
+                email: cred.email, password: cred.password,
+                totpSecret: cred.totpSecret, totpFallback: cred.totpPrev || "", log,
             });
             if (fetchR?.ok && fetchR.imapPassword) {
                 out.imapPassword = fetchR.imapPassword;
