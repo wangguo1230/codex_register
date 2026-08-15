@@ -34,7 +34,36 @@ export const GOOGLE_LOGIN_ERROR_LABEL = {
     ssl: "SSL/代理中断",
     cf: "Cloudflare 拦截",
     workspace: "落到 Gmail 营销页",
+    rejected: "出口被拒",
+    login_fail: "登录失败",
+    not_found: "找不到账号",
+    disabled: "账号已停用",
 };
+
+const HARDEN_IP_RE = /代理中断|换 session|signin\/rejected|拒绝页|SSL\/代理|ERR_PROXY|ERR_SSL|ERR_CONNECTION|ERR_TUNNEL|邮箱页卡住|应用专用密码生成被拒/i;
+const HARDEN_LOGIN_DEAD_RE = /登录失败|Wrong password|密码错误|Senha incorreta|找不到您的 Google|Couldn't find your Google|帐号已被停用|账号已停用|account has been disabled|尝试次数过多|Too many failed|This account cannot be accessed|账号已停用/i;
+
+export function isHardenIpError(msg = "") {
+    return HARDEN_IP_RE.test(String(msg || ""));
+}
+
+export function isHardenLoginDead(msg = "") {
+    const s = String(msg || "");
+    if (isHardenIpError(s)) return false;
+    return HARDEN_LOGIN_DEAD_RE.test(s);
+}
+
+export function classifyHardenLoginError(msg = "") {
+    const s = String(msg || "");
+    if (/Wrong password|密码错误|Senha incorreta|Kata sandi salah/i.test(s)) return "wrong_password";
+    if (/Couldn't find|找不到您的 Google/i.test(s)) return "not_found";
+    if (/disabled|停用/i.test(s)) return "disabled";
+    if (/rejected|拒绝页/i.test(s)) return "rejected";
+    if (isHardenIpError(s)) return "rejected";
+    return "login_fail";
+}
+
+export const HARDEN_PROXY_ROTATE_MAX = 2;
 
 export function emptyGoogleState() {
     return {
@@ -140,10 +169,14 @@ export function planHardenSkip(mb = {}) {
     return skip;
 }
 
-/** 继续完成：刚导入 / 整备未齐 / 整备部分，只要还缺「换成我们的 2FA」或 IMAP 就要进队。已齐这两项的不进。 */
+/** 继续完成：还缺 2FA/IMAP 才进队。登录失败判死不再扣；出口被拒只换有限次 IP。 */
 export function needsHardenRetry(mb = {}) {
     if (String(mb.google_stage || "") === "blocked") return false;
     if (String(mb.google_stage || "") === "gpt_ok") return false;
+    if (String(mb.google_stage || "") === "login_fail") return false;
+    const st = mb.google_state && typeof mb.google_state === "object" ? mb.google_state : {};
+    if (st.login === "fail") return false;
+    if (Number(st.proxy_rotates || 0) >= HARDEN_PROXY_ROTATE_MAX) return false;
     return !planHardenSkip(mb).usable;
 }
 

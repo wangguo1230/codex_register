@@ -865,6 +865,10 @@ export async function setMailboxPwStatus(id, pwStatus) {
 export async function setMailboxProxy(id, url, ip = "") {
     const u = String(url || "").trim();
     const p = String(ip || "").trim();
+    if (!u) {
+        await query(`UPDATE mailboxes SET proxy_url='', proxy_ip='' WHERE id=$1`, [id]);
+        return;
+    }
     if (p) {
         await query(`UPDATE mailboxes SET proxy_url=$1, proxy_ip=$2 WHERE id=$3`, [u, p, id]);
     } else {

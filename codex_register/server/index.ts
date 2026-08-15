@@ -446,8 +446,12 @@ async function applyGoogleHardenResult(id, mb, r) {
         imap_password: r.imapPassword || undefined,
         recovery_email: r.recoveryCleared ? "" : undefined,
     });
+    const brief = (r.errors || []).filter(Boolean).join("; ").slice(0, 160);
+    const {isHardenLoginDead, classifyHardenLoginError} = await import("../src/mail/google-state.js");
+    const loginDead = r.login === false || isHardenLoginDead(brief) || isHardenLoginDead(r.error || "");
     await db.refreshMailboxGoogleState(id, {
-        login: r.ok || r.password || r.totpSecret || r.imapPassword ? "ok" : undefined,
+        login: r.ok || r.password || r.totpSecret || r.imapPassword ? "ok" : (loginDead ? "fail" : undefined),
+        login_error: loginDead ? classifyHardenLoginError(brief || r.error || "登录失败") : undefined,
         password: r.passwordChanged ? "ok" : undefined,
         totp: r.totpSecret ? "ok" : undefined,
         totp_rotated: r.totpRotated ? true : undefined,
@@ -455,7 +459,7 @@ async function applyGoogleHardenResult(id, mb, r) {
         phone: r.phoneCleared ? "ok" : undefined,
         devices: r.devicesDone ? "ok" : undefined,
         imap: r.imapPassword ? "ok" : (r.errors || []).some((x) => /IMAP/i.test(String(x))) ? "fail" : undefined,
-        last_error: (r.errors || []).filter(Boolean).join("; ").slice(0, 160),
+        last_error: brief,
     }).catch(() => {});
 }
 
@@ -540,8 +544,28 @@ async function runOneGoogleHarden(id, opts = {}) {
         const stopped = batchHardenStop || isMailboxJobStopped() || ac.signal.aborted || (/已停止/.test(msg) && !closed);
         const err = stopped ? "已停止" : (closed ? "比特窗口被关掉（未登录或被限频踢下线）" : msg);
         logStep(`[整备] ${stopped ? "已停止" : "异常"}: ${err}`);
-        if (/账号已停用/.test(err)) {
-            await db.refreshMailboxGoogleState(id, {login: "fail", last_error: "账号已停用"}).catch(() => {});
+        const {isHardenIpError, isHardenLoginDead, classifyHardenLoginError, HARDEN_PROXY_ROTATE_MAX} = await import("../src/mail/google-state.js");
+        const st = mb.google_state && typeof mb.google_state === "object" ? mb.google_state : {};
+        if (!stopped && isHardenIpError(err)) {
+            await db.setMailboxProxy(id, "", "");
+            mb.proxy_url = "";
+            mb.proxy_ip = "";
+            const rotates = Number(st.proxy_rotates || 0) + 1;
+            const overlay = {proxy_rotates: rotates, last_error: err.slice(0, 160)};
+            if (rotates >= HARDEN_PROXY_ROTATE_MAX) {
+                overlay.login = "fail";
+                overlay.login_error = "rejected";
+                logStep(`[整备] 出口已换 ${rotates} 次仍过不去，判失败`);
+            } else {
+                logStep(`[整备] 出口不行，丢掉粘性 IP，再换 ${HARDEN_PROXY_ROTATE_MAX - rotates} 次`);
+            }
+            await db.refreshMailboxGoogleState(id, overlay).catch(() => {});
+        } else if (!stopped && (isHardenLoginDead(err) || /账号已停用/.test(err))) {
+            await db.refreshMailboxGoogleState(id, {
+                login: "fail",
+                login_error: classifyHardenLoginError(err),
+                last_error: err.slice(0, 160),
+            }).catch(() => {});
         }
         return {ok: false, error: err};
     } finally {
@@ -1061,6 +1085,7 @@ async function resumeMailJobs({onlyError = false, ids = null} = {}) {
             if (mb.provider !== "google") continue;
             if (mb.google_stage === "blocked" || mb.google_stage === "gpt_ok") continue;
             if (planHardenSkip(mb).usable) { skippedDone += 1; continue; }
+            if (!needsHardenRetry(mb)) continue;
             harden.push(mb);
             seen.add(mb.id);
         } else if (it.kind === "pw") pw.push(mb);
