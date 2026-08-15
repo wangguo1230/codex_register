@@ -222,7 +222,33 @@ async function extractSecretFromPage(page) {
     if (fromDom.length >= 16 && isLikelySecret(fromDom)) return fromDom;
     if (fromDlg.length >= 16) return fromDlg;
     if (otpSecret.length >= 16 && isLikelySecret(otpSecret)) return otpSecret;
+    const fromQr = await extractSecretFromQr(page, () => {});
+    if (fromQr) return fromQr;
     return extractTotpSecret(String(await page.innerText("body").catch(() => "")));
+}
+
+async function extractSecretFromQr(page, log = () => {}) {
+    const qr = setupQrInDialog(page).first();
+    if (!await qr.isVisible({timeout: 500}).catch(() => false)) return "";
+    let buf;
+    try { buf = await qr.screenshot({type: "png"}); }
+    catch { return ""; }
+    try {
+        const {PNG} = await import("pngjs");
+        const jsQR = (await import("jsqr")).default;
+        const png = PNG.sync.read(buf);
+        const code = jsQR(png.data, png.width, png.height);
+        const text = String(code?.data || "");
+        const m = text.match(/[?&]secret=([A-Z2-7]{16,64})/i);
+        const secret = (m ? m[1] : (/^[A-Z2-7]{16,64}$/i.test(text) ? text : "")).toUpperCase();
+        if (secret.length >= 16 && isLikelySecret(secret)) {
+            log(`[2FA] 从 QR 解出密钥 len=${secret.length}`);
+            return secret;
+        }
+    } catch (e) {
+        log(`[2FA] QR 解码失败 ${String(e?.message || e).slice(0, 80)}`);
+    }
+    return "";
 }
 
 async function scrollDialogToTop(page) {
@@ -914,6 +940,7 @@ async function clickCantScanByDom(page, log) {
         .or(dlg.getByText(/can.?t scan it\??/i)).first();
     if (!await el.isVisible({timeout: 800}).catch(() => false)) return false;
     await el.scrollIntoViewIfNeeded().catch(() => {});
+    await page.waitForTimeout(400);
     const box = await el.boundingBox().catch(() => null);
     if (box) await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
     else await el.click({timeout: 2500, noWaitAfter: true}).catch(() => el.click({force: true}));
@@ -1270,9 +1297,13 @@ export async function change2faOnPage(page, {
         if (["qr", "secret"].includes(setup) && await clickCantScanByDom(page, log)) cantClicked = true;
     }
     if (!cantClicked && !/otpauth:\/\//i.test(String(await page.innerText("body").catch(() => "")))) {
-        log("[2FA] 未找到无法扫描按钮");
-        await dumpPage(page, "2fa_no_cant_scan", log, email);
-        return {ok: false, error: "未找到无法扫描按钮"};
+        const fromQr = await extractSecretFromQr(page, log);
+        if (!fromQr) {
+            log("[2FA] 未找到无法扫描按钮，QR 也解不出");
+            await dumpPage(page, "2fa_no_cant_scan", log, email);
+            return {ok: false, error: "未找到无法扫描按钮"};
+        }
+        log("[2FA] Can't scan 没切过去，已从 QR 拿到密钥");
     }
     await page.waitForTimeout(3000);
 
