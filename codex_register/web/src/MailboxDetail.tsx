@@ -85,7 +85,7 @@ export function MailboxDetail({mailbox, onClose}: {mailbox: Mailbox; onClose: ()
                         <span className="text-gray-400">管理阶段</span>
                         <span className="text-gray-800">
                             {mailbox.google_stage === "gpt_ok" ? "已注册 GPT"
-                                : mailbox.google_stage === "ready" ? "可取件"
+                                : mailbox.google_stage === "ready" ? "已整备"
                                 : mailbox.google_stage === "blocked" ? "卡住"
                                 : mailbox.google_stage === "partial" ? "整备未齐"
                                 : mailbox.google_stage === "login_fail" ? "登不上"

@@ -31,7 +31,21 @@ function extractEmails(text: string): string[] {
 }
 const GOOGLE_STAGE_LABEL: Record<string, string> = {
     imported: "刚导入", login_ok: "能登录", login_fail: "登不上",
-    partial: "整备未齐", ready: "可取件", gpt_ok: "已注册 GPT", blocked: "卡住",
+    partial: "整备未齐", ready: "已整备", gpt_ok: "已注册 GPT", blocked: "卡住",
+};
+const GOOGLE_STAGE_SEARCH: Record<string, string> = {
+    imported: "刚导入 imported",
+    login_ok: "能登录 login_ok",
+    login_fail: "登不上 login_fail",
+    partial: "整备未齐 未整备 partial",
+    ready: "已整备 整备的 整备完 备完 可取件 整备 ready",
+    gpt_ok: "已注册 gpt gpt_ok",
+    blocked: "卡住 blocked",
+};
+const GOOGLE_STAGE_KEYWORD: Record<string, string> = {
+    整备的: "ready", 已整备: "ready", 整备完: "ready", 备完: "ready", 可取件: "ready", 整备: "ready",
+    整备未齐: "partial", 未整备: "partial",
+    刚导入: "imported", 能登录: "login_ok", 登不上: "login_fail", 卡住: "blocked",
 };
 const GOOGLE_STAGE_COLOR: Record<string, string> = {
     imported: "#6b7280", login_ok: "#2563eb", login_fail: "#dc2626",
@@ -275,6 +289,9 @@ export function MailboxPanel({notify}: {notify?: (m: string) => void}) {
         };
         const hit = keywordQs.map((q) => map[q]).find(Boolean);
         if (hit && usageFilter !== hit) setUsageFilter(hit);
+        const stageHit = keywordQs.map((q) => GOOGLE_STAGE_KEYWORD[q]).find(Boolean);
+        if (stageHit && fGmail !== stageHit) setFGmail(stageHit);
+        if (stageHit && fProvider !== "google") setFProvider("google");
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [keywordQs.join(",")]);
     useEffect(() => {
@@ -305,6 +322,8 @@ export function MailboxPanel({notify}: {notify?: (m: string) => void}) {
         m.grp || "",
         m.google_stage || "",
         GOOGLE_STAGE_LABEL[m.google_stage || ""] || "",
+        GOOGLE_STAGE_SEARCH[m.google_stage || ""] || "",
+        m.imap_password ? "imap 有imap" : "",
     ].join(" ").toLowerCase();
     const filtered = searchBase.filter((m) => {
         if (fProvider && providerOf(m) !== fProvider) return false;
