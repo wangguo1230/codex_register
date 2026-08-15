@@ -690,6 +690,39 @@ function mailJobFreeSlots() {
     return Math.max(0, cap - localMailJobIds.size);
 }
 
+let jumpGateWarned = false;
+/** 配了跳板就必须真能连；一条都没有就不领 harden，避免一登录就开窗秒删。 */
+async function hardenClaimSlots() {
+    const free = mailJobFreeSlots();
+    const configured = (scheduler.collectJumpLines() || []).filter(Boolean).length;
+    if (!configured) return free;
+    const urls = mailJumpPool.urls || [];
+    if (!urls.length) {
+        if (!jumpGateWarned) {
+            console.warn("[mail-jobs] 跳板已配置但没有可用本地端口，本机不领整备");
+            jumpGateWarned = true;
+        }
+        return 0;
+    }
+    let healthy = 0;
+    for (const url of urls) {
+        let h = mailJumpPool.health.get(url);
+        if (!h || Date.now() - (h.at || 0) > 90_000) {
+            h = await mailJumpPool.checkOne(url);
+        }
+        if (h?.ok) healthy += 1;
+    }
+    if (!healthy) {
+        if (!jumpGateWarned) {
+            console.warn("[mail-jobs] 跳板探测全失败，本机不领整备");
+            jumpGateWarned = true;
+        }
+        return 0;
+    }
+    jumpGateWarned = false;
+    return Math.max(0, Math.min(free, healthy * JUMP_MAX_EXITS - localMailJobIds.size));
+}
+
 function jobPayload(job) {
     const p = job?.payload;
     if (!p) return {};
@@ -747,10 +780,12 @@ async function runClaimedMailJob(job) {
         } else {
             const r = await runOneGoogleHarden(job.mailbox_id, {jobId: job.id});
             const err = (r.errors || [r.error]).filter(Boolean).map((e) => String(e).split("\n")[0]).join("; ");
-            const {isBitTransientError} = await import("../src/bitbrowser.js");
+            const {isBitTransientError, isProxyInfraError} = await import("../src/bitbrowser.js");
             if (!r.ok && isBitTransientError(err)) {
                 await parkJobsForBitDown(err);
                 await db.requeueMailJob(job.id, "比特异常，退回排队");
+            } else if (!r.ok && isProxyInfraError(err)) {
+                await db.requeueMailJob(job.id, "跳板/代理异常，退回排队");
             } else {
                 await db.completeMailJob(job.id, !!r.ok, err, {
                     instanceId: db.instanceId,
@@ -764,10 +799,12 @@ async function runClaimedMailJob(job) {
         }
     } catch (e) {
         const msg = String(e?.message || e);
-        const {isBitTransientError} = await import("../src/bitbrowser.js");
+        const {isBitTransientError, isProxyInfraError} = await import("../src/bitbrowser.js");
         if (isBitTransientError(msg)) {
             await parkJobsForBitDown(msg);
             await db.requeueMailJob(job.id, "比特异常，退回排队").catch(() => {});
+        } else if (isProxyInfraError(msg)) {
+            await db.requeueMailJob(job.id, "跳板/代理异常，退回排队").catch(() => {});
         } else {
             await db.completeMailJob(job.id, false, msg).catch(() => {});
         }
@@ -833,14 +870,14 @@ async function tickMailJobs() {
             scheduleMailboxJobBroadcast();
             return;
         }
-        const slots = mailJobFreeSlots();
+        const bitDown = isBitLoggedOut();
+        const slots = bitDown ? mailJobFreeSlots() : await hardenClaimSlots();
         if (!slots) {
             scheduleMailboxJobBroadcast();
             return;
         }
         const snap = scheduler.mailProxyPoolSnap();
         setExpectedBitTiles(Math.max(1, Number(snap.slots) || slots || 4));
-        const bitDown = isBitLoggedOut();
         const jobs = await db.claimMailJobs(db.instanceId, slots, bitDown ? "pw" : "");
         if (bitDown && !jobs.length) {
             scheduleMailboxJobBroadcast();
@@ -4308,8 +4345,11 @@ app.listen(PORT, () => {
     (async () => {
         try {
             const {sweepStaleBitWindows} = await import("../src/bitbrowser.js");
-            const n = await sweepStaleBitWindows({includeClosed: true, log: (m) => console.log(m)});
-            if (n) console.log(`[指纹] 启动清残留 ${n} 个（避免重启叠出 8 个窗）`);
+            const n = await sweepStaleBitWindows({
+                includeClosed: true, onlyClosed: true, minAgeMs: 10 * 60 * 1000,
+                log: (m) => console.log(m),
+            });
+            if (n) console.log(`[指纹] 启动只清已关残留 ${n} 个（不开着的窗）`);
         } catch (e: any) {
             console.warn(`[指纹] 启动清理失败: ${e?.message || e}`);
         }
@@ -4337,10 +4377,6 @@ async function shutdownThisInstance(signal: string) {
     rechargeStop = true;
     batchHardenStop = true;
     try { await closeTrackedBitWindows(); } catch { /* */ }
-    try {
-        const {sweepStaleBitWindows} = await import("../src/bitbrowser.js");
-        await sweepStaleBitWindows({includeClosed: true, log: (m) => console.log(m)});
-    } catch { /* */ }
     scheduler.pause();
     scheduler.pauseClaude();
     scheduler.releasingGpt = true;

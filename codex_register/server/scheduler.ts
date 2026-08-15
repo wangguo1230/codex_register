@@ -221,6 +221,10 @@ class Scheduler extends EventEmitter {
         for (const raw of lines) {
             const url = this.resolveJumpLine(raw, this.jumpFleet);
             if (!url || seen.has(url)) continue;
+            if (isVlessUrl(raw)) {
+                const hit = (this.jumpFleet || []).find((f) => f.socks === url || f.vless === raw);
+                if (!hit?.running) continue;
+            }
             seen.add(url);
             socks.push(url);
         }

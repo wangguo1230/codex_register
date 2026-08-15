@@ -270,6 +270,11 @@ export function isBitTransientError(msg) {
     return /login expired|login out|未登录|please login|token 失效|比特已退出|没有找到相应数据|服务调用成功，但没有找到/i.test(String(msg || ""));
 }
 
+/** 跳板/出口挂了，不是这个号本身失败。 */
+export function isProxyInfraError(msg) {
+    return /跳板池全忙|跳板连不上|跳板不可用|代理不通|ECONNREFUSED|本地端口没起来|xray 启动失败|gate\.kookeey/i.test(String(msg || ""));
+}
+
 export async function listAllBitWindows({force = false} = {}) {
     const now = Date.now();
     if (now < listBackoffUntil && listCache.at) return listCache.all;
@@ -312,10 +317,12 @@ export async function listAutomationBitWindows() {
     }));
 }
 
-/** 停任务：关掉本进程登记的窗，再清自动化残留（含外部脚本开的窗）。 */
+/** 停任务：只关本进程登记的窗，再删已经关掉的配置。开着但没登记的不碰。 */
 export async function stopAutomationBitWindows({includeClosed = true, log = () => {}} = {}) {
     const n1 = await closeTrackedBitWindows();
-    const n2 = await sweepStaleBitWindows({keepIds: [], includeClosed, log});
+    const n2 = includeClosed
+        ? await sweepStaleBitWindows({keepIds: [], includeClosed: true, onlyClosed: true, log})
+        : 0;
     return n1 + n2;
 }
 
@@ -351,11 +358,14 @@ export async function sweepClosedGptWindows({log = () => {}} = {}) {
     return n;
 }
 
+function windowAgeMs(w) {
+    const created = Date.parse(String(w?.createdTime || "").replace(" ", "T"));
+    return Number.isFinite(created) ? Date.now() - created : 9e15;
+}
+
 /**
- * 清掉自动化留下的比特指纹。keepIds / 当前登记的 live 窗口会留下。
- * includeClosed: 连已关但没删的配置也删掉（占会员额度）。
+ * 只删已经关掉且超过 10 分钟的配置。开着的窗一律不关。
  */
-/** 关掉本进程没登记的自动化窗，避免 Windows 强杀后窗越堆越多。 */
 export async function ensureBitWindowBudget({log = () => {}} = {}) {
     const cap = Math.max(1, expectedBitTiles || 4);
     let windows = [];
@@ -365,23 +375,27 @@ export async function ensureBitWindowBudget({log = () => {}} = {}) {
         return 0;
     }
     const ours = windows.filter(isOurAutomationWindow);
-    const extras = ours.filter((w) => w?.id && !liveBitIds.has(w.id));
     let n = 0;
-    for (const w of extras) {
+    for (const w of ours) {
+        if (!w?.id) continue;
         const open = Number(w.status) === 1;
-        const created = Date.parse(String(w.createdTime || "").replace(" ", "T"));
-        const age = Number.isFinite(created) ? Date.now() - created : 9e15;
-        // 刚开的窗可能是上一进程还在跑，别一启动就全杀掉导致 Login Expired。
-        if (open && age < 3 * 60 * 1000) continue;
-        if (open) await closeBitWindow(w.id);
+        if (open) continue;
+        if (liveBitIds.has(w.id)) continue;
+        if (windowAgeMs(w) < 10 * 60 * 1000) continue;
         await deleteBitWindow(w.id);
         n += 1;
-        log(`[指纹] 清超额残留 ${w.name || w.id} status=${w.status} 本机登记=${liveBitIds.size} 上限=${cap}`);
+        log(`[指纹] 清已关残留 ${w.name || w.id} 本机登记=${liveBitIds.size} 上限=${cap}`);
     }
     return n;
 }
 
-export async function sweepStaleBitWindows({keepIds = [], includeClosed = true, log = () => {}} = {}) {
+export async function sweepStaleBitWindows({
+    keepIds = [],
+    includeClosed = true,
+    onlyClosed = false,
+    minAgeMs = 0,
+    log = () => {},
+} = {}) {
     const keep = new Set([...keepIds, ...liveBitIds].filter(Boolean));
     let windows = [];
     try { windows = await listAllBitWindows(); }
@@ -391,8 +405,12 @@ export async function sweepStaleBitWindows({keepIds = [], includeClosed = true, 
     }
     const stale = windows.filter((w) => {
         if (!w?.id || keep.has(w.id)) return false;
-        if (!includeClosed && Number(w.status) === 0) return false;
-        return isOurAutomationWindow(w);
+        if (!isOurAutomationWindow(w)) return false;
+        const open = Number(w.status) === 1;
+        if (onlyClosed && open) return false;
+        if (!includeClosed && !open) return false;
+        if (minAgeMs > 0 && windowAgeMs(w) < minAgeMs) return false;
+        return true;
     });
     let n = 0;
     for (const w of stale) {
