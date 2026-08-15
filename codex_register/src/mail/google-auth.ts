@@ -41,7 +41,7 @@ const CHALLENGE_MARKERS = [
     "actividad inusual", "activité inhabituelle",
 ];
 
-const VERIFY_YOU_RE = /verify (that )?it.?s you|first verify that|verifica(?:r)? que eres t[uú]|verificar que [eé]s voc[eê]|v[eé]rifiez que c.?est (bien )?vous|確認是你|确认是你|ini benar-benar kamu/i;
+const VERIFY_YOU_RE = /verify (that )?it.?s you|first verify that|please sign in again|sign in again to continue|verifica(?:r)? que eres t[uú]|verificar que [eé]s voc[eê]|v[eé]rifiez que c.?est (bien )?vous|確認是你|确认是你|ini benar-benar kamu|请重新登录|请再次登录/i;
 const IMAGE_CAPTCHA_RE = /type the text you (hear or )?see|enter the characters you see|characters you see in the image|digite o texto que|escribe el texto/i;
 const TOTP_PLACEHOLDER_RE = /enter( the)? code|ingresar el c[oó]digo|introduc(?:ir|e)(?: el)? c[oó]digo|c[oó]digo|验证码|kod(?:e|igo)?/i;
 const WRONG_TOTP_RE = /wrong code|incorrect code|that code didn.?t work|c[oó]digo (incorrecto|errado|inv[aá]lido)|code incorrect|kode salah|验证码有误|代码不正确|代码有误|wrong pin/i;
@@ -1379,6 +1379,19 @@ export async function submitGoogleTotp(page, secret, write = () => {}, attempt =
     return "ok";
 }
 
+async function waitLeftSignInAgain(page, ms = 12000) {
+    const t0 = Date.now();
+    while (Date.now() - t0 < ms) {
+        if (await findLoginPasswordBox(page)) return "password";
+        if (await totpFieldVisible(page)) return "totp";
+        const text = String(await page.innerText("body").catch(() => ""));
+        if (!isVerifyItsYouText(text) && !/please sign in again|sign in again to continue/i.test(text)) return "left";
+        if (await googleSslDead(page)) throw new Error("代理中断 二次验证 SSL，换 session 重开窗");
+        await page.waitForTimeout(400);
+    }
+    return "";
+}
+
 /** 处理敏感操作前的密码 + TOTP 二次验证。 */
 export async function googleReauthPassword(page, passwordOrOpts, totpSecret = "", log = console.log) {
     const opts = passwordOrOpts && typeof passwordOrOpts === "object"
@@ -1389,6 +1402,7 @@ export async function googleReauthPassword(page, passwordOrOpts, totpSecret = ""
     const totpFallback = String(opts.totpFallback || opts.totp_prev || "").replace(/\s+/g, "").toUpperCase();
     const write = typeof opts.log === "function" ? opts.log : console.log;
     let totpWrong = 0;
+    let signInAgainClicks = 0;
 
     for (let i = 0; i < 8; i++) {
         const url = page.url();
@@ -1400,8 +1414,7 @@ export async function googleReauthPassword(page, passwordOrOpts, totpSecret = ""
         }
         if (await dismissSavePasswordPrompt(page, write)) continue;
         if (await dismissGoogleGlitch(page, write)) continue;
-        const needBody = /accounts\.google\.com|signin|challenge/i.test(url);
-        const body = needBody ? String(await page.innerText("body").catch(() => "")) : "";
+        const body = String(await page.innerText("body").catch(() => ""));
         if (IMAGE_CAPTCHA_RE.test(body)) {
             write("  二次验证遇到图片验证码，换出口再试");
             return false;
@@ -1479,11 +1492,26 @@ export async function googleReauthPassword(page, passwordOrOpts, totpSecret = ""
 
         if (isVerifyItsYouText(body) || /accounts\.google\.com\/(signin|challenge|v3)/i.test(String(url))) {
             if (!await totpFieldVisible(page) && !await findLoginPasswordBox(page)) {
-                const onlyNext = page.getByRole("button", {name: /^(next|continue|下一步|继续)$/i}).first();
-                if (await onlyNext.isVisible({timeout: 400}).catch(() => false)) {
-                    await onlyNext.click().catch(() => onlyNext.click({force: true}));
-                    write("  二次验证先点 Next（sign in again）");
-                    await page.waitForTimeout(1500);
+                const clicked = await clickHostNext(page, "#identifierNext")
+                    || await clickHostNext(page, "#passwordNext")
+                    || await (async () => {
+                        const onlyNext = page.getByRole("button", {name: /^(next|continue|下一步|继续)$/i}).first();
+                        if (!await onlyNext.isVisible({timeout: 400}).catch(() => false)) return false;
+                        await onlyNext.click({timeout: 2500, noWaitAfter: true}).catch(() => onlyNext.click({force: true}));
+                        return true;
+                    })();
+                if (clicked) {
+                    signInAgainClicks += 1;
+                    write("  二次验证先点 Next（sign in again），等密码/验证码页");
+                    const left = await waitLeftSignInAgain(page, 12000);
+                    if (left) {
+                        write(`  sign in again 已过 → ${left}`);
+                        continue;
+                    }
+                    if (signInAgainClicks >= 2) {
+                        write("  sign in again 连续两次没动");
+                        return false;
+                    }
                     continue;
                 }
             }

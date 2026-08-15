@@ -4,7 +4,7 @@
  * 买来的老号做不了官方 Gmail OAuth（要 Cloud 项目 + 验证应用），
  * 开了 2FA 之后官方允许的取件方式就是「应用专用密码 + IMAP」。
  */
-import {googleReauthPassword, googleSslDead, recoverSslOrSlowPage, isVerifyItsYouText} from "./google-auth.js";
+import {googleReauthPassword, googleSslDead, recoverSslOrSlowPage, isVerifyItsYouText, ensureGoogleLoggedIn} from "./google-auth.js";
 import {ImapFlow} from "imapflow";
 
 const IMAP_SETTINGS = "https://mail.google.com/mail/u/0/#settings/fwdandpop";
@@ -102,7 +102,7 @@ async function clickCreateAppPassword(page, log) {
 
 /** 生成一枚应用专用密码，返回 16 位（无空格）。 */
 export async function createGmailAppPassword(page, {
-    password = "", totpSecret = "", totpFallback = "", appName = "mail-fetch", log = () => {},
+    email = "", password = "", totpSecret = "", totpFallback = "", appName = "mail-fetch", log = () => {},
 } = {}) {
     log("[取件] 打开应用专用密码页");
     try {
@@ -124,9 +124,19 @@ export async function createGmailAppPassword(page, {
         }
         if (isVerifyItsYouText(body) || /accounts\.google\.com\/(signin|challenge|v3)/i.test(page.url())) {
             log("[取件] 应用专用密码页要二次验证");
-            await googleReauthPassword(page, {password, totpSecret, totpFallback, log});
+            const passed = await googleReauthPassword(page, {password, totpSecret, totpFallback, log});
             await page.waitForTimeout(800);
-            if (!/apppasswords/i.test(page.url()) && !isVerifyItsYouText(String(await page.innerText("body").catch(() => "")))) {
+            const still = isVerifyItsYouText(String(await page.innerText("body").catch(() => "")));
+            if ((!passed || still) && email) {
+                log("[取件] sign in again 没过去，改走完整登录再进应用密码页");
+                const ok = await ensureGoogleLoggedIn(page, APP_PASSWORD_URL, {
+                    email, password, totpSecret, totpFallback, log,
+                });
+                if (!ok) {
+                    await dumpAppPwFail(page);
+                    throw new Error("应用专用密码页二次验证未过");
+                }
+            } else if (!/apppasswords/i.test(page.url()) && !still) {
                 try { await page.goto(APP_PASSWORD_URL, {waitUntil: "domcontentloaded", timeout: 60000}); } catch { /* */ }
             }
             continue;
@@ -429,7 +439,7 @@ export async function enableGmailFetch(page, {
     email, password = "", totpSecret = "", totpFallback = "", log = () => {},
 } = {}) {
     await enableGmailImap(page, log).catch((e) => log(`[取件] IMAP 设置跳过: ${e?.message || e}`));
-    const imapPassword = await createGmailAppPassword(page, {password, totpSecret, totpFallback, log});
+    const imapPassword = await createGmailAppPassword(page, {email, password, totpSecret, totpFallback, log});
     const probe = await testGmailImap(email, imapPassword);
     if (!probe.ok) {
         // 本机直连/探活失败不否掉已生成的应用密码，否则会空等 90 秒再整单失败。
