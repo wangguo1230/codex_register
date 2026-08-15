@@ -103,9 +103,9 @@ async function main() {
             cdpEndpoint = ws;
             emit({type: "progress", stage: "bit", message: `比特窗口已打开(${String(bitId).slice(0, 8)}…)`});
         } catch (e) {
-            try { chainClose(); } catch { /* */ }
             emit({type: "result", status: "failed", email, error: "比特窗口创建/打开失败: " + (e?.message ?? e)});
-            if (bitId) await deleteBitWindow(bitId);
+            if (bitId) { await closeBitWindow(bitId).catch(() => {}); await deleteBitWindow(bitId); }
+            try { chainClose(); } catch { /* */ }
             process.exit(1); return;
         }
     }
@@ -125,8 +125,9 @@ async function main() {
         });
     } finally {
         unbindGoogleLivePage();
-        try { chainClose(); } catch { /* */ }
+        // 先关窗口再拆本地转发，否则比特还指着已死端口，整页 No internet / ERR_PROXY_CONNECTION_FAILED
         if (bitId) { await closeBitWindow(bitId); await deleteBitWindow(bitId); emit({type: "progress", stage: "bit", message: "已关闭并删除比特窗口(释放额度)"}); }
+        try { chainClose(); } catch { /* */ }
     }
     if (!r.ok || !r.token) {
         emit({type: "result", status: "failed", email, error: r.error || "浏览器注册未拿到 token"});
