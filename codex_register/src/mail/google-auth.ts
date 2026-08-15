@@ -299,20 +299,41 @@ async function waitIdentifierUiReady(page, write, ms = 45000) {
 }
 
 const NET_DROP_RE = /ERR_CONNECTION_CLOSED|ERR_CONNECTION_RESET|ERR_CONNECTION_ABORTED|ERR_CONNECTION_REFUSED|ERR_EMPTY_RESPONSE|ERR_TIMED_OUT|ERR_TUNNEL|ERR_SSL|ERR_PROXY|ERR_SOCKET_NOT_CONNECTED|ERR_NETWORK_CHANGED|ERR_INTERNET_DISCONNECTED/i;
+const STATIC_DROP_RE = /\.(woff2?|ttf|eot|otf|png|jpe?g|gif|svg|ico|webp|css)(\?|$)/i;
+
+function isWatchedGoogleUrl(url) {
+    return /accounts\.google\.com|googleapis\.com|gstatic\.com|fonts\.gstatic|www\.google\.com|play\.google\.com|batchexecute|identifier|signin/i.test(url);
+}
+
+function isCriticalGoogleDrop(url) {
+    return /accounts\.google\.com|batchexecute|identifier|signin\/v3|googleapis\.com/i.test(url)
+        && !STATIC_DROP_RE.test(url);
+}
 
 function attachGoogleNetWatch(page) {
     const fails = [];
+    let markedAt = 0;
     const onFail = (req) => {
         const err = String(req.failure()?.errorText || "");
         if (!NET_DROP_RE.test(err)) return;
         const url = String(req.url() || "");
-        if (!/accounts\.google\.com|googleapis\.com|gstatic\.com\/accounts|play\.google\.com|batchexecute|identifier|signin/i.test(url)) return;
-        fails.push({url: url.slice(0, 140), err, at: Date.now()});
+        if (!isWatchedGoogleUrl(url)) return;
+        fails.push({
+            url: url.slice(0, 160),
+            err,
+            at: Date.now(),
+            critical: isCriticalGoogleDrop(url),
+        });
     };
     page.on("requestfailed", onFail);
     return {
+        mark() { markedAt = Date.now(); },
         recent(ms = 12000) {
             const cut = Date.now() - ms;
+            return fails.filter((f) => f.at >= cut);
+        },
+        sinceMark(padMs = 500) {
+            const cut = Math.max(0, (markedAt || 0) - padMs);
             return fails.filter((f) => f.at >= cut);
         },
         detach() { page.off("requestfailed", onFail); },
@@ -352,8 +373,12 @@ async function waitLeftIdentifier(page, pwdSoon, netWatch) {
         if (await findLoginPasswordBox(page)) return {left: true};
         if (await totpFieldVisible(page)) return {left: true};
         if (await pwdSoon.isVisible({timeout: 150}).catch(() => false)) return {left: true};
-        const drops = netWatch?.recent(10000) || [];
-        if (drops.length && w >= 3) return {left: false, netDrop: drops[drops.length - 1]};
+        const drops = netWatch?.sinceMark ? netWatch.sinceMark() : (netWatch?.recent(12000) || []);
+        const critical = drops.filter((d) => d.critical);
+        // batchexecute / identifier 被掐：1.5s 后重开，别干等。
+        if (critical.length && w >= 3) return {left: false, netDrop: critical[critical.length - 1]};
+        // 点 Next 后字体/gstatic 也被掐，且还停在邮箱页：按代理切断处理。
+        if (drops.length && w >= 10) return {left: false, netDrop: drops[drops.length - 1]};
         if (w > 8 && await identifierStillLoading(page)) continue;
     }
     return {left: false};
@@ -629,6 +654,7 @@ export async function googleLogin(page, emailOrOpts, password = "", totpSecret =
                         how = await clickIdentifierNext(page) || "retry";
                     }
                     write(`  邮箱页提交 #${emailNextClicks} via=${how || "?"} nextReady=${await hostNextReady(page, "#identifierNext")}`);
+                    netWatch.mark?.();
                     const wait = await waitLeftIdentifier(page, pwdSoon, netWatch);
                     if (wait.left) await page.waitForTimeout(700);
                     if (wait.netDrop && identNetReloads < 4) {
