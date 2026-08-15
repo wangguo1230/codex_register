@@ -1302,9 +1302,16 @@ export async function googleReauthPassword(page, passwordOrOpts, totpSecret = ""
 
     for (let i = 0; i < 8; i++) {
         const url = page.url();
-        const body = String(await page.innerText("body").catch(() => ""));
+        // 已经在 authenticator 详情页：不要再拉整页 HTML，更不要把 Change 当挑战选项点。
+        if (/myaccount\.google\.com/i.test(url) && !/accounts\.google\.com/i.test(url)) {
+            const changeReady = page.getByRole("button", {name: /change authenticator|set up authenticator|更改身份验证|设置身份验证/i})
+                .or(page.getByText(/^your authenticator$/i));
+            if (await changeReady.first().isVisible({timeout: 250}).catch(() => false)) return true;
+        }
         if (await dismissSavePasswordPrompt(page, write)) continue;
         if (await dismissGoogleGlitch(page, write)) continue;
+        const needBody = /accounts\.google\.com|signin|challenge/i.test(url);
+        const body = needBody ? String(await page.innerText("body").catch(() => "")) : "";
         if (IMAGE_CAPTCHA_RE.test(body)) {
             write("  二次验证遇到图片验证码，换出口再试");
             return false;
@@ -1350,16 +1357,14 @@ export async function googleReauthPassword(page, passwordOrOpts, totpSecret = ""
         const pwdCount = await page.locator('input[type="password"]:visible, input[name="Passwd"]:visible').count().catch(() => 0);
         if (pwdCount >= 2 && !reauthBox) break;
 
-        // 2FA 方式选择（仅当还没有验证码框时）
-        const content = await page.content();
-        const alreadyCode = /Enter code|输入验证码|Ingresar el c[oó]digo|Introduc/i.test(content);
-        if (!alreadyCode && /uthenticat|utenticador/i.test(content) && !isVerifyItsYouText(body)) {
-            const authOpt = page.locator(
-                '[data-challengetype], li, [role="link"], [role="button"]',
-            ).filter({hasText: /uthenticat|utenticador/i});
-            if (await authOpt.first().isVisible({timeout: 1000}).catch(() => false)) {
+        // 只点挑战列表里的 Authenticator 项，不要点详情页的 Change authenticator app。
+        if (isVerifyItsYouText(body) || /accounts\.google\.com\/(signin|challenge|v3)/i.test(String(url))) {
+            const authOpt = page.locator("[data-challengetype]").filter({hasText: /uthenticat|utenticador|验证器/i});
+            if (await authOpt.first().isVisible({timeout: 400}).catch(() => false)
+                && !await totpFieldVisible(page)) {
                 await authOpt.first().click();
-                await page.waitForTimeout(3000);
+                write("  二次验证改走 Authenticator");
+                await page.waitForTimeout(1200);
                 continue;
             }
         }
@@ -1368,10 +1373,12 @@ export async function googleReauthPassword(page, passwordOrOpts, totpSecret = ""
         await page.waitForTimeout(1500);
     }
 
-    const leftover = String(await page.innerText("body").catch(() => ""));
-    if (isVerifyItsYouText(leftover) || IMAGE_CAPTCHA_RE.test(leftover)) {
-        write("  二次验证未过");
-        return false;
+    if (/accounts\.google\.com/i.test(page.url())) {
+        const leftover = String(await page.innerText("body").catch(() => ""));
+        if (isVerifyItsYouText(leftover) || IMAGE_CAPTCHA_RE.test(leftover)) {
+            write("  二次验证未过");
+            return false;
+        }
     }
     return true;
 }

@@ -369,26 +369,17 @@ async function clickVisibleHref(page, pred, log, tag) {
     return false;
 }
 
+function changeAuthenticatorBtn(page) {
+    return page.locator("button").filter({
+        hasText: /change authenticator app|set up authenticator app|更改身份验证|设置身份验证/i,
+    }).first();
+}
+
 async function onAuthenticatorDetail(page) {
+    if (await changeAuthenticatorBtn(page).isVisible({timeout: 250}).catch(() => false)) return true;
     const ready = page.getByRole("button", {name: /change authenticator|set up authenticator|更改身份验证|设置身份验证/i})
-        .or(page.getByText(/your authenticator|change authenticator app|set up authenticator/i));
-    if (await ready.first().isVisible({timeout: 400}).catch(() => false)) return true;
-    if (!/\/authenticator/i.test(page.url())) return false;
-    return page.evaluate(() => {
-        const bad = /play\.google|apps\.apple|support\.google|policies\.google|\/TOS|privacy/i;
-        const vis = (el) => {
-            if (!el || !el.getClientRects().length) return false;
-            const r = el.getBoundingClientRect();
-            return r.width > 6 && r.height > 6;
-        };
-        for (const card of document.querySelectorAll("article, li, [role='listitem'], [role='region'], section, div")) {
-            if ((card.innerText || "").length > 2200) continue;
-            const as = [...card.querySelectorAll("a")].filter((a) => vis(a) && !bad.test(a.href || ""));
-            const btns = [...card.querySelectorAll("button, [role='button']")].filter(vis);
-            if (as.length === 1 && btns.some((b) => ((b.textContent || "").trim().length <= 2))) return true;
-        }
-        return false;
-    }).catch(() => false);
+        .or(page.getByText(/^your authenticator$/i));
+    return ready.first().isVisible({timeout: 250}).catch(() => false);
 }
 
 async function dismissAccountFlyout(page) {
@@ -569,25 +560,25 @@ async function fillChangeAuthenticatorCode(page, totpSecret, log) {
 
 async function waitAuthenticatorSetup(page, ms = 9000) {
     const deadline = Date.now() + ms;
+    const cant = page.getByText(/can.?t scan it\??|cannot scan|无法扫描/i);
+    const qr = page.locator("canvas, img[alt*='QR' i], img[src*='qr']");
+    const secret = page.getByText(/secret key|setup key|密钥|otpauth:\/\//i);
     while (Date.now() < deadline) {
         if (await isAccountPickerDialog(page)) {
             await dismissAccountFlyout(page);
-            await page.waitForTimeout(250);
+            await page.waitForTimeout(150);
             continue;
         }
-        if (await page.locator("canvas, img[alt*='QR' i], img[src*='qr']").first().isVisible({timeout: 180}).catch(() => false)) return "qr";
-        const t = String(await page.innerText("body").catch(() => ""));
-        if (/otpauth:\/\//i.test(t) || /secret key|setup key|密钥|can.?t scan|cannot scan|无法扫描/i.test(t)) return "secret";
+        if (await qr.first().isVisible({timeout: 120}).catch(() => false)) return "qr";
+        if (await cant.first().isVisible({timeout: 120}).catch(() => false)) return "secret";
+        if (await secret.first().isVisible({timeout: 120}).catch(() => false)) return "secret";
         if (await findChangeTotpDialog(page)) return "reauth";
-        const dlgs = page.locator('[role="dialog"], [role="alertdialog"]');
-        const dn = await dlgs.count().catch(() => 0);
-        for (let i = 0; i < dn; i++) {
-            const dlg = dlgs.nth(i);
-            if (!await dlg.isVisible({timeout: 120}).catch(() => false)) continue;
+        const dlg = page.locator('[role="dialog"], [role="alertdialog"]').first();
+        if (await dlg.isVisible({timeout: 80}).catch(() => false)) {
             const dt = String(await dlg.innerText().catch(() => ""));
             if (dialogLooksLikeReplaceConfirm(dt)) return "confirm";
         }
-        await page.waitForTimeout(350);
+        await page.waitForTimeout(180);
     }
     return "";
 }
@@ -643,8 +634,15 @@ async function clickDialogNext(page, log) {
 /** 不看文案：先关账号浮层，再点卡片里垃圾桶旁边那条业务链接。不要点当前页自己的 /authenticator。 */
 async function clickAuthenticatorChangeByDom(page, log) {
     await dismissAccountFlyout(page);
+    const pill = changeAuthenticatorBtn(page);
+    if (await pill.isVisible({timeout: 400}).catch(() => false)) {
+        await pill.scrollIntoViewIfNeeded().catch(() => {});
+        await pill.click({timeout: 2000}).catch(() => pill.click({force: true, timeout: 1500}));
+        log("[2FA] 点了 Change authenticator app 按钮");
+        return true;
+    }
     const namedBtn = page.getByRole("button", {name: /change authenticator|set up authenticator|更改身份验证|设置身份验证/i}).first();
-    if (await namedBtn.isVisible({timeout: 800}).catch(() => false)) {
+    if (await namedBtn.isVisible({timeout: 350}).catch(() => false)) {
         await namedBtn.scrollIntoViewIfNeeded().catch(() => {});
         await namedBtn.click().catch(() => namedBtn.click({force: true}));
         log("[2FA] 点了 Change authenticator app 按钮");
@@ -720,11 +718,12 @@ async function clickCantScanByDom(page, log) {
 
 async function openAuthenticatorDetail(page, log) {
     if (await onAuthenticatorDetail(page)) return true;
-    if (await isAccountPickerDialog(page) || /Choose an account|SignOutOptions/i.test(String(await page.innerText("body").catch(() => "")))) {
+    if (await isAccountPickerDialog(page)) {
         await dismissAccountFlyout(page);
         await page.keyboard.press("Escape").catch(() => {});
     }
     for (let attempt = 0; attempt < 3; attempt++) {
+        if (await onAuthenticatorDetail(page)) return true;
         const already = /myaccount\.google\.com\/.*authenticator/i.test(page.url())
             && !/accounts\.google\.com/i.test(page.url());
         if (!already || attempt > 0) {
@@ -735,17 +734,18 @@ async function openAuthenticatorDetail(page, log) {
                 log(`[2FA] 打开 authenticator 超时: ${String(e?.message || e).slice(0, 70)}`);
             }
         }
-        await recoverSslOrSlowPage(page, log, AUTHENTICATOR_URL, 2);
-        if (await googleSslDead(page)) continue;
-        for (let i = 0; i < 30; i++) {
-            await page.waitForTimeout(400);
+        if (await googleSslDead(page)) {
+            await recoverSslOrSlowPage(page, log, AUTHENTICATOR_URL, 2);
+            if (await googleSslDead(page)) continue;
+        }
+        for (let i = 0; i < 20; i++) {
             if (await onAuthenticatorDetail(page)) return true;
             if (await googleSslDead(page)) break;
-            if (isVerifyItsYouText(String(await page.innerText("body").catch(() => "")))
-                || /accounts\.google\.com\/(v3\/)?signin|challenge\/totp/i.test(page.url())) {
+            if (/accounts\.google\.com\/(v3\/)?signin|challenge\/totp/i.test(page.url())) {
                 log("[2FA] authenticator 页又要二次验证");
                 return false;
             }
+            await page.waitForTimeout(250);
         }
     }
     return false;
@@ -770,19 +770,24 @@ export async function change2faOnPage(page, {
             return {ok: false, error: "Google 登录失败"};
         }
     }
-    try { await page.goto(AUTHENTICATOR_URL, {waitUntil: "domcontentloaded", timeout: 60000}); } catch { /* ignore */ }
-    await recoverSslOrSlowPage(page, log, AUTHENTICATOR_URL, 3);
-    await page.waitForTimeout(1200);
-    await preferEnglishGoogleUi(page, log, AUTHENTICATOR_URL);
-    await googleReauthPassword(page, {password, totpSecret, log});
-    for (let i = 0; i < 6; i++) {
-        const t = String(await page.innerText("body").catch(() => ""));
-        if (!isVerifyItsYouText(t) && !/accounts\.google\.com\/(v3\/)?signin|challenge\/totp/i.test(page.url())) break;
-        await googleReauthPassword(page, {password, totpSecret, log});
-        await page.waitForTimeout(1500);
+    if (!await onAuthenticatorDetail(page)) {
+        try { await page.goto(AUTHENTICATOR_URL, {waitUntil: "domcontentloaded", timeout: 60000}); } catch { /* ignore */ }
+        if (await googleSslDead(page)) await recoverSslOrSlowPage(page, log, AUTHENTICATOR_URL, 3);
     }
-    if (isVerifyItsYouText(String(await page.innerText("body").catch(() => "")))
-        || /accounts\.google\.com\/(v3\/)?signin|challenge\/totp/i.test(page.url())) {
+    if (!await onAuthenticatorDetail(page)) {
+        await preferEnglishGoogleUi(page, log, AUTHENTICATOR_URL);
+        await googleReauthPassword(page, {password, totpSecret, log});
+        for (let i = 0; i < 4; i++) {
+            if (await onAuthenticatorDetail(page)) break;
+            if (!/accounts\.google\.com\/(v3\/)?signin|challenge\/totp/i.test(page.url())
+                && !isVerifyItsYouText(String(await page.locator("h1, h2, [role='heading']").first().innerText().catch(() => "")))) {
+                break;
+            }
+            await googleReauthPassword(page, {password, totpSecret, log});
+            await page.waitForTimeout(800);
+        }
+    }
+    if (/accounts\.google\.com\/(v3\/)?signin|challenge\/totp/i.test(page.url())) {
         log("[2FA] 二次验证未过，仍在 Verify it's you");
         await dumpPage(page, "2fa_still_verify", log, email);
         return {ok: false, error: "二次验证未过"};
@@ -795,12 +800,11 @@ export async function change2faOnPage(page, {
     const leaveCritical = enterMailJobCritical();
     try {
     const AUTH_PATTERNS = ["uthenticat", "utenticador", "uthentifizierung"];
-    const contentLower = String(await page.innerText("body")).toLowerCase();
-    const onVerify = isVerifyItsYouText(contentLower);
+    const onVerify = /accounts\.google\.com\/(v3\/)?signin|challenge\/totp/i.test(page.url());
     let foundAuth = !onVerify && (
-        /\/authenticator/i.test(page.url())
-        || await page.locator('a[href*="authenticator"]').first().isVisible({timeout: 400}).catch(() => false)
-        || CHANGE_KEYWORDS.some((kw) => contentLower.includes(kw.toLowerCase()))
+        await onAuthenticatorDetail(page)
+        || /\/authenticator/i.test(page.url())
+        || await page.locator('a[href*="authenticator"]').first().isVisible({timeout: 250}).catch(() => false)
     );
 
     if (!foundAuth && !onVerify) {
@@ -840,7 +844,7 @@ export async function change2faOnPage(page, {
     }
 
     if (!foundAuth) {
-        if (await googleSslDead(page) || /err_ssl|can.?t provide a secure connection|chrome-error|sent an invalid response/i.test(contentLower)) {
+        if (await googleSslDead(page)) {
             log("[2FA] 入口页被 SSL 掐了，刷新再进");
             await recoverSslOrSlowPage(page, log, AUTHENTICATOR_URL, 4);
             const again = String(await page.innerText("body").catch(() => "")).toLowerCase();
@@ -919,7 +923,7 @@ export async function change2faOnPage(page, {
             }
             if (!clickedAction) break;
             clickedChange = true;
-            setup = await waitAuthenticatorSetup(page, 8000);
+            setup = await waitAuthenticatorSetup(page, 5000);
         }
     }
 
