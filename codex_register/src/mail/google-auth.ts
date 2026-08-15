@@ -266,6 +266,7 @@ async function clickNext(page, _timeout = 800) {
 
 async function identifierStillLoading(page) {
     const t = String(await page.innerText("body").catch(() => "")).replace(/\s+/g, " ").trim();
+    if (!t || t.length < 8) return true;
     return /^(Loading\b)/i.test(t) || /\bLoading Sign in\b/i.test(t);
 }
 
@@ -547,6 +548,7 @@ export async function googleLogin(page, emailOrOpts, password = "", totpSecret =
         let emailNextClicks = 0;
         let identReloaded = false;
         let identNetReloads = 0;
+        let identBlankTries = 0;
         let passwordNextClicks = 0;
         let tryAnotherClicks = 0;
         let sslRetries = 0;
@@ -600,6 +602,7 @@ export async function googleLogin(page, emailOrOpts, password = "", totpSecret =
             if (step === "identifier" && !pwdVisible && !await totpFieldVisible(page)) {
                 const ei = await findIdentifierBox(page) || page.locator('input[name="identifier"], #identifierId').first();
                 if (await ei.isVisible({timeout: 1500}).catch(() => false)) {
+                    identBlankTries = 0;
                     if (!emailSubmitted) {
                         await waitIdentifierUiReady(page, write, 45000);
                         for (let i = 0; i < 40 && !await hostNextReady(page, "#identifierNext"); i++) await page.waitForTimeout(400);
@@ -695,8 +698,20 @@ export async function googleLogin(page, emailOrOpts, password = "", totpSecret =
                     await recoverSslOrSlowPage(page, write, identifierEntryUrl(page), 2);
                     continue;
                 }
-                write("  邮箱框未就绪，继续等（动态代理较慢）");
-                await waitIdentifierUiReady(page, write, 30000);
+                identBlankTries += 1;
+                write(`  邮箱框未就绪，继续等（动态代理较慢） ${identBlankTries}/3`);
+                if (identBlankTries >= 3) {
+                    if (identNetReloads < 2) {
+                        identNetReloads += 1;
+                        identBlankTries = 0;
+                        write(`  登录页空白，整页重开 ${identNetReloads}/2`);
+                        await hardReloadIdentifier(page, write);
+                        continue;
+                    }
+                    write("  登录页一直空白，当代理/页面挂死");
+                    return false;
+                }
+                await waitIdentifierUiReady(page, write, 20000);
                 continue;
             }
 
