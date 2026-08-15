@@ -321,13 +321,47 @@ export async function hardenGoogleAccountOnPage(page, cred, log = () => {}, onCh
     }
     if (gone("删辅助邮箱")) return finalize();
 
+    const takeImap = async (why) => {
+        if (skip.imap || out.imapPassword) {
+            log("[邮箱管理] IMAP 已有应用密码，跳过");
+            out.imapPassword = out.imapPassword || cred.imapPassword || "";
+            return;
+        }
+        log(`[邮箱管理] 开通 IMAP（${why}）`);
+        try {
+            const fetchR = await enableGmailFetch(page, {
+                email: cred.email, password: cred.password,
+                totpSecret: cred.totpSecret, totpFallback: cred.totpPrev || "", log,
+            });
+            if (fetchR?.ok && fetchR.imapPassword) {
+                out.imapPassword = fetchR.imapPassword;
+                cred.imapPassword = fetchR.imapPassword;
+                await onCheckpoint({imapPassword: fetchR.imapPassword});
+            } else noteErr(fetchR?.error, "IMAP 开通失败");
+        } catch (e) {
+            noteErr(e?.message || e, "IMAP 开通失败");
+        }
+    };
+
+    // 先取应用密码、再换我们的 2FA。刚换完验证器 Google 常拒发密码；应用密码不跟某一把 TOTP 绑定。
+    if (stopNow()) return stopAndKeep();
+    if (skip.imap) {
+        out.imapPassword = cred.imapPassword || "";
+        log("[邮箱管理 3/6] IMAP 已有应用密码，跳过");
+    } else if (!String(cred.totpSecret || "").trim()) {
+        log("[邮箱管理 3/6] 还没有可用 TOTP，先换 2FA 再取 IMAP");
+    } else {
+        await takeImap("用当前验证器，换 2FA 之前");
+    }
+    if (gone("IMAP")) return finalize();
+
+    if (stopNow()) return stopAndKeep();
     if (skip.totp) {
-        log("[邮箱管理 3/6] 换 2FA 已做过，跳过");
+        log("[邮箱管理 4/6] 换 2FA 已做过，跳过");
         out.totpRotated = true;
         out.totpSecret = cred.totpSecret || out.totpSecret;
     } else {
-        log("[邮箱管理 3/6] 更换 Google 2FA");
-        if (stopNow()) return stopAndKeep();
+        log("[邮箱管理 4/6] 更换 Google 2FA");
         const oldTotp = cred.totpSecret;
         const t = await runTimed("换2FA", () => change2faOnPage(page, {
             email: cred.email, password: cred.password,
@@ -347,31 +381,6 @@ export async function hardenGoogleAccountOnPage(page, cred, log = () => {}, onCh
         }
     }
     if (gone("换2FA")) return finalize();
-
-    if (stopNow()) return stopAndKeep();
-    if (skip.imap) {
-        log("[邮箱管理 4/6] IMAP 已通，跳过");
-        out.imapPassword = cred.imapPassword || "";
-    } else if (out.totpRotated && !skip.totp) {
-        log("[邮箱管理 4/6] 本轮刚换完 2FA，Google 这时常拒发应用密码，IMAP 留到下一轮");
-        noteErr("刚换2FA，IMAP 改下一轮再取", "IMAP 留待冷却");
-    } else {
-        log("[邮箱管理 4/6] 开通 IMAP（改密之前）");
-        try {
-            const fetchR = await enableGmailFetch(page, {
-                email: cred.email, password: cred.password,
-                totpSecret: cred.totpSecret, totpFallback: cred.totpPrev || "", log,
-            });
-            if (fetchR?.ok && fetchR.imapPassword) {
-                out.imapPassword = fetchR.imapPassword;
-                cred.imapPassword = fetchR.imapPassword;
-                await onCheckpoint({imapPassword: fetchR.imapPassword});
-            } else noteErr(fetchR?.error, "IMAP 开通失败");
-        } catch (e) {
-            noteErr(e?.message || e, "IMAP 开通失败");
-        }
-    }
-    if (gone("IMAP")) return finalize();
     if ((out.totpRotated || skip.totp) && (out.imapPassword || skip.imap)) {
         log("[邮箱管理] 2FA+IMAP 已齐，本轮结束，不再改密/踢设备");
         return finalize();
