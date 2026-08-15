@@ -242,14 +242,32 @@ export async function hardenGoogleAccountOnPage(page, cred, log = () => {}, onCh
     const pageGone = () => {
         try { return page.isClosed(); } catch { return true; }
     };
+    const {isMailboxJobStopped} = await import("./mailbox-job-stop.js");
+    const stopNow = () => isMailboxJobStopped();
+    const finalize = () => {
+        const missing = [];
+        if (!out.totpSecret && !cred.totpSecret) missing.push("2FA");
+        if (!out.passwordChanged) missing.push("改密");
+        if (!out.recoveryCleared && hadRecovery) missing.push("辅助邮箱");
+        if (!out.imapPassword) missing.push("IMAP");
+        out.missing = missing;
+        out.ok = !missing.includes("改密") && !missing.includes("IMAP");
+        return out;
+    };
+    const stopAndKeep = () => {
+        log("[邮箱管理] 已停止，已落库的步骤保留，后续不再跑");
+        return finalize();
+    };
 
     if (skip.totp) {
         log("[邮箱管理 1/5] 换 2FA 已做过，跳过");
     } else {
         log("[邮箱管理 1/5] 更换 Google 2FA");
+        if (stopNow()) return stopAndKeep();
         const t = await change2faOnPage(page, {
             email: cred.email, password: cred.password,
             totpSecret: cred.totpSecret, recoveryEmail: cred.recoveryEmail, log,
+            onPersist: onCheckpoint,
         }).catch((e) => ({ok: false, error: String(e?.message || e)}));
         if (t?.ok && t.totpSecret) {
             cred.totpSecret = t.totpSecret;
@@ -273,11 +291,14 @@ export async function hardenGoogleAccountOnPage(page, cred, log = () => {}, onCh
     if (skip.password) {
         log("[邮箱管理 2/5] 密码已换过，跳过");
         out.passwordChanged = true;
+    } else if (stopNow()) {
+        return stopAndKeep();
     } else {
         log("[邮箱管理 2/5] 修改 Google 密码");
         const pw = await changePasswordOnPage(page, {
             email: cred.email, password: cred.password,
             totpSecret: cred.totpSecret, recoveryEmail: cred.recoveryEmail, log,
+            onPersist: async (np) => { await onCheckpoint({password: np, passwordChanged: true}); },
         }).catch((e) => ({ok: false, error: String(e?.message || e)}));
         if (pw?.ok && pw.newPassword) {
             cred.password = pw.newPassword;
@@ -297,6 +318,7 @@ export async function hardenGoogleAccountOnPage(page, cred, log = () => {}, onCh
         return out;
     }
 
+    if (stopNow()) return stopAndKeep();
     if (process.env.REG_SKIP_DEVICES === "1" || skip.devices) {
         log("[邮箱管理 3/5] 踢设备已做过，跳过");
         out.devicesDone = true;
@@ -308,6 +330,7 @@ export async function hardenGoogleAccountOnPage(page, cred, log = () => {}, onCh
         if (!sess?.ok) noteErr(sess?.error, "登出设备失败");
     }
 
+    if (stopNow()) return stopAndKeep();
     if (skip.phone) {
         log("[邮箱管理 4/5] 恢复手机已清，跳过");
         out.phoneCleared = true;
@@ -318,6 +341,7 @@ export async function hardenGoogleAccountOnPage(page, cred, log = () => {}, onCh
         if (!phone?.ok) noteErr(phone?.error, "删手机号失败");
     }
 
+    if (stopNow()) return stopAndKeep();
     if (skip.recovery) {
         log("[邮箱管理 4/5] 辅助邮箱已清，跳过");
         out.recoveryCleared = true;
@@ -331,6 +355,7 @@ export async function hardenGoogleAccountOnPage(page, cred, log = () => {}, onCh
         if (!rec?.ok) noteErr(rec?.error, "删辅助邮箱失败");
     }
 
+    if (stopNow()) return stopAndKeep();
     if (skip.imap) {
         log("[邮箱管理 5/5] IMAP 已通，跳过");
         out.imapPassword = cred.imapPassword || "";
@@ -349,16 +374,9 @@ export async function hardenGoogleAccountOnPage(page, cred, log = () => {}, onCh
         }
     }
 
-    const missing = [];
-    if (!out.totpSecret && !cred.totpSecret) missing.push("2FA");
-    if (!out.passwordChanged) missing.push("改密");
-    if (!out.recoveryCleared && hadRecovery) missing.push("辅助邮箱");
-    if (!out.imapPassword) missing.push("IMAP");
-    out.missing = missing;
-    // 能用就算成功：我们的密码 + 应用专用密码。换2FA/踢设备失败记缺口，不把整单打成 0 成功。
-    out.ok = !missing.includes("改密") && !missing.includes("IMAP");
+    finalize();
     const errBrief = out.errors.filter((e) => e !== "窗口被关").map((e) => String(e).split("\n")[0].slice(0, 80)).join("；");
-    const title = out.ok ? (missing.length ? "可用" : "完成") : ("未完成: " + (missing.join("/") || "部分步骤失败"));
+    const title = out.ok ? (out.missing.length ? "可用" : "完成") : ("未完成: " + (out.missing.join("/") || "部分步骤失败"));
     log(`[邮箱管理] ${title}${errBrief ? " · " + errBrief : ""}`);
     return out;
 }
@@ -400,9 +418,10 @@ export async function withGoogleBitSession({proxyUrl = "", name = "gmail", remar
         }
     }
     let bitId = "";
+    const {shouldForceDropWindow} = await import("./mailbox-job-stop.js");
     const dropWindow = () => { if (bitId) closeBitWindow(bitId); };
-    const onAbort = () => dropWindow();
-    const stopWatch = setInterval(() => { if (stopped()) dropWindow(); }, 1500);
+    // 停止不要立刻关窗：改密/换2FA 可能已在 Google 生效，先等落库。
+    const stopWatch = setInterval(() => { if (shouldForceDropWindow()) dropWindow(); }, 800);
     try {
         if (stopped()) throw new Error("已停止");
         try {
@@ -421,7 +440,6 @@ export async function withGoogleBitSession({proxyUrl = "", name = "gmail", remar
         }
         log(`[指纹] 比特窗口 ${bitId}${liveProxy ? " ← " + String(liveProxy).replace(/:[^:@/]+@/, ":***@") : "（无代理）"}${bitProxy && bitProxy !== liveProxy ? " 经跳板" : ""}`);
         trackBitWindow(bitId);
-        signal?.addEventListener("abort", onAbort);
         const {ws} = await openBitWindow(bitId, {extractIp});
         if (stopped()) throw new Error("已停止");
         const browser = await chromium.connectOverCDP(ws);
@@ -439,7 +457,6 @@ export async function withGoogleBitSession({proxyUrl = "", name = "gmail", remar
         }
     } finally {
         clearInterval(stopWatch);
-        try { signal?.removeEventListener("abort", onAbort); } catch { /* */ }
         if (bitId) {
             await closeBitWindow(bitId);
             await deleteBitWindow(bitId);

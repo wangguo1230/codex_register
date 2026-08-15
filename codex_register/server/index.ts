@@ -546,13 +546,25 @@ async function stopAllMailJobs() {
     for (const ac of hardenAbort.values()) {
         try { ac.abort(); } catch { /* */ }
     }
-    const closed = await stopAutomationBitWindows({includeClosed: true, log: (m) => console.log(m)});
     lastMailJobProg = await db.mailJobsProgress().catch(() => lastMailJobProg);
     if (lastMailJobProg) lastMailJobProg.paused = true;
-    await refreshMailboxJobWindows();
     await reportMailInstance().catch(() => {});
     broadcast("batchHarden", {...snapshotMailboxJob(), proxyPool: scheduler.mailProxyPoolSnap()});
-    return {ok: true, closed, canceled};
+    // 先停领、再等改密/换2FA 落库，不要立刻关指纹（Google 已改钥、库还是旧的会丢号）。
+    void (async () => {
+        const {mailJobInCritical} = await import("../src/mail/mailbox-job-stop.js");
+        const t0 = Date.now();
+        while (localMailJobIds.size && Date.now() - t0 < 70_000) {
+            if (!mailJobInCritical() && Date.now() - t0 > 3000) break;
+            await new Promise((r) => setTimeout(r, 400));
+        }
+        const closed = await stopAutomationBitWindows({includeClosed: true, log: (m) => console.log(m)});
+        console.log(`[整备] 停止收尾关窗 ${closed} 进行中=${localMailJobIds.size}`);
+        await refreshMailboxJobWindows();
+        await reportMailInstance().catch(() => {});
+        broadcast("batchHarden", {...snapshotMailboxJob(), proxyPool: scheduler.mailProxyPoolSnap()});
+    })();
+    return {ok: true, closed: 0, canceled, draining: true};
 }
 
 function scheduleMailboxJobBroadcast() {

@@ -186,7 +186,7 @@ async function withGooglePage(fn) {
  * 登录失败 / 无输入框返回 {ok:false}；提交后返回新密码（verified 看成功文案）。
  */
 export async function changePasswordOnPage(page, {
-    email, password, totpSecret = "", recoveryEmail = "", newPassword = "", log = () => {},
+    email, password, totpSecret = "", recoveryEmail = "", newPassword = "", log = () => {}, onPersist,
 } = {}) {
     log("[密码] 开始修改密码");
     const ok = await ensureGoogleLoggedIn(
@@ -244,26 +244,56 @@ export async function changePasswordOnPage(page, {
     let clicked = false;
     const submit = page.locator('form button[type="submit"], #passwordNext button, #passwordNext, c-wiz form button').last();
     if (await submit.isVisible({timeout: 1500}).catch(() => false)) {
-        await submit.click().catch(() => submit.click({force: true}));
-        clicked = true;
-        log("[密码] 点了表单提交按钮");
-        await page.waitForTimeout(5000);
+        const {enterMailJobCritical} = await import("./mailbox-job-stop.js");
+        const leaveCritical = enterMailJobCritical();
+        try {
+            await submit.click().catch(() => submit.click({force: true}));
+            clicked = true;
+            log("[密码] 点了表单提交按钮");
+            if (typeof onPersist === "function" && np) {
+                await onPersist(np).catch(() => {});
+                log("[密码] 已提交，新密码先落库");
+            }
+            await page.waitForTimeout(5000);
+        } finally {
+            leaveCritical();
+        }
     }
     if (!clicked) {
         for (const kw of CHANGE_PWD_KEYWORDS) {
             const btn = page.locator(`button:has-text("${kw}")`);
             if (await btn.first().isVisible({timeout: 1200}).catch(() => false)) {
-                await btn.first().click();
-                clicked = true;
-                log(`[密码] 点击: ${kw}`);
-                await page.waitForTimeout(5000);
+                const {enterMailJobCritical} = await import("./mailbox-job-stop.js");
+                const leaveCritical = enterMailJobCritical();
+                try {
+                    await btn.first().click();
+                    clicked = true;
+                    log(`[密码] 点击: ${kw}`);
+                    if (typeof onPersist === "function" && np) {
+                        await onPersist(np).catch(() => {});
+                        log("[密码] 已提交，新密码先落库");
+                    }
+                    await page.waitForTimeout(5000);
+                } finally {
+                    leaveCritical();
+                }
                 break;
             }
         }
     }
     if (!clicked) {
-        await page.keyboard.press("Enter").catch(() => {});
-        await page.waitForTimeout(5000);
+        const {enterMailJobCritical} = await import("./mailbox-job-stop.js");
+        const leaveCritical = enterMailJobCritical();
+        try {
+            await page.keyboard.press("Enter").catch(() => {});
+            if (typeof onPersist === "function" && np) {
+                await onPersist(np).catch(() => {});
+                log("[密码] 已回车提交，新密码先落库");
+            }
+            await page.waitForTimeout(5000);
+        } finally {
+            leaveCritical();
+        }
     }
 
     const looksChanged = (raw) => {
@@ -603,7 +633,7 @@ async function openAuthenticatorDetail(page, log) {
 
 /** 在已打开的 page 上添加 / 替换 TOTP（对应原 change_2fa）。 */
 export async function change2faOnPage(page, {
-    email, password, totpSecret = "", recoveryEmail = "", log = () => {},
+    email, password, totpSecret = "", recoveryEmail = "", log = () => {}, onPersist,
 } = {}) {
     log("[2FA] 开始修改 TOTP");
 
@@ -634,7 +664,13 @@ export async function change2faOnPage(page, {
         await dumpPage(page, "2fa_still_verify", log, email);
         return {ok: false, error: "二次验证未过"};
     }
-
+    const {isMailboxJobStopped, enterMailJobCritical} = await import("./mailbox-job-stop.js");
+    if (isMailboxJobStopped()) {
+        log("[2FA] 已停止，尚未点更改");
+        return {ok: false, error: "已停止"};
+    }
+    const leaveCritical = enterMailJobCritical();
+    try {
     const AUTH_PATTERNS = ["uthenticat", "utenticador", "uthentifizierung"];
     const contentLower = String(await page.innerText("body")).toLowerCase();
     const onVerify = isVerifyItsYouText(contentLower);
@@ -883,6 +919,10 @@ export async function change2faOnPage(page, {
         await dumpPage(page, "2fa_no_code_input", log, email);
         return {ok: false, error: "未找到验证码输入框或 Wrong code"};
     }
+    if (typeof onPersist === "function" && newSecret) {
+        await onPersist({totpSecret: newSecret}).catch(() => {});
+        log("[2FA] 新密钥已先落库");
+    }
 
     const resultText = await page.innerText("body");
     const successMarkers = [
@@ -897,6 +937,9 @@ export async function change2faOnPage(page, {
     }
 
     return {ok: true, totpSecret: newSecret};
+    } finally {
+        leaveCritical();
+    }
 }
 
 export async function changeGooglePassword(email, oldPassword, newPassword, {

@@ -15,6 +15,39 @@ export function requestMailboxJobStop() {
     writeFileSync(STOP_PATH, `${Date.now()}\n`, "utf8");
 }
 
+export function mailboxJobStopAgeMs() {
+    try {
+        const t = Number(String(readFileSync(STOP_PATH, "utf8") || "").trim());
+        if (Number.isFinite(t) && t > 0) return Math.max(0, Date.now() - t);
+        return existsSync(STOP_PATH) ? Date.now() : 0;
+    } catch {
+        return 0;
+    }
+}
+
+/** 改密/换2FA 进行中：停任务也不能立刻关窗，否则 Google 已生效、库还是旧钥匙。 */
+let criticalCount = 0;
+export function enterMailJobCritical() {
+    criticalCount += 1;
+    let left = false;
+    return () => {
+        if (left) return;
+        left = true;
+        criticalCount = Math.max(0, criticalCount - 1);
+    };
+}
+export function mailJobInCritical() {
+    return criticalCount > 0;
+}
+
+/** 登录等非改钥步骤：停了约 2.5s 可关。正在改密/换2FA：最多等到 graceMs。 */
+export function shouldForceDropWindow(graceMs = 70_000) {
+    if (!isMailboxJobStopped()) return false;
+    const age = mailboxJobStopAgeMs();
+    if (mailJobInCritical()) return age >= graceMs;
+    return age >= 2500;
+}
+
 export function clearMailboxJobStop() {
     try { unlinkSync(STOP_PATH); } catch { /* no file */ }
 }
