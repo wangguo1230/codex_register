@@ -1,8 +1,11 @@
 # 启动前强杀旧 :3100 / server/index.ts，不走 Node 关窗收尾。
 param([int]$Port = 3100)
 $me = $PID
-Get-CimInstance Win32_Process -Filter "Name='node.exe'" -ErrorAction SilentlyContinue |
-    Where-Object { $_.CommandLine -and $_.CommandLine -match 'server[/\\]index\.ts|tsx server' } |
+Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+    Where-Object {
+        $_.Name -match 'node|tsx' -and $_.CommandLine -and
+        ($_.CommandLine -match 'server[/\\]index\.ts' -or $_.CommandLine -match 'tsx server')
+    } |
     ForEach-Object {
         if ($_.ProcessId -ne $me) {
             Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue

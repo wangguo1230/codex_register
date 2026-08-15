@@ -4429,6 +4429,19 @@ function collectPidsOnPort(port) {
     return [...pids];
 }
 function killExistingHttp(port) {
+    const me = process.pid;
+    if (process.platform === "win32") {
+        try {
+            const out = execSync(
+                `powershell -NoProfile -Command "Get-CimInstance Win32_Process -Filter \\"Name='node.exe'\\" | Where-Object { $_.CommandLine -and $_.CommandLine -match 'server[/\\\\]index\\\\.ts|tsx server' } | ForEach-Object { $_.ProcessId }"`,
+                {encoding: "utf8"},
+            );
+            for (const pid of out.split(/\s+/).map(Number).filter((p) => p && p !== me)) {
+                try { execSync(`taskkill /F /PID ${pid}`, {stdio: "ignore"}); } catch { /* */ }
+                console.log(`[server] 先结束残留 server/index.ts pid=${pid}`);
+            }
+        } catch { /* */ }
+    }
     const pids = collectPidsOnPort(port);
     for (const pid of pids) {
         try {
