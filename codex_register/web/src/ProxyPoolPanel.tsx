@@ -106,9 +106,9 @@ export function ProxyPoolPanel({
             </div>
             <div style={{marginBottom: 14, padding: 12, background: "#eef2ff", border: "1px solid #c7d2fe", borderRadius: 10}}>
                 <div style={{fontSize: 13, fontWeight: 700, color: "#312e81", marginBottom: 4}}>跳板 vless</div>
-                <div style={{fontSize: 11, color: "#4338ca", marginBottom: 8}}>把 vless:// 链接贴在这里，一行一条。点「保存并起 xray」我会自己起本地端口（10811 起），不占你的 10808。1 个跳板最多带 2 条出口。</div>
+                <div style={{fontSize: 11, color: "#4338ca", marginBottom: 8}}>一行一条。vless:// 会自己起 xray（10811 起）；socks5:// / socks:// 直接当跳板，不用起 xray。1 个跳板最多带 2 条出口。不占 10808。</div>
                 <textarea value={jumpText} onChange={(e) => setJumpText(e.target.value)}
-                          placeholder={"vless://uuid@host:port?type=tcp&security=reality&pbk=…#name\nvless://另一条…"}
+                          placeholder={"vless://uuid@host:port?security=reality&pbk=…#name\nsocks5://user:pass@host:8001"}
                           style={{width: "100%", height: 96, resize: "vertical", padding: 8, fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace", fontSize: 12, border: "1px solid #a5b4fc", borderRadius: 8, outline: "none", boxSizing: "border-box", background: "#fff"}}/>
                 <div style={{display: "flex", gap: 8, alignItems: "center", marginTop: 6, flexWrap: "wrap"}}>
                     <button onClick={async () => {

@@ -11,11 +11,46 @@ export type MailProxyLease = {
     release: () => void;
 };
 
+function decodeB64UserPass(raw: string): {user: string; pass: string} | null {
+    const compact = String(raw || "").replace(/[^A-Za-z0-9+/]/g, "");
+    if (compact.length < 12 || compact.length % 4 === 1) return null;
+    try {
+        const dec = Buffer.from(compact, "base64").toString("utf8");
+        const i = dec.indexOf(":");
+        if (i <= 0) return null;
+        const user = dec.slice(0, i);
+        const pass = dec.slice(i + 1);
+        if (!user || !pass || !/^[\x21-\x7e]+$/.test(user) || !/^[\x21-\x7e]+$/.test(pass)) return null;
+        if (Buffer.from(compact, "base64").toString("base64").replace(/=+$/, "") !== compact.replace(/=+$/, "")) return null;
+        return {user, pass};
+    } catch {
+        return null;
+    }
+}
+
 export function normalizeProxyUrl(raw: string): string {
     const s = String(raw || "").trim();
     if (!s || s.startsWith("#")) return "";
     if (/^[a-z][a-z0-9+.-]*:\/\//i.test(s)) {
-        try { new URL(s); return s; } catch { return ""; }
+        try {
+            const u = new URL(s);
+            if (/^vless:/i.test(u.protocol)) return s;
+            if (/^socks/i.test(u.protocol)) {
+                const userRaw = decodeURIComponent(u.username || "");
+                const passRaw = decodeURIComponent(u.password || "");
+                const decoded = !passRaw ? decodeB64UserPass(userRaw) : null;
+                const user = decoded ? decoded.user : userRaw;
+                const pass = decoded ? decoded.pass : passRaw;
+                const host = u.hostname;
+                const port = u.port || "1080";
+                if (!host) return "";
+                if (user || pass) {
+                    return `socks5://${encodeURIComponent(user)}:${encodeURIComponent(pass)}@${host}:${port}`;
+                }
+                return `socks5://${host}:${port}`;
+            }
+            return s;
+        } catch { return ""; }
     }
     const parts = s.split(":").map((x) => x.trim());
     if (parts.length === 2 && parts[0] && /^\d+$/.test(parts[1])) return `socks5://${parts[0]}:${parts[1]}`;
