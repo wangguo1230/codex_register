@@ -109,6 +109,18 @@ export function rotateKookeeySession(url: string): string {
     } catch { return url; }
 }
 
+/** 一号一代理：新开一条粘性 session（不带 -5m），同一账号全程钉死这个出口。 */
+export function mintStickySession(url: string): string {
+    try {
+        const pass = decodeURIComponent(new URL(url).password || "");
+        const m = pass.match(KOOK_PASS_RE);
+        if (!m) return url;
+        return withKookeeySession(url, randomSessionId(), "");
+    } catch {
+        return url;
+    }
+}
+
 function templateKey(url: string): string {
     try {
         const u = new URL(url);
@@ -313,7 +325,7 @@ export class MailProxyPool {
         };
     }
 
-    async lease(owner: string, {fallback = "", timeoutMs = 10 * 60 * 1000, maxPerTemplate = 1} = {}): Promise<MailProxyLease> {
+    async lease(owner: string, {fallback = "", timeoutMs = 10 * 60 * 1000, maxPerTemplate = 1, freshSession = false} = {}): Promise<MailProxyLease> {
         const deadline = Date.now() + Math.max(1000, timeoutMs);
         const cap = Math.max(1, Number(maxPerTemplate) || 1);
         while (Date.now() < deadline) {
@@ -322,10 +334,11 @@ export class MailProxyPool {
                 .sort((a, b) => (this.lastUsed.get(a) || 0) - (this.lastUsed.get(b) || 0));
             if (freeExact[0]) {
                 const url = freeExact[0];
-                this.leased.set(url, {owner: String(owner || ""), at: Date.now(), url});
+                const live = url !== DIRECT && freshSession && kookeeySessionOf(url) ? mintStickySession(url) : url;
+                this.leased.set(url, {owner: String(owner || ""), at: Date.now(), url: live});
                 this.lastUsed.set(url, Date.now());
                 return {
-                    url: url === DIRECT ? "" : ensureKookeeySticky(url),
+                    url: live === DIRECT ? "" : (freshSession ? live : ensureKookeeySticky(live)),
                     owner: String(owner || ""),
                     release: () => this.release(url),
                 };

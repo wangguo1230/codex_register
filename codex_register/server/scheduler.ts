@@ -361,9 +361,10 @@ class Scheduler extends EventEmitter {
                     fallback: "",
                     timeoutMs: 20_000,
                     maxPerTemplate: 1,
+                    freshSession: true,
                 });
                 const jump = this.gptProxyJump || "";
-                this.logJob(info, `GPT 代理池租到 ${String(info.mailLease.url || "直连").replace(/:[^:@/]+@/, ":***@")}（1 代理 = 1 指纹${jump ? `，经跳板 ${jump}` : "，无跳板直连网关"}）`);
+                this.logJob(info, `GPT 代理池租到 ${String(info.mailLease.url || "直连").replace(/:[^:@/]+@/, ":***@")}（一号一代理 · 新 session${jump ? `，经跳板 ${jump}` : "，无跳板直连网关"}）`);
             } catch (e) {
                 this.running.delete(runId);
                 await db.releaseGptIfRunning(acc.id);
