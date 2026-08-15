@@ -290,6 +290,10 @@ export function maskProxyUrl(url: string): string {
     if (!s) return "(直连)";
     try {
         const u = new URL(s);
+        if (/^vless:/i.test(u.protocol)) {
+            const name = decodeURIComponent((u.hash || "").replace(/^#/, ""));
+            return `vless://***@${u.hostname}${u.port ? ":" + u.port : ""}${name ? "#" + name : ""}`;
+        }
         const auth = u.username ? `${decodeURIComponent(u.username)}:***@` : "";
         const sess = kookeeySessionOf(s);
         return `${u.protocol}//${auth}${u.hostname}${u.port ? ":" + u.port : ""}${sess ? "#s" + sess : ""}`;
@@ -515,4 +519,5 @@ export class JumpPool {
 }
 
 export const mailJumpPool = new JumpPool();
-export const gptJumpPool = new JumpPool();
+/** 邮箱/GPT 共用同一份跳板租约，保证 1 个跳板全局最多 2 条出口。 */
+export const gptJumpPool = mailJumpPool;

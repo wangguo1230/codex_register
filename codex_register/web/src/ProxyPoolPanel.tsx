@@ -21,11 +21,8 @@ export function ProxyPoolPanel({
     const [poolSnap, setPoolSnap] = useState({total: 0, slots: 0, leased: 0, free: 0});
     const [poolCopies, setPoolCopies] = useState(1);
     const [jumpText, setJumpText] = useState("");
-    const [jumpHint, setJumpHint] = useState("");
     const [jumpBusy, setJumpBusy] = useState(false);
-    const [vlessText, setVlessText] = useState("");
-    const [jumpXray, setJumpXray] = useState<{running?: boolean; port?: number; node?: string; error?: string} | null>(null);
-    const [jumpItems, setJumpItems] = useState<{masked: string; leased: number; cap: number; ok: boolean | null; ip: string; reason: string}[]>([]);
+    const [jumpItems, setJumpItems] = useState<{masked: string; leased: number; cap: number; ok: boolean | null; ip: string; reason: string; node?: string; port?: number; xray?: boolean | null; source?: string; xrayError?: string}[]>([]);
 
     const toast = (m: string) => notify?.(m);
     const emit = (snap: {total?: number; slots?: number; leased?: number; free?: number}, jump?: string) => {
@@ -36,7 +33,6 @@ export function ProxyPoolPanel({
             free: snap.free || 0,
         };
         setPoolSnap(next);
-        if (typeof jump === "string") setJumpText(jump);
         onMeta?.({...next, jump: typeof jump === "string" ? jump : jumpText});
     };
 
@@ -49,12 +45,7 @@ export function ProxyPoolPanel({
             const snap = isGpt ? st.gptProxyPoolSnap : st.mailProxyPoolSnap;
             const jump = isGpt ? st.gptProxyJump : st.mailProxyJump;
             if (snap) emit(snap, typeof jump === "string" ? jump : undefined);
-            else if (typeof jump === "string") setJumpText(jump);
-            if (st.regProxy) setJumpHint(st.regProxy);
-            if (st.jumpXrayVless) setVlessText(st.jumpXrayVless);
-            else if (st.claudeXrayVless) setVlessText(st.claudeXrayVless);
-            if (st.jumpXray) setJumpXray(st.jumpXray);
-            const jlines = isGpt ? st.gptJumpPool : st.mailJumpPool;
+            const jlines = (isGpt ? st.gptJumpPool : st.mailJumpPool) || st.jumpFleet?.map((f: {vless: string}) => f.vless);
             if (Array.isArray(jlines) && jlines.length) setJumpText(jlines.join("\n"));
             const jsnap = isGpt ? st.gptJumpPoolSnap : st.mailJumpPoolSnap;
             if (jsnap?.items) setJumpItems(jsnap.items);
@@ -87,8 +78,6 @@ export function ProxyPoolPanel({
         emit(r, r.jump);
     };
     const setPool = isGpt ? api.setGptProxyPool : api.setMailProxyPool;
-    const setJump = isGpt ? api.setGptProxyJump : api.setMailProxyJump;
-    const testJump = isGpt ? api.testGptProxyJump : api.testMailProxyJump;
     const doSavePool = async () => {
         try {
             const r = await setPool(poolText, {append: false, copies: 1});
@@ -105,7 +94,6 @@ export function ProxyPoolPanel({
         } catch (e: any) { toast("导入代理失败: " + e.message); }
     };
 
-    const inp = {padding: "6px 10px", border: "1px solid #e5e7eb", borderRadius: 8, fontSize: 13, outline: "none", boxSizing: "border-box" as const};
     const card = {background: "#fff", border: "1px solid #e8eaed", borderRadius: 12, padding: 16, boxShadow: "0 1px 3px rgba(0,0,0,0.04)", maxWidth: 1180};
 
     return (
@@ -113,30 +101,32 @@ export function ProxyPoolPanel({
             <div style={{display: "flex", alignItems: "baseline", gap: 8, flexWrap: "wrap", marginBottom: 8}}>
                 <span style={{fontSize: 13, fontWeight: 600, color: "#111827"}}>{title}</span>
                 <span style={{fontSize: 11, color: "#9ca3af"}}>{hint || (isGpt
-                    ? "GPT 注册专用。跳板池先探活，1 个跳板最多带 2 条出口。和邮箱池分开。"
-                    : "邮箱整备专用。跳板池先探活，1 个跳板最多带 2 条出口。和 GPT 池分开。")}</span>
+                    ? "GPT 注册专用。跳板贴 vless，保存后自动起 xray。1 个跳板最多带 2 条出口。"
+                    : "邮箱整备专用。跳板贴 vless，保存后自动起 xray。1 个跳板最多带 2 条出口。")}</span>
             </div>
             <textarea value={poolText} onChange={(e) => setPoolText(e.target.value)}
                       placeholder={"一行一个，支持：\ngate-hk.kookeey.info:1000:user:pass-US-session-5m\nip:port:user:pass\nsocks5://user:pass@host:port"}
                       style={{width: "100%", height: 140, resize: "vertical", padding: 10, fontFamily: "monospace", fontSize: 12, border: "1px solid #e5e7eb", borderRadius: 8, outline: "none", boxSizing: "border-box"}}/>
             <div style={{marginTop: 10}}>
-                <div style={{fontSize: 12, color: "#374151", marginBottom: 4}}>跳板池（一行一个，1 个跳板最多带 2 条出口，租之前会探活）</div>
+                <div style={{fontSize: 12, color: "#374151", marginBottom: 4}}>跳板池（一行一个 vless:// ，保存后自动起 xray，1 个跳板最多带 2 条出口。不占 10808）</div>
                 <textarea value={jumpText} onChange={(e) => setJumpText(e.target.value)}
-                          placeholder={jumpHint || "socks5://127.0.0.1:10811\nsocks5://127.0.0.1:10812"}
-                          style={{width: "100%", height: 72, resize: "vertical", padding: 8, fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace", fontSize: 12, border: "1px solid #e5e7eb", borderRadius: 8, outline: "none", boxSizing: "border-box"}}/>
+                          placeholder={"vless://uuid@host:port?type=tcp&security=reality&pbk=…#name\nvless://另一条…"}
+                          style={{width: "100%", height: 88, resize: "vertical", padding: 8, fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace", fontSize: 12, border: "1px solid #e5e7eb", borderRadius: 8, outline: "none", boxSizing: "border-box"}}/>
                 <div style={{display: "flex", gap: 8, alignItems: "center", marginTop: 6, flexWrap: "wrap"}}>
                     <button onClick={async () => {
                         setJumpBusy(true);
                         try {
                             const save = isGpt ? api.setGptJumpPool : api.setMailJumpPool;
                             const r = await save(jumpText, true);
+                            if (Array.isArray((r as any).lines) && (r as any).lines.length) setJumpText((r as any).lines.join("\n"));
                             setJumpItems(r.items || []);
                             onMeta?.({...poolSnap, jump: (r.items || [])[0]?.url || ""});
                             const ok = (r.items || []).filter((x) => x.ok).length;
-                            toast(`跳板池 ${r.total} 条，探活通过 ${ok}，每条最多带 ${r.maxPerJump} 个出口`);
-                        } catch (e: any) { toast("保存/探活跳板失败: " + e.message); }
+                            const xrayOk = (r.items || []).filter((x) => x.xray !== false).length;
+                            toast(`已起 xray ${xrayOk}/${r.total}，探活通过 ${ok}，每条最多带 ${r.maxPerJump} 个出口`);
+                        } catch (e: any) { toast("保存/起跳板失败: " + e.message); }
                         finally { setJumpBusy(false); }
-                    }} disabled={jumpBusy} style={{height: 32, padding: "0 10px", border: "none", background: "#4f46e5", color: "#fff", borderRadius: 8, fontSize: 12, cursor: jumpBusy ? "wait" : "pointer"}}>{jumpBusy ? "在测…" : "保存并探活"}</button>
+                    }} disabled={jumpBusy} style={{height: 32, padding: "0 10px", border: "none", background: "#4f46e5", color: "#fff", borderRadius: 8, fontSize: 12, cursor: jumpBusy ? "wait" : "pointer"}}>{jumpBusy ? "在起 xray…" : "保存并起 xray"}</button>
                     <button onClick={async () => {
                         setJumpBusy(true);
                         try {
@@ -148,61 +138,33 @@ export function ProxyPoolPanel({
                         finally { setJumpBusy(false); }
                     }} disabled={jumpBusy} style={{height: 32, padding: "0 10px", border: "1px solid #d1d5db", background: "#fff", borderRadius: 8, fontSize: 12, cursor: jumpBusy ? "wait" : "pointer"}}>再测一遍</button>
                     <button onClick={async () => {
-                        const next = (jumpText ? jumpText + "\n" : "") + "socks5://127.0.0.1:10808";
-                        setJumpText(next);
-                    }} style={{height: 32, padding: "0 10px", border: "1px solid #e5e7eb", background: "#fff", borderRadius: 8, fontSize: 12, cursor: "pointer", color: "#6b7280"}}>加入 10808</button>
-                    <button onClick={async () => {
                         setJumpText("");
                         try {
                             const save = isGpt ? api.setGptJumpPool : api.setMailJumpPool;
                             await save("", false);
                             setJumpItems([]);
-                            toast("已清空跳板池");
+                            toast("已清空跳板池并停掉跳板 xray");
                         } catch (e: any) { toast(e.message); }
                     }} style={{height: 32, padding: "0 10px", border: "none", background: "transparent", fontSize: 12, color: "#9ca3af", cursor: "pointer"}}>清空</button>
                 </div>
                 {jumpItems.length > 0 && (
                     <div style={{marginTop: 6, display: "flex", flexDirection: "column", gap: 3}}>
                         {jumpItems.map((it, i) => (
-                            <div key={i} style={{fontSize: 11, color: it.ok === false ? "#b45309" : "#374151", fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace"}}>
-                                {it.ok === true ? "通" : it.ok === false ? "死" : "?"} {it.masked} · {it.leased}/{it.cap}{it.ip ? ` · ${it.ip}` : ""}{it.reason ? ` · ${it.reason}` : ""}
+                            <div key={i} style={{fontSize: 11, color: it.ok === false || it.xray === false ? "#b45309" : "#374151", fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace"}}>
+                                {it.ok === true ? "通" : it.ok === false ? "死" : "?"}
+                                {it.xray === false ? " xray没起" : it.port ? ` xray:${it.port}` : ""}
+                                {it.node ? ` ${it.node}` : ""} {it.source || it.masked} · {it.leased}/{it.cap}
+                                {it.ip ? ` · ${it.ip}` : ""}
+                                {it.xrayError || it.reason ? ` · ${it.xrayError || it.reason}` : ""}
                             </div>
                         ))}
                     </div>
                 )}
             </div>
-            <div style={{display: "flex", gap: 8, alignItems: "center", marginTop: 8, flexWrap: "wrap"}}>
-                <span style={{fontSize: 12, color: "#374151", whiteSpace: "nowrap"}}>跳板 vless</span>
-                <input value={vlessText} onChange={(e) => setVlessText(e.target.value)}
-                       placeholder="vless://…  自己起 xray @10811，不占用你的 10808"
-                       style={{flex: "1 1 320px", ...inp, fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace"}}/>
-                <button onClick={async () => {
-                    if (!vlessText.trim()) { toast("先贴一条 vless"); return; }
-                    setJumpBusy(true);
-                    try {
-                        const r = await api.startJumpXray(vlessText.trim());
-                        setJumpXray(r.xray);
-                        setJumpText(r.jump);
-                        onMeta?.({...poolSnap, jump: r.jump});
-                        toast(`跳板 xray 已起 ${r.xray.node || ""} @${r.jump}，10808 还给你`);
-                    } catch (e: any) { toast("起跳板 vless 失败: " + e.message); }
-                    finally { setJumpBusy(false); }
-                }} style={{height: 32, padding: "0 10px", border: "none", background: "#4f46e5", color: "#fff", borderRadius: 8, fontSize: 12, cursor: "pointer"}}>起独立跳板</button>
-                {jumpXray?.running && <button onClick={async () => {
-                    try {
-                        const r = await api.stopJumpXray();
-                        setJumpXray(r.xray);
-                        toast("已停跳板 xray");
-                    } catch (e: any) { toast(e.message); }
-                }} style={{height: 32, padding: "0 10px", border: "none", background: "#dc2626", color: "#fff", borderRadius: 8, fontSize: 12, cursor: "pointer"}}>停跳板</button>}
-            </div>
-            <div style={{fontSize: 11, color: jumpXray?.error ? "#dc2626" : (jumpText.trim() ? "#4338ca" : "#9ca3af"), marginTop: 4}}>
-                {jumpXray?.running
-                    ? `独立跳板运行中 ${jumpXray.node || ""} @127.0.0.1:${jumpXray.port || 10811}。10808 是你自己的，任务不占用。`
-                    : jumpText.trim()
-                        ? `链式已开：本机 → ${jumpText.trim()} → 代理池网关。`
-                        : "未开跳板：本机直连代理池网关。贴一条 vless 点「起独立跳板」。"}
-                {jumpXray?.error ? ` ${jumpXray.error}` : ""}
+            <div style={{fontSize: 11, color: jumpItems.some((x) => x.xray === false || x.ok === false) ? "#dc2626" : (jumpText.trim() ? "#4338ca" : "#9ca3af"), marginTop: 4}}>
+                {jumpText.trim()
+                    ? "保存后每条 vless 起一个独立 xray（10811 起往上排）。10808 是你自己的，任务不占用。"
+                    : "未开跳板：本机直连代理池网关。把跳板 vless 贴进上面的框，点「保存并起 xray」。"}
             </div>
             <div style={{display: "flex", gap: 10, alignItems: "center", marginTop: 8, flexWrap: "wrap"}}>
                 <button onClick={doImportPool} style={{padding: "6px 14px", background: "#0d9488", color: "#fff", border: "none", borderRadius: 8, cursor: "pointer", fontSize: 13}}>批量导入追加</button>

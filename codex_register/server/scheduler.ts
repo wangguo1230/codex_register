@@ -10,7 +10,8 @@ import * as db from "./db.js";
 import {appConfig} from "../src/config.js";
 import {randomPassword} from "../src/utils.js";
 import {resolveEngine} from "./domain/register-engine.js";
-import {mailProxyPool, gptProxyPool, mailJumpPool, gptJumpPool, expandProxyImport, toProxyImportLine, setMailProxyJump, JUMP_MAX_EXITS} from "../src/mail/proxy-pool.js";
+import {mailProxyPool, gptProxyPool, mailJumpPool, gptJumpPool, expandProxyImport, toProxyImportLine, setMailProxyJump, JUMP_MAX_EXITS, maskProxyUrl, normalizeProxyUrl} from "../src/mail/proxy-pool.js";
+import {startJumpFleet, stopJumpFleet, isVlessUrl, listJumpXrays} from "./xray-proxy.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const CODEX_ROOT = path.resolve(__dirname, "..");
@@ -72,8 +73,9 @@ class Scheduler extends EventEmitter {
         // 独立 xray 的本地监听端口(可配置+持久化):用专属端口与系统 v2rayN/其他服务隔离,清理时只按各自端口精确清,永不误杀。
         this.regProxyPort = 10809;
         this.claudeProxyPort = 10810;
-        this.jumpProxyPort = 10811;    // 邮箱/GPT 跳板独立 xray，不占用用户 10808
-        this.jumpXrayVless = "";       // 跳板 vless，自启后 mail/gpt jump 都指向 127.0.0.1:10811
+        this.jumpProxyPort = 10811;    // 跳板 xray 起始端口，不占用用户 10808
+        this.jumpXrayVless = "";       // 兼容：第一条跳板 vless
+        this.jumpFleet = [];           // [{vless,socks,port,node,running,error}]
         this.mailSeparator = "----";   // 邮箱----密码 分隔符(导入/校验共用)
         this.xrayBinPath = "";         // xray 二进制路径(前端可配;空=自动探测)
         this.pwConcurrency = 1;        // 邮箱批量改密并发(headed Chrome,默认串行)
@@ -124,6 +126,115 @@ class Scheduler extends EventEmitter {
         } catch { /* 损坏则保留默认 */ }
     }
 
+    collectJumpLines() {
+        const out = [];
+        const seen = new Set();
+        const push = (raw) => {
+            const s = String(raw || "").trim();
+            if (!s || seen.has(s)) return;
+            seen.add(s);
+            out.push(s);
+        };
+        for (const x of (this.mailJumpPool || [])) push(x);
+        for (const x of (this.gptJumpPool || [])) push(x);
+        push(this.jumpXrayVless);
+        if (!out.length) {
+            push(this.mailProxyJump);
+            push(this.gptProxyJump);
+        }
+        return out;
+    }
+
+    resolveJumpLine(raw, fleet = this.jumpFleet || []) {
+        const s = String(raw || "").trim();
+        if (!s) return "";
+        if (isVlessUrl(s)) {
+            let key = s;
+            try {
+                const u = new URL(s);
+                key = `${decodeURIComponent(u.username || "")}@${u.hostname}:${u.port}`;
+            } catch { /* */ }
+            const hit = (fleet || []).find((f) => {
+                if (f.vless === s) return true;
+                try {
+                    const u = new URL(f.vless);
+                    return `${decodeURIComponent(u.username || "")}@${u.hostname}:${u.port}` === key;
+                } catch { return false; }
+            });
+            return hit?.socks || "";
+        }
+        return normalizeProxyUrl(s) || s;
+    }
+
+    jumpPoolSnapshot() {
+        const snap = mailJumpPool.snapshot();
+        const fleet = this.jumpFleet || [];
+        const bySocks = new Map(fleet.map((f) => [f.socks, f]));
+        return {
+            ...snap,
+            lines: this.collectJumpLines(),
+            xrays: fleet,
+            items: (snap.items || []).map((it) => {
+                const f = bySocks.get(it.url);
+                return {
+                    ...it,
+                    node: f?.node || "",
+                    port: f?.port || 0,
+                    xray: f ? !!f.running : null,
+                    xrayError: f?.error || "",
+                    source: f ? maskProxyUrl(f.vless) : it.masked,
+                };
+            }),
+        };
+    }
+
+    async ensureJumpFleet() {
+        const lines = this.collectJumpLines();
+        const vless = lines.filter((x) => isVlessUrl(x));
+        if (!vless.length) {
+            if ((this.jumpFleet || []).length) stopJumpFleet();
+            this.jumpFleet = [];
+            const socks = [];
+            const seen = new Set();
+            for (const raw of lines) {
+                const url = this.resolveJumpLine(raw, []);
+                if (!url || seen.has(url)) continue;
+                seen.add(url);
+                socks.push(url);
+            }
+            mailJumpPool.setUrls(socks);
+            this.mailProxyJump = socks[0] || "";
+            this.gptProxyJump = socks[0] || "";
+            if (this.mailProxyJump) setMailProxyJump(this.mailProxyJump);
+            return [];
+        }
+        this.jumpFleet = await startJumpFleet(vless, {
+            binPath: this.xrayBinPath || undefined,
+            basePort: Number(this.jumpProxyPort) || 10811,
+        });
+        if (this.jumpFleet[0]) {
+            this.jumpXrayVless = this.jumpFleet[0].vless;
+            this.jumpProxyPort = this.jumpFleet[0].port || this.jumpProxyPort;
+        }
+        const socks = [];
+        const seen = new Set();
+        for (const raw of lines) {
+            const url = this.resolveJumpLine(raw, this.jumpFleet);
+            if (!url || seen.has(url)) continue;
+            seen.add(url);
+            socks.push(url);
+        }
+        mailJumpPool.setUrls(socks);
+        this.mailProxyJump = socks[0] || "";
+        this.gptProxyJump = socks[0] || "";
+        if (this.mailProxyJump) setMailProxyJump(this.mailProxyJump);
+        const dead = this.jumpFleet.filter((f) => !f.running);
+        if (dead.length) {
+            console.warn(`[jump] ${dead.length} 条 vless xray 没起来: ${dead.map((f) => f.error || f.node).join(" ; ")}`);
+        }
+        return this.jumpFleet;
+    }
+
     syncJumpPoolsFromSettings() {
         const mail = Array.isArray(this.mailJumpPool) && this.mailJumpPool.length
             ? this.mailJumpPool
@@ -133,9 +244,9 @@ class Scheduler extends EventEmitter {
             : (this.gptProxyJump ? [this.gptProxyJump] : mail.slice());
         this.mailJumpPool = mail;
         this.gptJumpPool = gpt;
-        mailJumpPool.setUrls(mail);
-        gptJumpPool.setUrls(gpt);
-        if (mail[0]) setMailProxyJump(mail[0]);
+        const socks = mail.concat(gpt).map((x) => this.resolveJumpLine(x, [])).filter(Boolean);
+        mailJumpPool.setUrls(socks.filter((u) => !isVlessUrl(u)));
+        if (mail[0] && !isVlessUrl(mail[0])) setMailProxyJump(this.resolveJumpLine(mail[0], []) || "");
     }
     normalizeRebindAfterPaid() {
         const v = String(this.rebindAfterPaid || "");
@@ -255,30 +366,42 @@ class Scheduler extends EventEmitter {
 
     setMailProxyJump(url) {
         this.mailProxyJump = String(url || "").trim();
-        if (this.mailProxyJump) this.setMailJumpPool([this.mailProxyJump]);
-        else this.setMailJumpPool([]);
-        setMailProxyJump(this.mailProxyJump);
+        if (this.mailProxyJump) this.mailJumpPool = [this.mailProxyJump];
+        else this.mailJumpPool = [];
+        this.gptJumpPool = this.mailJumpPool.slice();
+        this.gptProxyJump = this.mailProxyJump;
+        const pending = this.ensureJumpFleet();
+        if (pending && typeof pending.then === "function") pending.catch((e) => console.warn("[jump] 起 xray 失败", e?.message || e));
         this.saveSettings();
         return this.mailProxyJump;
     }
 
-    setMailJumpPool(list) {
+    async setMailJumpPool(list) {
         const urls = Array.isArray(list) ? list.map((x) => String(x || "").trim()).filter(Boolean) : [];
         this.mailJumpPool = urls;
-        this.mailProxyJump = urls[0] || "";
-        mailJumpPool.setUrls(urls);
-        setMailProxyJump(this.mailProxyJump);
+        this.gptJumpPool = urls.slice();
+        if (!urls.length) {
+            this.jumpXrayVless = "";
+            this.mailProxyJump = "";
+            this.gptProxyJump = "";
+        }
+        await this.ensureJumpFleet();
         this.saveSettings();
-        return mailJumpPool.snapshot();
+        return this.jumpPoolSnapshot();
     }
 
-    setGptJumpPool(list) {
+    async setGptJumpPool(list) {
         const urls = Array.isArray(list) ? list.map((x) => String(x || "").trim()).filter(Boolean) : [];
         this.gptJumpPool = urls;
-        this.gptProxyJump = urls[0] || "";
-        gptJumpPool.setUrls(urls);
+        this.mailJumpPool = urls.slice();
+        if (!urls.length) {
+            this.jumpXrayVless = "";
+            this.mailProxyJump = "";
+            this.gptProxyJump = "";
+        }
+        await this.ensureJumpFleet();
         this.saveSettings();
-        return gptJumpPool.snapshot();
+        return this.jumpPoolSnapshot();
     }
 
     applyJumpSocks(port) {
@@ -286,10 +409,6 @@ class Scheduler extends EventEmitter {
         this.mailProxyJump = jump;
         this.gptProxyJump = jump;
         mailJumpPool.addUrl(jump);
-        gptJumpPool.addUrl(jump);
-        this.mailJumpPool = mailJumpPool.urls.slice();
-        this.gptJumpPool = gptJumpPool.urls.slice();
-        setMailProxyJump(jump);
         this.saveSettings();
         return jump;
     }
@@ -372,10 +491,11 @@ class Scheduler extends EventEmitter {
             pwConcurrency: this.pwConcurrency, rtProxy: this.rtProxy || "", rtConcurrency: this.rtConcurrency, defaultPassword: String(appConfig.defaultPassword || "").trim(),
             mailProxyPool: this.mailProxyPool || [], mailProxyPoolLines: (this.mailProxyPool || []).map(toProxyImportLine), mailProxyPoolSnap: this.mailProxyPoolSnap(),
             mailProxyJump: this.mailProxyJump || "",
-            mailJumpPool: this.mailJumpPool || [], mailJumpPoolSnap: mailJumpPool.snapshot(),
+            mailJumpPool: this.mailJumpPool || [], mailJumpPoolSnap: this.jumpPoolSnapshot(),
             gptProxyPool: this.gptProxyPool || [], gptProxyPoolLines: (this.gptProxyPool || []).map(toProxyImportLine), gptProxyPoolSnap: this.gptProxyPoolSnap(),
             gptProxyJump: this.gptProxyJump || "",
-            gptJumpPool: this.gptJumpPool || [], gptJumpPoolSnap: gptJumpPool.snapshot(),
+            gptJumpPool: this.gptJumpPool || [], gptJumpPoolSnap: this.jumpPoolSnapshot(),
+            jumpFleet: this.jumpFleet || [], jumpXrays: listJumpXrays(),
             running: [...this.running.values()].filter((i) => i.domain === "gpt").map((i) => i.id),
             runningClaude: [...this.running.values()].filter((i) => i.domain === "claude").map((i) => i.id)};
     }

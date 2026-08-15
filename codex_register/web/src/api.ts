@@ -233,6 +233,31 @@ export interface XrayStatus {
     error: string;
 }
 
+export interface JumpPoolItem {
+    url: string;
+    masked: string;
+    leased: number;
+    cap: number;
+    owners: string[];
+    ok: boolean | null;
+    ip: string;
+    reason: string;
+    ms: number;
+    node?: string;
+    port?: number;
+    xray?: boolean | null;
+    source?: string;
+    xrayError?: string;
+}
+
+export interface JumpPoolSnap {
+    ok: boolean;
+    total: number;
+    maxPerJump: number;
+    lines?: string[];
+    items: JumpPoolItem[];
+}
+
 export interface Daily {
     enabled: boolean;
     hour: number;
@@ -384,13 +409,11 @@ export const api = {
         j<{ok: boolean; urls: string[]; lines?: string[]; jump?: string; total: number; slots: number; leased: number; free: number; inserted?: number; skipped?: number}>(
             "/api/mailboxes/proxy-pool", {method: "POST", body: JSON.stringify({text, append: !!opts?.append, copies: opts?.copies || 1})}),
     setMailProxyJump: (jump: string) => j<{ok: boolean; jump: string}>("/api/mailboxes/proxy-jump", {method: "POST", body: JSON.stringify({jump})}),
-    mailJumpPool: () => j<{ok: boolean; total: number; maxPerJump: number; items: {url: string; masked: string; leased: number; cap: number; owners: string[]; ok: boolean | null; ip: string; reason: string; ms: number}[]}>("/api/mailboxes/jump-pool"),
+    mailJumpPool: () => j<JumpPoolSnap>("/api/mailboxes/jump-pool"),
     setMailJumpPool: (text: string, check?: boolean) =>
-        j<{ok: boolean; total: number; maxPerJump: number; items: {url: string; masked: string; leased: number; cap: number; owners: string[]; ok: boolean | null; ip: string; reason: string; ms: number}[]}>(
-            "/api/mailboxes/jump-pool", {method: "POST", body: JSON.stringify({text, check: !!check})}),
+        j<JumpPoolSnap>("/api/mailboxes/jump-pool", {method: "POST", body: JSON.stringify({text, check: !!check})}),
     checkMailJumpPool: () =>
-        j<{ok: boolean; total: number; maxPerJump: number; items: {url: string; masked: string; leased: number; cap: number; owners: string[]; ok: boolean | null; ip: string; reason: string; ms: number}[]}>(
-            "/api/mailboxes/jump-pool/check", {method: "POST", body: JSON.stringify({})}),
+        j<JumpPoolSnap>("/api/mailboxes/jump-pool/check", {method: "POST", body: JSON.stringify({})}),
     testMailProxyJump: (jump?: string) =>
         j<{ok: boolean; jump?: string; sample?: string; ip?: string; google?: number; ms?: number; reason?: string; error?: string}>(
             "/api/mailboxes/proxy-jump/test", {method: "POST", body: JSON.stringify({jump: jump || ""})}),
@@ -399,13 +422,11 @@ export const api = {
         j<{ok: boolean; urls: string[]; lines?: string[]; jump?: string; total: number; slots: number; leased: number; free: number; inserted?: number; skipped?: number}>(
             "/api/gpt/proxy-pool", {method: "POST", body: JSON.stringify({text, append: !!opts?.append, copies: opts?.copies || 1})}),
     setGptProxyJump: (jump: string) => j<{ok: boolean; jump: string}>("/api/gpt/proxy-jump", {method: "POST", body: JSON.stringify({jump})}),
-    gptJumpPool: () => j<{ok: boolean; total: number; maxPerJump: number; items: {url: string; masked: string; leased: number; cap: number; owners: string[]; ok: boolean | null; ip: string; reason: string; ms: number}[]}>("/api/gpt/jump-pool"),
+    gptJumpPool: () => j<JumpPoolSnap>("/api/gpt/jump-pool"),
     setGptJumpPool: (text: string, check?: boolean) =>
-        j<{ok: boolean; total: number; maxPerJump: number; items: {url: string; masked: string; leased: number; cap: number; owners: string[]; ok: boolean | null; ip: string; reason: string; ms: number}[]}>(
-            "/api/gpt/jump-pool", {method: "POST", body: JSON.stringify({text, check: !!check})}),
+        j<JumpPoolSnap>("/api/gpt/jump-pool", {method: "POST", body: JSON.stringify({text, check: !!check})}),
     checkGptJumpPool: () =>
-        j<{ok: boolean; total: number; maxPerJump: number; items: {url: string; masked: string; leased: number; cap: number; owners: string[]; ok: boolean | null; ip: string; reason: string; ms: number}[]}>(
-            "/api/gpt/jump-pool/check", {method: "POST", body: JSON.stringify({})}),
+        j<JumpPoolSnap>("/api/gpt/jump-pool/check", {method: "POST", body: JSON.stringify({})}),
     testGptProxyJump: (jump?: string) =>
         j<{ok: boolean; jump?: string; sample?: string; ip?: string; google?: number; ms?: number; reason?: string; error?: string}>(
             "/api/gpt/proxy-jump/test", {method: "POST", body: JSON.stringify({jump: jump || ""})}),
@@ -420,7 +441,7 @@ export const api = {
     setClaudeProxy: (proxy: string) => j<{claudeProxy: string}>("/api/control/claude-proxy", {method: "POST", body: JSON.stringify({proxy})}),
     startClaudeXray: (vlessUrl: string) => j<{xray: XrayStatus; claudeProxy: string}>("/api/control/claude-xray", {method: "POST", body: JSON.stringify({vlessUrl})}),
     stopClaudeXray: () => j<{xray: XrayStatus}>("/api/control/claude-xray/stop", {method: "POST"}),
-    startJumpXray: (vlessUrl: string) => j<{ok: boolean; xray: XrayStatus; jump: string}>("/api/control/jump-xray", {method: "POST", body: JSON.stringify({vlessUrl})}),
+    startJumpXray: (vlessUrl: string) => j<{ok: boolean; xray: XrayStatus; jump: string; jumpPool?: JumpPoolSnap}>("/api/control/jump-xray", {method: "POST", body: JSON.stringify({vlessUrl})}),
     stopJumpXray: () => j<{ok: boolean; xray: XrayStatus}>("/api/control/jump-xray/stop", {method: "POST"}),
     // 配置独立 xray 本地端口(持久化):用专属端口隔离,避免与系统 v2rayN/其他服务冲突及清理误杀
     setProxyPorts: (regPort: number, claudePort: number) => j<{regProxyPort: number; claudeProxyPort: number; regProxy: string; claudeProxy: string}>("/api/control/proxy-ports", {method: "POST", body: JSON.stringify({regPort, claudePort})}),

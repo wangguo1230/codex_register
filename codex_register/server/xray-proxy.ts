@@ -4,6 +4,7 @@
 // 与用户自己的 v2rayN(如 10808)完全隔离:独立进程、独立端口、独立 config。
 import {spawn, execSync} from "node:child_process";
 import {writeFileSync, mkdirSync, existsSync} from "node:fs";
+import net from "node:net";
 import path from "node:path";
 import {fileURLToPath} from "node:url";
 
@@ -120,4 +121,138 @@ export function stopXray(name = "reg") {
     const it = inst(name);
     if (it.proc) { try { it.proc.kill("SIGTERM"); } catch { /* ignore */ } it.proc = null; }
     it.state = {running: false, port: 0, node: "", vless: it.state.vless, pid: 0, error: ""};
+}
+
+export function isVlessUrl(s) {
+    return /^vless:\/\//i.test(String(s || "").trim());
+}
+
+export function vlessIdentity(raw) {
+    const v = parseVless(raw);
+    return `${v.uuid}@${v.host}:${v.port}`;
+}
+
+function jumpInstanceName(raw) {
+    const id = vlessIdentity(raw).replace(/[^a-zA-Z0-9]+/g, "").slice(0, 20);
+    return `jump-${id || "x"}`;
+}
+
+function isJumpName(name) {
+    return name === "jump" || String(name || "").startsWith("jump-");
+}
+
+/** 用户自己的 10808、GPT 旧口、Claude 口，跳板 xray 永不占用、不杀。 */
+export const JUMP_RESERVED_PORTS = [10808, 10809, 10810];
+export const JUMP_PORT_BASE = 10811;
+
+export function listJumpXrays() {
+    return Object.keys(INSTANCES).filter(isJumpName).map((name) => ({name, ...inst(name).state}));
+}
+
+export function stopJumpFleet() {
+    for (const name of Object.keys(INSTANCES)) {
+        if (isJumpName(name)) stopXray(name);
+    }
+}
+
+export function waitLocalPort(port, timeoutMs = 2500) {
+    const p = Number(port);
+    const deadline = Date.now() + Math.max(200, timeoutMs);
+    return new Promise((resolve) => {
+        const tryOnce = () => {
+            const sock = net.connect({host: "127.0.0.1", port: p});
+            const done = (ok) => { try { sock.destroy(); } catch { /* */ } resolve(ok); };
+            sock.setTimeout(250);
+            sock.on("connect", () => done(true));
+            sock.on("timeout", () => {
+                try { sock.destroy(); } catch { /* */ }
+                if (Date.now() >= deadline) resolve(false);
+                else setTimeout(tryOnce, 80);
+            });
+            sock.on("error", () => {
+                if (Date.now() >= deadline) resolve(false);
+                else setTimeout(tryOnce, 80);
+            });
+        };
+        tryOnce();
+    });
+}
+
+function pickJumpPort(used) {
+    for (let p = JUMP_PORT_BASE; p < JUMP_PORT_BASE + 40; p++) {
+        if (JUMP_RESERVED_PORTS.includes(p) || used.has(p)) continue;
+        return p;
+    }
+    throw new Error("跳板本地端口用完了（10811-10850）");
+}
+
+/**
+ * 多条 vless 各自起一个独立 xray，从 10811 往上排。
+ * 同一条 vless 已在跑则复用，不再重启。不碰 10808。
+ */
+export async function startJumpFleet(vlessUrls, opts: {binPath?: string; basePort?: number} = {}) {
+    const wanted = [];
+    const seen = new Set();
+    for (const raw of vlessUrls || []) {
+        const s = String(raw || "").trim();
+        if (!isVlessUrl(s)) continue;
+        let key = s;
+        try { key = vlessIdentity(s); } catch { continue; }
+        if (seen.has(key)) continue;
+        seen.add(key);
+        wanted.push(s);
+    }
+
+    const existing = listJumpXrays();
+    const byKey = new Map();
+    for (const row of existing) {
+        if (!row.vless) continue;
+        try { byKey.set(vlessIdentity(row.vless), row); } catch { /* */ }
+    }
+    for (const row of existing) {
+        let keep = false;
+        try { keep = row.vless && seen.has(vlessIdentity(row.vless)); } catch { keep = false; }
+        if (!keep) stopXray(row.name);
+    }
+
+    const used = new Set(JUMP_RESERVED_PORTS);
+    for (const row of listJumpXrays()) if (row.port) used.add(row.port);
+
+    const out = [];
+    for (const vless of wanted) {
+        const key = vlessIdentity(vless);
+        const name = jumpInstanceName(vless);
+        const prev = byKey.get(key);
+        const already = prev?.running && prev.port && !JUMP_RESERVED_PORTS.includes(prev.port);
+        let port = already ? prev.port : 0;
+        if (!port) {
+            port = prev?.port && !JUMP_RESERVED_PORTS.includes(prev.port) && !used.has(prev.port)
+                ? prev.port
+                : pickJumpPort(used);
+        }
+        used.add(port);
+        if (already && prev.name === name) {
+            out.push({
+                vless, socks: `socks5://127.0.0.1:${port}`, port,
+                node: prev.node || parseVless(vless).name, name, running: true, error: "",
+            });
+            continue;
+        }
+        try {
+            startXray(vless, {name, localPort: port, binPath: opts.binPath});
+            const up = await waitLocalPort(port, 3000);
+            const st = xrayStatus(name);
+            out.push({
+                vless, socks: `socks5://127.0.0.1:${port}`, port,
+                node: st.node || parseVless(vless).name, name,
+                running: !!st.running && up, error: up ? (st.error || "") : (st.error || "本地端口没起来"),
+            });
+        } catch (e) {
+            out.push({
+                vless, socks: `socks5://127.0.0.1:${port}`, port,
+                node: parseVless(vless).name, name, running: false, error: String(e?.message || e),
+            });
+        }
+    }
+    return out;
 }

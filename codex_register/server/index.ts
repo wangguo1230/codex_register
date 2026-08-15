@@ -43,7 +43,7 @@ import {changeChatgptEmail, needsPwdReauth} from "../src/change-email.js";
 import {testGmailImap} from "../src/mail/google-imap.js";
 import {rememberGoogleCred} from "../src/mail/google-account.js";
 import {rememberMailcomPassword} from "../src/mail/mailcom.js";
-import {startXray, stopXray, xrayStatus} from "./xray-proxy.js";
+import {startXray, stopXray, xrayStatus, listJumpXrays, isVlessUrl, stopJumpFleet} from "./xray-proxy.js";
 import {queryClaudeInfo, claudeChat} from "../src/claude-api.js";
 import {execSync} from "node:child_process";
 
@@ -473,23 +473,26 @@ app.post("/api/mailboxes/proxy-pool", (req, res) => {
     const snap = scheduler.setMailProxyPool(text, {append, copies});
     res.json({ok: true, urls: scheduler.mailProxyPool || [], jump: scheduler.mailProxyJump || "", ...snap});
 });
-app.post("/api/mailboxes/proxy-jump", (req, res) => {
+app.post("/api/mailboxes/proxy-jump", async (req, res) => {
     const jump = scheduler.setMailProxyJump(String(req.body?.jump ?? ""));
-    res.json({ok: true, jump, jumpPool: mailJumpPool.snapshot()});
+    try { await scheduler.ensureJumpFleet(); } catch (e: any) { return res.status(400).json({error: String(e?.message ?? e)}); }
+    res.json({ok: true, jump: scheduler.mailProxyJump || jump, jumpPool: scheduler.jumpPoolSnapshot()});
 });
 app.get("/api/mailboxes/jump-pool", (req, res) => {
-    res.json({ok: true, ...mailJumpPool.snapshot()});
+    res.json({ok: true, ...scheduler.jumpPoolSnapshot()});
 });
 app.post("/api/mailboxes/jump-pool", async (req, res) => {
     const text = req.body?.text != null ? String(req.body.text) : Array.isArray(req.body?.urls) ? req.body.urls.join("\n") : "";
-    const urls = text.split(/[\r\n,;]+/).map((s) => s.trim()).filter(Boolean);
-    const snap = scheduler.setMailJumpPool(urls);
-    if (req.body?.check) await mailJumpPool.checkAll();
-    res.json({ok: true, ...mailJumpPool.snapshot()});
+    const urls = text.split(/[\r\n]+/).map((s) => s.trim()).filter(Boolean);
+    try {
+        await scheduler.setMailJumpPool(urls);
+        if (req.body?.check) await mailJumpPool.checkAll();
+        res.json({ok: true, ...scheduler.jumpPoolSnapshot()});
+    } catch (e: any) { res.status(400).json({error: String(e?.message ?? e)}); }
 });
 app.post("/api/mailboxes/jump-pool/check", async (req, res) => {
     await mailJumpPool.checkAll();
-    res.json({ok: true, ...mailJumpPool.snapshot()});
+    res.json({ok: true, ...scheduler.jumpPoolSnapshot()});
 });
 app.post("/api/mailboxes/proxy-jump/test", async (req, res) => {
     const jump = String(req.body?.jump ?? scheduler.mailProxyJump ?? "").trim();
@@ -516,25 +519,29 @@ app.post("/api/gpt/proxy-pool", (req, res) => {
     const snap = scheduler.setGptProxyPool(text, {append, copies});
     res.json({ok: true, urls: scheduler.gptProxyPool || [], jump: scheduler.gptProxyJump || "", ...snap});
 });
-app.post("/api/gpt/proxy-jump", (req, res) => {
+app.post("/api/gpt/proxy-jump", async (req, res) => {
     const jump = scheduler.setGptProxyJump(String(req.body?.jump ?? ""));
-    if (jump) scheduler.setGptJumpPool([jump]);
-    else scheduler.setGptJumpPool([]);
-    res.json({ok: true, jump, jumpPool: gptJumpPool.snapshot()});
+    try {
+        if (jump) await scheduler.setGptJumpPool([jump]);
+        else await scheduler.setGptJumpPool([]);
+    } catch (e: any) { return res.status(400).json({error: String(e?.message ?? e)}); }
+    res.json({ok: true, jump: scheduler.gptProxyJump || jump, jumpPool: scheduler.jumpPoolSnapshot()});
 });
 app.get("/api/gpt/jump-pool", (req, res) => {
-    res.json({ok: true, ...gptJumpPool.snapshot()});
+    res.json({ok: true, ...scheduler.jumpPoolSnapshot()});
 });
 app.post("/api/gpt/jump-pool", async (req, res) => {
     const text = req.body?.text != null ? String(req.body.text) : Array.isArray(req.body?.urls) ? req.body.urls.join("\n") : "";
-    const urls = text.split(/[\r\n,;]+/).map((s) => s.trim()).filter(Boolean);
-    scheduler.setGptJumpPool(urls);
-    if (req.body?.check) await gptJumpPool.checkAll();
-    res.json({ok: true, ...gptJumpPool.snapshot()});
+    const urls = text.split(/[\r\n]+/).map((s) => s.trim()).filter(Boolean);
+    try {
+        await scheduler.setGptJumpPool(urls);
+        if (req.body?.check) await gptJumpPool.checkAll();
+        res.json({ok: true, ...scheduler.jumpPoolSnapshot()});
+    } catch (e: any) { res.status(400).json({error: String(e?.message ?? e)}); }
 });
 app.post("/api/gpt/jump-pool/check", async (req, res) => {
     await gptJumpPool.checkAll();
-    res.json({ok: true, ...gptJumpPool.snapshot()});
+    res.json({ok: true, ...scheduler.jumpPoolSnapshot()});
 });
 app.post("/api/gpt/proxy-jump/test", async (req, res) => {
     const jump = String(req.body?.jump ?? scheduler.gptProxyJump ?? "").trim();
@@ -1008,26 +1015,39 @@ app.post("/api/control/claude-xray", (req, res) => {
     } catch (e: any) { res.status(400).json({error: String(e?.message ?? e)}); }
 });
 app.post("/api/control/claude-xray/stop", (req, res) => { stopXray("claude"); scheduler.claudeXrayVless = ""; scheduler.saveSettings(); res.json({ok: true, xray: xrayStatus("claude")}); });
-// 邮箱/GPT 共用跳板：独立 xray @10811，不占用用户自己的 10808。
-function applyJumpXray(vlessUrl: string) {
-    const port = Number(scheduler.jumpProxyPort) || 10811;
-    const r = startXray(vlessUrl, {name: "jump", localPort: port, binPath: scheduler.xrayBinPath || undefined});
-    scheduler.jumpXrayVless = vlessUrl;
-    scheduler.jumpProxyPort = r.port;
-    const jump = scheduler.applyJumpSocks(r.port);
-    return {xray: xrayStatus("jump"), jump};
+// 邮箱/GPT 共用跳板：每条 vless 起一个独立 xray（10811 起），不占用用户 10808。
+async function applyJumpXray(vlessUrl: string) {
+    const v = String(vlessUrl || "").trim();
+    if (!isVlessUrl(v)) throw new Error("跳板要 vless:// ，我会自己起 xray");
+    const have = (scheduler.mailJumpPool || []).includes(v);
+    if (!have) {
+        scheduler.mailJumpPool = [...(scheduler.mailJumpPool || []), v];
+        scheduler.gptJumpPool = [...(scheduler.gptJumpPool || []), v];
+    }
+    scheduler.jumpXrayVless = v;
+    await scheduler.ensureJumpFleet();
+    scheduler.saveSettings();
+    const row = (scheduler.jumpFleet || []).find((f) => f.vless === v) || (scheduler.jumpFleet || [])[0];
+    return {
+        xray: row
+            ? {running: !!row.running, port: row.port, node: row.node, vless: row.vless, pid: 0, error: row.error || ""}
+            : xrayStatus("jump"),
+        jump: row?.socks || "",
+        jumpPool: scheduler.jumpPoolSnapshot(),
+    };
 }
-app.post("/api/control/jump-xray", (req, res) => {
-    const vlessUrl = String(req.body?.vlessUrl || scheduler.jumpXrayVless || scheduler.claudeXrayVless || "").trim();
+app.post("/api/control/jump-xray", async (req, res) => {
+    const vlessUrl = String(req.body?.vlessUrl || scheduler.jumpXrayVless || "").trim();
     if (!vlessUrl) return res.status(400).json({error: "缺少 vless 链接"});
-    try { res.json({ok: true, ...applyJumpXray(vlessUrl)}); }
+    try { res.json({ok: true, ...await applyJumpXray(vlessUrl)}); }
     catch (e: any) { res.status(400).json({error: String(e?.message ?? e)}); }
 });
 app.post("/api/control/jump-xray/stop", (req, res) => {
-    stopXray("jump");
+    stopJumpFleet();
     scheduler.jumpXrayVless = "";
+    scheduler.jumpFleet = [];
     scheduler.saveSettings();
-    res.json({ok: true, xray: xrayStatus("jump")});
+    res.json({ok: true, xray: xrayStatus("jump"), xrays: listJumpXrays()});
 });
 // 删除 Claude 账号(始终软删邮箱)
 app.delete("/api/claude/accounts/:id", async (req, res) => {
@@ -2064,7 +2084,7 @@ app.get("/api/state", async (req, res) => {
         lastMailJobProg.paused = await db.isMailClaimPaused();
         lastMailInstances = await db.listMailInstances();
     } catch { /* 表未就绪 */ }
-    res.json({state: {...scheduler.state(), xray: xrayStatus(), claudeXray: xrayStatus("claude"), jumpXray: xrayStatus("jump"), ...mailboxStateExtras()}, stats: await db.stats()});
+    res.json({state: {...scheduler.state(), xray: xrayStatus(), claudeXray: xrayStatus("claude"), jumpXray: (scheduler.jumpFleet || [])[0] || xrayStatus("jump"), jumpXrays: listJumpXrays(), ...mailboxStateExtras()}, stats: await db.stats()});
 });
 app.get("/api/stats", async (req, res) => res.json(await db.stats()));
 
@@ -3923,12 +3943,12 @@ if (scheduler.claudeXrayVless) {
         console.log(`[server] Claude 独立 xray 已自启: ${r.node} @ 127.0.0.1:${r.port}`);
     } catch (e: any) { console.warn(`[server] Claude xray 自启失败(不影响服务): ${e?.message ?? e}`); }
 }
-if (scheduler.jumpXrayVless) {
-    try {
-        const r = applyJumpXray(String(scheduler.jumpXrayVless));
-        console.log(`[server] 跳板独立 xray 已自启: ${r.xray.node} @ ${r.jump}（不占用 10808）`);
-    } catch (e: any) { console.warn(`[server] 跳板 xray 自启失败: ${e?.message ?? e}`); }
-}
+try {
+    const fleet = await scheduler.ensureJumpFleet();
+    if (fleet.length) {
+        console.log(`[server] 跳板 xray 已自启 ${fleet.length} 条（不占用 10808）: ${fleet.map((f) => `${f.node || "?"}@${f.port}${f.running ? "" : " 失败"}`).join(", ")}`);
+    }
+} catch (e: any) { console.warn(`[server] 跳板 xray 自启失败: ${e?.message ?? e}`); }
 await ensureSchema();
 await initDb();
 await db.init();
