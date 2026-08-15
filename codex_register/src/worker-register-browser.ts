@@ -68,69 +68,90 @@ async function main() {
         emit({type: "progress", stage: "imap", message: "Gmail 已有 IMAP，跳过邮箱管理，走 IMAP 收码注册"});
     }
 
-    let chainClose = () => {};
-    if (useBit) {
-        try {
-            if (!await bitHealth()) throw new Error("比特浏览器未启动(127.0.0.1:54345)，请先打开「比特浏览器」");
-            emit({type: "progress", stage: "bit", message: "创建比特浏览器窗口(独立指纹)…"});
-            let bitProxy = process.env.PROXY_URL || "";
-            let timeZone = "";
-            if (bitProxy) {
-                const {pickLiveMailProxy, maskProxyUrl, getMailProxyJump, setMailProxyJump} = await import("./mail/proxy-pool.js");
-                setMailProxyJump(process.env.MAIL_PROXY_JUMP || getMailProxyJump() || "");
-                const jump = getMailProxyJump();
-                emit({type: "progress", stage: "net", message: jump ? `[网络] 经跳板 ${jump} 测出口` : "[网络] 无跳板，直连测出口"});
-                const picked = await pickLiveMailProxy(bitProxy, {tries: 3, log: (m) => emit({type: "progress", stage: "net", message: `[网络] ${m}`})});
-                if (!picked.ok) throw new Error(`代理不通: ${picked.probe.reason || "未知"}`);
-                bitProxy = picked.url;
-                emit({type: "progress", stage: "net", message: `[网络] 通 ${maskProxyUrl(bitProxy)}`});
-                if (jump) {
-                    const {wrapExitThroughJump, timezoneFromExitUrl} = await import("./mail/proxy-chain.js");
-                    const wrapped = await wrapExitThroughJump(bitProxy, jump);
-                    chainClose = wrapped.close;
-                    bitProxy = wrapped.url;
-                    timeZone = timezoneFromExitUrl(picked.url);
-                    emit({type: "progress", stage: "net", message: `[网络] 链式跳板 :${wrapped.localPort}`});
-                }
-            }
-            bitId = await createBitWindow({
-                proxy: bitProxy,
-                name: isGoogle ? `gpt-${email.split("@")[0].slice(0, 12)}` : "reg",
-                remark: isGoogle ? "gmail-gpt-imap" : "codex-reg",
-                timeZone,
-            });
-            const {ws} = await openBitWindow(bitId, {extractIp: !timeZone});
-            cdpEndpoint = ws;
-            emit({type: "progress", stage: "bit", message: `比特窗口已打开(${String(bitId).slice(0, 8)}…)`});
-        } catch (e) {
-            emit({type: "result", status: "failed", email, error: "比特窗口创建/打开失败: " + (e?.message ?? e)});
-            if (bitId) { await closeBitWindow(bitId).catch(() => {}); await deleteBitWindow(bitId); }
-            try { chainClose(); } catch { /* */ }
-            process.exit(1); return;
+    const proxyDead = (err) => /代理中断|ERR_PROXY|chrome-error|代理不通|多次打开 auth\/login 失败/i.test(String(err || ""));
+
+    async function teardownBit(id, closeFn) {
+        unbindGoogleLivePage();
+        if (id) {
+            await closeBitWindow(id).catch(() => {});
+            await deleteBitWindow(id).catch(() => {});
+            emit({type: "progress", stage: "bit", message: "已关闭并删除比特窗口(释放额度)"});
         }
+        try { closeFn(); } catch { /* */ }
+    }
+
+    async function openBitOnProxy(rawProxy) {
+        let closeFn = () => {};
+        let id = null;
+        let cdp = "";
+        if (!useBit) return {id, cdp, closeFn, proxyUrl: rawProxy};
+        if (!await bitHealth()) throw new Error("比特浏览器未启动(127.0.0.1:54345)，请先打开「比特浏览器」");
+        emit({type: "progress", stage: "bit", message: "创建比特浏览器窗口(独立指纹)…"});
+        let bitProxy = rawProxy || "";
+        let timeZone = "";
+        if (bitProxy) {
+            const {pickLiveMailProxy, maskProxyUrl, getMailProxyJump, setMailProxyJump} = await import("./mail/proxy-pool.js");
+            setMailProxyJump(process.env.MAIL_PROXY_JUMP || getMailProxyJump() || "");
+            const jump = getMailProxyJump();
+            emit({type: "progress", stage: "net", message: jump ? `[网络] 经跳板 ${jump} 测出口` : "[网络] 无跳板，直连测出口"});
+            const picked = await pickLiveMailProxy(bitProxy, {tries: 3, log: (m) => emit({type: "progress", stage: "net", message: `[网络] ${m}`})});
+            if (!picked.ok) throw new Error(`代理不通: ${picked.probe.reason || "未知"}`);
+            bitProxy = picked.url;
+            emit({type: "progress", stage: "net", message: `[网络] 通 ${maskProxyUrl(bitProxy)}`});
+            if (jump) {
+                const {wrapExitThroughJump, timezoneFromExitUrl} = await import("./mail/proxy-chain.js");
+                const wrapped = await wrapExitThroughJump(bitProxy, jump);
+                closeFn = wrapped.close;
+                bitProxy = wrapped.url;
+                timeZone = timezoneFromExitUrl(picked.url);
+                emit({type: "progress", stage: "net", message: `[网络] 链式跳板 :${wrapped.localPort}`});
+            }
+        }
+        id = await createBitWindow({
+            proxy: bitProxy,
+            name: isGoogle ? `gpt-${email.split("@")[0].slice(0, 12)}` : "reg",
+            remark: isGoogle ? "gmail-gpt-imap" : "codex-reg",
+            timeZone,
+        });
+        const {ws} = await openBitWindow(id, {extractIp: !timeZone});
+        cdp = ws;
+        emit({type: "progress", stage: "bit", message: `比特窗口已打开(${String(id).slice(0, 8)}…)`});
+        return {id, cdp, closeFn, proxyUrl: bitProxy};
     }
 
     let r;
-    try {
-        if (isGoogle) emit({type: "progress", stage: "gpt", message: "【注册GPT】打开 ChatGPT 登录/注册"});
-        r = await registerViaBrowser(email, {
-            password,
-            totpSecret: totpSecretEnv,
-            proxyUrl: process.env.PROXY_URL || "",
-            headless: process.env.CHAT_HEADLESS === "1", // 默认 headed(过 CF);无头服务器需 xvfb
-            chatMessage,
-            cdpEndpoint, // 有=连接比特窗口;无=launch 临时 Chrome
-            preferGoogleSso: false,
-            log: (m) => emit({type: "progress", stage: "browser", message: m}),
-        });
-    } finally {
-        unbindGoogleLivePage();
-        // 先关窗口再拆本地转发，否则比特还指着已死端口，整页 No internet / ERR_PROXY_CONNECTION_FAILED
-        if (bitId) { await closeBitWindow(bitId); await deleteBitWindow(bitId); emit({type: "progress", stage: "bit", message: "已关闭并删除比特窗口(释放额度)"}); }
-        try { chainClose(); } catch { /* */ }
-    }
-    if (!r.ok || !r.token) {
-        emit({type: "result", status: "failed", email, error: r.error || "浏览器注册未拿到 token"});
+    let proxyUrl = process.env.PROXY_URL || "";
+    for (let attempt = 0; attempt < 2; attempt++) {
+        let opened = {id: null, cdp: "", closeFn: () => {}, proxyUrl};
+        try {
+            if (attempt) {
+                const {mintStickySession} = await import("./mail/proxy-pool.js");
+                proxyUrl = mintStickySession(process.env.PROXY_URL || proxyUrl);
+                emit({type: "progress", stage: "net", message: "代理断了，换新 session 重开窗"});
+            }
+            opened = await openBitOnProxy(proxyUrl);
+            bitId = opened.id;
+            cdpEndpoint = opened.cdp;
+            if (isGoogle) emit({type: "progress", stage: "gpt", message: "【注册GPT】打开 ChatGPT 登录/注册"});
+            r = await registerViaBrowser(email, {
+                password,
+                totpSecret: totpSecretEnv,
+                proxyUrl: process.env.PROXY_URL || "",
+                headless: process.env.CHAT_HEADLESS === "1",
+                chatMessage,
+                cdpEndpoint,
+                preferGoogleSso: false,
+                log: (m) => emit({type: "progress", stage: "browser", message: m}),
+            });
+        } catch (e) {
+            r = {ok: false, error: String(e?.message ?? e)};
+        } finally {
+            await teardownBit(opened.id, opened.closeFn);
+            bitId = null;
+        }
+        if (r?.ok && r.token) break;
+        if (attempt === 0 && proxyDead(r?.error)) continue;
+        emit({type: "result", status: "failed", email, error: r?.error || "浏览器注册未拿到 token"});
         process.exit(1); return;
     }
 

@@ -109,9 +109,22 @@ export function rewriteExitToLocal(exitUrl: string, localPort: number) {
     return `${proto}://${auth}127.0.0.1:${localPort}`;
 }
 
+async function connectViaJumpRetry(jumpRaw: string, destHost: string, destPort: number, tries = 3) {
+    let last: any;
+    for (let i = 0; i < tries; i++) {
+        try {
+            return await connectViaJump(jumpRaw, destHost, destPort, 12000);
+        } catch (e) {
+            last = e;
+            await new Promise((r) => setTimeout(r, 400 + i * 400));
+        }
+    }
+    throw last || new Error("跳板连不上出口网关");
+}
+
 export async function openLocalRelay(jumpRaw: string, destHost: string, destPort: number) {
     const server = net.createServer((client) => {
-        connectViaJump(jumpRaw, destHost, destPort, 12000).then((up) => {
+        connectViaJumpRetry(jumpRaw, destHost, destPort, 3).then((up) => {
             try { client.setKeepAlive(true, 15000); } catch { /* */ }
             try { up.setKeepAlive(true, 15000); } catch { /* */ }
             const pump = (a: net.Socket, b: net.Socket) => {

@@ -17,6 +17,27 @@ import {resolveGoogleCred} from "./mail/google-account.js";
 
 const AUTH_URL = "https://chatgpt.com/auth/login";
 
+function proxyDeadReason(url = "", text = "") {
+    const blob = `${url} ${text}`;
+    if (/ERR_PROXY_CONNECTION_FAILED|ERR_PROXY|something wrong with the proxy|Checking the proxy address/i.test(blob)) {
+        return "ERR_PROXY_CONNECTION_FAILED";
+    }
+    if (/chrome-error:|ERR_TUNNEL|ERR_CONNECTION_CLOSED|ERR_CONNECTION_RESET|ERR_INTERNET_DISCONNECTED/i.test(blob)) {
+        return "chrome-error";
+    }
+    return "";
+}
+
+async function assertProxyAlive(page, log) {
+    const url = page.url();
+    const text = await page.innerText("body").catch(() => "");
+    const why = proxyDeadReason(url, text);
+    if (why) {
+        log(`代理断了 ${why} url=${String(url).slice(0, 60)}`);
+        throw new Error(`代理中断 ${why}，换 session 重开窗`);
+    }
+}
+
 function parseProxyOpt(url) {
     if (!url) return undefined;
     try {
@@ -246,6 +267,7 @@ export async function registerViaBrowser(email, {password = "", totpSecret = "",
             catch (e: any) { log(`打开失败(${String(e?.message ?? e).slice(0, 50)})，重试 ${i + 1}/3`); await page.waitForTimeout(3000); }
         }
         if (!opened) throw new Error("多次打开 auth/login 失败(代理/网络不稳，ERR_CONNECTION_CLOSED)");
+        await assertProxyAlive(page, log);
         const useGoogleSso = !!preferGoogleSso;
         if (useGoogleSso) {
             await page.waitForTimeout(2500);
@@ -262,6 +284,7 @@ export async function registerViaBrowser(email, {password = "", totpSecret = "",
             let sawEmail = false;
             const alreadyNext = () => /email-verification|about-you|create-account|mfa-challenge/i.test(page.url());
             for (let w = 0; w < 20 && !sawEmail; w++) {
+                await assertProxyAlive(page, log);
                 if (alreadyNext()) { log(`已到下一页 ${page.url().slice(0, 70)}，跳过邮箱框`); break; }
                 if (await emailEl.isVisible().catch(() => false)) { sawEmail = true; break; }
                 if (w === 8) {
