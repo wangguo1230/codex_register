@@ -12,6 +12,7 @@ import {launchGoogleBrowser} from "./google-account.js";
 
 const PASSWORD_URL = "https://myaccount.google.com/signinoptions/password?hl=en";
 const TWO_STEP_URL = "https://myaccount.google.com/signinoptions/two-step-verification?hl=en";
+const AUTHENTICATOR_URL = "https://myaccount.google.com/two-step-verification/authenticator?hl=en";
 
 const CHANGE_PWD_KEYWORDS = [
     "Ubah sandi", "Change password", "更改密码", "Alterar senha",
@@ -602,9 +603,9 @@ async function clickDialogNext(page, log) {
 async function clickAuthenticatorChangeByDom(page, log) {
     await dismissAccountFlyout(page);
     const namedBtn = page.getByRole("button", {name: /change authenticator|set up authenticator|更改身份验证|设置身份验证/i}).first();
-    if (await namedBtn.isVisible({timeout: 500}).catch(() => false)) {
+    if (await namedBtn.isVisible({timeout: 800}).catch(() => false)) {
         await namedBtn.scrollIntoViewIfNeeded().catch(() => {});
-        await namedBtn.click({force: true}).catch(() => namedBtn.click());
+        await namedBtn.click().catch(() => namedBtn.click({force: true}));
         log("[2FA] 点了 Change authenticator app 按钮");
         return true;
     }
@@ -717,29 +718,31 @@ export async function change2faOnPage(page, {
 } = {}) {
     log("[2FA] 开始修改 TOTP");
 
-    const ok = await ensureGoogleLoggedIn(
-        page, TWO_STEP_URL,
-        {email, password, totpSecret, recoveryEmail, requireInbox: false},
-        log,
-    );
-    if (!ok) {
-        log("[2FA] 登录失败");
-        return {ok: false, error: "Google 登录失败"};
+    const alreadyIn = /myaccount\.google\.com/i.test(String(page.url()))
+        && !/accounts\.google\.com/i.test(String(page.url()));
+    if (!alreadyIn) {
+        const ok = await ensureGoogleLoggedIn(
+            page, AUTHENTICATOR_URL,
+            {email, password, totpSecret, recoveryEmail, requireInbox: false},
+            log,
+        );
+        if (!ok) {
+            log("[2FA] 登录失败");
+            return {ok: false, error: "Google 登录失败"};
+        }
     }
-    try { await page.goto(TWO_STEP_URL, {waitUntil: "domcontentloaded", timeout: 30000}); } catch { /* ignore */ }
-    await page.waitForTimeout(1500);
-    await preferEnglishGoogleUi(page, log, TWO_STEP_URL);
-
+    try { await page.goto(AUTHENTICATOR_URL, {waitUntil: "domcontentloaded", timeout: 30000}); } catch { /* ignore */ }
+    await page.waitForTimeout(1200);
+    await preferEnglishGoogleUi(page, log, AUTHENTICATOR_URL);
     await googleReauthPassword(page, {password, totpSecret, log});
     for (let i = 0; i < 6; i++) {
         const t = String(await page.innerText("body").catch(() => ""));
-        if (!isVerifyItsYouText(t)) break;
+        if (!isVerifyItsYouText(t) && !/accounts\.google\.com\/(v3\/)?signin|challenge\/totp/i.test(page.url())) break;
         await googleReauthPassword(page, {password, totpSecret, log});
-        await page.waitForTimeout(2500);
+        await page.waitForTimeout(1500);
     }
-    await page.waitForTimeout(2000);
-    const afterReauth = String(await page.innerText("body").catch(() => ""));
-    if (isVerifyItsYouText(afterReauth)) {
+    if (isVerifyItsYouText(String(await page.innerText("body").catch(() => "")))
+        || /accounts\.google\.com\/(v3\/)?signin|challenge\/totp/i.test(page.url())) {
         log("[2FA] 二次验证未过，仍在 Verify it's you");
         await dumpPage(page, "2fa_still_verify", log, email);
         return {ok: false, error: "二次验证未过"};
@@ -819,11 +822,17 @@ export async function change2faOnPage(page, {
         } else {
             let clickedAction = await clickAuthenticatorChangeByDom(page, log);
             if (!clickedAction) {
-                clickedAction = !!(await clickText(page, CHANGE_KEYWORDS.concat(SETUP_KEYWORDS), 1500));
-                if (clickedAction) log("[2FA] 文案兜底点到了更改");
+                const pill = page.getByText(/^change authenticator app$/i).or(page.getByText(/change authenticator app/i)).first();
+                if (await pill.isVisible({timeout: 700}).catch(() => false)) {
+                    await pill.scrollIntoViewIfNeeded().catch(() => {});
+                    await pill.click().catch(() => pill.click({force: true}));
+                    clickedAction = true;
+                    log("[2FA] 点了 Change authenticator app 文案");
+                }
             }
             if (!clickedAction) break;
-            setup = await waitAuthenticatorSetup(page, 3500);
+            setup = await waitAuthenticatorSetup(page, 7000);
+            if (!setup && await findChangeTotpDialog(page)) setup = "reauth";
         }
         if (setup === "reauth") {
             const filled = await fillChangeAuthenticatorCode(page, totpSecret, log);

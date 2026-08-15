@@ -141,7 +141,8 @@ console.log("=== 抽检开始", stamp(), "out=", OUT, "===");
 const swept = await sweepStaleBitWindows({includeClosed: true, log: (m) => console.log(m)});
 console.log("清残留窗", swept);
 
-const loginResults = await Promise.all(LOGIN_EMAILS.map((e, i) => runOne("login", e, i)));
+const changeOnly = process.argv.includes("--change-only");
+const loginResults = changeOnly ? [] : await Promise.all(LOGIN_EMAILS.map((e, i) => runOne("login", e, i)));
 const changeResults = await Promise.all(CHANGE_EMAILS.map((e, i) => runOne("change", e, i + 2)));
 
 const summary = {at: stamp(), login: loginResults, change: changeResults};

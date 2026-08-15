@@ -10,7 +10,7 @@
  * - 页面 loading 等待
  * - 密码 + TOTP 二次验证（敏感操作前）
  */
-import {generateTotp, generateTotpCandidates, waitNextTotpWindow, waitTotpSafeWindow, straightenGoogleCreds} from "../mfa.js";
+import {generateTotp, generateTotpCandidates, totpRemainSec, waitNextTotpWindow, waitTotpSafeWindow, straightenGoogleCreds} from "../mfa.js";
 
 const SKIP_TEXTS = [
     "Lain kali", "Not now", "Maybe later", "以后再说", "Agora não", "Plus tard",
@@ -1199,7 +1199,9 @@ async function waitTotpOutcome(page, hadWrong, write) {
 export async function submitGoogleTotp(page, secret, write = () => {}, attempt = 1) {
     if (await dismissGoogleGlitch(page, write)) return "glitch";
     await dismissSavePasswordPrompt(page, write).catch(() => {});
-    await waitTotpSafeWindow(14);
+    const remain = totpRemainSec();
+    if (remain < 6) await waitTotpSafeWindow(8);
+    else if (remain < 8) await waitTotpSafeWindow(8);
     const hadWrong = await pageHasWrongTotp(page);
     const code = generateTotp(secret);
     if (!code) return "missing";
@@ -1212,8 +1214,8 @@ export async function submitGoogleTotp(page, secret, write = () => {}, attempt =
     if (outcome === "left" || outcome === "wrong" || outcome === "glitch") return outcome;
 
     if (await googleGlitchVisible(page)) return "glitch";
-    if (await clickHostNext(page, "#totpNext")) {
-        write("  验证码页点 #totpNext 一次");
+    if (await clickStepNext(page)) {
+        write("  验证码页点 Next/Verify");
     } else {
         write("  验证码页 Next 未点到，已回车过");
     }
@@ -1232,7 +1234,7 @@ export async function googleReauthPassword(page, passwordOrOpts, totpSecret = ""
     const totp = String(opts.totpSecret || "");
     const write = typeof opts.log === "function" ? opts.log : console.log;
 
-    for (let i = 0; i < 5; i++) {
+    for (let i = 0; i < 8; i++) {
         const url = page.url();
         const body = String(await page.innerText("body").catch(() => ""));
         if (await dismissSavePasswordPrompt(page, write)) continue;
