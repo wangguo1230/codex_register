@@ -456,8 +456,9 @@ export function MailboxPanel({notify}: {notify?: (m: string) => void}) {
     const toggleSel = (id: number) => setSelected((s) => { const n = new Set(s); n.has(id) ? n.delete(id) : n.add(id); return n; });
     const filteredIdSet = useMemo(() => new Set(filtered.map((m) => m.id)), [filtered]);
     const visibleIds = useMemo(() => visibleRows.map((m) => m.id), [visibleRows]);
-    const allSelected = visibleIds.length > 0 && visibleIds.every((id) => selected.has(id));
-    const toggleAll = () => setSelected(allSelected ? new Set() : new Set(visibleIds));
+    const allFilteredSelected = filtered.length > 0 && filtered.every((m) => selected.has(m.id));
+    const allSelected = allFilteredSelected;
+    const toggleAll = () => setSelected(allFilteredSelected ? new Set() : new Set(filtered.map((m) => m.id)));
     const selCount = useMemo(() => {
         let n = 0;
         for (const id of selected) if (filteredIdSet.has(id)) n++;
@@ -491,7 +492,7 @@ export function MailboxPanel({notify}: {notify?: (m: string) => void}) {
     const doBatchHarden = async () => {
         const ids = [...selected].filter((id) => filtered.some((m) => m.id === id && m.provider === "google"));
         if (!ids.length) { toast("请先勾选 Gmail"); return; }
-        if (!confirm(`整备选中 ${ids.length} 个 Gmail？\n每个代理同时只开 1 个比特指纹窗口。并发受代理池数量和改密并发限制。`)) return;
+        if (!confirm(`完全整备选中 ${ids.length} 个 Gmail？\n会做完全部步骤：清手机/辅助邮箱、换成我们的 2FA、开通 IMAP、改密、踢设备。\n「继续未完成」只补 2FA+IMAP；要六项都跑请用这一颗。`)) return;
         try {
             const r = await api.batchHardenMailboxGoogle(ids);
             toast(`已入队 ${r.count} 个${r.skipped ? `（跳过 ${r.skipped} 个已在跑/排队）` : ""} · 本机空位 ${r.concurrency} · 代理 ${r.proxies}，有空闲就认领`);
@@ -729,12 +730,13 @@ export function MailboxPanel({notify}: {notify?: (m: string) => void}) {
                 </div>
             )}
 
-            {/* 批量操作：仅多选时出现（任务控制已在上方一行） */}
-            {selCount > 0 && !job.running && (
+            {/* 批量操作：有勾选就出现。任务在跑也要能「完全整备」，不能把按钮藏掉。 */}
+            {selCount > 0 && (
                 <div style={{display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap", background: "#fff", border: "1px solid #e8eaed", borderRadius: 12, padding: "8px 12px", flexShrink: 0}}>
-                    <span style={{fontSize: 13, color: "#374151"}}>已选 <b>{selCount}</b></span>
+                    <span style={{fontSize: 13, color: "#374151"}}>已选 <b>{selCount}</b>{filtered.length ? ` / ${filtered.length}` : ""}</span>
                     <button onClick={doBatchChange} style={{padding: "5px 12px", background: "#f59e0b", color: "#fff", border: "none", borderRadius: 6, cursor: "pointer", fontSize: 12}}>改密</button>
-                    <button onClick={doBatchHarden} style={{padding: "5px 12px", background: "#b45309", color: "#fff", border: "none", borderRadius: 6, cursor: "pointer", fontSize: 12}}>整备 Gmail</button>
+                    <button onClick={doBatchHarden} title="六项都跑：2FA、IMAP、改密、踢设备、清手机、清辅助邮箱"
+                            style={{padding: "5px 12px", background: "#b45309", color: "#fff", border: "none", borderRadius: 6, cursor: "pointer", fontSize: 12, fontWeight: 600}}>完全整备</button>
                     <button onClick={() => doBatchUsage("hold")} style={{padding: "5px 12px", background: "#7c3aed", color: "#fff", border: "none", borderRadius: 6, cursor: "pointer", fontSize: 12}}>设独立</button>
                     <button onClick={() => doBatchUsage("free")} style={{padding: "5px 12px", background: "#6b7280", color: "#fff", border: "none", borderRadius: 6, cursor: "pointer", fontSize: 12}}>放回</button>
                     <input value={moveGrp} onChange={(e) => setMoveGrp(e.target.value)} placeholder="新分组" list="mb-grp-options"
@@ -945,7 +947,7 @@ export function MailboxPanel({notify}: {notify?: (m: string) => void}) {
                 <table style={{width: "100%", borderCollapse: "collapse", fontSize: 13}}>
                     <thead style={{position: "sticky", top: 0, background: "#f9fafb"}}>
                         <tr style={{textAlign: "left", color: "#6b7280"}}>
-                            <th style={{padding: "8px 10px", width: 32}}><input type="checkbox" checked={allSelected} onChange={toggleAll} title="全选/取消当前列表"/></th>
+                            <th style={{padding: "8px 10px", width: 32}}><input type="checkbox" checked={allSelected} onChange={toggleAll} title="全选/取消当前筛选的全部邮箱（不只是这一页）"/></th>
                             <th style={{padding: "8px 10px"}}>邮箱</th>
                             <th style={{padding: "8px 10px"}}>密码</th>
                             <th style={{padding: "8px 10px"}}>类型</th>
