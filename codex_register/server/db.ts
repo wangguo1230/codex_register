@@ -1489,10 +1489,13 @@ export async function requeueRecentBitTransientFails() {
          SET status='pending', instance_id='', last_line='比特恢复，重新排队', error='', ok=NULL, finished_at=NULL
          WHERE j.id IN (
            SELECT DISTINCT ON (mailbox_id) id FROM mail_jobs
-           WHERE kind='harden' AND status='error'
-             AND finished_at > $1
-             AND (error ILIKE '%比特%' OR error ILIKE '%Login Expired%' OR error ILIKE '%Login out%'
-                  OR error ILIKE '%没有找到相应数据%')
+           WHERE kind='harden' AND (
+             (status='error'
+               AND finished_at > $1
+               AND (error ILIKE '%比特%' OR error ILIKE '%Login Expired%' OR error ILIKE '%Login out%'
+                    OR error ILIKE '%没有找到相应数据%'))
+             OR (status='canceled' AND last_line ILIKE '%等 Windows 比特重新登录%')
+           )
            ORDER BY mailbox_id, id DESC
          )
          AND NOT EXISTS (
