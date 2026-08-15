@@ -419,6 +419,17 @@ export async function setMailboxesUsage(ids, usage) {
     return { count: n };
 }
 
+export async function setMailboxesGrp(ids, grp) {
+    const g = String(grp ?? "");
+    const arr = (Array.isArray(ids) ? ids : []).map(Number).filter(Number.isInteger);
+    if (!arr.length) return {count: 0};
+    const {rowCount} = await query(
+        `UPDATE mailboxes SET grp=$1 WHERE id = ANY($2) AND deleted_at=0 AND usage IN ('free','hold')`,
+        [g, arr],
+    );
+    return {count: rowCount || 0};
+}
+
 export async function getMailbox(id) {
     // 含已删除:详情/查账密仍要能读
     const { rows } = await query(`SELECT * FROM mailboxes WHERE id=$1`, [id]);
@@ -734,15 +745,31 @@ export async function allocateMailboxIdsTo(usage, ids, batch = "") {
     if (!arr.length) return { allocated: 0, skipped: 0 };
     return withTransaction(async (client) => {
         const now = Date.now();
-        let allocated = 0, skipped = 0;
+        let allocated = 0, skipped = 0, skippedImap = 0, skippedSold = 0, skippedBusy = 0;
+        const newGrp = String(batch || "").trim();
         for (const id of arr) {
             const { rows: [mb] } = await client.query(
-                `SELECT id, grp FROM mailboxes WHERE id=$1 AND usage='free' AND deleted_at=0 FOR UPDATE SKIP LOCKED`, [id]
+                `SELECT id, grp, provider, imap_password, sold_at, usage FROM mailboxes
+                 WHERE id=$1 AND deleted_at=0 AND usage IN ('free','hold') FOR UPDATE`, [id]
             );
             if (!mb) { skipped++; continue; }
-            const res = await client.query(`UPDATE mailboxes SET usage=$1 WHERE id=$2 AND usage='free' AND deleted_at=0`, [usage, mb.id]);
-            if (!res.rowCount) { skipped++; continue; }
-            const b = String(batch || mb.grp || "");
+            if (Number(mb.sold_at) > 0) { skippedSold++; continue; }
+            if (mb.provider === "google" && usage === "gpt" && !String(mb.imap_password || "").trim()) {
+                skippedImap++;
+                continue;
+            }
+            if (usage === "gpt") {
+                const { rows: [alive] } = await client.query(
+                    `SELECT id FROM gpt_accounts WHERE mailbox_id=$1 AND deleted_at=0`, [mb.id]
+                );
+                if (alive) { skippedBusy++; continue; }
+            }
+            const b = newGrp || String(mb.grp || "");
+            if (newGrp) {
+                await client.query(`UPDATE mailboxes SET usage=$1, grp=$2 WHERE id=$3`, [usage, newGrp, mb.id]);
+            } else {
+                await client.query(`UPDATE mailboxes SET usage=$1 WHERE id=$2`, [usage, mb.id]);
+            }
             if (usage === "gpt") {
                 await insertOrReviveGpt(client, mb.id, b, now);
             } else {
@@ -750,7 +777,7 @@ export async function allocateMailboxIdsTo(usage, ids, batch = "") {
             }
             allocated++;
         }
-        return { allocated, skipped };
+        return { allocated, skipped, skippedImap, skippedSold, skippedBusy };
     });
 }
 

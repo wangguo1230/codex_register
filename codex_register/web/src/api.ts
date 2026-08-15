@@ -347,6 +347,7 @@ export const api = {
     // 切换邮箱状态 free(待分配) ↔ hold(独立);单个 / 批量
     setMailboxUsage: (id: number, usage: "free" | "hold") => j<{ok: boolean; usage: string}>(`/api/mailboxes/${id}/usage`, {method: "POST", body: JSON.stringify({usage})}),
     setMailboxesUsage: (ids: number[], usage: "free" | "hold") => j<{ok: boolean; count: number}>("/api/mailboxes/usage", {method: "POST", body: JSON.stringify({ids, usage})}),
+    setMailboxesGrp: (ids: number[], grp: string) => j<{ok: boolean; count: number; grp: string}>("/api/mailboxes/grp", {method: "POST", body: JSON.stringify({ids, grp})}),
     // 邮箱域批量改密(操作 mailboxes 表,覆盖 free/gpt/claude)。ids=选中的 mailbox id
     batchChangeMailboxPasswd: (ids: number[]) => j<{ok: boolean; count: number; msg?: string}>("/api/mailboxes/batch-change-passwd", {method: "POST", body: JSON.stringify({ids})}),
     // 邮箱域:收件箱/正文/操作日志(覆盖所有邮箱)
@@ -359,7 +360,7 @@ export const api = {
     // 按指定邮箱 id 分配给业务域(GPT「从邮箱选号」用)。changePwFirst=先串行改密再分配(改完不论成败都分配)。
     // 返回:直接分配→{allocated,skipped};先改密→{ok,changePwFirst,willChange}(改密+分配在后台跑,进度走 batchPw 事件)。
     allocateMailboxIds: (usage: "gpt" | "claude", ids: number[], batch?: string, changePwFirst?: boolean) =>
-        j<{allocated?: number; skipped?: number; changePwFirst?: boolean; willChange?: number; error?: string}>(
+        j<{allocated?: number; skipped?: number; skippedImap?: number; skippedSold?: number; skippedBusy?: number; changePwFirst?: boolean; willChange?: number; error?: string}>(
             "/api/mailboxes/allocate", {method: "POST", body: JSON.stringify({usage, ids, batch: batch || "", changePwFirst: !!changePwFirst})}),
     deleteMailbox: (id: number) => j<{ok: boolean; reason?: string}>(`/api/mailboxes/${id}`, {method: "DELETE"}),
     batchDeleteMailbox: (ids: number[]) => j<{ok: boolean; count: number; skipped: number}>("/api/mailboxes/batch-delete", {method: "POST", body: JSON.stringify({ids})}),

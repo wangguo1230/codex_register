@@ -102,6 +102,7 @@ export function MailboxPanel({notify}: {notify?: (m: string) => void}) {
     const [importProvider, setImportProvider] = useState<"mailcom"|"icloud"|"google">("mailcom");
     const [lookupExtra, setLookupExtra] = useState<Mailbox[]>([]); // 当前筛选列表里没有、lookup 补回来的号(含已删)
     const [mailSep, setMailSep] = useState("----"); // 邮箱----密码 分隔符
+    const [moveGrp, setMoveGrp] = useState("");
     const [allocCount, setAllocCount] = useState(1);
     const [allocSrc, setAllocSrc] = useState("__ALL__"); // 分配来源:__ALL__=全池 / "g:<分组名>"=只从该分组(避免误分想保留的)
     const [busy, setBusy] = useState(false);
@@ -407,6 +408,38 @@ export function MailboxPanel({notify}: {notify?: (m: string) => void}) {
         const ids = [...selected].filter((id) => filtered.some((m) => m.id === id));
         if (!ids.length) { toast("请先勾选邮箱"); return; }
         try { const r = await api.setMailboxesUsage(ids, usage); toast(`已${usage === "hold" ? "设为独立" : "放回待分配"} ${r.count} 个(gpt/claude 已跳过)`); setSelected(new Set()); load(); } catch (e: any) { toast(e.message); }
+    };
+    const doBatchGrp = async () => {
+        const ids = [...selected].filter((id) => filtered.some((m) => m.id === id && (m.usage === "free" || m.usage === "hold")));
+        if (!ids.length) { toast("请先勾选独立或待分配邮箱"); return; }
+        const name = moveGrp.trim();
+        if (!confirm(`把选中 ${ids.length} 个邮箱改到分组「${name || "（空）"}」？\n已归属 GPT/Claude 的不会改。`)) return;
+        try {
+            const r = await api.setMailboxesGrp(ids, name);
+            toast(`已改分组 ${r.count} 个 → ${name || "（空）"}`);
+            load();
+        } catch (e: any) { toast(e.message); }
+    };
+    const doBatchAllocGpt = async () => {
+        const rows = filtered.filter((m) => selected.has(m.id) && (m.usage === "free" || m.usage === "hold") && !m.sold_at);
+        if (!rows.length) { toast("请先勾选未售的独立/待分配邮箱"); return; }
+        const noImap = rows.filter((m) => m.provider === "google" && !String(m.imap_password || "").trim());
+        const ok = rows.filter((m) => !(m.provider === "google" && !String(m.imap_password || "").trim()));
+        if (!ok.length) { toast("选中的 Gmail 都没有 IMAP，不能注册 GPT"); return; }
+        const batch = moveGrp.trim();
+        const bits = [`把 ${ok.length} 个邮箱分配进 GPT 注册队列`];
+        if (batch) bits.push(`并改到分组「${batch}」`);
+        if (noImap.length) bits.push(`跳过 ${noImap.length} 个没有 IMAP 的 Gmail`);
+        if (!confirm(bits.join("\n") + "？")) return;
+        setBusy(true);
+        try {
+            const r = await api.allocateMailboxIds("gpt", ok.map((m) => m.id), batch);
+            const skip = [r.skippedImap && `无IMAP ${r.skippedImap}`, r.skippedSold && `已售 ${r.skippedSold}`, r.skippedBusy && `已挂GPT ${r.skippedBusy}`, r.skipped && `其它 ${r.skipped}`].filter(Boolean).join("，");
+            toast(`已分配 ${r.allocated ?? 0} 个进 GPT${skip ? `（跳过 ${skip}）` : ""}。到 GPT 页点「开始」注册`);
+            setSelected(new Set());
+            load();
+        } catch (e: any) { toast(e.message); }
+        finally { setBusy(false); }
     };
     const copyCreds = async (rows: Mailbox[]) => {
         if (!rows.length) { toast("没有可复制的邮箱"); return; }
@@ -728,6 +761,10 @@ export function MailboxPanel({notify}: {notify?: (m: string) => void}) {
                             <button onClick={doBatchHarden} disabled={selCount === 0} style={{padding: "5px 12px", background: "#b45309", color: "#fff", border: "none", borderRadius: 6, cursor: selCount === 0 ? "not-allowed" : "pointer"}}>🛠 批量整备 Gmail</button>
                             <button onClick={() => doBatchUsage("hold")} disabled={selCount === 0} style={{padding: "5px 12px", background: "#7c3aed", color: "#fff", border: "none", borderRadius: 6, cursor: selCount === 0 ? "not-allowed" : "pointer"}}>🔒 设为独立</button>
                             <button onClick={() => doBatchUsage("free")} disabled={selCount === 0} style={{padding: "5px 12px", background: "#6b7280", color: "#fff", border: "none", borderRadius: 6, cursor: selCount === 0 ? "not-allowed" : "pointer"}}>↩ 放回待分配</button>
+                            <input value={moveGrp} onChange={(e) => setMoveGrp(e.target.value)} placeholder="新分组/批次" list="mb-grp-options"
+                                   style={{width: 140, height: 28, padding: "0 8px", border: "1px solid #d1d5db", borderRadius: 6, fontSize: 12}}/>
+                            <button onClick={doBatchGrp} disabled={selCount === 0} style={{padding: "5px 12px", background: "#4f46e5", color: "#fff", border: "none", borderRadius: 6, cursor: selCount === 0 ? "not-allowed" : "pointer"}}>改分组</button>
+                            <button onClick={doBatchAllocGpt} disabled={selCount === 0 || busy} style={{padding: "5px 12px", background: "#059669", color: "#fff", border: "none", borderRadius: 6, cursor: selCount === 0 ? "not-allowed" : "pointer"}}>→ 分配给 GPT</button>
                             <button onClick={doCopySel} disabled={selCount === 0} style={{padding: "5px 12px", background: "#2563eb", color: "#fff", border: "none", borderRadius: 6, cursor: selCount === 0 ? "not-allowed" : "pointer"}}>📋 复制账密({selCount})</button>
                             <button onClick={doBatchDelete} disabled={selCount === 0} style={{padding: "5px 12px", background: "#dc2626", color: "#fff", border: "none", borderRadius: 6, cursor: selCount === 0 ? "not-allowed" : "pointer"}}>🗑 批量删除</button>
                         </>}

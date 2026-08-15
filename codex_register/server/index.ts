@@ -254,8 +254,8 @@ app.post("/api/mailboxes/allocate", async (req, res) => {
         if (!ids.length) return res.status(400).json({error: "未选择邮箱"});
         const changePwFirst = req.body.changePwFirst === true;
         if (changePwFirst) {
-            const mbs = (await Promise.all(ids.map((id) => db.getMailbox(id)))).filter((m) => m && m.usage === "free");
-            if (!mbs.length) return res.status(400).json({error: "选中的邮箱都不是待分配(free)状态,无法先改密"});
+            const mbs = (await Promise.all(ids.map((id) => db.getMailbox(id)))).filter((m) => m && (m.usage === "free" || m.usage === "hold"));
+            if (!mbs.length) return res.status(400).json({error: "选中的邮箱都不是待分配/独立状态,无法先改密"});
             await beginMailQueue();
             const enq = await db.enqueueMailJobs(mbs.map((m) => ({
                 id: m.id, email: m.email, payload: {oldPw: m.password, afterAllocate: {usage, batch}},
@@ -849,6 +849,14 @@ app.post("/api/mailboxes/usage", async (req, res) => {
     if (r.error) return res.status(400).json(r);
     broadcast("mailboxes", {stats: await db.mailboxStats()});
     res.json({ok: true, count: r.count, usage});
+});
+app.post("/api/mailboxes/grp", async (req, res) => {
+    const ids = Array.isArray(req.body?.ids) ? req.body.ids.map(Number) : [];
+    const grp = String(req.body?.grp ?? "");
+    if (!ids.length) return res.status(400).json({error: "未选择邮箱"});
+    const r = await db.setMailboxesGrp(ids, grp);
+    broadcast("mailboxes", {stats: await db.mailboxStats()});
+    res.json({ok: true, count: r.count, grp});
 });
 
 // ---- 邮箱域:收件箱/正文/操作日志(架构 v2:收件箱等邮箱能力集中到邮箱管理,覆盖 free/gpt/claude 所有邮箱)----
