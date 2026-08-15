@@ -364,6 +364,7 @@ export async function hardenGoogleAccountOnPage(page, cred, log = () => {}, onCh
             });
             if (fetchR?.ok && fetchR.imapPassword) {
                 out.imapPassword = fetchR.imapPassword;
+                cred.imapPassword = fetchR.imapPassword;
                 await onCheckpoint({imapPassword: fetchR.imapPassword});
             } else noteErr(fetchR?.error, "IMAP 开通失败");
         } catch (e) {
@@ -371,6 +372,10 @@ export async function hardenGoogleAccountOnPage(page, cred, log = () => {}, onCh
         }
     }
     if (gone("IMAP")) return finalize();
+    if ((out.totpRotated || skip.totp) && (out.imapPassword || skip.imap)) {
+        log("[邮箱管理] 2FA+IMAP 已齐，本轮结束，不再改密/踢设备");
+        return finalize();
+    }
 
     if (skip.password) {
         log("[邮箱管理 5/6] 密码已换过，跳过");
