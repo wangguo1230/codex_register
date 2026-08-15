@@ -2646,11 +2646,20 @@ function normalizeRebindPool(raw = {}) {
     )];
     const fromText = extractEmailsFromText(String(raw.text || ""));
     for (const e of fromText) if (!emails.includes(e)) emails.push(e);
-    const hasGrp = Object.prototype.hasOwnProperty.call(raw, "grp") && raw.grp !== null && raw.grp !== "__ALL__";
-    return {
-        emails: emails.length ? emails : undefined,
-        grp: hasGrp ? String(raw.grp) : undefined,
-    };
+    const rawGrp = raw.grp;
+    const hasGrp = rawGrp !== undefined && rawGrp !== null
+        && rawGrp !== "__ALL__" && rawGrp !== "__PICK__" && String(rawGrp) !== "undefined";
+    const out = {};
+    if (emails.length) out.emails = emails;
+    if (hasGrp) out.grp = String(rawGrp);
+    return out;
+}
+
+function rebindPoolHint(pool = {}) {
+    const parts = [];
+    if (pool.grp !== undefined) parts.push(`分组「${pool.grp || "无分组"}」`);
+    if (pool.emails?.length) parts.push(`${pool.emails.length} 个指定邮箱`);
+    return parts.length ? `，范围=${parts.join(" ")}` : "";
 }
 
 function enqueueGmailRebind(q, {force = false, target, pool} = {}) {
@@ -2667,7 +2676,7 @@ function enqueueGmailRebind(q, {force = false, target, pool} = {}) {
     gmailRebindCancelled.delete(id);
     gmailRebindQueued.add(id);
     gmailRebindTargets.set(id, dest);
-    const p = dest === "gmail" ? normalizeRebindPool(pool) : {};
+    const p = dest === "gmail" ? normalizeRebindPool(pool || {}) : {};
     if (p.emails || p.grp !== undefined) gmailRebindPool.set(id, p);
     else gmailRebindPool.delete(id);
     gmailRebindIds.push(id);
@@ -2780,9 +2789,7 @@ async function runGmailRebind(queueId) {
 
         const pool = dest === "gmail" ? (gmailRebindPool.get(queueId) || {}) : {};
         const excludeIds = [];
-        const poolHint = dest === "gmail" && (pool.emails || pool.grp !== undefined)
-            ? `，范围=${pool.grp !== undefined ? `分组「${pool.grp || "无分组"}」` : ""}${pool.emails ? `${pool.emails.length} 个指定邮箱` : ""}`
-            : "";
+        const poolHint = dest === "gmail" ? rebindPoolHint(pool) : "";
         for (let attempt = 1; attempt <= 8; attempt++) {
             if (isGmailRebindCancelled(queueId)) {
                 rechargeLog(`换绑 ⏭ ${acc.email}: 已取消`);
@@ -2791,7 +2798,14 @@ async function runGmailRebind(queueId) {
             claimed = dest === "mailcom"
                 ? await db.claimFreeMailcomMailbox()
                 : await db.claimFreeGoogleImapMailbox({grp: pool.grp, emails: pool.emails, excludeIds});
-            if (!claimed) return fail(attempt === 1 ? `${miss}${poolHint}` : `范围内已无可用 ${destLabel}${poolHint}`, false);
+            if (!claimed) {
+                let why = attempt === 1 ? `${miss}${poolHint}` : `范围内已无可用 ${destLabel}${poolHint}`;
+                if (dest === "gmail" && pool.emails?.length && attempt === 1) {
+                    const detail = await db.explainRebindGmailMiss(pool.emails).catch(() => "");
+                    if (detail) why = `${why}；${detail}`;
+                }
+                return fail(why, false);
+            }
             rememberClaimed(claimed);
             if (dest === "gmail") {
                 rechargeLog(`换绑 ${acc.email} → ${claimed.email}：先探 IMAP（第 ${attempt} 个${poolHint}）`);
@@ -3535,10 +3549,8 @@ app.post("/api/recharge/rebind-gmail", async (req, res) => {
         const dest = resolveRebindTarget(q, {force: true, target});
         if (enqueueGmailRebind(q, {force: true, target: dest, pool})) {
             queued++;
-            const scope = dest === "gmail" && (pool.emails || pool.grp !== undefined)
-                ? `（${pool.grp !== undefined ? `分组「${pool.grp || "无分组"}」` : ""}${pool.emails ? `${pool.emails.length} 个指定邮箱` : ""}）`
-                : "";
-            rechargeLog(`换绑排队 ${q.email} → ${rebindTargetLabel(dest)}${scope}`);
+            const hint = dest === "gmail" ? rebindPoolHint(pool) : "";
+            rechargeLog(`换绑排队 ${q.email} → ${rebindTargetLabel(dest)}${hint ? hint.replace(/^，范围=/, "（") + "）" : ""}`);
         } else {
             skipped.push({email: q.email, reason: "已在换绑"});
         }

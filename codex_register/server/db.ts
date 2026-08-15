@@ -531,6 +531,36 @@ function googleImapClaimWhere({grp, emails, excludeIds} = {}) {
     return {sql: conds.join(" AND "), params};
 }
 
+/** 指定邮箱领不到时，说明每个号为什么不在可换绑池里。 */
+export async function explainRebindGmailMiss(emails = []) {
+    const list = [...new Set((emails || []).map((e) => String(e || "").trim().toLowerCase()).filter((e) => e.includes("@")))];
+    if (!list.length) return "";
+    const {rows} = await query(
+        `SELECT m.email, m.usage, m.deleted_at, COALESCE(m.sold_at,0) AS sold_at, m.provider,
+                COALESCE(m.imap_password,'') AS imap_password, COALESCE(m.google_stage,'') AS google_stage,
+                EXISTS (SELECT 1 FROM gpt_accounts g WHERE g.mailbox_id=m.id AND COALESCE(g.deleted_at,0)=0) AS gpt,
+                EXISTS (SELECT 1 FROM claude_accounts c WHERE c.mailbox_id=m.id) AS claude
+         FROM mailboxes m WHERE lower(m.email) = ANY($1)`,
+        [list],
+    );
+    const by = new Map(rows.map((r) => [String(r.email || "").toLowerCase(), r]));
+    const bits = [];
+    for (const email of list) {
+        const r = by.get(email);
+        if (!r) { bits.push(`${email} 库里没有`); continue; }
+        if (Number(r.deleted_at) > 0) { bits.push(`${email} 已删除`); continue; }
+        if (Number(r.sold_at) > 0) { bits.push(`${email} 已售`); continue; }
+        if (r.provider !== "google") { bits.push(`${email} 不是 Gmail`); continue; }
+        if (r.usage !== "hold") { bits.push(`${email} 不是独立(${r.usage})`); continue; }
+        if (!String(r.imap_password || "").trim()) { bits.push(`${email} 无 IMAP 密码`); continue; }
+        if (r.google_stage === "gpt_ok") { bits.push(`${email} 已挂过 GPT`); continue; }
+        if (r.gpt) { bits.push(`${email} 已被 GPT 占用`); continue; }
+        if (r.claude) { bits.push(`${email} 已被 Claude 占用`); continue; }
+        bits.push(`${email} 在池里但这次没领到`);
+    }
+    return bits.slice(0, 6).join("；");
+}
+
 export async function countFreeMailcomMailboxes() {
     const { rows } = await query(`SELECT COUNT(*)::int AS n FROM mailboxes m WHERE ${FREE_MAILCOM_SQL}`);
     return rows[0]?.n || 0;
