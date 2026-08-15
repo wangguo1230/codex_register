@@ -1050,6 +1050,14 @@ export async function change2faOnPage(page, {
     let clickedChange = false;
     for (let tryChange = 0; tryChange < 10 && !["qr", "secret"].includes(setup); tryChange++) {
         if (await isAccountPickerDialog(page)) await dismissAccountFlyout(page);
+        const bodyNow = String(await page.innerText("body").catch(() => ""));
+        if (isVerifyItsYouText(bodyNow)
+            || /accounts\.google\.com\/(v3\/)?signin|challenge\/(totp|pwd|ipp)/i.test(page.url())) {
+            log("[2FA] 换密钥前要二次验证，先过 Verify it's you");
+            await googleReauthPassword(page, {password, totpSecret, log});
+            setup = await waitAuthenticatorSetup(page, 12000);
+            continue;
+        }
         if (await findChangeTotpDialog(page)) {
             const filled = await fillChangeAuthenticatorCode(page, totpSecret, log);
             if (filled === "wrong" || filled === "pending") {
