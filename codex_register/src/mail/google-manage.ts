@@ -225,26 +225,45 @@ async function extractSecretFromPage(page) {
     return extractTotpSecret(String(await page.innerText("body").catch(() => "")));
 }
 
+async function scrollDialogToTop(page) {
+    const dlg = page.locator('[role="dialog"], [role="alertdialog"]').first();
+    if (!await dlg.isVisible({timeout: 200}).catch(() => false)) return;
+    await dlg.evaluate((el) => {
+        el.scrollTop = 0;
+        for (const n of el.querySelectorAll("*")) {
+            if (n.scrollHeight > n.clientHeight + 20) n.scrollTop = 0;
+        }
+    }).catch(() => {});
+}
+
 async function leaveSecretPageForVerify(page, log) {
     for (let i = 0; i < 4; i++) {
+        await scrollDialogToTop(page);
+        const dlg = page.locator('[role="dialog"], [role="alertdialog"]').first();
+        const dlgText = await dlg.isVisible({timeout: 200}).catch(() => false)
+            ? String(await dlg.innerText().catch(() => ""))
+            : "";
+        const blob = dlgText || String(await page.innerText("body").catch(() => ""));
+        const hasVerify = await page.getByRole("button", {name: /^verify$|验证|verificar|verifikasi/i})
+            .first().isVisible({timeout: 250}).catch(() => false);
         const hasCodeInput = await page.locator(
-            '[role="dialog"] input[type="tel"], [role="dialog"] input[autocomplete="one-time-code"], [role="dialog"] input[maxlength="6"], [role="alertdialog"] input[type="tel"], [role="alertdialog"] input[placeholder*="code" i]',
+            '[role="dialog"] input, [role="alertdialog"] input',
         ).first().isVisible({timeout: 400}).catch(() => false);
-        const blob = String(await page.innerText("body").catch(() => ""));
         const onVerifyCopy = /enter the 6-digit|输入.*6.*位/i.test(blob);
-        const secretStill = /enter this secret key|this secret key|can't scan it|cannot scan|无法扫描/i.test(blob)
+        const secretStill = /enter this secret key|this secret key/i.test(blob)
             && !!extractTotpSecret(blob);
-        if (hasCodeInput && (onVerifyCopy || !secretStill)) return true;
-        const verifyBtn = page.getByRole("button", {name: /verify|验证|verificar|verifikasi/i}).first();
-        if (await verifyBtn.isVisible({timeout: 250}).catch(() => false) && hasCodeInput) return true;
+        // Verify 按钮出现 = 已经在填新码页。输入框常被滚出视口，不能再点 Next。
+        if ((hasVerify || onVerifyCopy || hasCodeInput) && !secretStill) {
+            log("[2FA] 已到新码页");
+            return true;
+        }
         const hit = await clickVisibleButton(page, NEXT_KEYWORDS);
         log(hit ? "[2FA] 密钥页点 Next，去填新码" : "[2FA] 密钥页 Next 没点到，再等");
         await page.waitForTimeout(1800);
-        if (hasCodeInput) return true;
     }
-    return page.locator(
-        '[role="dialog"] input[type="tel"], [role="dialog"] input[autocomplete="one-time-code"], [role="dialog"] input[maxlength="6"]',
-    ).first().isVisible({timeout: 400}).catch(() => false);
+    await scrollDialogToTop(page);
+    return page.getByRole("button", {name: /^verify$|验证|verificar|verifikasi/i})
+        .first().isVisible({timeout: 400}).catch(() => false);
 }
 
 async function withGooglePage(fn) {
@@ -1155,7 +1174,8 @@ export async function change2faOnPage(page, {
         // 经跳板 Verify 要 8–12s，窗口剩 8s 再填会在提交途中过期。
         if (totpRemainSec() < 8) await waitTotpSafeWindow(10);
         const code = generateTotp(newSecret);
-        const dialog = await findChangeTotpDialog(page) || page.locator('[role="dialog"], [role="alertdialog"]').filter({hasText: /code|验证码/i}).first();
+        await scrollDialogToTop(page);
+        const dialog = await findChangeTotpDialog(page) || page.locator('[role="dialog"], [role="alertdialog"]').first();
         const foundInput = await findDialogCodeInput(dialog, page);
         if (!foundInput) {
             const via = await submitGoogleTotp(page, newSecret, (m) => log(`[2FA] ${m}`), attempt);
