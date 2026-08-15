@@ -259,16 +259,35 @@ export async function hardenGoogleAccountOnPage(page, cred, log = () => {}, onCh
         return finalize();
     };
 
+    const runTimed = async (label, fn, ms = 90000, failOnTimeout = false) => {
+        let timer;
+        try {
+            return await Promise.race([
+                fn(),
+                new Promise((resolve) => {
+                    timer = setTimeout(() => {
+                        log(`[邮箱管理] ${label} 超时 ${Math.round(ms / 1000)}s，先跳过`);
+                        resolve(failOnTimeout
+                            ? {ok: false, error: `${label}超时`, timeout: true}
+                            : {ok: true, skipped: true, timeout: true});
+                    }, ms);
+                }),
+            ]);
+        } finally {
+            clearTimeout(timer);
+        }
+    };
+
     if (skip.totp) {
         log("[邮箱管理 1/5] 换 2FA 已做过，跳过");
     } else {
         log("[邮箱管理 1/5] 更换 Google 2FA");
         if (stopNow()) return stopAndKeep();
-        const t = await change2faOnPage(page, {
+        const t = await runTimed("换2FA", () => change2faOnPage(page, {
             email: cred.email, password: cred.password,
             totpSecret: cred.totpSecret, recoveryEmail: cred.recoveryEmail, log,
             onPersist: onCheckpoint,
-        }).catch((e) => ({ok: false, error: String(e?.message || e)}));
+        }).catch((e) => ({ok: false, error: String(e?.message || e)})), 180000, true);
         if (t?.ok && t.totpSecret) {
             cred.totpSecret = t.totpSecret;
             out.totpSecret = t.totpSecret;
@@ -321,23 +340,6 @@ export async function hardenGoogleAccountOnPage(page, cred, log = () => {}, onCh
         log("[邮箱管理] 窗口已关，后续步骤不再跑");
         return out;
     }
-
-    const runTimed = async (label, fn, ms = 90000) => {
-        let timer;
-        try {
-            return await Promise.race([
-                fn(),
-                new Promise((resolve) => {
-                    timer = setTimeout(() => {
-                        log(`[邮箱管理] ${label} 超时 ${Math.round(ms / 1000)}s，先跳过`);
-                        resolve({ok: true, skipped: true, timeout: true});
-                    }, ms);
-                }),
-            ]);
-        } finally {
-            clearTimeout(timer);
-        }
-    };
 
     if (stopNow()) return stopAndKeep();
     if (process.env.REG_SKIP_DEVICES === "1" || skip.devices) {
@@ -526,7 +528,8 @@ export async function runGoogleHardenWithBit(acc, {proxyUrl = "", log = () => {}
     const short = String(acc.email || "").split("@")[0].slice(0, 12);
     return withGoogleBitSession({proxyUrl, name: `harden-${short}`, remark: "gmail-harden", log, signal}, async (page) => {
         const ok = await ensureGoogleLoggedIn(page, "https://myaccount.google.com/security?hl=en", {...cred, requireInbox: false}, log);
-        if (!ok) return {ok: false, error: "Gmail 登录失败", errors: ["登录失败"]};
-        return await hardenGoogleAccountOnPage(page, cred, log, onCheckpoint);
+        if (!ok) return {ok: false, error: "Gmail 登录失败", errors: ["登录失败"], login: false};
+        const done = await hardenGoogleAccountOnPage(page, cred, log, onCheckpoint);
+        return {...done, login: true};
     });
 }

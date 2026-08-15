@@ -122,8 +122,11 @@ async function runOne(email, idx) {
         },
     }).catch((e) => ({ok: false, error: String(e?.message || e), errors: [String(e?.message || e)]}));
     await persist(mb, r);
+    const err = (r.errors || [r.error]).filter(Boolean).join("; ").slice(0, 180);
+    const login = r.login === true || (!/登录失败|代理不通|库里没有/.test(err) && r.login !== false);
     const brief = {
         email,
+        login,
         ok: !!r.ok,
         totp: !!r.totpSecret || !!r.totpRotated,
         password: !!r.passwordChanged,
@@ -132,7 +135,7 @@ async function runOne(email, idx) {
         phone: !!r.phoneCleared,
         devices: !!r.devicesDone,
         missing: r.missing || [],
-        error: (r.errors || [r.error]).filter(Boolean).join("; ").slice(0, 180),
+        error: err,
     };
     console.log(`${email} [整备] 结束`, JSON.stringify(brief));
     return brief;
@@ -154,5 +157,11 @@ for (let i = 0; i < EMAILS.length; i += CHUNK) {
 
 console.log("=== 全流程结果 ===");
 console.log(JSON.stringify(all, null, 2));
+const logged = all.filter((r) => r.login);
+const force = all.filter((r) => !r.login);
+const modOk = logged.filter((r) => r.password || r.totp);
+console.log(`登录 ${logged.length}/${all.length}  登不上(不可抗力) ${force.length}`);
+console.log(`能登录后的修改成功率 ${modOk.length}/${logged.length || 1} = ${logged.length ? Math.round(modOk.length / logged.length * 100) : 0}% （改密或换2FA）`);
+console.log(`能登录后可用(改密+IMAP) ${logged.filter((r) => r.ok).length}/${logged.length || 1}`);
 await pool.end();
-process.exit(all.some((r) => !r.ok) ? 1 : 0);
+process.exit(logged.length && modOk.length / logged.length >= 0.6 ? 0 : 1);

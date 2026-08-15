@@ -788,6 +788,10 @@ export async function googleLogin(page, emailOrOpts, password = "", totpSecret =
             }
 
             // TOTP：窗口够用再填；Google 常自动提交，先等，再视情况点 Next。Wrong code 换下一窗重试。
+            if (totpAttempts >= 3 && totp && await totpFieldVisible(page) && await pageHasWrongTotp(page)) {
+                write("  TOTP 连续 Wrong code，当密钥无效，不再死磕");
+                return false;
+            }
             if (totpAttempts < 6 && totp && await totpFieldVisible(page)) {
                 totpAttempts += 1;
                 const submitted = await submitGoogleTotp(page, totp, write, totpAttempts);
