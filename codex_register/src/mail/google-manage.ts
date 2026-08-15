@@ -413,9 +413,15 @@ async function isAccountPickerDialog(page) {
 
 function dialogLooksLikeChangeTotp(text) {
     const t = String(text || "");
-    if (!/change authenticator|authenticator app|更改身份验证|验证器/i.test(t)) return false;
-    if (/enter the 6-digit|enter code|输入.*6.*位|输入验证码|verify|验证/i.test(t)) return true;
-    return /change authenticator app/i.test(t);
+    return /enter the 6-digit|enter code|输入.*6.*位|输入验证码/i.test(t)
+        && /change authenticator|authenticator app|更改身份验证|验证器/i.test(t);
+}
+
+function dialogLooksLikeReplaceConfirm(text) {
+    const t = String(text || "");
+    if (/enter the 6-digit|enter code|输入.*6.*位|输入验证码/i.test(t)) return false;
+    return /won.t be able to use your old|you will no longer|old authenticator|无法再使用|旧的身份验证|replace this authenticator/i.test(t)
+        || (/change authenticator app/i.test(t) && /next|continue|change|replace|下一步|继续|更换/i.test(t));
 }
 
 async function findChangeTotpDialog(page) {
@@ -577,16 +583,13 @@ async function waitAuthenticatorSetup(page, ms = 9000) {
         const t = String(await page.innerText("body").catch(() => ""));
         if (/otpauth:\/\//i.test(t) || /secret key|setup key|密钥|can't scan it|cannot scan|无法扫描/i.test(t)) return "secret";
         if (await findChangeTotpDialog(page)) return "reauth";
-        const heading = page.getByRole("heading", {name: /change authenticator/i}).first();
-        if (await heading.isVisible({timeout: 150}).catch(() => false)) return "reauth";
         const dlgs = page.locator('[role="dialog"], [role="alertdialog"]');
         const dn = await dlgs.count().catch(() => 0);
         for (let i = 0; i < dn; i++) {
             const dlg = dlgs.nth(i);
             if (!await dlg.isVisible({timeout: 120}).catch(() => false)) continue;
             const dt = String(await dlg.innerText().catch(() => ""));
-            if (/change authenticator app/i.test(dt)) return "reauth";
-            if (/replace authenticator|replace this|更换此|替换/i.test(dt) && !/enter the 6-digit|enter code/i.test(dt)) return "confirm";
+            if (dialogLooksLikeReplaceConfirm(dt)) return "confirm";
         }
         await page.waitForTimeout(350);
     }
@@ -601,9 +604,10 @@ async function clickDialogNext(page, log) {
     for (let i = 0; i < n; i++) {
         const cand = loc.nth(i);
         if (!await cand.isVisible({timeout: 150}).catch(() => false)) continue;
-        if (dialogLooksLikeChangeTotp(String(await cand.innerText().catch(() => "")))) continue;
-        dlg = cand;
-        break;
+        const t = String(await cand.innerText().catch(() => ""));
+        if (dialogLooksLikeChangeTotp(t)) continue;
+        if (dialogLooksLikeReplaceConfirm(t) || !dlg) dlg = cand;
+        if (dialogLooksLikeReplaceConfirm(t)) break;
     }
     if (!dlg) return false;
     const codeBox = dlg.locator('input[placeholder*="code" i], input[name="totpPin"], input[autocomplete="one-time-code"]').first();
