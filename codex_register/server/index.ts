@@ -696,6 +696,21 @@ function jobPayload(job) {
     return p;
 }
 
+let bitParkAnnounced = false;
+async function parkJobsForBitDown(reason) {
+    const {markBitLoggedOut} = await import("../src/bitbrowser.js");
+    markBitLoggedOut(true);
+    const n = await db.requeueRunningOnInstance(db.instanceId, "比特掉登录，退回排队").catch(() => 0);
+    for (const ac of hardenAbort.values()) {
+        try { ac.abort(); } catch { /* */ }
+    }
+    if (!bitParkAnnounced) {
+        console.warn(`[mail-jobs] 比特不可用，已领任务退回排队（不当失败）: ${String(reason || "").slice(0, 120)} n=${n}`);
+        bitParkAnnounced = true;
+    }
+    scheduleMailboxJobBroadcast();
+}
+
 async function runClaimedMailJob(job) {
     localMailJobIds.add(job.mailbox_id);
     try {
@@ -729,17 +744,30 @@ async function runClaimedMailJob(job) {
         } else {
             const r = await runOneGoogleHarden(job.mailbox_id, {jobId: job.id});
             const err = (r.errors || [r.error]).filter(Boolean).map((e) => String(e).split("\n")[0]).join("; ");
-            await db.completeMailJob(job.id, !!r.ok, err, {
-                instanceId: db.instanceId,
-                imap: !!r.imapPassword || !!r.imap, totp: !!r.totpSecret, totpRotated: !!r.totpRotated,
-                password: !!r.passwordChanged, recovery: !!r.recoveryCleared,
-                phone: !!r.phoneCleared, devices: !!r.devicesDone,
-                missing: r.missing || [], errors: (r.errors || []).map((e) => String(e).split("\n")[0].slice(0, 120)),
-                skipped: !!r.skipped,
-            });
+            const {isBitTransientError} = await import("../src/bitbrowser.js");
+            if (!r.ok && isBitTransientError(err)) {
+                await parkJobsForBitDown(err);
+                await db.requeueMailJob(job.id, "比特异常，退回排队");
+            } else {
+                await db.completeMailJob(job.id, !!r.ok, err, {
+                    instanceId: db.instanceId,
+                    imap: !!r.imapPassword || !!r.imap, totp: !!r.totpSecret, totpRotated: !!r.totpRotated,
+                    password: !!r.passwordChanged, recovery: !!r.recoveryCleared,
+                    phone: !!r.phoneCleared, devices: !!r.devicesDone,
+                    missing: r.missing || [], errors: (r.errors || []).map((e) => String(e).split("\n")[0].slice(0, 120)),
+                    skipped: !!r.skipped,
+                });
+            }
         }
     } catch (e) {
-        await db.completeMailJob(job.id, false, String(e?.message || e)).catch(() => {});
+        const msg = String(e?.message || e);
+        const {isBitTransientError} = await import("../src/bitbrowser.js");
+        if (isBitTransientError(msg)) {
+            await parkJobsForBitDown(msg);
+            await db.requeueMailJob(job.id, "比特异常，退回排队").catch(() => {});
+        } else {
+            await db.completeMailJob(job.id, false, msg).catch(() => {});
+        }
     } finally {
         localMailJobIds.delete(job.mailbox_id);
         hardenAbort.delete(job.mailbox_id);
@@ -766,9 +794,19 @@ async function tickMailJobs() {
     if (mailJobTickBusy || instanceShuttingDown) return;
     mailJobTickBusy = true;
     try {
-        if (Date.now() - lastBitBudgetAt > 45_000) {
+        const {isBitLoggedOut, ensureBitWindowBudget, setExpectedBitTiles, listAllBitWindows} = await import("../src/bitbrowser.js");
+        if (isBitLoggedOut()) {
+            try {
+                await listAllBitWindows({force: true});
+                if (!isBitLoggedOut()) {
+                    const back = await db.requeueRecentBitTransientFails().catch(() => []);
+                    bitParkAnnounced = false;
+                    if (back.length) console.log(`[mail-jobs] 比特已恢复，误失败 ${back.length} 个重新排队`);
+                }
+            } catch { /* 仍未登录 */ }
+        }
+        if (Date.now() - lastBitBudgetAt > 45_000 && !isBitLoggedOut()) {
             lastBitBudgetAt = Date.now();
-            const {ensureBitWindowBudget, setExpectedBitTiles} = await import("../src/bitbrowser.js");
             const snap = scheduler.mailProxyPoolSnap();
             setExpectedBitTiles(Math.max(1, Math.min(scheduler.pwConcurrency || 1, snap.slots || 1)));
             const swept = await ensureBitWindowBudget({log: (m) => console.log(m)});

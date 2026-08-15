@@ -1463,6 +1463,43 @@ export async function setMailJobLine(jobId, line) {
         [String(line || "").slice(0, 180), Date.now(), jobId]);
 }
 
+export async function requeueMailJob(jobId, line = "比特异常，退回排队") {
+    await query(
+        `UPDATE mail_jobs
+         SET status='pending', instance_id='', last_line=$1, error='', ok=NULL, finished_at=NULL
+         WHERE id=$2 AND status IN ('running','error')`,
+        [String(line || "").slice(0, 180), jobId],
+    );
+}
+
+export async function requeueRunningOnInstance(instId, line = "比特掉登录，退回排队") {
+    const {rows} = await query(
+        `UPDATE mail_jobs
+         SET status='pending', instance_id='', last_line=$1, error='', ok=NULL, finished_at=NULL
+         WHERE status='running' AND instance_id=$2
+         RETURNING id`,
+        [String(line || "").slice(0, 180), instId],
+    );
+    return rows.length;
+}
+
+export async function requeueRecentBitTransientFails() {
+    const {rows} = await query(
+        `UPDATE mail_jobs j
+         SET status='pending', instance_id='', last_line='比特恢复，重新排队', error='', ok=NULL, finished_at=NULL
+         WHERE j.kind='harden' AND j.status='error'
+           AND j.finished_at > $1
+           AND (j.error ILIKE '%比特%' OR j.error ILIKE '%Login Expired%' OR j.error ILIKE '%没有找到相应数据%')
+           AND NOT EXISTS (
+             SELECT 1 FROM mail_jobs x
+             WHERE x.mailbox_id=j.mailbox_id AND x.status IN ('pending','running')
+           )
+         RETURNING j.id, j.email`,
+        [Date.now() - 2 * 60 * 60 * 1000],
+    );
+    return rows;
+}
+
 export async function completeMailJob(jobId, ok, error = "", result = null) {
     await query(
         `UPDATE mail_jobs

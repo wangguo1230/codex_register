@@ -29,7 +29,7 @@ async function bitPost(pathname, body) {
     if (!j || j.success !== true) {
         const msg = JSON.stringify(j).slice(0, 200);
         if (/频繁|频率|too many|rate/i.test(msg)) markListBackoff(60_000);
-        if (/login out|未登录|please login|token 失效|检查登录状态/i.test(msg)) markBitLoggedOut(true);
+        if (/login expired|login out|未登录|please login|token 失效|检查登录状态/i.test(msg)) markBitLoggedOut(true);
         throw new Error(`比特API ${pathname} 失败: ${msg}`);
     }
     if (pathname === "/browser/list" || pathname === "/browser/update") markBitLoggedOut(false);
@@ -266,6 +266,10 @@ export function isBitLoggedOut() {
     return Date.now() < bitLoggedOutUntil;
 }
 
+export function isBitTransientError(msg) {
+    return /login expired|login out|未登录|please login|token 失效|比特已退出|没有找到相应数据|服务调用成功，但没有找到/i.test(String(msg || ""));
+}
+
 export async function listAllBitWindows({force = false} = {}) {
     const now = Date.now();
     if (now < listBackoffUntil && listCache.at) return listCache.all;
@@ -364,7 +368,12 @@ export async function ensureBitWindowBudget({log = () => {}} = {}) {
     const extras = ours.filter((w) => w?.id && !liveBitIds.has(w.id));
     let n = 0;
     for (const w of extras) {
-        if (Number(w.status) === 1) await closeBitWindow(w.id);
+        const open = Number(w.status) === 1;
+        const created = Date.parse(String(w.createdTime || "").replace(" ", "T"));
+        const age = Number.isFinite(created) ? Date.now() - created : 9e15;
+        // 刚开的窗可能是上一进程还在跑，别一启动就全杀掉导致 Login Expired。
+        if (open && age < 3 * 60 * 1000) continue;
+        if (open) await closeBitWindow(w.id);
         await deleteBitWindow(w.id);
         n += 1;
         log(`[指纹] 清超额残留 ${w.name || w.id} status=${w.status} 本机登记=${liveBitIds.size} 上限=${cap}`);
