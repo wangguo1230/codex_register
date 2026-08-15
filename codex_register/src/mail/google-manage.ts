@@ -1028,6 +1028,21 @@ export async function change2faOnPage(page, {
     }
 
     if (!foundAuth) {
+        const body = String(await page.innerText("body").catch(() => ""));
+        if (isVerifyItsYouText(body)
+            || /accounts\.google\.com\/(v3\/)?signin|challenge\/(totp|pwd)/i.test(page.url())
+            || /enter your password|to continue, first verify/i.test(body)) {
+            log("[2FA] 入口落在二次验证，先过再进");
+            await googleReauthPassword(page, {password, totpSecret, log});
+            foundAuth = await onAuthenticatorDetail(page) || /\/authenticator/i.test(page.url());
+            if (!foundAuth) {
+                try { await page.goto(AUTHENTICATOR_URL, {waitUntil: "domcontentloaded", timeout: 60000}); } catch { /* */ }
+                foundAuth = await onAuthenticatorDetail(page) || /\/authenticator/i.test(page.url());
+            }
+        }
+    }
+
+    if (!foundAuth) {
         log("[2FA] 未找到 Authenticator 入口");
         await dumpPage(page, "2fa_no_auth_entry", log, email);
         return {ok: false, error: "未找到 Authenticator 入口"};

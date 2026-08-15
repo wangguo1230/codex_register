@@ -4,7 +4,7 @@
  * 买来的老号做不了官方 Gmail OAuth（要 Cloud 项目 + 验证应用），
  * 开了 2FA 之后官方允许的取件方式就是「应用专用密码 + IMAP」。
  */
-import {googleReauthPassword} from "./google-auth.js";
+import {googleReauthPassword, googleSslDead, recoverSslOrSlowPage, isVerifyItsYouText} from "./google-auth.js";
 import {ImapFlow} from "imapflow";
 
 const IMAP_SETTINGS = "https://mail.google.com/mail/u/0/#settings/fwdandpop";
@@ -61,6 +61,45 @@ export async function enableGmailImap(page, log = () => {}) {
     return false;
 }
 
+async function dumpAppPwFail(page) {
+    try {
+        const {mkdirSync} = await import("node:fs");
+        const path = await import("node:path");
+        const dir = path.resolve(process.cwd(), "captures", "screenshots");
+        mkdirSync(dir, {recursive: true});
+        await page.screenshot({path: path.join(dir, `apppw_fail_${Date.now()}.png`)});
+    } catch { /* ignore */ }
+}
+
+async function readAppPassword(page) {
+    let secret = extractAppPassword(await page.innerText("body").catch(() => ""));
+    if (secret) return secret;
+    for (const frame of page.frames()) {
+        secret = extractAppPassword(await frame.innerText("body").catch(() => ""));
+        if (secret) return secret;
+    }
+    return "";
+}
+
+async function clickCreateAppPassword(page, log) {
+    const named = page.getByRole("button", {name: /^(create|generate|创建|生成|buat|criar)$/i})
+        .or(page.getByRole("button", {name: /create|generate|创建|生成/i}));
+    if (await named.first().isVisible({timeout: 800}).catch(() => false)) {
+        await named.first().scrollIntoViewIfNeeded().catch(() => {});
+        await named.first().click({timeout: 2500}).catch(() => named.first().click({force: true}));
+        log("[取件] 点了 Create");
+        return true;
+    }
+    const hit = await clickFirst(page, [
+        'button:has-text("Create")',
+        'button:has-text("Generate")',
+        'button:has-text("创建")',
+        'button:has-text("生成")',
+    ], 2000);
+    if (hit) log("[取件] 点了 Create");
+    return hit;
+}
+
 /** 生成一枚应用专用密码，返回 16 位（无空格）。 */
 export async function createGmailAppPassword(page, {
     password = "", totpSecret = "", totpFallback = "", appName = "mail-fetch", log = () => {},
@@ -69,14 +108,40 @@ export async function createGmailAppPassword(page, {
     try {
         await page.goto(APP_PASSWORD_URL, {waitUntil: "domcontentloaded", timeout: 60000});
     } catch { /* ignore */ }
-    await page.waitForTimeout(3000);
-    await googleReauthPassword(page, {password, totpSecret, totpFallback, log});
-    await page.waitForTimeout(2500);
+    await page.waitForTimeout(1500);
+    if (await googleSslDead(page)) {
+        const dest = APP_PASSWORD_URL;
+        const recovered = await recoverSslOrSlowPage(page, log, dest, 3);
+        if (!recovered && await googleSslDead(page)) {
+            throw new Error("代理中断 应用专用密码页 SSL，换 session 重开窗");
+        }
+    }
+
+    for (let gate = 0; gate < 4; gate++) {
+        const body = String(await page.innerText("body").catch(() => ""));
+        if (await googleSslDead(page)) {
+            throw new Error("代理中断 应用专用密码页 SSL，换 session 重开窗");
+        }
+        if (isVerifyItsYouText(body) || /accounts\.google\.com\/(signin|challenge|v3)/i.test(page.url())) {
+            log("[取件] 应用专用密码页要二次验证");
+            await googleReauthPassword(page, {password, totpSecret, totpFallback, log});
+            await page.waitForTimeout(800);
+            if (!/apppasswords/i.test(page.url()) && !isVerifyItsYouText(String(await page.innerText("body").catch(() => "")))) {
+                try { await page.goto(APP_PASSWORD_URL, {waitUntil: "domcontentloaded", timeout: 60000}); } catch { /* */ }
+            }
+            continue;
+        }
+        break;
+    }
 
     const blocked = await page.innerText("body").catch(() => "");
     if (/turn on 2-step|enable 2-step|两步验证|2-Step Verification is off/i.test(blocked)
         && /app password/i.test(blocked)) {
         throw new Error("未开 Google 2FA，无法创建应用专用密码");
+    }
+    if (isVerifyItsYouText(blocked) || /accounts\.google\.com\/(signin|challenge|v3)/i.test(page.url())) {
+        await dumpAppPwFail(page);
+        throw new Error("应用专用密码页二次验证未过");
     }
 
     const nameInput = page.locator(
@@ -86,33 +151,24 @@ export async function createGmailAppPassword(page, {
         await nameInput.fill("");
         await nameInput.fill(`${appName}-${Date.now().toString(36).slice(-4)}`);
         await page.waitForTimeout(400);
+        log("[取件] 已填应用名");
     }
 
-    const created = await clickFirst(page, [
-        page.getByRole("button", {name: /Create|Generate|创建|生成|Buat|Criar/i}).first(),
-        'button:has-text("Create")',
-        'button:has-text("Generate")',
-        'button:has-text("创建")',
-        'button:has-text("生成")',
-    ], 3000);
-    if (!created) log("[取件] 未点到创建按钮，尝试从页面直接抽密码");
-    await page.waitForTimeout(2500);
-
-    let secret = extractAppPassword(await page.innerText("body").catch(() => ""));
-    if (!secret) {
-        for (const frame of page.frames()) {
-            secret = extractAppPassword(await frame.innerText("body").catch(() => ""));
-            if (secret) break;
+    let secret = "";
+    for (let tryCreate = 0; tryCreate < 3 && !secret; tryCreate++) {
+        const created = await clickCreateAppPassword(page, log);
+        if (!created && tryCreate === 0) log("[取件] 未点到创建按钮，尝试从页面直接抽密码");
+        for (let w = 0; w < 8 && !secret; w++) {
+            await page.waitForTimeout(500);
+            secret = await readAppPassword(page);
+        }
+        if (!secret && isVerifyItsYouText(String(await page.innerText("body").catch(() => "")))) {
+            log("[取件] 点 Create 后又要二次验证");
+            await googleReauthPassword(page, {password, totpSecret, totpFallback, log});
         }
     }
     if (!secret) {
-        try {
-            const {mkdirSync} = await import("node:fs");
-            const path = await import("node:path");
-            const dir = path.resolve(process.cwd(), "captures", "screenshots");
-            mkdirSync(dir, {recursive: true});
-            await page.screenshot({path: path.join(dir, `apppw_fail_${Date.now()}.png`)});
-        } catch { /* ignore */ }
+        await dumpAppPwFail(page);
         throw new Error("未能提取应用专用密码(未点到创建或页面无 4 组密码)");
     }
     log(`[取件] 应用专用密码已生成: ${secret.slice(0, 4)}****`);

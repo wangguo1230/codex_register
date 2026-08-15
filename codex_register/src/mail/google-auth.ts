@@ -278,7 +278,7 @@ async function pageBodyText(page, timeout = 5000) {
     }
 }
 
-async function waitIdentifierUiReady(page, write, ms = 45000) {
+async function waitIdentifierUiReady(page, write, ms = 15000) {
     const deadline = Date.now() + ms;
     let sslTries = 0;
     while (Date.now() < deadline) {
@@ -289,11 +289,11 @@ async function waitIdentifierUiReady(page, write, ms = 45000) {
             write(`  登录页 SSL/代理中断，刷新 ${sslTries}/3`);
             await recoverSslOrSlowPage(page, write, identifierEntryUrl(page), 1);
         }
-        const loading = await identifierStillLoading(page);
         const box = await findIdentifierBox(page);
-        const ready = await hostNextReady(page, "#identifierNext");
-        if (!loading && box && ready) return true;
-        await page.waitForTimeout(500);
+        // 框已经出来就填，不等 “Loading Sign in” 消掉，也不等 Next 变蓝。
+        if (box) return true;
+        if (loginStep(url) === "password" || loginStep(url) === "totp") return true;
+        await page.waitForTimeout(400);
     }
     write("  邮箱页仍在 Loading 或 Next 未就绪");
     return false;
@@ -360,7 +360,7 @@ async function hardReloadIdentifier(page, write) {
     }
     await page.waitForTimeout(1500);
     await recoverSslOrSlowPage(page, write, dest, 2);
-    await waitIdentifierUiReady(page, write, 45000);
+    await waitIdentifierUiReady(page, write, 12000);
 }
 
 async function waitLeftIdentifier(page, pwdSoon, netWatch) {
@@ -554,7 +554,7 @@ export async function googleLogin(page, emailOrOpts, password = "", totpSecret =
         let sslRetries = 0;
         write("  等登录页就绪（动态代理可能较慢）");
         await recoverSslOrSlowPage(page, write, identifierEntryUrl(page), 2);
-        await waitIdentifierUiReady(page, write, 45000);
+        await waitIdentifierUiReady(page, write, 15000);
         for (let step = 0; step < 20; step++) {
             const err = await checkError(page);
             if (err) {
@@ -607,9 +607,6 @@ export async function googleLogin(page, emailOrOpts, password = "", totpSecret =
                 if (await ei.isVisible({timeout: 1500}).catch(() => false)) {
                     identBlankTries = 0;
                     if (!emailSubmitted) {
-                        await waitIdentifierUiReady(page, write, 45000);
-                        for (let i = 0; i < 40 && !await hostNextReady(page, "#identifierNext"); i++) await page.waitForTimeout(400);
-                        await page.waitForTimeout(400);
                         await typeGoogleInput(ei, email);
                         const shown = String(await ei.inputValue().catch(() => ""));
                         if (shown.toLowerCase() !== email.toLowerCase()) {
@@ -620,8 +617,7 @@ export async function googleLogin(page, emailOrOpts, password = "", totpSecret =
                         emailSubmitted = true;
                         write(`  邮箱已输入: ${email} 框内=${String(await ei.inputValue().catch(() => "")).slice(0, 40)}`);
                         await ei.press("Tab").catch(() => {});
-                        await page.waitForTimeout(600);
-                        for (let i = 0; i < 20 && !await hostNextReady(page, "#identifierNext"); i++) await page.waitForTimeout(250);
+                        await page.waitForTimeout(250);
                     }
                     if (emailNextClicks >= 3) {
                         const leftover = String(await page.innerText("body").catch(() => "")).replace(/\s+/g, " ").slice(0, 160);
@@ -633,7 +629,7 @@ export async function googleLogin(page, emailOrOpts, password = "", totpSecret =
                             write("  邮箱页卡住，刷新登录页再试");
                             await page.reload({waitUntil: "domcontentloaded", timeout: 60000}).catch(() => {});
                             await recoverSslOrSlowPage(page, write, identifierEntryUrl(page), 2);
-                            await waitIdentifierUiReady(page, write, 45000);
+                            await waitIdentifierUiReady(page, write, 12000);
                             continue;
                         }
                         try {
@@ -643,7 +639,7 @@ export async function googleLogin(page, emailOrOpts, password = "", totpSecret =
                             mkdirSync(dir, {recursive: true});
                             await page.screenshot({path: path.join(dir, `id_stuck_${Date.now()}.png`), fullPage: true});
                         } catch { /* ignore */ }
-                        return false;
+                        throw new Error("代理中断 邮箱页卡住换不出去，换 session 重开窗");
                     }
                     emailNextClicks += 1;
                     let how = "";
@@ -713,7 +709,7 @@ export async function googleLogin(page, emailOrOpts, password = "", totpSecret =
                         continue;
                     }
                     write("  登录页一直空白，当代理/页面挂死");
-                    return false;
+                    throw new Error("代理中断 登录页一直空白，换 session 重开窗");
                 }
                 await waitIdentifierUiReady(page, write, 20000);
                 continue;
@@ -1432,14 +1428,24 @@ export async function googleReauthPassword(page, passwordOrOpts, totpSecret = ""
         const reauthBox = await findLoginPasswordBox(page);
         if (reauthBox) {
             await typeGoogleInput(reauthBox, pwd, {selectAll: true});
-            await page.waitForTimeout(600);
+            await page.waitForTimeout(400);
             if (!String(await reauthBox.inputValue().catch(() => ""))) {
                 write("  二次验证密码框是空的，不点 Next");
+                await page.waitForTimeout(600);
                 continue;
             }
-            await reauthBox.press("Enter").catch(() => {});
-            write("  密码二次验证（回车）");
-            await page.waitForTimeout(2500);
+            let how = "";
+            if (await clickHostNext(page, "#passwordNext")) how = "host";
+            else {
+                const named = page.getByRole("button", {name: /^(next|continue|下一步|继续)$/i}).first();
+                if (await tryClick(named, 2000)) how = "role";
+            }
+            if (!how) {
+                await reauthBox.press("Enter").catch(() => {});
+                how = "enter";
+            }
+            write(`  密码二次验证（${how === "enter" ? "回车" : "Next"}）`);
+            await page.waitForTimeout(1800);
             continue;
         }
         const pwdCount = await page.locator('input[type="password"]:visible, input[name="Passwd"]:visible').count().catch(() => 0);
@@ -1457,7 +1463,23 @@ export async function googleReauthPassword(page, passwordOrOpts, totpSecret = ""
             }
         }
 
+        if (isVerifyItsYouText(body) || /accounts\.google\.com\/(signin|challenge|v3)/i.test(String(url))) {
+            if (!await totpFieldVisible(page) && !await findLoginPasswordBox(page)) {
+                const onlyNext = page.getByRole("button", {name: /^(next|continue|下一步|继续)$/i}).first();
+                if (await onlyNext.isVisible({timeout: 400}).catch(() => false)) {
+                    await onlyNext.click().catch(() => onlyNext.click({force: true}));
+                    write("  二次验证先点 Next（sign in again）");
+                    await page.waitForTimeout(1500);
+                    continue;
+                }
+            }
+        }
+
         if (!isVerifyItsYouText(body) && !/accounts\.google\.com\/(signin|challenge|v3)/i.test(String(url))) break;
+        if (await googleSslDead(page)) {
+            write("  二次验证页 SSL 死了");
+            throw new Error("代理中断 二次验证 SSL，换 session 重开窗");
+        }
         await page.waitForTimeout(1500);
     }
 
