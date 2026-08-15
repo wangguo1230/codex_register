@@ -820,6 +820,11 @@ export async function setMailboxPassword(id, password, pwStatus?) {
     await refreshMailboxGoogleState(id).catch(() => {});
 }
 
+export async function setMailboxPwStatus(id, pwStatus) {
+    await query(`UPDATE mailboxes SET pw_status=$1 WHERE id=$2`, [String(pwStatus || ""), id]);
+    await refreshMailboxGoogleState(id).catch(() => {});
+}
+
 export async function setMailboxTotp(id, totpSecret) {
     await query(`UPDATE mailboxes SET totp_secret=$1 WHERE id=$2`, [totpSecret || "", id]);
     await refreshMailboxGoogleState(id).catch(() => {});

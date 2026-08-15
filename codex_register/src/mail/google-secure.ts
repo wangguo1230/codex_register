@@ -223,6 +223,7 @@ export async function hardenGoogleAccountOnPage(page, cred, log = () => {}, onCh
         sessionsSignedOut: 0,
         devicesDone: false,
         passwordChanged: false,
+        totpRotated: false,
         imapPassword: "",
         missing: [],
         errors: [],
@@ -249,12 +250,12 @@ export async function hardenGoogleAccountOnPage(page, cred, log = () => {}, onCh
     const stopNow = () => isMailboxJobStopped();
     const finalize = () => {
         const missing = [];
-        if (!out.totpSecret && !cred.totpSecret) missing.push("2FA");
+        if (!(out.totpRotated || skip.totp)) missing.push("2FA");
         if (!out.passwordChanged) missing.push("改密");
         if (!out.recoveryCleared && hadRecovery) missing.push("辅助邮箱");
         if (!out.imapPassword) missing.push("IMAP");
         out.missing = missing;
-        out.ok = !missing.includes("改密") && !missing.includes("IMAP");
+        out.ok = !missing.includes("改密") && !missing.includes("IMAP") && !missing.includes("2FA");
         return out;
     };
     const stopAndKeep = () => {
@@ -283,6 +284,8 @@ export async function hardenGoogleAccountOnPage(page, cred, log = () => {}, onCh
 
     if (skip.totp) {
         log("[邮箱管理 1/5] 换 2FA 已做过，跳过");
+        out.totpRotated = true;
+        out.totpSecret = cred.totpSecret || out.totpSecret;
     } else {
         log("[邮箱管理 1/5] 更换 Google 2FA");
         if (stopNow()) return stopAndKeep();
@@ -308,8 +311,7 @@ export async function hardenGoogleAccountOnPage(page, cred, log = () => {}, onCh
     if (pageGone()) {
         noteErr("窗口被关", "窗口被关");
         log("[邮箱管理] 窗口已关，后续步骤不再跑");
-        out.ok = false;
-        return out;
+        return finalize();
     }
 
     if (skip.password) {
@@ -344,7 +346,7 @@ export async function hardenGoogleAccountOnPage(page, cred, log = () => {}, onCh
     if (pageGone()) {
         noteErr("窗口被关", "窗口被关");
         log("[邮箱管理] 窗口已关，后续步骤不再跑");
-        return out;
+        return finalize();
     }
 
     if (stopNow()) return stopAndKeep();

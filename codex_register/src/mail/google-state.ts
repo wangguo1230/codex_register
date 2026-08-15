@@ -9,7 +9,7 @@ import {looksLikeTotpSecret} from "../mfa.js";
  *   login_ok  能进 Google，整备还没做完
  *   login_fail 登不上（错密/验证码/插页）
  *   partial   整备做了一部分（2FA/改密/IMAP/辅助邮箱有缺口）
- *   ready     IMAP 通，可以取件注册
+ *   ready     IMAP 通且 2FA 已换成我们的，可以取件注册
  *   gpt_ok    GPT 已注册
  *   blocked   自动化过不去，要换策略或人工
  */
@@ -61,8 +61,8 @@ function pickStage(s) {
     if (s.gpt === "ok") return "gpt_ok";
     if (s.login === "fail") return s.login_error || s.last_error ? "blocked" : "login_fail";
     if (s.stage === "blocked") return "blocked";
-    if (s.imap === "ok") return "ready";
-    if (s.login === "ok" && (s.password === "ok" || s.recovery === "ok" || s.phone === "ok")) return "partial";
+    if (s.imap === "ok" && s.totp_rotated) return "ready";
+    if (s.login === "ok" && (s.password === "ok" || s.recovery === "ok" || s.phone === "ok" || s.imap === "ok" || s.totp_rotated)) return "partial";
     if (s.login === "ok") return "login_ok";
     return "imported";
 }
@@ -131,6 +131,8 @@ export function googleStateSummary(state) {
     if (s.login === "fail") bits.push(GOOGLE_LOGIN_ERROR_LABEL[s.login_error] || s.login_error || "登不上");
     if (s.imap === "ok") bits.push("IMAP");
     else if (s.imap === "none") bits.push("无IMAP");
+    if (s.totp_rotated) bits.push("2FA已换");
+    else if (s.totp === "ok") bits.push("2FA未换");
     if (s.recovery === "fail") bits.push("有辅助邮箱");
     else if (s.recovery === "ok") bits.push("辅助已清");
     if (s.gpt === "ok") bits.push("GPT");
@@ -150,7 +152,10 @@ export function googleChecklist(state) {
         {key: "login", label: "登录", ...mark(s.login, "能进", GOOGLE_LOGIN_ERROR_LABEL[s.login_error] || "失败", "未验证")},
         {key: "phone", label: "恢复手机", ...mark(s.phone, "没有/已删", "还在", "未查")},
         {key: "recovery", label: "辅助邮箱", ...mark(s.recovery, "没有/已删", "还在", "未查")},
-        {key: "totp", label: "Google 2FA", ...mark(s.totp, "有密钥", "失败", "没有")},
+        {key: "totp", label: "Google 2FA", ...(s.totp_rotated
+            ? {ok: true, text: "已换成我们的"}
+            : s.totp === "ok" ? {ok: false, text: "还是卖家的"}
+            : mark(s.totp, "有密钥", "失败", "没有"))},
         {key: "password", label: "密码", ...mark(s.password, "已换成我们的", "未换", "仍是卖家的")},
         {key: "devices", label: "其它设备", ...mark(s.devices, "已登出", "未登出", "跳过/未知")},
         {key: "imap", label: "IMAP 取件", ...mark(s.imap, "应用专用密码已开", "开通失败", "未开")},

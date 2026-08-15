@@ -342,7 +342,11 @@ async function changeGoogleTotpWithPool(mb, log) {
 }
 
 async function applyGoogleHardenResult(id, mb, r) {
-    if (r.passwordChanged && r.password) await db.setMailboxPassword(id, r.password, r.ok ? `✅整备 ${pwStamp()}` : `⚠整备部分 ${pwStamp()}`);
+    if (r.passwordChanged && r.password) {
+        await db.setMailboxPassword(id, r.password, r.ok ? `✅整备 ${pwStamp()}` : `⚠整备部分 ${pwStamp()}`);
+    } else if (r.ok) {
+        await db.setMailboxPwStatus(id, `✅整备 ${pwStamp()}`);
+    }
     if (r.totpSecret) await db.setMailboxTotp(id, r.totpSecret);
     await db.applyMailboxUpdate(mb.email, {
         imap_password: r.imapPassword || undefined,
@@ -372,6 +376,7 @@ async function runOneGoogleHarden(id, opts = {}) {
         logMailbox(id, "[整备] 缺口已齐，不再开窗");
         return {
             ok: true, skipped: true, password: mb.password, totpSecret: mb.totp_secret,
+            totpRotated: true,
             imapPassword: mb.imap_password, recoveryCleared: true, passwordChanged: true, devicesDone: true,
         };
     }
