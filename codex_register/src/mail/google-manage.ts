@@ -841,46 +841,51 @@ export async function change2faOnPage(page, {
     await dismissAccountFlyout(page);
 
     let setup = "";
-    for (let tryChange = 0; tryChange < 6 && !setup; tryChange++) {
+    let clickedChange = false;
+    for (let tryChange = 0; tryChange < 8 && !["qr", "secret"].includes(setup); tryChange++) {
         if (await isAccountPickerDialog(page)) await dismissAccountFlyout(page);
         if (await findChangeTotpDialog(page)) {
-            setup = "reauth";
-        } else {
+            const filled = await fillChangeAuthenticatorCode(page, totpSecret, log);
+            if (filled === "wrong" || filled === "pending") {
+                log("[2FA] 等下一窗换新码再填");
+                await waitNextTotpWindow();
+                continue;
+            }
+            if (filled !== "ok") {
+                log("[2FA] 更换前验证码没填上");
+                continue;
+            }
+            setup = await waitAuthenticatorSetup(page, 10000);
+            continue;
+        }
+        const confirmOpen = await page.evaluate(() => {
+            const t = [...document.querySelectorAll('[role="dialog"], [role="alertdialog"]')]
+                .filter((el) => el.getClientRects().length)
+                .map((el) => el.innerText || "")
+                .join("\n");
+            return /won.t be able to use your old|old authenticator|无法再使用/i.test(t);
+        }).catch(() => false);
+        if (confirmOpen) {
+            const hit = await clickDialogNext(page, log);
+            log(hit ? "[2FA] 确认框已点 Next，等填码/QR" : "[2FA] 确认框 Next 没点到");
+            setup = await waitAuthenticatorSetup(page, 12000);
+            continue;
+        }
+        if (["qr", "secret"].includes(setup)) break;
+        if (!clickedChange || tryChange >= 2) {
             let clickedAction = await clickAuthenticatorChangeByDom(page, log);
             if (!clickedAction) {
-                const pill = page.getByText(/^change authenticator app$/i).or(page.getByText(/change authenticator app/i)).first();
-                if (await pill.isVisible({timeout: 700}).catch(() => false)) {
-                    await pill.scrollIntoViewIfNeeded().catch(() => {});
+                const pill = page.getByRole("button", {name: /change authenticator app/i}).first();
+                if (await pill.isVisible({timeout: 600}).catch(() => false)) {
                     await pill.click().catch(() => pill.click({force: true}));
                     clickedAction = true;
                     log("[2FA] 点了 Change authenticator app 文案");
                 }
             }
             if (!clickedAction) break;
-            setup = await waitAuthenticatorSetup(page, 7000);
-            if (!setup && await findChangeTotpDialog(page)) setup = "reauth";
-        }
-        if (setup === "reauth") {
-            const filled = await fillChangeAuthenticatorCode(page, totpSecret, log);
-            if (filled === "wrong" || filled === "pending") {
-                log("[2FA] 等下一窗换新码再填");
-                await waitNextTotpWindow();
-                setup = "";
-                continue;
-            }
-            if (filled !== "ok") {
-                log("[2FA] 更换前验证码没填上");
-                setup = "";
-                continue;
-            }
-            setup = await waitAuthenticatorSetup(page, 9000);
-        }
-        if (setup === "confirm") {
-            await clickDialogNext(page, log);
+            clickedChange = true;
             setup = await waitAuthenticatorSetup(page, 8000);
         }
-        if (!setup || setup === "confirm" || setup === "reauth") log("[2FA] 点了更改但仍在总览，再点一次");
-        if (setup === "confirm" || setup === "reauth") setup = "";
     }
 
     if (!setup && await findChangeTotpDialog(page)) {
@@ -895,8 +900,9 @@ export async function change2faOnPage(page, {
     if (!setup) setup = await waitAuthenticatorSetup(page, 6000);
 
     let cantClicked = setup === "secret";
-    if (!cantClicked && setup === "dialog") {
-        if (await clickCantScanByDom(page, log)) cantClicked = true;
+    const canSeeCantScan = await page.getByText(/can.?t scan|cannot scan|无法扫描/i).first().isVisible({timeout: 500}).catch(() => false);
+    if (!cantClicked && (setup === "qr" || setup === "dialog" || canSeeCantScan)) {
+        if (canSeeCantScan && await clickCantScanByDom(page, log)) cantClicked = true;
     }
     if (!cantClicked) {
         const qrNearby = await page.evaluate(() => {
