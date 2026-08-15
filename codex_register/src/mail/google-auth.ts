@@ -98,6 +98,7 @@ const PASSWORD_BOX_SEL = [
     '#password input',
     'input[type="password"]',
     'input[aria-label*="password" i]',
+    'input[placeholder*="password" i]',
     'input[aria-label*="contrase" i]',
     'input[aria-label*="senha" i]',
     'input[aria-label*="sandi" i]',
@@ -1379,6 +1380,23 @@ export async function submitGoogleTotp(page, secret, write = () => {}, attempt =
     return "ok";
 }
 
+async function waitLeftPasswordReauth(page, ms = 10000) {
+    const t0 = Date.now();
+    const startUrl = String(page.url() || "");
+    while (Date.now() - t0 < ms) {
+        if (await totpFieldVisible(page)) return "totp";
+        const text = String(await page.innerText("body").catch(() => ""));
+        if (/wrong password|incorrect password|couldn.?t sign you in|密码错误/i.test(text)) return "wrong";
+        const url = String(page.url() || "");
+        const stillPwd = /enter your password|to continue, first verify/i.test(text)
+            || /challenge\/pwd|signin\/challenge\/pwd/i.test(url);
+        if (!stillPwd && (url !== startUrl || !isVerifyItsYouText(text))) return "left";
+        if (await googleSslDead(page)) throw new Error("代理中断 二次验证 SSL，换 session 重开窗");
+        await page.waitForTimeout(400);
+    }
+    return "";
+}
+
 async function waitLeftSignInAgain(page, ms = 12000) {
     const t0 = Date.now();
     while (Date.now() - t0 < ms) {
@@ -1403,6 +1421,7 @@ export async function googleReauthPassword(page, passwordOrOpts, totpSecret = ""
     const write = typeof opts.log === "function" ? opts.log : console.log;
     let totpWrong = 0;
     let signInAgainClicks = 0;
+    let reauthPwdTries = 0;
 
     for (let i = 0; i < 8; i++) {
         const url = page.url();
@@ -1452,8 +1471,15 @@ export async function googleReauthPassword(page, passwordOrOpts, totpSecret = ""
         }
 
         // 密码（排除修改密码页 2 个框；只填看得见的大框）
-        const reauthBox = await findLoginPasswordBox(page);
-        if (reauthBox) {
+        await primePasswordField(page);
+        const phBox = page.getByPlaceholder(/enter (your )?password|ingresa (tu )?contrase|digite (sua )?senha|输入密码/i).first();
+        const labeled = page.getByLabel(/enter (your )?password|^password$|contrase|senha|密码/i).first();
+        const reauthBox = (await phBox.isVisible({timeout: 300}).catch(() => false) ? phBox : null)
+            || (await labeled.isVisible({timeout: 200}).catch(() => false) ? labeled : null)
+            || await findLoginPasswordBox(page);
+        const boxOk = reauthBox && await reauthBox.isVisible({timeout: 400}).catch(() => false);
+        if (boxOk) {
+            await reauthBox.click({timeout: 1500}).catch(() => reauthBox.click({force: true}));
             await typeGoogleInput(reauthBox, pwd, {selectAll: true});
             await page.waitForTimeout(400);
             if (!String(await reauthBox.inputValue().catch(() => ""))) {
@@ -1461,6 +1487,12 @@ export async function googleReauthPassword(page, passwordOrOpts, totpSecret = ""
                 await page.waitForTimeout(600);
                 continue;
             }
+            reauthPwdTries += 1;
+            if (reauthPwdTries > 3) {
+                write("  二次验证密码已试 3 次仍在验证页");
+                return false;
+            }
+            write(`  二次验证已填密码 len=${pwd.length}，再点 Next`);
             let how = "";
             if (await clickHostNext(page, "#passwordNext")) how = "host";
             else {
@@ -1471,8 +1503,11 @@ export async function googleReauthPassword(page, passwordOrOpts, totpSecret = ""
                 await reauthBox.press("Enter").catch(() => {});
                 how = "enter";
             }
-            write(`  密码二次验证（${how === "enter" ? "回车" : "Next"}）`);
-            await page.waitForTimeout(1800);
+            write(`  密码二次验证（${how === "enter" ? "回车" : "Next"}），等离开验证页`);
+            const left = await waitLeftPasswordReauth(page, 10000);
+            if (left === "wrong") write("  二次验证密码被拒");
+            else if (left) write(`  密码二次验证已过 → ${left}`);
+            else write("  点 Next 后仍停在验证密码页");
             continue;
         }
         const pwdCount = await page.locator('input[type="password"]:visible, input[name="Passwd"]:visible').count().catch(() => 0);

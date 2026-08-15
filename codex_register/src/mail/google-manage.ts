@@ -1043,6 +1043,13 @@ export async function change2faOnPage(page, {
     }
 
     if (!foundAuth) {
+        const leftover = String(await page.innerText("body").catch(() => ""));
+        if (isVerifyItsYouText(leftover) || /enter your password|to continue, first verify/i.test(leftover)
+            || /accounts\.google\.com\/(v3\/)?signin|challenge\/(totp|pwd)/i.test(page.url())) {
+            log("[2FA] 二次验证没过，还在密码/验证码页，不是没有 Authenticator");
+            await dumpPage(page, "2fa_still_verify", log, email);
+            return {ok: false, error: "二次验证未过"};
+        }
         log("[2FA] 未找到 Authenticator 入口");
         await dumpPage(page, "2fa_no_auth_entry", log, email);
         return {ok: false, error: "未找到 Authenticator 入口"};
