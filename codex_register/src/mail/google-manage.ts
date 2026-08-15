@@ -601,6 +601,13 @@ async function clickDialogNext(page, log) {
 /** 不看文案：先关账号浮层，再点卡片里垃圾桶旁边那条业务链接。不要点当前页自己的 /authenticator。 */
 async function clickAuthenticatorChangeByDom(page, log) {
     await dismissAccountFlyout(page);
+    const namedBtn = page.getByRole("button", {name: /change authenticator|set up authenticator|更改身份验证|设置身份验证/i}).first();
+    if (await namedBtn.isVisible({timeout: 500}).catch(() => false)) {
+        await namedBtn.scrollIntoViewIfNeeded().catch(() => {});
+        await namedBtn.click({force: true}).catch(() => namedBtn.click());
+        log("[2FA] 点了 Change authenticator app 按钮");
+        return true;
+    }
     const named = page.getByRole("link", {name: /change authenticator|set up authenticator|更改身份验证|设置身份验证/i}).first();
     if (await named.isVisible({timeout: 500}).catch(() => false)) {
         await named.scrollIntoViewIfNeeded().catch(() => {});
@@ -624,10 +631,11 @@ async function clickAuthenticatorChangeByDom(page, log) {
         document.querySelectorAll("[data-cm-2fa]").forEach((el) => el.removeAttribute("data-cm-2fa"));
         for (const card of document.querySelectorAll("article, li, [role='listitem'], [role='region'], section, div")) {
             if ((card.innerText || "").length > 2200) continue;
-            const links = [...card.querySelectorAll("a, [role='link']")].filter((el) => vis(el) && !bad.test(el.href || el.getAttribute("href") || ""));
+            const links = [...card.querySelectorAll("a, [role='link'], button, [role='button']")].filter((el) => vis(el) && !bad.test(el.href || el.getAttribute("href") || ""));
             const trash = [...card.querySelectorAll("button, [role='button']")].filter((el) => vis(el) && isTrash(el));
             if (!trash.length || !links.length) continue;
-            const action = links.find((el) => !isTrash(el));
+            const action = links.find((el) => !isTrash(el) && /change|set up|更改|设置|authenticator/i.test(`${el.textContent || ""} ${el.getAttribute("aria-label") || ""}`))
+                || links.find((el) => !isTrash(el));
             if (!action) continue;
             action.setAttribute("data-cm-2fa", "1");
             return action.textContent.trim().slice(0, 50) || action.getAttribute("href") || "ok";
