@@ -10,7 +10,7 @@ import {sweepStaleBitWindows} from "../src/bitbrowser.ts";
 import {withGoogleBitSession} from "../src/mail/google-secure.ts";
 import {ensureGoogleLoggedIn} from "../src/mail/google-auth.ts";
 import {change2faOnPage} from "../src/mail/google-manage.ts";
-import {pickLiveMailProxy} from "../src/mail/proxy-pool.ts";
+import {pickLiveMailProxy, setMailProxyJump} from "../src/mail/proxy-pool.ts";
 
 function looksLikeAccountHome(url, body) {
     const u = String(url || "");
@@ -50,6 +50,7 @@ const poolLines = await (async () => {
     try {
         const {readFileSync} = await import("node:fs");
         const s = JSON.parse(readFileSync(new URL("../data/settings.json", import.meta.url), "utf8"));
+        if (s.mailProxyJump) setMailProxyJump(String(s.mailProxyJump));
         return Array.isArray(s.mailProxyPool) ? s.mailProxyPool.filter(Boolean) : [];
     } catch {
         return [];
