@@ -396,6 +396,14 @@ export async function changePasswordOnPage(page, {
         return false;
     };
     let text = await page.innerText("body");
+    if (await googleSslDead(page) || /ERR_SSL|can.t provide a secure connection|chrome-error|invalid response/i.test(text)) {
+        log("[密码] 提交后 SSL 断了，先恢复再确认是否改成功");
+        const recovered = await recoverSslOrSlowPage(page, log, PASSWORD_URL, 3);
+        text = String(await page.innerText("body").catch(() => ""));
+        if (!recovered && (await googleSslDead(page) || /ERR_SSL|chrome-error/i.test(text))) {
+            throw new Error("代理中断 改密提交后 SSL，换 session 重开窗");
+        }
+    }
     let verified = looksChanged(text);
     if (!verified) {
         await page.waitForTimeout(4000);
