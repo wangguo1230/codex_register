@@ -40,7 +40,7 @@ export const GOOGLE_LOGIN_ERROR_LABEL = {
     disabled: "账号已停用",
 };
 
-const HARDEN_IP_RE = /代理中断|换 session|signin\/rejected|拒绝页|SSL\/代理|ERR_PROXY|ERR_SSL|ERR_CONNECTION|ERR_TUNNEL|邮箱页卡住|应用专用密码生成被拒/i;
+const HARDEN_IP_RE = /代理中断|换 session|signin\/rejected|拒绝页|SSL\/代理|ERR_PROXY|ERR_SSL|ERR_CONNECTION|ERR_TUNNEL|邮箱页卡住/i;
 const HARDEN_LOGIN_DEAD_RE = /登录失败|Wrong password|密码错误|Senha incorreta|找不到您的 Google|Couldn't find your Google|帐号已被停用|账号已停用|account has been disabled|尝试次数过多|Too many failed|This account cannot be accessed|账号已停用/i;
 
 export function isHardenIpError(msg = "") {

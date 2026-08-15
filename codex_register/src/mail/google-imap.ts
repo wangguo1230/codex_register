@@ -183,7 +183,7 @@ export async function createGmailAppPassword(page, {
                 genErrs += 1;
                 if (genErrs >= 2) {
                     await dumpAppPwFail(page);
-                    throw new Error("代理中断 应用专用密码生成被拒，换 session 重开窗");
+                    throw new Error("Google 拒绝生成应用密码");
                 }
                 log(`[取件] Google 拒绝生成应用密码，换个名字再试 ${genErrs}/2`);
                 await page.waitForTimeout(8000);
@@ -226,7 +226,7 @@ export async function createGmailAppPassword(page, {
     if (!secret) {
         await dumpAppPwFail(page);
         throw new Error(genErrs
-            ? "代理中断 应用专用密码生成被拒，换 session 重开窗"
+            ? "Google 拒绝生成应用密码"
             : "未能提取应用专用密码(未点到创建或页面无 4 组密码)");
     }
     log(`[取件] 应用专用密码已生成: ${secret.slice(0, 4)}****`);

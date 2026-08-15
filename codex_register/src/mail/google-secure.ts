@@ -239,9 +239,7 @@ export async function hardenGoogleAccountOnPage(page, cred, log = () => {}, onCh
     const closed = (e) => /has been closed|Target page|Target closed|Browser has been closed/i.test(String(e || ""));
     const noteErr = (e, fallback) => {
         const s = String(e || fallback || "失败");
-        if (!closed(s) && /代理中断|ERR_PROXY|代理不通|换 session|ERR_TUNNEL|ERR_CONNECTION|ERR_SSL|SSL\/代理/i.test(s)) {
-            throw new Error(s.includes("换 session") ? s : `${s}，换 session 重开窗`);
-        }
+        // 已经登录进去了，单步失败只记缺口，禁止再抛「换 session」把窗关掉。
         out.errors.push(closed(s) ? "窗口被关" : s.split("\n")[0].slice(0, 160));
     };
     const pageGone = () => {

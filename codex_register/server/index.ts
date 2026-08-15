@@ -4570,6 +4570,7 @@ process.on("exit", dropHttpPid);
 const httpServer = app.listen(PORT, "0.0.0.0", () => {
     httpReady = true;
     console.log(`[server] http://localhost:${PORT}  instance=${db.instanceId}  (前端 ${existsSync(WEB_DIST) ? "已托管" : "未构建, 用 vite dev"})`);
+    clearMailboxJobStop();
     db.setMailClaimPaused(false).catch(() => {});
     db.drainPendingPwQueueToMailJobs().then((n) => {
         if (n) console.log(`[mail-jobs] 已把 ${n} 条旧 pw_queue 迁入 mail_jobs`);
