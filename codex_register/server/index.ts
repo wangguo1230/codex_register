@@ -15,6 +15,15 @@ process.on("uncaughtException", (err) => {
     console.error(err);
     process.exit(1);
 });
+// spawnWorker 等异步链路若漏 catch，不要默默拖垮进程（前端会表现为点开始 500 / 连不上）
+process.on("unhandledRejection", (reason) => {
+    const msg = String((reason as any)?.message || reason || "");
+    if (isImapTlsCrash(reason)) {
+        console.warn("[imap] TLS unhandledRejection 已忽略:", msg.slice(0, 160));
+        return;
+    }
+    console.error("[unhandledRejection]", msg.slice(0, 400));
+});
 import cors from "cors";
 import {existsSync, readFileSync, writeFileSync, unlinkSync, mkdtempSync, rmSync} from "node:fs";
 import os from "node:os";
@@ -1733,13 +1742,59 @@ app.delete("/api/accounts/:id", async (req, res) => {
     res.json({ok: true});
 });
 
+/** state() 序列化失败时给前端最小可用回包，避免点「开始」直接 500 */
+function controlStatePayload() {
+    try {
+        return {ok: true, ...scheduler.state()};
+    } catch (e: any) {
+        console.warn("[control] state() 失败，回退精简包:", e?.message || e);
+        return {
+            ok: true,
+            instanceId: db.instanceId,
+            paused: scheduler.paused,
+            pausedClaude: scheduler.pausedClaude,
+            concurrency: scheduler.concurrency,
+            regEngine: scheduler.regEngine,
+            bitBrowser: scheduler.bitBrowser,
+            running: [...scheduler.running.values()].filter((i) => i.domain === "gpt").map((i) => i.id),
+            runningClaude: [...scheduler.running.values()].filter((i) => i.domain === "claude").map((i) => i.id),
+        };
+    }
+}
 app.post("/api/control/start", (req, res) => {
-    if (req.body?.concurrency) scheduler.setConcurrency(req.body.concurrency);
-    scheduler.start();
-    res.json({ok: true, ...scheduler.state()});
+    try {
+        // 只改并发，不在这里 tick（避免仍 paused 时先 tick 一遍 + 与 start 抢 ticking）
+        const c = req.body?.concurrency;
+        if (c != null && c !== "") {
+            scheduler.concurrency = Math.max(1, Math.min(16, Number(c) || 1));
+            try { scheduler.saveSettings(); } catch (e: any) {
+                console.warn("[control/start] saveSettings:", e?.message || e);
+            }
+        }
+        scheduler.paused = false;
+        void Promise.resolve(scheduler.tick()).catch((e) => console.error("[control/start] tick:", e?.message || e));
+        res.json(controlStatePayload());
+    } catch (e: any) {
+        console.error("[control/start]", e);
+        res.status(500).json({error: String(e?.message || e || "start failed")});
+    }
 });
-app.post("/api/control/pause", (req, res) => { scheduler.pause(); res.json({ok: true, ...scheduler.state()}); });
-app.post("/api/control/stop", (req, res) => { scheduler.stopAll(); res.json({ok: true, ...scheduler.state()}); });
+app.post("/api/control/pause", (req, res) => {
+    try {
+        scheduler.pause();
+        res.json(controlStatePayload());
+    } catch (e: any) {
+        res.status(500).json({error: String(e?.message || e)});
+    }
+});
+app.post("/api/control/stop", (req, res) => {
+    try {
+        scheduler.stopAll();
+        res.json(controlStatePayload());
+    } catch (e: any) {
+        res.status(500).json({error: String(e?.message || e)});
+    }
+});
 app.post("/api/control/concurrency", (req, res) => res.json({ok: true, concurrency: scheduler.setConcurrency(req.body?.concurrency)}));
 app.post("/api/control/otp", (req, res) => { scheduler.otpSingle = !!req.body?.single; scheduler.saveSettings(); res.json({ok: true, otpSingle: scheduler.otpSingle}); });
 app.post("/api/control/mail-separator", (req, res) => { const s = String(req.body?.separator || "").trim(); if (!s) return res.status(400).json({error: "分隔符不能为空"}); scheduler.mailSeparator = s; scheduler.saveSettings(); res.json({ok: true, mailSeparator: scheduler.mailSeparator}); });

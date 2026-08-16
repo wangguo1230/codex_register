@@ -448,10 +448,16 @@ class Scheduler extends EventEmitter {
     }
 
     // ---- 域级控制(GPT/Claude 各自暂停/停止,共用同一进程池) ----
-    start() { this.paused = false; this.tick(); }
+    start() {
+        this.paused = false;
+        void Promise.resolve(this.tick()).catch((e) => console.error("[scheduler.start] tick:", e?.message || e));
+    }
     pause() { this.paused = true; }
     stopAll() { this.paused = true; this.killDomain("gpt"); }
-    startClaude() { this.pausedClaude = false; this.tick(); }
+    startClaude() {
+        this.pausedClaude = false;
+        void Promise.resolve(this.tick()).catch((e) => console.error("[scheduler.startClaude] tick:", e?.message || e));
+    }
     pauseClaude() { this.pausedClaude = true; }
     stopClaude() { this.pausedClaude = true; this.killDomain("claude"); }
     killDomain(domain) {
@@ -499,7 +505,17 @@ class Scheduler extends EventEmitter {
             gptProxyPool: this.gptProxyPool || [], gptProxyPoolLines: (this.gptProxyPool || []).map(toProxyImportLine), gptProxyPoolSnap: this.gptProxyPoolSnap(),
             gptProxyJump: this.gptProxyJump || "",
             gptJumpPool: this.gptJumpPool || [], gptJumpPoolSnap: this.jumpPoolSnapshot(),
-            jumpFleet: this.jumpFleet || [], jumpXrays: listJumpXrays(),
+            jumpFleet: this.jumpFleet || [],
+            // 只回纯字段，避免 state 里混进不可 JSON 化的内容导致 res.json 500
+            jumpXrays: (listJumpXrays() || []).map((r) => ({
+                name: r?.name || "",
+                running: !!r?.running,
+                port: Number(r?.port) || 0,
+                node: r?.node || "",
+                vless: r?.vless || "",
+                pid: Number(r?.pid) || 0,
+                error: r?.error || "",
+            })),
             running: [...this.running.values()].filter((i) => i.domain === "gpt").map((i) => i.id),
             runningClaude: [...this.running.values()].filter((i) => i.domain === "claude").map((i) => i.id)};
     }
@@ -508,111 +524,147 @@ class Scheduler extends EventEmitter {
         if (this.ticking) return;
         this.ticking = true;
         try {
-        if (this.paused && this.pausedClaude) return; // 两域都暂停才完全不认领
-        // 浏览器引擎跑真 Chrome(headed，重)，硬上限 4，避免开一堆窗口卡机；用户并发设更小则用更小
-        const effective = this.regEngine === "browser" ? Math.min(this.concurrency, 4) : this.concurrency;
-        while (this.running.size < effective) {
-            // 各域仅在本域未暂停时认领。GPT 优先,再 Claude。邮箱整备不占这池。
-            let acc = null;
-            if (!this.paused) acc = await db.claimNext();
-            if (!acc && !this.pausedClaude) acc = await db.claimNextClaude();
-            if (!acc) break;
-            if ((acc.domain || "gpt") === "gpt") {
-                const snap = this.gptProxyPoolSnap();
-                const busy = [...this.running.values()].filter((i) => i.wantGptPool).length;
-                if (busy >= Math.max(1, snap.slots || 1)) {
-                    await db.releaseGptIfRunning(acc.id);
-                    this.log(acc.id, "GPT 代理池已满（1 代理 = 1 指纹），先退回排队");
-                    break;
+            if (this.paused && this.pausedClaude) return; // 两域都暂停才完全不认领
+            // 浏览器引擎跑真 Chrome(headed，重)，硬上限 4，避免开一堆窗口卡机；用户并发设更小则用更小
+            const effective = this.regEngine === "browser" ? Math.min(this.concurrency, 4) : this.concurrency;
+            while (this.running.size < effective) {
+                // 各域仅在本域未暂停时认领。GPT 优先,再 Claude。邮箱整备不占这池。
+                let acc = null;
+                if (!this.paused) acc = await db.claimNext();
+                if (!acc && !this.pausedClaude) acc = await db.claimNextClaude();
+                if (!acc) break;
+                if ((acc.domain || "gpt") === "gpt") {
+                    const snap = this.gptProxyPoolSnap();
+                    const busy = [...this.running.values()].filter((i) => i.wantGptPool).length;
+                    if (busy >= Math.max(1, snap.slots || 1)) {
+                        await db.releaseGptIfRunning(acc.id);
+                        this.log(acc.id, "GPT 代理池已满（1 代理 = 1 指纹），先退回排队");
+                        break;
+                    }
+                }
+                // 必须 await + catch：否则 spawn 抛错变成 unhandledRejection，进程可能被干掉，前端就看到 500
+                try {
+                    await this.spawnWorker(acc);
+                } catch (e) {
+                    const msg = String(e?.message || e);
+                    console.error("[tick] spawnWorker 异常", acc?.id, acc?.email, msg);
+                    try { await db.releaseGptIfRunning(acc.id); } catch { /* */ }
+                    try { await db.releaseClaudeIfRunning(acc.id); } catch { /* */ }
+                    this.running.delete(`gpt:${acc.id}`);
+                    this.running.delete(`claude:${acc.id}`);
+                    this.running.delete(`${acc.domain || "gpt"}:${acc.id}`);
+                    try { this.log(acc.id, `spawn 异常已回收: ${msg.slice(0, 160)}`); } catch { /* */ }
                 }
             }
-            this.spawnWorker(acc);
+            try { this.emit("stats", await db.stats()); } catch (e) {
+                console.warn("[tick] stats:", e?.message || e);
+            }
+        } catch (e) {
+            console.error("[tick]", e?.message || e);
+        } finally {
+            this.ticking = false;
         }
-        this.emit("stats", await db.stats());
-        } finally { this.ticking = false; }
     }
 
     // running Map 键=复合 runId(`${domain}:${id}`),避免 gpt/claude 各自自增 id 重叠碰撞。
     async spawnWorker(acc) {
         const domain = acc.domain || "gpt";
-        if (domain === "gpt" && !acc.gpt_password) {
-            const touched = !!(acc.auth_file || acc.token || acc.error || acc.started_at);
-            const pw = touched ? String(appConfig.defaultPassword || "").trim() : randomPassword(16);
-            if (pw) {
-                await db.updateAccount(acc.id, {gpt_password: pw});
-                acc.gpt_password = pw;
-            }
-        }
         const runId = `${domain}:${acc.id}`;
-        const tmpFile = path.join(this.tmpDir, `mc-${domain}-${acc.id}.txt`);
-        writeFileSync(tmpFile, [acc.email, acc.password, acc.mailbox_totp || "", acc.recovery_email || "", acc.mailbox_imap || ""].join("----") + "\n", "utf8");
-        const info = {child: null, tmpFile, gotResult: false, engine: null, domain, id: acc.id, mailboxId: acc.mailbox_id, releasing: false, wantGptPool: domain === "gpt", mailLease: null, jumpLease: null};
-        this.running.set(runId, info);
-        if (info.wantGptPool) {
-            try {
-                if (gptJumpPool.urls.length) {
-                    info.jumpLease = await gptJumpPool.lease(acc.email, {timeoutMs: 20_000, maxPerJump: JUMP_MAX_EXITS});
+        let info = null;
+        try {
+            if (domain === "gpt" && !acc.gpt_password) {
+                const touched = !!(acc.auth_file || acc.token || acc.error || acc.started_at);
+                const pw = touched ? String(appConfig.defaultPassword || "").trim() : randomPassword(16);
+                if (pw) {
+                    await db.updateAccount(acc.id, {gpt_password: pw});
+                    acc.gpt_password = pw;
                 }
-                info.mailLease = await gptProxyPool.lease(acc.email, {
-                    fallback: "",
-                    timeoutMs: 20_000,
-                    maxPerTemplate: 1,
-                    freshSession: true,
-                });
-                const jump = info.jumpLease?.url || this.gptProxyJump || "";
-                this.logJob(info, `GPT 代理池租到 ${String(info.mailLease.url || "直连").replace(/:[^:@/]+@/, ":***@")}（一号一代理 · 新 session${jump ? `，经跳板 ${jump} 1跳板≤${JUMP_MAX_EXITS}出口` : "，无跳板直连网关"}）`);
+            }
+            const tmpFile = path.join(this.tmpDir, `mc-${domain}-${acc.id}.txt`);
+            writeFileSync(tmpFile, [acc.email, acc.password, acc.mailbox_totp || "", acc.recovery_email || "", acc.mailbox_imap || ""].join("----") + "\n", "utf8");
+            info = {child: null, tmpFile, gotResult: false, engine: null, domain, id: acc.id, mailboxId: acc.mailbox_id, releasing: false, wantGptPool: domain === "gpt", mailLease: null, jumpLease: null};
+            this.running.set(runId, info);
+            if (info.wantGptPool) {
+                try {
+                    if (gptJumpPool.urls.length) {
+                        info.jumpLease = await gptJumpPool.lease(acc.email, {timeoutMs: 20_000, maxPerJump: JUMP_MAX_EXITS});
+                    }
+                    info.mailLease = await gptProxyPool.lease(acc.email, {
+                        fallback: "",
+                        timeoutMs: 20_000,
+                        maxPerTemplate: 1,
+                        freshSession: true,
+                    });
+                    const jump = info.jumpLease?.url || this.gptProxyJump || "";
+                    this.logJob(info, `GPT 代理池租到 ${String(info.mailLease.url || "直连").replace(/:[^:@/]+@/, ":***@")}（一号一代理 · 新 session${jump ? `，经跳板 ${jump} 1跳板≤${JUMP_MAX_EXITS}出口` : "，无跳板直连网关"}）`);
+                } catch (e) {
+                    try { info.jumpLease?.release(); } catch { /* */ }
+                    this.running.delete(runId);
+                    await db.releaseGptIfRunning(acc.id);
+                    this.log(acc.id, `GPT 代理池租不到: ${e?.message || e}，退回排队`);
+                    return;
+                }
+            }
+
+            // 注册知识收敛在引擎:调度器只管进程/并发/事件(通用)。按账号所属域选引擎。
+            const engine = resolveEngine(domain);
+            let script, env;
+            try {
+                ({script, env} = engine.buildSpawn(acc, this, tmpFile));
             } catch (e) {
+                // 如 Gmail 无 IMAP：启动前直接失败，释放代理与 running 槽
+                try { info.mailLease?.release(); } catch { /* */ }
                 try { info.jumpLease?.release(); } catch { /* */ }
                 this.running.delete(runId);
-                await db.releaseGptIfRunning(acc.id);
-                this.log(acc.id, `GPT 代理池租不到: ${e?.message || e}，退回排队`);
+                const err = String(e?.message || e);
+                this.log(acc.id, `❌ 无法启动注册: ${err}`);
+                if (domain === "gpt") {
+                    await db.markFailed(acc.id, err);
+                    this.emit("status", {id: acc.id, status: "failed"});
+                    try { this.emit("stats", await db.stats()); } catch { /* */ }
+                }
+                try { rmSync(tmpFile, {force: true}); } catch { /* */ }
                 return;
             }
-        }
+            if (info.mailLease) env.PROXY_URL = info.mailLease.url || "";
+            env.MAIL_PROXY_JUMP = info.jumpLease?.url || this.gptProxyJump || env.MAIL_PROXY_JUMP || "";
+            const child = spawn(TSX_BIN, [script], {cwd: CODEX_ROOT, env: {...process.env, ...env}, shell: IS_WIN});
+            info.child = child;
+            info.engine = engine;
+            if (domain === "claude") this.emit("claude", {stats: await db.claudeStats()});
+            else {
+                this.emit("status", {id: acc.id, status: "running"});
+                try { this.emit("stats", await db.stats()); } catch { /* */ }
+            }
+            this.logJob(info, `▶ 启动注册 worker (pid=${child.pid})`);
 
-        // 注册知识收敛在引擎:调度器只管进程/并发/事件(通用)。按账号所属域选引擎。
-        const engine = resolveEngine(domain);
-        let script, env;
-        try {
-            ({script, env} = engine.buildSpawn(acc, this, tmpFile));
+            let buf = "";
+            const onData = (chunk) => {
+                buf += chunk.toString();
+                let idx;
+                const run = async () => {
+                    while ((idx = buf.indexOf("\n")) >= 0) {
+                        const line = buf.slice(0, idx);
+                        buf = buf.slice(idx + 1);
+                        try { await this.handleLine(info, line); }
+                        catch (e) { this.logJob(info, `[handleLine] ${String(e?.message || e).slice(0, 120)}`); }
+                    }
+                };
+                void run();
+            };
+            child.stdout.on("data", onData);
+            child.stderr.on("data", (d) => { const t = d.toString().trim(); if (t) this.logJob(info, `[stderr] ${t}`); });
+            child.on("error", (err) => this.logJob(info, `[spawn error] ${err?.message ?? err}`));
+            child.on("exit", (code) => { void this.onExit(runId, code); });
         } catch (e) {
-            // 如 Gmail 无 IMAP：启动前直接失败，释放代理与 running 槽
-            try { info.mailLease?.release(); } catch { /* */ }
-            try { info.jumpLease?.release(); } catch { /* */ }
+            // 兜底：任何未预期错误都回收 running，避免卡槽 + unhandledRejection 打崩进程
+            try { info?.mailLease?.release(); } catch { /* */ }
+            try { info?.jumpLease?.release(); } catch { /* */ }
             this.running.delete(runId);
-            const err = String(e?.message || e);
-            this.log(acc.id, `❌ 无法启动注册: ${err}`);
-            if (domain === "gpt") {
-                await db.markFailed(acc.id, err);
-                this.emit("status", {id: acc.id, status: "failed"});
-                this.emit("stats", await db.stats());
-            }
-            try { rmSync(tmpFile, {force: true}); } catch { /* */ }
-            return;
+            try { await db.releaseGptIfRunning(acc.id); } catch { /* */ }
+            try { if (info?.tmpFile) rmSync(info.tmpFile, {force: true}); } catch { /* */ }
+            throw e;
         }
-        if (info.mailLease) env.PROXY_URL = info.mailLease.url || "";
-        env.MAIL_PROXY_JUMP = info.jumpLease?.url || this.gptProxyJump || env.MAIL_PROXY_JUMP || "";
-        const child = spawn(TSX_BIN, [script], {cwd: CODEX_ROOT, env: {...process.env, ...env}, shell: IS_WIN});
-        info.child = child;
-        info.engine = engine;
-        if (domain === "claude") this.emit("claude", {stats: await db.claudeStats()});
-        else { this.emit("status", {id: acc.id, status: "running"}); this.emit("stats", await db.stats()); }
-        this.logJob(info, `▶ 启动注册 worker (pid=${child.pid})`);
-
-        let buf = "";
-        const onData = async (chunk) => {
-            buf += chunk.toString();
-            let idx;
-            while ((idx = buf.indexOf("\n")) >= 0) {
-                const line = buf.slice(0, idx);
-                buf = buf.slice(idx + 1);
-                await this.handleLine(info, line);
-            }
-        };
-        child.stdout.on("data", onData);
-        child.stderr.on("data", (d) => { const t = d.toString().trim(); if (t) this.logJob(info, `[stderr] ${t}`); });
-        child.on("error", (err) => this.logJob(info, `[spawn error] ${err?.message ?? err}`));
-        child.on("exit", (code) => this.onExit(runId, code));
     }
 
     // job runner 只做:分帧解析 worker 输出 → result 事件转发给该 job 的引擎解释,普通行落日志。
