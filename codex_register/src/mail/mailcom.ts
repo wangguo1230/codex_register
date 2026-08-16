@@ -15,6 +15,7 @@ import {existsSync, readFileSync} from "node:fs";
 import path from "node:path";
 import {chromium} from "playwright-core";
 import {findLatestVerificationMail} from "./verification-matcher.js";
+import {formatBeijingDateTime} from "../utils.js";
 
 const POOL_FILE = process.env.MAILCOM_TOKENS_FILE
     ? path.resolve(process.env.MAILCOM_TOKENS_FILE)
@@ -1241,7 +1242,7 @@ function mapMailHead(m) {
         from: m.from,
         subject: m.subject,
         timestamp: m.timestamp,
-        date: m.timestamp ? new Date(Number(m.timestamp)).toISOString().replace("T", " ").slice(0, 16) : "",
+        date: m.timestamp ? formatBeijingDateTime(Number(m.timestamp)) : "",
     };
 }
 

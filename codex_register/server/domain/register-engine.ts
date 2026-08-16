@@ -40,6 +40,10 @@ export const GptRegisterEngine = {
         const provider = acc.provider || (/@(gmail|googlemail)\.com$/i.test(acc.email || "") ? "google" : "mailcom");
         const isGoogle = provider === "google";
         const hasImap = isGoogle && !!(acc.mailbox_imap || acc.imap_password || "").trim();
+        // Gmail 注册必须 IMAP 收码：无应用密码直接失败，禁止启动 worker 去网页兜底
+        if (isGoogle && !hasImap) {
+            throw new Error(`Gmail 没有 IMAP 应用密码，不能注册 GPT: ${acc.email || ""}`);
+        }
         // Gmail 老号强制浏览器+比特，HTTP 引擎没有整备/收信能力
         const script = (cfg.regEngine === "browser" || isGoogle) ? "src/worker-register-browser.ts" : "src/worker-register.ts";
         const env = {
@@ -65,12 +69,13 @@ export const GptRegisterEngine = {
             MAILCOM_PROXY: cfg.mailProxy || "",
             BITBROWSER: (cfg.bitBrowser || isGoogle) ? "1" : "", // Gmail 老号强制比特窗口
             REG_GOOGLE_PREP: "0",
-            // 有 IMAP 的 Gmail 只走 IMAP 收码，不再先整备/登 Google
+            // Gmail 只走 IMAP 收码，不再先整备/登 Google 网页收件箱
             REG_GOOGLE_HARDEN: "0",
-            REG_GOOGLE_SSO: hasImap ? "0" : "1",
+            REG_GOOGLE_SSO: "0",
             REG_SKIP_DEVICES: "1",
             REG_GOOGLE_CHANGE_PW: "0",
             REG_GOOGLE_CHANGE_2FA: "0",
+            REG_GMAIL_IMAP_ONLY: isGoogle ? "1" : "0",
         };
         return {script, env};
     },

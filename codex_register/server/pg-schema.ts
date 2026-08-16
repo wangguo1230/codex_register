@@ -224,6 +224,12 @@ export async function ensureSchema() {
         await client.query(`ALTER TABLE recharge_queue ADD COLUMN IF NOT EXISTS rebind_error TEXT DEFAULT ''`);
         await client.query(`ALTER TABLE recharge_queue ADD COLUMN IF NOT EXISTS rebind_target TEXT DEFAULT ''`);
         await client.query(`ALTER TABLE recharge_queue ADD COLUMN IF NOT EXISTS rebind_pool JSONB`);
+        // 交付：未交付=充值作业中；移除→已交付（保留记录与换绑关系，不删号）
+        await client.query(`ALTER TABLE recharge_queue ADD COLUMN IF NOT EXISTS delivery_status TEXT DEFAULT 'undelivered'`);
+        await client.query(`ALTER TABLE recharge_queue ADD COLUMN IF NOT EXISTS delivered_at BIGINT DEFAULT 0`);
+        // 换绑前邮箱（首次换绑写入后保留，便于看 原→新）
+        await client.query(`ALTER TABLE recharge_queue ADD COLUMN IF NOT EXISTS rebind_from TEXT DEFAULT ''`);
+        await client.query(`CREATE INDEX IF NOT EXISTS idx_recharge_queue_delivery ON recharge_queue(delivery_status)`);
 
         // ChatGPT 登录凭证(与邮箱密码分离):每号独立密码 + TOTP
         await client.query(`ALTER TABLE gpt_accounts ADD COLUMN IF NOT EXISTS gpt_password TEXT DEFAULT ''`);

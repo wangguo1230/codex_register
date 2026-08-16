@@ -56,7 +56,12 @@ export async function getEmailAddress(): Promise<string> {
   return provider.getEmailAddress();
 }
 
-export async function getEmailVerificationCode(email: string, options?: {minTimestampMs?: number; excludeCode?: string}): Promise<string> {
+export async function getEmailVerificationCode(email: string, options?: {minTimestampMs?: number; excludeCode?: string; allowWebFallback?: boolean}): Promise<string> {
+  // Gmail 一律走 google provider（IMAP 必填，无应用密码直接报错），避免全局 provider=mailcom 时误登 mail.com
+  if (/@(gmail|googlemail)\.com$/i.test(String(email || ""))) {
+    const {getGoogleEmailVerificationCode} = await import("./mail/google-account.js");
+    return getGoogleEmailVerificationCode(email, options);
+  }
   return provider.getEmailVerificationCode(email, options);
 }
 

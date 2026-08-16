@@ -572,7 +572,24 @@ class Scheduler extends EventEmitter {
 
         // 注册知识收敛在引擎:调度器只管进程/并发/事件(通用)。按账号所属域选引擎。
         const engine = resolveEngine(domain);
-        const {script, env} = engine.buildSpawn(acc, this, tmpFile);
+        let script, env;
+        try {
+            ({script, env} = engine.buildSpawn(acc, this, tmpFile));
+        } catch (e) {
+            // 如 Gmail 无 IMAP：启动前直接失败，释放代理与 running 槽
+            try { info.mailLease?.release(); } catch { /* */ }
+            try { info.jumpLease?.release(); } catch { /* */ }
+            this.running.delete(runId);
+            const err = String(e?.message || e);
+            this.log(acc.id, `❌ 无法启动注册: ${err}`);
+            if (domain === "gpt") {
+                await db.markFailed(acc.id, err);
+                this.emit("status", {id: acc.id, status: "failed"});
+                this.emit("stats", await db.stats());
+            }
+            try { rmSync(tmpFile, {force: true}); } catch { /* */ }
+            return;
+        }
         if (info.mailLease) env.PROXY_URL = info.mailLease.url || "";
         env.MAIL_PROXY_JUMP = info.jumpLease?.url || this.gptProxyJump || env.MAIL_PROXY_JUMP || "";
         const child = spawn(TSX_BIN, [script], {cwd: CODEX_ROOT, env: {...process.env, ...env}, shell: IS_WIN});

@@ -59,13 +59,16 @@ async function main() {
     let cred = null;
     if (isGoogle) {
         try { cred = resolveGoogleCred(email); }
-        catch { cred = {email, password: process.env.REG_PASSWORD || "", totpSecret: "", recoveryEmail: "", imapPassword: ""}; }
-        if (cred.imapPassword) rememberGoogleImapPassword(email, cred.imapPassword);
-        if (!String(cred.imapPassword || "").trim()) {
-            emit({type: "result", status: "failed", email, error: "Gmail 没有 IMAP 应用密码，不能注册 GPT"});
+        catch (e) {
+            emit({type: "result", status: "failed", email, error: `Gmail 凭证池找不到，不能 IMAP 注册: ${String(e?.message || e).slice(0, 100)}`});
             process.exit(1); return;
         }
-        emit({type: "progress", stage: "imap", message: "Gmail 已有 IMAP，跳过邮箱管理，走 IMAP 收码注册"});
+        if (cred.imapPassword) rememberGoogleImapPassword(email, cred.imapPassword);
+        if (!String(cred.imapPassword || "").trim()) {
+            emit({type: "result", status: "failed", email, error: "Gmail 没有 IMAP 应用密码，不能注册 GPT（必须 IMAP 收码）"});
+            process.exit(1); return;
+        }
+        emit({type: "progress", stage: "imap", message: "Gmail 强制 IMAP 收码注册（无网页收件箱兜底）"});
     }
 
     const shouldRotate = async (err) => {

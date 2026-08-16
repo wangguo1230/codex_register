@@ -13,7 +13,7 @@ import {getEmailVerificationCode} from "./mailbox.js";
 import {generateTotpCandidates, isMfaContinueUrl} from "./mfa.js";
 import {chatOnPage} from "./simulate-chat.js";
 import {googleLogin, isOnGoogleLoginPage} from "./mail/google-auth.js";
-import {resolveGoogleCred} from "./mail/google-account.js";
+import {resolveGoogleCred, waitGoogleImapOtp} from "./mail/google-account.js";
 
 const AUTH_URL = "https://chatgpt.com/auth/login";
 
@@ -99,6 +99,116 @@ async function checkDeactivated(page) {
     if (/account_deactivated|账户已被删除或停用|已被删除或停用|deleted or deactivated|account.{0,6}deactivated/i.test(body)) {
         throw new DeactivatedError("账号已停用/删除(account_deactivated)，勿重试");
     }
+}
+
+/** OpenAI 身份验证限流页：请求过多 / rate_limit_exceeded（可冷却后重试，非号废） */
+function isAuthRateLimitText(text = "") {
+    const t = String(text || "").replace(/\s+/g, " ");
+    return /rate_limit_exceeded|请求过多|身份验证错误|too many requests|please try again later/i.test(t)
+        && !/account_deactivated|已被删除或停用/i.test(t);
+}
+
+/** 验证码/登录中途常见：Oops Route Error (400 Invalid content type: text/html) → 点 Try again */
+function isRouteErrorText(text = "") {
+    const t = String(text || "").replace(/\s+/g, " ");
+    return /oops,?\s*an error occurred|route error|invalid content type|text\/html.*charset/i.test(t)
+        && !/account_deactivated|已被删除或停用/i.test(t);
+}
+
+async function isRouteErrorPage(page) {
+    try {
+        const body = await page.innerText("body").catch(() => "");
+        if (isRouteErrorText(body)) return true;
+        // 大标题 / 按钮兜底
+        if (await page.getByRole("heading", {name: /oops,?\s*an error occurred/i}).first().isVisible().catch(() => false)) return true;
+        return false;
+    } catch {
+        return false;
+    }
+}
+
+/**
+ * 点「Try again / 重试」离开 Route Error，尽量回到验证码框。
+ * @returns true 已点过并离开错误页；false 本页不是 Route Error
+ */
+async function recoverRouteError(page, log, {maxTries = 4} = {}) {
+    if (!(await isRouteErrorPage(page))) return false;
+    for (let i = 0; i < maxTries; i++) {
+        log(`OpenAI Route Error（Invalid content type），第 ${i + 1}/${maxTries} 次点 Try again`);
+        const btn = page.getByRole("button", {name: /^\s*(Try again|Retry|重试|再试一次)\s*$/i}).first()
+            .or(page.locator('button:has-text("Try again"), button:has-text("重试")').first());
+        if (await btn.isVisible().catch(() => false)) {
+            await btn.click({timeout: 5000, force: true}).catch(() => {});
+        } else {
+            // 找不到按钮就刷新当前页
+            await page.reload({waitUntil: "domcontentloaded", timeout: 45_000}).catch(() => {});
+        }
+        await page.waitForTimeout(2000 + i * 800);
+        if (!(await isRouteErrorPage(page))) {
+            log("Route Error 已离开，继续验证码流程");
+            return true;
+        }
+    }
+    throw new Error("OpenAI Route Error 多次点 Try again 仍失败");
+}
+
+async function isAuthRateLimitPage(page) {
+    try {
+        const body = await page.innerText("body").catch(() => "");
+        if (isAuthRateLimitText(body)) return true;
+        // 文案被拆开时靠错误码节点兜底
+        const code = await page.locator("text=/rate_limit_exceeded/i").first().isVisible().catch(() => false);
+        return !!code;
+    } catch {
+        return false;
+    }
+}
+
+/**
+ * 撞限流：优先点「重试」；无效则冷却后回 auth/login 重开。
+ * @returns true 表示已恢复（可继续流程）；false 表示本页不是限流
+ * 连续撞满 maxTries 抛错，外层可换 IP/session
+ */
+async function recoverAuthRateLimit(page, log, {maxTries = 5, reopenUrl = AUTH_URL} = {}) {
+    if (!(await isAuthRateLimitPage(page))) return false;
+    for (let i = 0; i < maxTries; i++) {
+        const waitMs = Math.min(90_000, 12_000 * Math.pow(1.6, i) + Math.floor(Math.random() * 3_000));
+        log(`OpenAI 身份验证限流(rate_limit_exceeded)，第 ${i + 1}/${maxTries} 次：先点重试，不行则等 ${Math.round(waitMs / 1000)}s 重开登录页`);
+
+        // 1) 点页面上的「重试 / Try again」
+        const retryBtn = page.getByRole("button", {name: /^\s*(重试|Try again|Retry|再试一次)\s*$/i}).first()
+            .or(page.locator('button:has-text("重试"), button:has-text("Try again")').first());
+        let clicked = false;
+        if (await retryBtn.isVisible().catch(() => false)) {
+            await retryBtn.click({timeout: 5000}).catch(() => {});
+            clicked = true;
+            await page.waitForTimeout(2500);
+            if (!(await isAuthRateLimitPage(page))) {
+                log("点「重试」后已离开限流页");
+                return true;
+            }
+        }
+
+        // 2) 冷却 + 整页重开登录（清掉卡死的 auth 会话）
+        if (!clicked) log("未找到「重试」按钮，直接冷却重开");
+        await page.waitForTimeout(waitMs);
+        try {
+            await page.goto(reopenUrl, {waitUntil: "domcontentloaded", timeout: 60_000});
+        } catch (e) {
+            const msg = String(e?.message || e);
+            if (/ERR_PROXY|PROXY_CONNECTION|ERR_TUNNEL/i.test(msg)) {
+                throw new Error("代理中断 ERR_PROXY_CONNECTION_FAILED，换 session 重开窗");
+            }
+            log(`限流后重开登录失败: ${msg.slice(0, 80)}`);
+        }
+        await page.waitForTimeout(1500);
+        await assertPageUsable(page, log).catch(() => {});
+        if (!(await isAuthRateLimitPage(page))) {
+            log("冷却重开后已离开限流页，继续注册");
+            return true;
+        }
+    }
+    throw new Error("OpenAI 身份验证限流(rate_limit_exceeded)多次重试仍失败，换 IP/session 重跑");
 }
 
 // 找可见输入框(多选择器兜底)
@@ -259,6 +369,18 @@ async function tryGoogleSso(page, email, log) {
 }
 
 export async function registerViaBrowser(email, {password = "", totpSecret = "", proxyUrl = "", headless = false, chatMessage = "", cdpEndpoint = "", preferGoogleSso = false, log = () => {}} = {}) {
+    // Gmail GPT 注册：必须有 IMAP 应用密码，收码只走 IMAP，没有就立刻失败
+    const isGoogleMail = /@(gmail|googlemail)\.com$/i.test(String(email || ""));
+    if (isGoogleMail) {
+        let gCred = null;
+        try { gCred = resolveGoogleCred(email); } catch (e) {
+            throw new Error(`Gmail 凭证池找不到 ${email}，无法 IMAP 收码: ${String(e?.message || e).slice(0, 80)}`);
+        }
+        if (!String(gCred?.imapPassword || "").trim()) {
+            throw new Error(`Gmail 没有 IMAP 应用密码，不能注册 GPT: ${email}`);
+        }
+        log(`Gmail 将用 IMAP 收码注册（已有应用密码）`);
+    }
     let browser, ctx;
     // 信号清理:worker 被 kill 时确保 Chrome 进程不泄漏(同步 kill Chrome 进程,不走 async close)
     const cleanup = () => {
@@ -301,6 +423,8 @@ export async function registerViaBrowser(email, {password = "", totpSecret = "",
         }
         if (!opened) throw new Error("多次打开 auth/login 失败(代理/网络不稳，ERR_CONNECTION_CLOSED)");
         await assertPageUsable(page, log);
+        // 一打开就撞身份验证限流 → 冷却/点重试后再继续
+        await recoverAuthRateLimit(page, log);
         const useGoogleSso = !!preferGoogleSso;
         if (useGoogleSso) {
             await page.waitForTimeout(2500);
@@ -308,80 +432,95 @@ export async function registerViaBrowser(email, {password = "", totpSecret = "",
                 // 已进主站，后面走拿 token
             }
         }
-        // 填邮箱 + 点继续，降级时重载页面重试(最多 3 轮)
+        // 填邮箱 + 点继续（限流/降级可多轮）
         const LOGIN_MAX_RETRY = 3;
-        const alreadyIn = /^https:\/\/chatgpt\.com\/?($|\?|#)/.test(page.url()) && !/auth\/login/.test(page.url());
-        for (let loginAttempt = 0; loginAttempt < LOGIN_MAX_RETRY && !alreadyIn; loginAttempt++) {
-            // 邮箱框出来再短等 hydrate。CF 挑战先等它自己过，不要 15s 就扔。
-            const emailEl = page.locator("#email, input[type='email'], input[name='email']").first();
-            let sawEmail = false;
-            const alreadyNext = () => /email-verification|about-you|create-account|mfa-challenge/i.test(page.url());
-            for (let w = 0; w < 20 && !sawEmail; w++) {
-                await assertPageUsable(page, log);
-                if (alreadyNext()) { log(`已到下一页 ${page.url().slice(0, 70)}，跳过邮箱框`); break; }
-                if (await emailEl.isVisible().catch(() => false)) { sawEmail = true; break; }
-                if (w === 8) {
-                    log("登录页还没有邮箱框，刷新一次等 CF…");
-                    await page.reload({waitUntil: "domcontentloaded", timeout: 30000}).catch(() => {});
+        const isAlreadyIn = () => /^https:\/\/chatgpt\.com\/?($|\?|#)/.test(page.url()) && !/auth\/login/.test(page.url());
+        const alreadyNext = () => /email-verification|about-you|create-account|mfa-challenge/i.test(page.url());
+
+        /** 在登录页填邮箱并提交；撞 rate_limit 会冷却后重来 */
+        async function submitEmailOnLoginPage() {
+            if (isAlreadyIn() || alreadyNext()) return;
+            for (let loginAttempt = 0; loginAttempt < LOGIN_MAX_RETRY; loginAttempt++) {
+                if (isAlreadyIn() || alreadyNext()) return;
+                const emailEl = page.locator("#email, input[type='email'], input[name='email']").first();
+                let sawEmail = false;
+                for (let w = 0; w < 20 && !sawEmail; w++) {
+                    await assertPageUsable(page, log);
+                    if (await recoverAuthRateLimit(page, log)) continue;
+                    if (alreadyNext() || isAlreadyIn()) return;
+                    if (await emailEl.isVisible().catch(() => false)) { sawEmail = true; break; }
+                    if (w === 8) {
+                        log("登录页还没有邮箱框，刷新一次等 CF…");
+                        await page.reload({waitUntil: "domcontentloaded", timeout: 30000}).catch(() => {});
+                    }
+                    await page.waitForTimeout(800);
                 }
-                await page.waitForTimeout(800);
-            }
-            if (alreadyNext()) break;
-            if (!sawEmail) {
+                if (alreadyNext() || isAlreadyIn()) return;
+                if (!sawEmail) {
+                    await assertPageUsable(page, log);
+                    if (await recoverAuthRateLimit(page, log)) continue;
+                    if (loginAttempt < LOGIN_MAX_RETRY - 1) {
+                        log(`邮箱输入框未出现(url=${page.url().slice(0, 60)})，重载重试`);
+                        await page.goto(AUTH_URL, {waitUntil: "domcontentloaded", timeout: 60000}).catch(() => {});
+                        continue;
+                    }
+                    throw new Error(`邮箱输入框未出现(可能被 CF 拦，url=${page.url().slice(0, 60)})`);
+                }
+                for (let w = 0; w < 6 && await emailEl.isDisabled().catch(() => false); w++) await page.waitForTimeout(300);
+                await page.waitForTimeout(500);
+                await emailEl.click({force: true});
+                await emailEl.pressSequentially(email, {delay: 15});
+                await page.waitForTimeout(300);
+                if ((await emailEl.inputValue().catch(() => "")).trim().toLowerCase() !== email.toLowerCase()) {
+                    await emailEl.fill("");
+                    await emailEl.pressSequentially(email, {delay: 60});
+                    await page.waitForTimeout(600);
+                }
+                log(`填邮箱 ${email}(实际 value=${(await emailEl.inputValue().catch(() => "")).slice(0, 40)})，提交`);
+                if (!await clickContinue(page, log)) {
+                    await emailEl.press("Enter").catch(() => {});
+                }
+                await page.waitForURL(
+                    (u) => /email-verification|about-you|create-account|mfa-challenge|chatgpt\.com\/?($|\?|#)/i.test(String(u)),
+                    {timeout: 8000},
+                ).catch(() => {});
                 await assertPageUsable(page, log);
-                if (loginAttempt < LOGIN_MAX_RETRY - 1) {
-                    log(`邮箱输入框未出现(url=${page.url().slice(0, 60)})，重载重试`);
-                    await page.goto(AUTH_URL, {waitUntil: "domcontentloaded", timeout: 60000}).catch(() => {});
+                // 提交邮箱后常出「身份验证错误 / rate_limit_exceeded」→ 冷却后整段重填
+                if (await recoverAuthRateLimit(page, log)) {
+                    log("限流恢复，重新填邮箱提交…");
                     continue;
                 }
-                throw new Error(`邮箱输入框未出现(可能被 CF 拦，url=${page.url().slice(0, 60)})`);
-            }
-            for (let w = 0; w < 6 && await emailEl.isDisabled().catch(() => false); w++) await page.waitForTimeout(300);
-            await page.waitForTimeout(500);
-            await emailEl.click({force: true});
-            await emailEl.pressSequentially(email, {delay: 15});
-            await page.waitForTimeout(300);
-            if ((await emailEl.inputValue().catch(() => "")).trim().toLowerCase() !== email.toLowerCase()) {
-                await emailEl.fill("");
-                await emailEl.pressSequentially(email, {delay: 60});
+                if (/email-verification|about-you|create-account|mfa-challenge/i.test(page.url()) || isAlreadyIn()) return;
                 await page.waitForTimeout(600);
-            }
-            log(`填邮箱 ${email}(实际 value=${(await emailEl.inputValue().catch(() => "")).slice(0, 40)})，提交`);
-            if (!await clickContinue(page, log)) {
-                await emailEl.press("Enter").catch(() => {});
-            }
-            await page.waitForURL(
-                (u) => /email-verification|about-you|create-account|mfa-challenge|chatgpt\.com\/?($|\?|#)/i.test(String(u)),
-                {timeout: 8000},
-            ).catch(() => {});
-            // 兜底:若点继续触发了浏览器原生 GET 提交(仍在 login 页、未出现验证码/密码框) → 此时 React 已 hydrate,重填邮箱重点一次
-            await assertPageUsable(page, log);
-            if (/email-verification|about-you|create-account|mfa-challenge/i.test(page.url())) break;
-            await page.waitForTimeout(600);
-            if (/auth\/login/.test(page.url()) && !(await page.locator('input[autocomplete="one-time-code"], input[type="password"]').first().isVisible().catch(() => false))) {
-                const el2 = page.locator("#email, input[type='email']").first();
-                if (await el2.isVisible().catch(() => false)) {
-                    log("疑似原生 GET 提交(仍在 login)，React 已就绪，重填邮箱重点继续…");
-                    await el2.click().catch(() => {});
-                    await el2.fill("").catch(() => {});
-                    await el2.pressSequentially(email, {delay: 30}).catch(() => {});
-                    await page.waitForTimeout(400);
-                    await clickContinue(page, log);
+                if (/auth\/login/.test(page.url()) && !(await page.locator('input[autocomplete="one-time-code"], input[type="password"]').first().isVisible().catch(() => false))) {
+                    const el2 = page.locator("#email, input[type='email']").first();
+                    if (await el2.isVisible().catch(() => false)) {
+                        log("疑似原生 GET 提交(仍在 login)，React 已就绪，重填邮箱重点继续…");
+                        await el2.click().catch(() => {});
+                        await el2.fill("").catch(() => {});
+                        await el2.pressSequentially(email, {delay: 30}).catch(() => {});
+                        await page.waitForTimeout(400);
+                        await clickContinue(page, log);
+                        if (await recoverAuthRateLimit(page, log)) continue;
+                    }
+                }
+                await page.waitForTimeout(600);
+                if (alreadyNext() || isAlreadyIn()) return;
+                const stillOnLogin = /auth\/login/.test(page.url())
+                    && !(await page.locator('input[autocomplete="one-time-code"], input[type="password"]').first().isVisible().catch(() => false))
+                    && /Continue with (Google|Apple|phone)|使用\s*(Google|Apple|电话)|Log in or sign up|登录或注册/i.test((await page.innerText("body").catch(() => "")).replace(/\s+/g, " "));
+                if (!stillOnLogin) return;
+                if (useGoogleSso && await tryGoogleSso(page, email, log)) return;
+                if (loginAttempt < LOGIN_MAX_RETRY - 1) {
+                    log(`降级为原生表单(第 ${loginAttempt + 1}/${LOGIN_MAX_RETRY} 次)，重载页面重试…`);
+                    await page.goto(AUTH_URL, {waitUntil: "domcontentloaded", timeout: 60000}).catch(() => {});
+                } else {
+                    throw new Error("出口 IP 被 chatgpt 降级为原生表单(重试 " + LOGIN_MAX_RETRY + " 次仍失败)，此 IP 注册走不通 → 换 IP 重跑");
                 }
             }
-            await page.waitForTimeout(600);
-            const stillOnLogin = /auth\/login/.test(page.url())
-                && !(await page.locator('input[autocomplete="one-time-code"], input[type="password"]').first().isVisible().catch(() => false))
-                && /Continue with (Google|Apple|phone)|使用\s*(Google|Apple|电话)|Log in or sign up|登录或注册/i.test((await page.innerText("body").catch(() => "")).replace(/\s+/g, " "));
-            if (!stillOnLogin) break;
-            if (useGoogleSso && await tryGoogleSso(page, email, log)) break;
-            if (loginAttempt < LOGIN_MAX_RETRY - 1) {
-                log(`降级为原生表单(第 ${loginAttempt + 1}/${LOGIN_MAX_RETRY} 次)，重载页面重试…`);
-                await page.goto(AUTH_URL, {waitUntil: "domcontentloaded", timeout: 60000}).catch(() => {});
-            } else {
-                throw new Error("出口 IP 被 chatgpt 降级为原生表单(重试 " + LOGIN_MAX_RETRY + " 次仍失败)，此 IP 注册走不通 → 换 IP 重跑");
-            }
         }
+
+        await submitEmailOnLoginPage();
 
         // 2) 等下一页出现:验证码框 / 密码框 / 已登录(已注册号密码登录可能免 OTP)。轮询 ~20s,兼容注册/登录/慢渲染。
         const codeSel = 'input[autocomplete="one-time-code"], input[name="code"], input[name="otp"], input[name="totpPin"]';
@@ -418,14 +557,39 @@ export async function registerViaBrowser(email, {password = "", totpSecret = "",
             return false;
         }
         let stage = "";
-        for (let i = 0; i < 12 && !stage; i++) {
-            await assertPageUsable(page, log);
-            if (/accounts\/authorize|security verification/i.test(page.url() + (await page.innerText("body").catch(() => "")))) {
-                await page.waitForTimeout(2000);
-                await assertPageUsable(page, log);
+        // 限流把流程打回登录页时，内层重填邮箱再 detect（最多 3 轮大门）
+        for (let gate = 0; gate < 3 && !stage; gate++) {
+            if (gate) {
+                log(`限流/回登录后第 ${gate + 1}/3 轮：重新填邮箱`);
+                await page.goto(AUTH_URL, {waitUntil: "domcontentloaded", timeout: 60000}).catch(() => {});
+                await recoverAuthRateLimit(page, log);
+                await submitEmailOnLoginPage();
             }
-            await page.waitForTimeout(800);
-            stage = await detect();
+            for (let i = 0; i < 12 && !stage; i++) {
+                await assertPageUsable(page, log);
+                if (await recoverAuthRateLimit(page, log)) {
+                    await page.waitForTimeout(800);
+                    stage = await detect();
+                    if (!stage && /auth\/login/i.test(page.url())) {
+                        stage = "";
+                        break; // 出到外层 gate，重填邮箱
+                    }
+                    continue;
+                }
+                if (await recoverRouteError(page, log)) {
+                    await page.waitForTimeout(800);
+                    stage = await detect();
+                    continue;
+                }
+                if (/accounts\/authorize|security verification/i.test(page.url() + (await page.innerText("body").catch(() => "")))) {
+                    await page.waitForTimeout(2000);
+                    await assertPageUsable(page, log);
+                }
+                await page.waitForTimeout(800);
+                stage = await detect();
+            }
+            if (!stage && /auth\/login/i.test(page.url()) && gate < 2) continue;
+            break;
         }
         // 仅已有账号的验证页才改走密码；新号创建必须走邮箱 OTP，不能先点「用密码继续」把验证码框弄没
         const bodyNow = (await page.innerText("body").catch(() => "")).replace(/\s+/g, " ");
@@ -453,6 +617,7 @@ export async function registerViaBrowser(email, {password = "", totpSecret = "",
             stage = "";
             for (let i = 0; i < 12 && !stage; i += 1) {
                 await page.waitForTimeout(2000);
+                if (await recoverAuthRateLimit(page, log)) continue;
                 if (/create-account\/password/i.test(page.url())) { if (i === 5) { log("密码页未跳转,再次点继续…"); await clickContinue(page, log); } continue; }
                 stage = (await detect()) || (totpSecret ? "totp" : "code");
             }
@@ -485,26 +650,60 @@ export async function registerViaBrowser(email, {password = "", totpSecret = "",
         }
 
         // 3) 验证码页 → 取码填入;验证失败(旧码残留/慢)则【排除旧码重取新码】重试(重跑已注册号邮箱有旧 OTP,易填旧码)
+        //    中途「Oops Route Error / Invalid content type」→ 点 Try again，勿当成功
         if (stage === "code") {
             for (let i = 0; i < 12; i++) {
+                if (await recoverRouteError(page, log)) continue;
                 if (/email-verification/i.test(page.url()) || await page.locator(codeSel).first().isVisible().catch(() => false)) break;
                 await page.waitForTimeout(1000);
             }
+            if (await isRouteErrorPage(page)) await recoverRouteError(page, log);
             if (!/email-verification/i.test(page.url()) && !await page.locator(codeSel).first().isVisible().catch(() => false)) {
                 throw new Error(`未进入邮箱验证码页(url=${page.url().slice(0, 80)})`);
             }
             let codeOk = false, lastCode = "";
+            // Route Error 重试不计入「旧码」轮次，单独多给几次
+            let routeErrRetries = 0;
             for (let ctry = 0; ctry < 3 && !codeOk; ctry += 1) {
                 await assertPageUsable(page, log);
-                log(`从 IMAP 取邮箱验证码… url=${page.url().slice(0, 80)}`);
+                if (await recoverAuthRateLimit(page, log)) {
+                    if (!/email-verification/i.test(page.url())
+                        && !await page.locator(codeSel).first().isVisible().catch(() => false)) {
+                        throw new Error("限流恢复后离开验证码页，需外层重跑整段注册");
+                    }
+                }
+                if (await recoverRouteError(page, log)) {
+                    // 回到验证码页后继续取码（同一轮 ctry 再试）
+                    ctry = Math.max(-1, ctry - 1);
+                    continue;
+                }
+                log(isGoogleMail
+                    ? `Gmail 从 IMAP 取 ChatGPT 验证码… url=${page.url().slice(0, 80)}`
+                    : `从邮箱取验证码… url=${page.url().slice(0, 80)}`);
                 let code = "";
+                const fetchCode = async () => {
+                    if (isGoogleMail) {
+                        const cred = resolveGoogleCred(email);
+                        if (!String(cred?.imapPassword || "").trim()) {
+                            throw new Error(`Gmail 没有 IMAP 应用密码，不能注册 GPT: ${email}`);
+                        }
+                        return waitGoogleImapOtp(cred, {
+                            excludeCode: lastCode || "",
+                            attempts: 12,
+                            intervalMs: 5000,
+                        });
+                    }
+                    return getEmailVerificationCode(email, lastCode ? {excludeCode: lastCode} : undefined);
+                };
                 try {
-                    code = await getEmailVerificationCode(email, lastCode ? {excludeCode: lastCode} : undefined);
+                    code = await fetchCode();
                 } catch (e) {
-                    log(`取码失败 ${String(e?.message || e).slice(0, 120)}，点 Resend 再取`);
+                    const msg = String(e?.message || e);
+                    if (/没有 IMAP|找不到|IMAP 应用密码/i.test(msg)) throw e;
+                    log(`取码失败 ${msg.slice(0, 120)}，点 Resend 再取`);
                     await page.getByText(/Resend email|重新发送|重发|Resend/i).first().click({timeout: 4000}).catch(() => {});
                     await page.waitForTimeout(10000);
-                    code = await getEmailVerificationCode(email, lastCode ? {excludeCode: lastCode} : undefined);
+                    code = await fetchCode();
                 }
                 lastCode = code;
                 if (!/^\d{6}$/.test(String(code || "").trim())) {
@@ -516,18 +715,32 @@ export async function registerViaBrowser(email, {password = "", totpSecret = "",
                     }
                     throw new Error(`拿到的验证码无效: ${String(code || "").slice(0, 20)}`);
                 }
+                // 填码前若已是 Route Error，先 Try again 再填
+                if (await recoverRouteError(page, log)) {
+                    routeErrRetries++;
+                    if (routeErrRetries > 5) throw new Error("验证码阶段 Route Error 过多");
+                    ctry = Math.max(-1, ctry - 1);
+                    continue;
+                }
                 log(`收到验证码 ${code}，填入`);
                 if (!await fillOtpCode(page, code, log)) {
+                    if (await recoverRouteError(page, log)) {
+                        ctry = Math.max(-1, ctry - 1);
+                        continue;
+                    }
                     if (ctry < 2) { log("验证码框还没出来，等一会再填"); await page.waitForTimeout(4000); continue; }
                     throw new Error("验证码输入框未找到");
                 }
                 await page.waitForTimeout(1500);
-                const oops = page.getByRole("button", {name: /try again|重试|tente novamente/i}).first();
-                if (await oops.isVisible({timeout: 800}).catch(() => false)
-                    || /oops, an error|invalid content type|route error/i.test(await page.innerText("body").catch(() => ""))) {
-                    log("验证码页出现 OpenAI Route Error，点 Try again 后重来");
-                    await oops.click({force: true}).catch(() => {});
-                    await page.waitForTimeout(2000);
+                if (await isAuthRateLimitPage(page)) {
+                    await recoverAuthRateLimit(page, log);
+                    continue;
+                }
+                if (await recoverRouteError(page, log)) {
+                    // 填完就炸了：点 Try again 后重新填同一码或换新码
+                    routeErrRetries++;
+                    if (routeErrRetries > 5) throw new Error("验证码阶段 Route Error 过多");
+                    ctry = Math.max(-1, ctry - 1);
                     continue;
                 }
                 if (/email-verification/i.test(page.url())) {
@@ -544,12 +757,34 @@ export async function registerViaBrowser(email, {password = "", totpSecret = "",
                     }
                 }
                 // 等待离开验证页: about-you / 主站都算过。最多 ~30s。
+                // 注意：Route Error 页 URL 往往不是 email-verification，绝不能当成成功
                 for (let w = 0; w < 15 && !codeOk; w += 1) {
                     await page.waitForTimeout(2000);
                     await checkDeactivated(page);
+                    if (await isAuthRateLimitPage(page)) {
+                        await recoverAuthRateLimit(page, log);
+                        break;
+                    }
+                    if (await isRouteErrorPage(page)) {
+                        log("提交后出现 Route Error，点 Try again 后重填验证码");
+                        await recoverRouteError(page, log);
+                        routeErrRetries++;
+                        break; // 出到 ctry 循环重来
+                    }
                     const u = page.url();
-                    codeOk = isLoggedIn() || /about-you|chatgpt\.com\/($|\?|#)/i.test(u) || !/email-verification/i.test(u);
-                    if (w === 5 && !codeOk) {
+                    const bodySnap = (await page.innerText("body").catch(() => "")).replace(/\s+/g, " ").slice(0, 200);
+                    if (isRouteErrorText(bodySnap)) {
+                        await recoverRouteError(page, log);
+                        break;
+                    }
+                    codeOk = isLoggedIn()
+                        || /about-you/i.test(u)
+                        || (/^https:\/\/chatgpt\.com\/?($|\?|#)/i.test(u) && !/auth\/|error|oops/i.test(u + bodySnap));
+                    // 仍在验证码流程（含 URL 变了但还是 OTP 框）不算成功
+                    if (await page.locator(codeSel).first().isVisible().catch(() => false) && !isLoggedIn()) {
+                        codeOk = false;
+                    }
+                    if (w === 5 && !codeOk && !await isRouteErrorPage(page)) {
                         log("验证码页未跳转，再点一次继续");
                         try {
                             const {mkdirSync} = await import("node:fs");
@@ -561,15 +796,23 @@ export async function registerViaBrowser(email, {password = "", totpSecret = "",
                         await clickContinue(page, log);
                     }
                 }
-                if (!codeOk && ctry === 0) log("验证仍未通过(疑旧码/错码/页面慢)，排除旧码重取新码重试…");
+                if (!codeOk && await isRouteErrorPage(page)) {
+                    await recoverRouteError(page, log);
+                    ctry = Math.max(-1, ctry - 1);
+                    continue;
+                }
+                if (!codeOk && ctry === 0) log("验证仍未通过(疑旧码/错码/页面慢/Route Error)，排除旧码重取新码重试…");
             }
-            if (!codeOk) throw new Error("邮箱验证码多次验证失败(可能旧码残留/接码问题/页面慢)");
+            if (!codeOk) throw new Error("邮箱验证码多次验证失败(可能旧码残留/接码问题/Route Error/页面慢)");
             // 邮箱 OTP 通过后常跳到 /mfa-challenge，这里再填 TOTP
             if (!isLoggedIn() && isMfaContinueUrl(page.url())) await handleTotp();
         } else if (stage === "loggedin") {
             log("提交邮箱后已直接登录(免 OTP)，跳到拿 token");
         } else {
             await assertPageUsable(page, log);
+            if (await isAuthRateLimitPage(page) || isAuthRateLimitText(await page.innerText("body").catch(() => ""))) {
+                throw new Error("OpenAI 身份验证限流(rate_limit_exceeded)多次重试仍失败，换 IP/session 重跑");
+            }
             const body = (await page.innerText("body").catch(() => "")).replace(/\s+/g, " ").slice(0, 200);
             throw new Error(`提交邮箱后未进验证码/密码/登录页(url=${page.url().slice(0, 60)}) 页面:${body}`);
         }

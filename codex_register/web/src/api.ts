@@ -229,6 +229,11 @@ export interface RechargeQueueItem {
     rebind_email?: string;
     rebind_error?: string;
     rebind_target?: string;
+    /** 换绑前原始邮箱（首次换绑写入后保留） */
+    rebind_from?: string;
+    /** undelivered=作业中；delivered=已交付（移出队列） */
+    delivery_status?: "undelivered" | "delivered" | string;
+    delivered_at?: number;
     created_at: number;
     submitted_at: number;
     finished_at?: number;
@@ -243,6 +248,8 @@ export interface RechargeQueueStats {
     done: number;
     error: number;
     total: number;
+    undelivered?: number;
+    delivered?: number;
 }
 
 /** Gmail 验证池 / 换绑池 一行（含账密） */
@@ -390,7 +397,8 @@ export const api = {
     testChat: (id: number) => j(`/api/accounts/${id}/test-chat`, {method: "POST"}),
     enrollMfa: (ids: number[]) => j<{ok: boolean; count: number}>("/api/control/enroll-mfa", {method: "POST", body: JSON.stringify({ids})}),
     batchTestAt: (ids: number[], relogin = false) => j<{count: number}>("/api/control/test-at", {method: "POST", body: JSON.stringify({ids, relogin})}),
-    stopBatchAt: () => j<{ok: boolean; msg?: string}>("/api/control/test-at/stop", {method: "POST"}),
+    batchAtStatus: () => j<{ok: boolean; running: boolean; done: number; total: number; lock?: string}>("/api/control/test-at/status"),
+    stopBatchAt: (force = false) => j<{ok: boolean; msg?: string; forced?: boolean; running?: boolean}>("/api/control/test-at/stop", {method: "POST", body: JSON.stringify({force: !!force})}),
     // acquire=true:过期/无rt 的号重登获取 rt(走 codex OAuth+接码,有成本);false:只刷新有效 rt、标记失效
     batchTestRt: (ids: number[], acquire = false) => j<{count: number}>("/api/control/test-rt", {method: "POST", body: JSON.stringify({ids, acquire})}),
     batchTestChat: (ids: number[]) => j<{count: number}>("/api/control/test-chat", {method: "POST", body: JSON.stringify({ids})}),
@@ -521,14 +529,22 @@ export const api = {
         j<{ok: boolean; count: number}>("/api/recharge/cards/validate", {method: "POST", body: JSON.stringify({ids})}),
     unpairRechargeCards: (ids: number[]) =>
         j<{ok: boolean}>("/api/recharge/cards/unpair", {method: "POST", body: JSON.stringify({ids})}),
-    // 充值队列
-    rechargeQueue: () => j<{list: RechargeQueueItem[]; stats: RechargeQueueStats}>("/api/recharge/queue"),
-    rechargeQueueBatches: () => j<{name: string; n: number}[]>("/api/recharge/queue/batches"),
+    // 充值队列（delivery: undelivered 默认作业中 | delivered 已交付 | all）
+    rechargeQueue: (delivery: "undelivered" | "delivered" | "all" = "undelivered") =>
+        j<{list: RechargeQueueItem[]; stats: RechargeQueueStats; delivery?: string}>(`/api/recharge/queue?delivery=${encodeURIComponent(delivery)}`),
+    rechargeQueueBatches: (delivery?: "undelivered" | "delivered" | "all") =>
+        j<{name: string; n: number}[]>(`/api/recharge/queue/batches${delivery ? `?delivery=${encodeURIComponent(delivery)}` : ""}`),
     rechargeableAccounts: () => j<Account[]>("/api/recharge/accounts"),
     addToRechargeQueue: (accountIds: number[], batch?: string) =>
         j<{ok: boolean; added: number}>("/api/recharge/queue/add", {method: "POST", body: JSON.stringify({accountIds, batch})}),
+    /** 标记已交付（原「移出队列」）：进已交付 tab，保留换绑记录，不删号 */
     removeFromRechargeQueue: (ids: number[]) =>
         j<{ok: boolean; count: number}>("/api/recharge/queue/remove", {method: "POST", body: JSON.stringify({ids})}),
+    deliverRechargeQueue: (ids: number[]) =>
+        j<{ok: boolean; count: number}>("/api/recharge/queue/deliver", {method: "POST", body: JSON.stringify({ids})}),
+    /** 已交付 → 退回未交付（误点恢复） */
+    undeliverRechargeQueue: (ids: number[]) =>
+        j<{ok: boolean; count: number}>("/api/recharge/queue/undeliver", {method: "POST", body: JSON.stringify({ids})}),
     setRechargeQueueBatch: (ids: number[], batch: string) =>
         j<{ok: boolean}>("/api/recharge/queue/set-batch", {method: "POST", body: JSON.stringify({ids, batch})}),
     resetRechargeQueue: (ids: number[]) =>
@@ -553,7 +569,7 @@ export const api = {
             {method: "POST", body: JSON.stringify({ids, reason: reason || "登录不可用"})},
         ),
     migrateToRebindGmailPool: (ids: number[]) =>
-        j<{ok: boolean; count: number; poolGrp?: string; gmailFreeImap?: number; mailcomFree?: number}>(
+        j<{ok: boolean; count: number; skipped?: {id: number; email: string; reason: string}[]; poolGrp?: string; gmailFreeImap?: number; mailcomFree?: number}>(
             "/api/recharge/rebind-gmail/migrate",
             {method: "POST", body: JSON.stringify({ids})},
         ),

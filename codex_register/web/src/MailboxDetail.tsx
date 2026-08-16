@@ -5,6 +5,29 @@ import {useEffect, useState} from "react";
 import {api, connectStream, type Mailbox} from "./api";
 import {formatHardenListReason} from "./google-harden-reason";
 
+/** 北京时间 HH:mm:ss（操作日志） */
+function fmtBjTime(ts?: number) {
+    if (!ts) return "";
+    return new Intl.DateTimeFormat("en-GB", {
+        timeZone: "Asia/Shanghai",
+        hour: "2-digit", minute: "2-digit", second: "2-digit",
+        hour12: false,
+    }).format(new Date(ts));
+}
+/** 北京时间 MM-DD HH:mm（收件箱兜底，服务端 date 已是北京时间） */
+function fmtBjMailDate(ts?: number, fallback = "") {
+    if (fallback) return fallback;
+    if (!ts) return "";
+    const parts = new Intl.DateTimeFormat("en-CA", {
+        timeZone: "Asia/Shanghai",
+        month: "2-digit", day: "2-digit",
+        hour: "2-digit", minute: "2-digit",
+        hour12: false,
+    }).formatToParts(new Date(ts));
+    const g = (t: string) => parts.find((p) => p.type === t)?.value || "00";
+    return `${g("month")}-${g("day")} ${g("hour")}:${g("minute")}`;
+}
+
 // 把正文里的 http(s) 链接渲染成可点击 <a>(新标签打开),其余原样。让邮件里的链接可见可点。
 function linkify(text: string) {
     return String(text).split(/(https?:\/\/[^\s()<>"']+)/g).map((p, i) =>
@@ -144,7 +167,7 @@ export function MailboxDetail({mailbox, onClose}: {mailbox: Mailbox; onClose: ()
                                 ? <div className="text-gray-500">（暂无该邮箱操作日志。登录/改密/收信操作会实时记录在此,与 GPT 注册日志分开）</div>
                                 : logs.map((l, i) => (
                                     <div key={i} className="whitespace-pre-wrap break-all">
-                                        <span className="text-gray-600">{new Date(l.ts).toLocaleTimeString()} </span>
+                                        <span className="text-gray-600">{fmtBjTime(l.ts)} </span>
                                         <span className={l.line.includes("✅") ? "text-green-400" : l.line.includes("❌") ? "text-red-400" : ""}>{l.line}</span>
                                     </div>
                                 ))}
@@ -162,7 +185,7 @@ export function MailboxDetail({mailbox, onClose}: {mailbox: Mailbox; onClose: ()
                             {inbox && !loading && inbox.mails.length === 0 && <div className="text-emerald-600 text-center py-10">✓ 已连接，收件箱为空</div>}
                             {inbox && inbox.mails.map((m: any) => (
                                 <div key={m.id} className="border-b py-2 cursor-pointer hover:bg-gray-50 -mx-2 px-2 rounded" onClick={() => toggleMail(m.id)}>
-                                    <div className="flex justify-between text-xs text-gray-400 mb-0.5"><span className="truncate max-w-[60%]">{m.from}</span><span>{m.date}</span></div>
+                                    <div className="flex justify-between text-xs text-gray-400 mb-0.5"><span className="truncate max-w-[60%]">{m.from}</span><span title="北京时间">{m.date || fmtBjMailDate(m.timestamp)}</span></div>
                                     <div className="text-sm text-gray-800 flex items-center gap-1"><span className="text-gray-400 text-xs">{expanded === m.id ? "▾" : "▸"}</span>{m.subject || "(无主题)"}</div>
                                     {expanded === m.id && <div className="mt-2 text-xs text-gray-600 whitespace-pre-wrap bg-gray-50 border rounded p-2 max-h-64 overflow-auto leading-relaxed select-text cursor-text" onClick={(e) => e.stopPropagation()}>{bodyLoading === m.id ? "正在加载正文…" : linkify(bodies[m.id] ?? "(点击加载)")}</div>}
                                 </div>

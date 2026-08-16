@@ -520,12 +520,16 @@ export async function importFreeMailboxes(rows, grp = "", usage = "free", provid
 /** 人工登录验证通过后迁入此分组，换绑只从这里领号 */
 export const REBIND_GMAIL_POOL_GRP = "换绑池";
 
+// 换绑可选最低准则：独立未售 + 有登录密码 + 有 Gmail 2FA + 有 IMAP 应用密码字段
+// （IMAP 迁入时并行探、通了立刻入池；真正换绑 claim 时只探网页登录）
 const FREE_GOOGLE_IMAP_SQL = `
     m.usage='hold' AND m.deleted_at=0
     AND COALESCE(m.sold_at,0)=0
     AND m.provider='google'
+    AND COALESCE(m.password,'') <> ''
+    AND COALESCE(m.totp_secret,'') <> ''
     AND COALESCE(m.imap_password,'') <> ''
-    AND COALESCE(m.google_stage,'') NOT IN ('gpt_ok','login_fail','blocked')
+    AND COALESCE(m.google_stage,'') NOT IN ('gpt_ok','login_fail','blocked','imported')
     AND NOT EXISTS (SELECT 1 FROM gpt_accounts g WHERE g.mailbox_id=m.id AND COALESCE(g.deleted_at,0)=0)
     AND NOT EXISTS (SELECT 1 FROM claude_accounts c WHERE c.mailbox_id=m.id)
 `;
@@ -591,18 +595,52 @@ export async function listRebindGmailPool() {
     };
 }
 
-/** 验证通过 → 迁入「换绑池」分组（批量）。 */
+/**
+ * 验证通过 → 迁入「换绑池」。
+ * 仅字段达标的可迁；调用方应先做 IMAP 探活（登录在换绑时再探）。
+ * 返回 {count, skipped:[{id,email,reason}]}
+ */
 export async function moveMailboxesToRebindPool(ids) {
     const list = [...new Set((ids || []).map(Number).filter(Number.isInteger))];
-    if (!list.length) return 0;
+    if (!list.length) return {count: 0, skipped: []};
+    const { rows: cands } = await query(
+        `SELECT m.id, m.email, COALESCE(m.password,'') AS password,
+                COALESCE(m.totp_secret,'') AS totp_secret,
+                COALESCE(m.imap_password,'') AS imap_password,
+                COALESCE(m.grp,'') AS grp, COALESCE(m.google_stage,'') AS google_stage
+         FROM mailboxes m
+         WHERE m.id = ANY($1)`,
+        [list],
+    );
+    const byId = new Map(cands.map((r) => [r.id, r]));
+    const skipped = [];
+    const okIds = [];
+    for (const id of list) {
+        const r = byId.get(id);
+        if (!r) { skipped.push({id, email: "", reason: "不存在"}); continue; }
+        if ((r.grp || "") === REBIND_GMAIL_POOL_GRP) { skipped.push({id, email: r.email, reason: "已在换绑池"}); continue; }
+        if (!String(r.password || "").trim()) { skipped.push({id, email: r.email, reason: "无登录密码"}); continue; }
+        if (!String(r.totp_secret || "").trim()) { skipped.push({id, email: r.email, reason: "无 Gmail 2FA（最低准则）"}); continue; }
+        if (!String(r.imap_password || "").trim()) { skipped.push({id, email: r.email, reason: "无 IMAP 应用密码（最低准则）"}); continue; }
+        okIds.push(id);
+    }
+    if (!okIds.length) return {count: 0, skipped};
     const { rowCount } = await query(
         `UPDATE mailboxes m SET grp=$1
          WHERE m.id = ANY($2)
            AND ${FREE_GOOGLE_IMAP_SQL}
            AND COALESCE(m.grp,'') <> $1`,
-        [REBIND_GMAIL_POOL_GRP, list],
+        [REBIND_GMAIL_POOL_GRP, okIds],
     );
-    return rowCount || 0;
+    // 字段过了但 stage/usage 不过的，补进 skipped
+    if ((rowCount || 0) < okIds.length) {
+        const { rows: left } = await query(
+            `SELECT id, email FROM mailboxes WHERE id = ANY($1) AND COALESCE(grp,'') <> $2`,
+            [okIds, REBIND_GMAIL_POOL_GRP],
+        );
+        for (const r of left) skipped.push({id: r.id, email: r.email, reason: "不满足独立未售/stage 条件"});
+    }
+    return {count: rowCount || 0, skipped};
 }
 
 /** 从换绑池移回指定分组（默认空分组）；仍保持独立未售。 */
@@ -754,23 +792,27 @@ export async function markMailboxSold(id, note = "") {
     const { rowCount } = await query(
         `UPDATE mailboxes
          SET sold_at=CASE WHEN sold_at>0 THEN sold_at ELSE $1 END,
-             note=CASE WHEN $3='' THEN note ELSE $3 END
+             note=CASE WHEN $3='' THEN note ELSE $3 END,
+             grp=CASE WHEN COALESCE(grp,'')=$4 THEN '' ELSE grp END
          WHERE id=$2 AND deleted_at=0`,
-        [now, mailboxId, tip],
+        [now, mailboxId, tip, REBIND_GMAIL_POOL_GRP],
     );
     return rowCount || 0;
 }
 
-/** 官方已占用/不可再用：标已售+独立，不再进空闲池。 */
+/** 官方已占用/不可再用：标已售+独立，不再进空闲池；若在换绑池则移出。 */
 export async function quarantineMailbox(id, reason = "") {
     const mailboxId = Number(id);
     if (!Number.isInteger(mailboxId)) return 0;
     const now = Date.now();
     const note = String(reason || "官方已占用").slice(0, 80);
     const { rowCount } = await query(
-        `UPDATE mailboxes SET usage='hold', sold_at=CASE WHEN sold_at>0 THEN sold_at ELSE $1 END, note=$2
-         WHERE id=$3 AND deleted_at=0`,
-        [now, note, mailboxId]
+        `UPDATE mailboxes SET usage='hold',
+            sold_at=CASE WHEN sold_at>0 THEN sold_at ELSE $1 END,
+            note=$2,
+            grp=CASE WHEN COALESCE(grp,'')=$3 THEN '' ELSE grp END
+         WHERE id=$4 AND deleted_at=0`,
+        [now, note, REBIND_GMAIL_POOL_GRP, mailboxId]
     );
     return rowCount || 0;
 }
@@ -785,7 +827,7 @@ export async function releaseMailboxToFree(id) {
     return rowCount || 0;
 }
 
-/** 官方换绑已成功后改指针：新邮箱 usage=gpt 且已售，旧邮箱已售不回池。 */
+/** 官方换绑已成功后改指针：新邮箱 usage=gpt 且已售并移出换绑池，旧邮箱已售不回池。 */
 export async function rebindGptMailbox(gptId, newMailboxId) {
     return withTransaction(async (client) => {
         const { rows: [gpt] } = await client.query(
@@ -803,15 +845,27 @@ export async function rebindGptMailbox(gptId, newMailboxId) {
         if (taken) throw new Error("目标邮箱已被其他 GPT 占用");
         const oldId = gpt.mailbox_id;
         const now = Date.now();
+        const pool = REBIND_GMAIL_POOL_GRP;
         await client.query(
             `UPDATE gpt_accounts SET mailbox_id=$1, sold_at=CASE WHEN sold_at>0 THEN sold_at ELSE $2 END WHERE id=$3`,
             [newMailboxId, now, gptId]
         );
-        await client.query(`UPDATE mailboxes SET usage='gpt', sold_at=CASE WHEN sold_at>0 THEN sold_at ELSE $2 END WHERE id=$1`, [newMailboxId, now]);
+        // 新号：已绑 GPT + 已售，并从换绑池分组清掉（避免池里还挂着）
+        await client.query(
+            `UPDATE mailboxes SET usage='gpt',
+                sold_at=CASE WHEN sold_at>0 THEN sold_at ELSE $2 END,
+                grp=CASE WHEN COALESCE(grp,'')=$3 THEN '' ELSE grp END
+             WHERE id=$1`,
+            [newMailboxId, now, pool],
+        );
         if (oldId && oldId !== newMailboxId) {
+            // 旧号：已售不回池，若曾在换绑池也清掉
             await client.query(
-                `UPDATE mailboxes SET usage='hold', sold_at=CASE WHEN sold_at>0 THEN sold_at ELSE $1 END WHERE id=$2 AND deleted_at=0`,
-                [now, oldId]
+                `UPDATE mailboxes SET usage='hold',
+                    sold_at=CASE WHEN sold_at>0 THEN sold_at ELSE $1 END,
+                    grp=CASE WHEN COALESCE(grp,'')=$3 THEN '' ELSE grp END
+                 WHERE id=$2 AND deleted_at=0`,
+                [now, oldId, pool],
             );
         }
         return {oldMailboxId: oldId, newMailboxId, email: mb.email};
@@ -1230,12 +1284,35 @@ export async function addToRechargeQueue(accountIds, batch = "") {
     });
 }
 
-export async function listRechargeQueue() {
-    const { rows: list } = await query(`SELECT * FROM recharge_queue ORDER BY id`);
-    const out = { pending: 0, paired: 0, submitting: 0, submitted: 0, done: 0, error: 0, total: 0 };
-    const { rows: statsRows } = await query(`SELECT status, COUNT(*)::int AS n FROM recharge_queue GROUP BY status`);
+/**
+ * 充值队列列表。
+ * delivery: undelivered（默认，作业中）| delivered（已交付/已移除）| all
+ */
+export async function listRechargeQueue(delivery = "undelivered") {
+    const d = String(delivery || "undelivered").toLowerCase();
+    const where = d === "all"
+        ? ""
+        : d === "delivered"
+            ? `WHERE COALESCE(delivery_status,'undelivered')='delivered'`
+            : `WHERE COALESCE(delivery_status,'undelivered')<>'delivered'`;
+    const { rows: list } = await query(
+        `SELECT * FROM recharge_queue ${where} ORDER BY ${d === "delivered" ? "delivered_at DESC NULLS LAST, id DESC" : "id"}`,
+    );
+    // 状态统计只算未交付（作业面板）
+    const out = { pending: 0, paired: 0, submitting: 0, submitted: 0, done: 0, error: 0, total: 0, undelivered: 0, delivered: 0 };
+    const { rows: statsRows } = await query(
+        `SELECT status, COUNT(*)::int AS n FROM recharge_queue
+         WHERE COALESCE(delivery_status,'undelivered')<>'delivered' GROUP BY status`,
+    );
     for (const r of statsRows) { out[r.status] = r.n; out.total += r.n; }
-    return { list, stats: out };
+    const { rows: delRows } = await query(
+        `SELECT COALESCE(delivery_status,'undelivered') AS d, COUNT(*)::int AS n FROM recharge_queue GROUP BY 1`,
+    );
+    for (const r of delRows) {
+        if (r.d === "delivered") out.delivered = r.n;
+        else out.undelivered = r.n;
+    }
+    return { list, stats: out, delivery: d === "delivered" ? "delivered" : d === "all" ? "all" : "undelivered" };
 }
 
 export async function getRechargeQueueItem(id) {
@@ -1243,20 +1320,43 @@ export async function getRechargeQueueItem(id) {
     return rows[0] || undefined;
 }
 
+/**
+ * 移出队列 = 标记已交付（保留队列行与换绑记录，不删 GPT/邮箱）。
+ * 已交付的可在「已交付」tab 查看。
+ */
 export async function removeFromRechargeQueue(ids) {
-    let count = 0;
-    await withTransaction(async (client) => {
-        for (const id of (ids || [])) {
-            const { rows: [item] } = await client.query(`SELECT * FROM recharge_queue WHERE id=$1`, [id]);
-            if (!item) continue;
-            const res = await client.query(`DELETE FROM recharge_queue WHERE id=$1`, [id]);
-            if (res.rowCount) {
-                await softDeleteGpt(client, item.account_id);
-                count++;
-            }
-        }
-    });
-    return { count };
+    return deliverRechargeQueue(ids);
+}
+
+/** 标记为已交付 */
+export async function deliverRechargeQueue(ids) {
+    const list = [...new Set((ids || []).map(Number).filter(Number.isInteger))];
+    if (!list.length) return { count: 0 };
+    const now = Date.now();
+    const { rowCount } = await query(
+        `UPDATE recharge_queue
+         SET delivery_status='delivered',
+             delivered_at=CASE WHEN COALESCE(delivered_at,0)>0 THEN delivered_at ELSE $1 END,
+             instance_id=''
+         WHERE id = ANY($2)
+           AND COALESCE(delivery_status,'undelivered')<>'delivered'`,
+        [now, list],
+    );
+    return { count: rowCount || 0 };
+}
+
+/** 已交付 → 退回未交付（误点恢复） */
+export async function undeliverRechargeQueue(ids) {
+    const list = [...new Set((ids || []).map(Number).filter(Number.isInteger))];
+    if (!list.length) return { count: 0 };
+    const { rowCount } = await query(
+        `UPDATE recharge_queue
+         SET delivery_status='undelivered', delivered_at=0
+         WHERE id = ANY($1)
+           AND COALESCE(delivery_status,'undelivered')='delivered'`,
+        [list],
+    );
+    return { count: rowCount || 0 };
 }
 
 export async function setRechargeQueueBatch(ids, batch) {
@@ -1273,13 +1373,14 @@ export async function claimRechargeQueueItems(ids, instId = instanceId) {
     if (!idList.length) return { claimed: [], skipped: [] };
     return withTransaction(async (client) => {
         const { rows: all } = await client.query(
-            `SELECT id, email, status, instance_id FROM recharge_queue WHERE id = ANY($1)`,
+            `SELECT id, email, status, instance_id, delivery_status FROM recharge_queue WHERE id = ANY($1)`,
             [idList]
         );
         const { rows } = await client.query(
             `SELECT * FROM recharge_queue
              WHERE id = ANY($1)
                AND status NOT IN ('submitted', 'done')
+               AND COALESCE(delivery_status,'undelivered')<>'delivered'
                AND instance_id = ''
              FOR UPDATE SKIP LOCKED`,
             [idList]
@@ -1294,7 +1395,9 @@ export async function claimRechargeQueueItems(ids, instId = instanceId) {
             email: r.email,
             status: r.status,
             instance_id: r.instance_id,
-            reason: r.status === "submitted" || r.status === "done"
+            reason: r.delivery_status === "delivered"
+                ? "已交付"
+                : r.status === "submitted" || r.status === "done"
                 ? `状态 ${r.status}`
                 : (r.instance_id ? `实例 ${r.instance_id} 处理中` : "无法认领"),
         }));
@@ -1338,7 +1441,7 @@ export async function releaseInstanceWork(instId = instanceId) {
 }
 
 export async function updateQueueItem(id, fields) {
-    const allowed = ["status", "card_id", "card_code", "task_no", "task_status", "task_message", "error", "batch", "plan_type", "submitted_at", "finished_at", "instance_id", "email", "rebind_status", "rebind_email", "rebind_error", "rebind_target", "rebind_pool"];
+    const allowed = ["status", "card_id", "card_code", "task_no", "task_status", "task_message", "error", "batch", "plan_type", "submitted_at", "finished_at", "instance_id", "email", "rebind_status", "rebind_email", "rebind_error", "rebind_target", "rebind_pool", "rebind_from", "delivery_status", "delivered_at"];
     const sets = [], vals = [];
     for (const k of allowed) {
         if (fields[k] !== undefined) {
@@ -1410,12 +1513,26 @@ export async function listPendingGmailRebinds() {
 }
 
 export async function listQueueSubmittedPending() {
-    const { rows } = await query(`SELECT * FROM recharge_queue WHERE status='submitted' AND task_status NOT IN ('paid','failed','canceled','returned') ORDER BY id`);
+    const { rows } = await query(
+        `SELECT * FROM recharge_queue
+         WHERE status='submitted'
+           AND COALESCE(delivery_status,'undelivered')<>'delivered'
+           AND task_status NOT IN ('paid','failed','canceled','returned')
+         ORDER BY id`,
+    );
     return rows;
 }
 
-export async function rechargeQueueBatches() {
-    const { rows } = await query(`SELECT batch AS name, COUNT(*)::int AS n FROM recharge_queue WHERE batch!='' GROUP BY batch ORDER BY MAX(id) DESC`);
+export async function rechargeQueueBatches(delivery = "undelivered") {
+    const d = String(delivery || "undelivered").toLowerCase();
+    const where = d === "all"
+        ? `batch!=''`
+        : d === "delivered"
+            ? `batch!='' AND COALESCE(delivery_status,'undelivered')='delivered'`
+            : `batch!='' AND COALESCE(delivery_status,'undelivered')<>'delivered'`;
+    const { rows } = await query(
+        `SELECT batch AS name, COUNT(*)::int AS n FROM recharge_queue WHERE ${where} GROUP BY batch ORDER BY MAX(id) DESC`,
+    );
     return rows;
 }
 

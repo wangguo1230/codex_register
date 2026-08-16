@@ -39,8 +39,9 @@ import {ISMSActivationBroker} from "./sms/activation-broker.js";
 type FetchLike = typeof fetch;
 
 const DEFAULT_INSECURE_TLS = true;
-const FETCH_RETRY_COUNT = 4;
-const FETCH_RETRY_DELAY_MS = 2000;
+// 重登 worker 可经 env 收紧，避免单出口连 Timeout×4 拖到一分钟以上
+const FETCH_RETRY_COUNT = Math.max(1, Math.min(6, Number(process.env.OPENAI_FETCH_RETRY || 4) || 4));
+const FETCH_RETRY_DELAY_MS = Math.max(200, Number(process.env.OPENAI_FETCH_RETRY_DELAY_MS || 2000) || 2000);
 /** 全进程 / 跨 worker authorize 节流：同一出口连打 auth.openai.com 易 429 */
 let lastAuthorizeAtMs = 0;
 /** 正常最小间隔；遇 429 后临时抬高 */

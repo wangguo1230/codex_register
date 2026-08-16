@@ -433,10 +433,30 @@ export default function App() {
         } catch (e: any) { notify("接码导入失败: " + e.message); }
     }
 
-    // 打开「从邮箱选号」弹窗:拉 free 邮箱列表 + 分组,重置勾选。批次默认沿用当前批次筛选。
+    /** GPT 选号口径：与后端 allocate 一致。Gmail 须已整备(ready=2FA+IMAP)且有应用密码；mail.com 等不限。 */
+    const isGptPickableMailbox = (m: Mailbox) => {
+        const isGoogle = m.provider === "google" || /@(gmail|googlemail)\.com$/i.test(m.email || "");
+        if (!isGoogle) return true;
+        const hasImap = !!(m.imap_password && String(m.imap_password).trim());
+        return String(m.google_stage || "") === "ready" && hasImap;
+    };
+    // 打开「从邮箱选号」弹窗:只拉可挂 GPT 的 free 号（Gmail=ready+IMAP），分组按过滤后重算
     async function openPicker() {
         setShowPicker(true); setPickerLoading(true); setPickerSel(new Set()); setPickerGrp(""); setPickerPw(""); setPickerBatch(batchFilter || "");
-        try { const r = await api.listMailboxes("free"); setPickerList(r.list); setPickerGrps(r.groups); }
+        try {
+            const r = await api.listMailboxes("free");
+            const list = (r.list || []).filter(isGptPickableMailbox);
+            const grpMap = new Map<string, number>();
+            for (const m of list) {
+                const g = m.grp || "";
+                grpMap.set(g, (grpMap.get(g) || 0) + 1);
+            }
+            const groups = [...grpMap.entries()]
+                .map(([grp, n]) => ({grp, n}))
+                .sort((a, b) => (a.grp || "").localeCompare(b.grp || "", "zh"));
+            setPickerList(list);
+            setPickerGrps(groups);
+        }
         catch (e: any) { notify("拉取待分配邮箱失败: " + e.message); }
         finally { setPickerLoading(false); }
     }
@@ -698,7 +718,7 @@ export default function App() {
                     <button onClick={ctrl(api.stop, "已停止本实例注册，未完成任务退回队列（其他实例可接着跑）")} className="px-3 py-1.5 bg-red-500 text-white rounded-lg text-sm hover:bg-red-600" title="只停本机。正在跑的号退回等待，其他实例会认领">⏹ 停止</button>
                     <button onClick={ctrl(api.retryFailed, "已把失败项重置为等待")} className="px-3 py-1.5 bg-gray-200 rounded-lg text-sm hover:bg-gray-300">↻ 重试失败</button>
                     <button onClick={() => { setShowProxy(true); notify("代理池已在下方展开"); }} className="px-3 py-1.5 bg-gray-200 rounded-lg text-sm hover:bg-gray-300">⚙ 代理池</button>
-                    <button onClick={openPicker} title="从待分配(free)邮箱里勾选具体账号,设批次、可选先改密后分配进 GPT 注册队列" className="px-3 py-1.5 bg-emerald-600 text-white rounded-lg text-sm hover:bg-emerald-700">📥 从邮箱选号</button>
+                    <button onClick={openPicker} title="从待分配里勾选可挂 GPT 的号：Gmail 仅显示已整备(2FA+IMAP)且有应用密码；mail.com 不限。可选批次/先改密后进注册队列" className="px-3 py-1.5 bg-emerald-600 text-white rounded-lg text-sm hover:bg-emerald-700">📥 从邮箱选号</button>
                     <button onClick={() => { setExportRange(selectedIds.size ? "selected" : batchFilter ? "batch" : "all"); setExportBatch(batchFilter); setShowExport(true); }} className="px-3 py-1.5 bg-indigo-600 text-white rounded-lg text-sm hover:bg-indigo-700">⬇ 导出…</button>
                     <button onClick={() => setShowRefreshAt(true)} className="px-3 py-1.5 bg-cyan-600 text-white rounded-lg text-sm hover:bg-cyan-700" title="粘贴邮箱列表,走浏览器登录重新获取 accessToken">🔄 批量刷新AT</button>
                     <button onClick={() => setShowAcquireRt(true)} className="px-3 py-1.5 bg-amber-600 text-white rounded-lg text-sm hover:bg-amber-700" title="粘贴邮箱----密码,走 OAuth 获取全新 refresh_token(Pro号无需接码)">🔑 批量获取RT</button>
@@ -1365,7 +1385,10 @@ export default function App() {
                 <div className="fixed inset-0 bg-black/40 flex items-center justify-center z-30" onClick={() => setShowPicker(false)}>
                     <div className="bg-white rounded-xl w-[560px] max-h-[80vh] flex flex-col shadow-2xl" onClick={(e) => e.stopPropagation()}>
                         <div className="px-5 py-3 border-b flex items-center justify-between">
-                            <span className="font-medium">📥 从邮箱选号分配到 GPT</span>
+                            <div>
+                                <span className="font-medium">📥 从邮箱选号分配到 GPT</span>
+                                <div className="text-[11px] text-gray-400 mt-0.5">Gmail 仅「已整备 ready + 有 IMAP」；mail.com 待分配均可</div>
+                            </div>
                             <button onClick={() => setShowPicker(false)} className="text-gray-400 hover:text-gray-700 text-lg leading-none">✕</button>
                         </div>
                         <div className="px-5 py-3 space-y-3 text-sm overflow-hidden flex flex-col min-h-0">
@@ -1373,7 +1396,7 @@ export default function App() {
                             <div className="flex items-center gap-2">
                                 <span className="w-14 text-gray-400 shrink-0">分组</span>
                                 <select value={pickerGrp} onChange={(e) => setPickerGrp(e.target.value)} className="flex-1 px-2 py-1.5 border rounded">
-                                    <option value="">全部待分配({pickerList.length})</option>
+                                    <option value="">可挂 GPT({pickerList.length})</option>
                                     <option value="__NONE__">未分组</option>
                                     {pickerGrps.filter((g) => g.grp).map((g) => <option key={g.grp} value={g.grp}>{g.grp}({g.n})</option>)}
                                 </select>
@@ -1399,7 +1422,12 @@ export default function App() {
                             </div>
                             <div className="border rounded overflow-auto min-h-[120px] max-h-[38vh]">
                                 {pickerLoading ? <div className="p-4 text-center text-gray-400">加载中…</div>
-                                    : pickerVisible.length === 0 ? <div className="p-4 text-center text-gray-400">没有待分配邮箱</div>
+                                    : pickerVisible.length === 0 ? (
+                                        <div className="p-4 text-center text-gray-400 text-xs leading-relaxed">
+                                            没有可挂 GPT 的待分配邮箱<br/>
+                                            <span className="text-gray-400">Gmail 需整备到 ready（2FA+IMAP）且有应用密码；mail.com 需 usage=free</span>
+                                        </div>
+                                    )
                                     : pickerVisible.map((m) => (
                                         <label key={m.id} className="flex items-center gap-2 px-3 py-1.5 border-b last:border-0 hover:bg-gray-50 cursor-pointer">
                                             <input type="checkbox" checked={pickerSel.has(m.id)} onChange={() => setPickerSel((prev) => { const s = new Set(prev); s.has(m.id) ? s.delete(m.id) : s.add(m.id); return s; })}/>
@@ -1407,6 +1435,9 @@ export default function App() {
                                                 ? <span className="px-1 rounded bg-red-50 text-red-700 text-[10px] font-semibold">Gmail</span>
                                                 : <span className="px-1 rounded bg-slate-100 text-slate-500 text-[10px]">mail.com</span>}
                                             <span className="font-mono text-gray-700 flex-1 truncate">{m.email}</span>
+                                            {(m.provider === "google" || /@(gmail|googlemail)\.com$/i.test(m.email || ""))
+                                                ? <span className="text-[10px] px-1 rounded bg-emerald-50 text-emerald-700" title="已整备 ready + IMAP">ready</span>
+                                                : null}
                                             {m.grp ? <span className="text-xs px-1 rounded bg-gray-100 text-gray-500">{m.grp}</span> : null}
                                             {String(m.pw_status || "").includes("✅") ? <span className="text-xs text-green-600" title={m.pw_status}>已改密</span> : null}
                                         </label>

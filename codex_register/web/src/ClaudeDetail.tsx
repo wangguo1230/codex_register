@@ -62,7 +62,7 @@ export function ClaudeDetail({account, onClose}: {account: ClaudeAccount; onClos
                             ? <div className="text-gray-500">（暂无该 Claude 账号日志。注册/查订阅/养号会实时记录在此,独立于邮箱与 GPT 日志）</div>
                             : logs.map((l, i) => (
                                 <div key={i} className="whitespace-pre-wrap break-all">
-                                    <span className="text-gray-600">{new Date(l.ts).toLocaleTimeString()} </span>
+                                    <span className="text-gray-600">{new Intl.DateTimeFormat("en-GB", {timeZone: "Asia/Shanghai", hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false}).format(new Date(l.ts))} </span>
                                     <span className={l.line.includes("✅") || l.line.includes("✓") ? "text-green-400" : l.line.includes("❌") || l.line.includes("✗") ? "text-red-400" : ""}>{l.line}</span>
                                 </div>
                             ))}

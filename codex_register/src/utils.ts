@@ -1,5 +1,27 @@
 import { createHash, randomBytes } from "node:crypto";
 
+/** 北京时间 YYYY-MM-DD HH:mm 或带秒；收件箱/日志展示用（固定 Asia/Shanghai，不跟机器时区） */
+export function formatBeijingDateTime(ts: number | Date | string | null | undefined, withSeconds = false): string {
+  if (ts == null || ts === "") return "";
+  const d = ts instanceof Date
+    ? ts
+    : new Date(typeof ts === "number" ? ts : (Number(ts) || Date.parse(String(ts))));
+  if (!Number.isFinite(d.getTime()) || d.getTime() <= 0) return "";
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Shanghai",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: withSeconds ? "2-digit" : undefined,
+    hour12: false,
+  }).formatToParts(d);
+  const g = (t: string) => parts.find((p) => p.type === t)?.value || "00";
+  const base = `${g("year")}-${g("month")}-${g("day")} ${g("hour")}:${g("minute")}`;
+  return withSeconds ? `${base}:${g("second")}` : base;
+}
+
 export function randomUrlSafeString(length: number): string {
   const size = length > 0 ? length : 32;
   return randomBytes(size).toString("base64url");

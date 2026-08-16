@@ -1,9 +1,23 @@
-import {useEffect, useState, useMemo, useRef} from "react";
-import {api, connectStream, type Account, type RechargeCard, type RechargeCardStats, type RechargeQueueItem, type RechargeQueueStats} from "./api";
+import {useEffect, useState, useMemo, useRef, type Dispatch, type SetStateAction} from "react";
+import {api, connectStream, type Account, type RebindGmailPoolItem, type RechargeCard, type RechargeCardStats, type RechargeQueueItem, type RechargeQueueStats} from "./api";
 
 const p2 = (n: number) => String(n).padStart(2, "0");
-const fmtTime = (ts?: number) => { if (!ts) return "—"; const d = new Date(ts); return `${p2(d.getMonth() + 1)}-${p2(d.getDate())} ${p2(d.getHours())}:${p2(d.getMinutes())}`; };
-const fmtLogTime = (ts?: number) => { if (!ts) return "—"; const d = new Date(ts); return `${p2(d.getMonth() + 1)}-${p2(d.getDate())} ${p2(d.getHours())}:${p2(d.getMinutes())}:${p2(d.getSeconds())}`; };
+/** 北京时间固定 Asia/Shanghai，不跟浏览器本地时区 */
+const fmtBjParts = (ts: number, withSec = false) => {
+    const parts = new Intl.DateTimeFormat("en-CA", {
+        timeZone: "Asia/Shanghai",
+        month: "2-digit", day: "2-digit",
+        hour: "2-digit", minute: "2-digit",
+        second: withSec ? "2-digit" : undefined,
+        hour12: false,
+    }).formatToParts(new Date(ts));
+    const g = (t: string) => parts.find((p) => p.type === t)?.value || "00";
+    return withSec
+        ? `${g("month")}-${g("day")} ${g("hour")}:${g("minute")}:${g("second")}`
+        : `${g("month")}-${g("day")} ${g("hour")}:${g("minute")}`;
+};
+const fmtTime = (ts?: number) => (!ts ? "—" : fmtBjParts(ts, false));
+const fmtLogTime = (ts?: number) => (!ts ? "—" : fmtBjParts(ts, true));
 const fmtDur = (start?: number, end?: number) => {
     if (!start || !end || end < start) return "—";
     const s = Math.round((end - start) / 1000);
@@ -16,11 +30,31 @@ const fmtDur = (start?: number, end?: number) => {
 const Q_LABEL: Record<string, string> = {pending: "待提交", paired: "已配对", submitting: "提交中", submitted: "已提交", done: "完成", error: "失败"};
 const Q_COLOR: Record<string, string> = {pending: "#6b7280", paired: "#2563eb", submitting: "#f59e0b", submitted: "#8b5cf6", done: "#16a34a", error: "#dc2626"};
 const TASK_COLOR: Record<string, string> = {pending: "#6b7280", leased: "#2563eb", running: "#2563eb", paid: "#16a34a", failed: "#dc2626", canceled: "#dc2626", returned: "#f59e0b", manual_review: "#f59e0b"};
-const EMPTY_Q: RechargeQueueStats = {pending: 0, paired: 0, submitting: 0, submitted: 0, done: 0, error: 0, total: 0};
+const EMPTY_Q: RechargeQueueStats = {pending: 0, paired: 0, submitting: 0, submitted: 0, done: 0, error: 0, total: 0, undelivered: 0, delivered: 0};
 const EMPTY_C: RechargeCardStats = {unused: 0, paired: 0, submitting: 0, submitted: 0, done: 0, error: 0, total: 0};
 
+/** 换绑展示：原邮箱 → 现邮箱 */
+function rebindLine(q: RechargeQueueItem): {text: string; title: string; ok: boolean} {
+    const from = String(q.rebind_from || "").trim();
+    const to = String(q.rebind_email || q.email || "").trim();
+    if (q.rebind_status === "ok" || (from && to && from !== to)) {
+        const text = from && to && from !== to ? `${from} → ${to}` : (to || from || "已换绑");
+        return {text, title: text, ok: true};
+    }
+    if (q.rebind_status === "pending") {
+        const t = q.rebind_target === "mailcom" ? " mail.com" : q.rebind_target === "gmail" ? " Gmail" : "";
+        return {text: `换绑中${t}`, title: q.rebind_error || "", ok: false};
+    }
+    if (q.rebind_status === "fail") return {text: q.rebind_error || "失败", title: q.rebind_error || "", ok: false};
+    if (q.rebind_status === "skipped") return {text: "无需换绑", title: "", ok: false};
+    return {text: "—", title: "", ok: false};
+}
+
 export function RechargePanel({notify}: {notify?: (m: string) => void}) {
-    // 队列
+    // 队列：未交付=作业中；已交付=移除后的历史（含换绑记录）
+    const [deliveryTab, setDeliveryTab] = useState<"undelivered" | "delivered">("undelivered");
+    const deliveryTabRef = useRef<"undelivered" | "delivered">("undelivered");
+    deliveryTabRef.current = deliveryTab;
     const [queue, setQueue] = useState<RechargeQueueItem[]>([]);
     const [qStats, setQStats] = useState<RechargeQueueStats>(EMPTY_Q);
     const [qSel, setQSel] = useState<Set<number>>(new Set());
@@ -74,16 +108,29 @@ export function RechargePanel({notify}: {notify?: (m: string) => void}) {
     const logBoxRef = useRef<HTMLDivElement>(null);
     const [showRebindGmail, setShowRebindGmail] = useState(false);
     const [rebindIds, setRebindIds] = useState<number[]>([]);
-    const [rebindMode, setRebindMode] = useState<"auto" | "grp" | "emails">("auto");
-    const [rebindGrp, setRebindGrp] = useState("");
-    const [rebindText, setRebindText] = useState("");
-    const [rebindPick, setRebindPick] = useState<Set<string>>(new Set());
-    const [rebindPool, setRebindPool] = useState<{list: {id: number; email: string; grp: string}[]; groups: {grp: string; n: number}[]; count: number}>({list: [], groups: [], count: 0});
-    const [rebindSearch, setRebindSearch] = useState("");
+    /** 验证区分组；换绑只从「换绑池」ready 列表选 */
+    const [stageGrp, setStageGrp] = useState("");
+    const [stagePick, setStagePick] = useState<Set<number>>(new Set());
+    const [readyPick, setReadyPick] = useState<Set<number>>(new Set());
+    const [stageSearch, setStageSearch] = useState("");
+    const [readySearch, setReadySearch] = useState("");
+    const [rebindPool, setRebindPool] = useState<{
+        poolGrp: string;
+        staging: RebindGmailPoolItem[];
+        ready: RebindGmailPoolItem[];
+        groups: {grp: string; n: number}[];
+        stagingCount: number;
+        readyCount: number;
+    }>({poolGrp: "换绑池", staging: [], ready: [], groups: [], stagingCount: 0, readyCount: 0});
 
     const toast = (m: string) => notify?.(m);
+    const isDeliveredTab = deliveryTab === "delivered";
 
-    const loadQueue = () => { api.rechargeQueue().then((r) => { setQueue(r.list); setQStats(r.stats); }).catch(() => {}); api.rechargeQueueBatches().then(setQBatches).catch(() => {}); };
+    const loadQueue = () => {
+        const d = deliveryTabRef.current;
+        api.rechargeQueue(d).then((r) => { setQueue(r.list); setQStats(r.stats); }).catch(() => {});
+        api.rechargeQueueBatches(d).then(setQBatches).catch(() => {});
+    };
     const loadCards = () => api.rechargeCards().then((r) => { setCards(r.list); setCStats(r.stats); }).catch(() => {});
     const applyRebindCounts = (c: {gmailFreeImap?: number; mailcomFree?: number; rebindAfterPaid?: string; rebindGmailAfterPaid?: boolean}) => {
         if (typeof c.gmailFreeImap === "number") setGmailFreeImap(c.gmailFreeImap);
@@ -97,7 +144,11 @@ export function RechargePanel({notify}: {notify?: (m: string) => void}) {
     useEffect(() => {
         loadQueue(); loadCards(); loadConfig(); loadLogs();
         const off = connectStream((ev, data: any) => {
-            if (ev === "rechargeQueue") { setQueue(data.list || []); setQStats(data.stats || EMPTY_Q); }
+            if (ev === "rechargeQueue") {
+                // 服务端广播始终是未交付列表；统计含 undelivered/delivered 计数
+                setQStats(data.stats || EMPTY_Q);
+                if (deliveryTabRef.current === "undelivered") setQueue(data.list || []);
+            }
             if (ev === "recharge") { setCards(data.list || []); setCStats(data.stats || EMPTY_C); }
             if (ev === "rechargeLog") {
                 setLogs((prev) => [...prev.slice(-500), data]);
@@ -115,6 +166,14 @@ export function RechargePanel({notify}: {notify?: (m: string) => void}) {
         const poll = setInterval(() => { loadLogs(); loadQueue(); }, 4000);
         return () => { off(); clearInterval(poll); };
     }, []);
+
+    // 切换 未交付/已交付 时重新拉列表
+    useEffect(() => {
+        setQSel(new Set());
+        setQFilter("all");
+        setQBatchFilter("");
+        loadQueue();
+    }, [deliveryTab]);
 
     useEffect(() => {
         const el = logBoxRef.current;
@@ -218,14 +277,26 @@ export function RechargePanel({notify}: {notify?: (m: string) => void}) {
         } catch (e: any) { toast("入队失败: " + e.message); } finally { setBusy(false); }
     };
 
+    /** 标记已交付：从作业队列移到「已交付」tab，保留账号与换绑记录 */
     const doRemoveFromQueue = async () => {
         const ids = selQIds();
         if (!ids.length) return;
-        if (!confirm(`确认移出 ${ids.length} 个账号?\n将同时删除对应 GPT 账号、日志及邮箱。`)) return;
+        if (!confirm(`确认将 ${ids.length} 个账号标记为已交付？\n会从「未交付」队列移出，可在「已交付」查看换绑记录；不会删除 GPT 账号或邮箱。`)) return;
         try {
-            await api.removeFromRechargeQueue(ids);
-            setQSel(new Set()); loadQueue(); toast(`已移出 ${ids.length} 个`);
-        } catch (e: any) { toast("移出失败: " + e.message); }
+            const r = await api.deliverRechargeQueue(ids);
+            setQSel(new Set()); loadQueue(); toast(`已交付 ${r.count ?? ids.length} 个`);
+        } catch (e: any) { toast("标记已交付失败: " + e.message); }
+    };
+
+    /** 已交付 → 退回未交付 */
+    const doUndeliver = async () => {
+        const ids = selQIds();
+        if (!ids.length) return;
+        if (!confirm(`确认将 ${ids.length} 个账号退回未交付？\n会重新出现在作业队列。`)) return;
+        try {
+            const r = await api.undeliverRechargeQueue(ids);
+            setQSel(new Set()); loadQueue(); toast(`已退回未交付 ${r.count ?? ids.length} 个`);
+        } catch (e: any) { toast("退回失败: " + e.message); }
     };
 
     const doSetBatch = async () => {
@@ -302,21 +373,34 @@ export function RechargePanel({notify}: {notify?: (m: string) => void}) {
             toast("换绑选项保存失败: " + e.message);
         }
     };
+    const loadRebindPool = async () => {
+        const r = await api.rebindGmailPool();
+        const next = {
+            poolGrp: r.poolGrp || "换绑池",
+            staging: r.staging || [],
+            ready: r.ready || [],
+            groups: r.groups || [],
+            stagingCount: r.stagingCount ?? (r.staging || []).length,
+            readyCount: r.readyCount ?? (r.ready || []).length,
+        };
+        setRebindPool(next);
+        return next;
+    };
     const openRebindGmail = async (ids?: number[]) => {
         const pick = ids && ids.length ? ids : selQIds();
         if (!pick.length) { toast("请先选择已付费的队列项"); return; }
         setRebindIds(pick);
-        setRebindMode("auto");
-        setRebindGrp("__PICK__");
-        setRebindText("");
-        setRebindPick(new Set());
-        setRebindSearch("");
+        setStagePick(new Set());
+        setReadyPick(new Set());
+        setStageSearch("");
+        setReadySearch("");
         setShowRebindGmail(true);
         try {
-            const r = await api.rebindGmailPool();
-            setRebindPool({list: r.list || [], groups: r.groups || [], count: r.count || 0});
+            const {groups} = await loadRebindPool();
+            const top = [...groups].sort((a, b) => (b.n || 0) - (a.n || 0))[0];
+            setStageGrp(top ? top.grp : "");
         } catch (e: any) {
-            toast("加载可换绑 Gmail 失败: " + e.message);
+            toast("加载 Gmail 池失败: " + e.message);
         }
     };
     const submitRebind = async (target: "gmail" | "mailcom", opts?: {emails?: string[]; grp?: string; text?: string}) => {
@@ -340,29 +424,144 @@ export function RechargePanel({notify}: {notify?: (m: string) => void}) {
         if (!confirm(`对选中的 ${ids.length} 项换绑 mail.com？\n只处理已付费(paid)的号，自动领取空闲 mail.com。换完旧邮箱标已售，不返还。`)) return;
         await submitRebind("mailcom");
     };
-    const doConfirmRebindGmail = async () => {
-        if (rebindMode === "grp") {
-            if (rebindGrp === "__PICK__") { toast("请选择分组"); return; }
-            await submitRebind("gmail", {grp: rebindGrp});
-            return;
+    const formatRebindCredLine = (m: RebindGmailPoolItem) =>
+        [m.email, m.password || "", m.totp_secret || "", m.imap_password || ""].join("----");
+    const copyRebindCreds = async (rows: RebindGmailPoolItem[], label: string) => {
+        if (!rows.length) { toast("没有可复制的邮箱"); return; }
+        const text = rows.map(formatRebindCredLine).join("\n");
+        try {
+            await navigator.clipboard.writeText(text);
+            toast(`已复制 ${rows.length} 条${label}（邮箱----密码----TOTP----IMAP）`);
+        } catch {
+            downloadText(text, "rebind-gmail-creds.txt");
+            toast(`已下载 ${rows.length} 条账密（剪贴板不可用）`);
         }
-        if (rebindMode === "emails") {
-            const fromPick = [...rebindPick];
-            const text = rebindText.trim();
-            if (!fromPick.length && !text) { toast("请勾选或粘贴要换绑的 Gmail"); return; }
-            await submitRebind("gmail", {emails: fromPick, text});
-            return;
-        }
-        await submitRebind("gmail");
     };
-    const rebindVisible = useMemo(() => {
-        const q = rebindSearch.trim().toLowerCase();
-        return rebindPool.list.filter((m) => {
-            if (rebindMode === "grp" && rebindGrp !== "__PICK__" && (m.grp || "") !== rebindGrp) return false;
-            if (q && !m.email.toLowerCase().includes(q) && !(m.grp || "").toLowerCase().includes(q)) return false;
+    const refreshStageGrp = (groups: {grp: string; n: number}[], staging: RebindGmailPoolItem[]) => {
+        if (staging.some((m) => (m.grp || "") === stageGrp)) return;
+        const top = [...groups].sort((a, b) => (b.n || 0) - (a.n || 0))[0];
+        setStageGrp(top ? top.grp : "");
+    };
+    const doMarkUnavailable = async (ids: number[]) => {
+        if (!ids.length) { toast("请先勾选邮箱"); return; }
+        if (!confirm(`将 ${ids.length} 个标记为「登录不可用」并踢出池？\n（标已售 + login_fail）`)) return;
+        setBusy(true);
+        try {
+            const r = await api.markRebindGmailUnavailable(ids, "登录不可用");
+            applyRebindCounts(r);
+            toast(`已标记不可用 ${r.count} 个`);
+            setStagePick(new Set());
+            setReadyPick(new Set());
+            const next = await loadRebindPool();
+            refreshStageGrp(next.groups, next.staging);
+        } catch (e: any) {
+            toast("标记失败: " + (e?.message || e));
+        } finally {
+            setBusy(false);
+        }
+    };
+    /** 验证通过 → 批量迁入换绑池（IMAP 通的立刻入池，慢号不挡已通过的） */
+    const doMigrateToReady = async (ids: number[]) => {
+        if (!ids.length) { toast("请先勾选验证通过的邮箱"); return; }
+        if (!confirm(`将 ${ids.length} 个迁入「${rebindPool.poolGrp}」？\n最低准则：有 2FA + 有 IMAP。\n服务端并行探 IMAP，通的立刻入池；不通的拒绝/标废。\n慢号不会拖住已通过的号。`)) return;
+        setBusy(true);
+        // 边迁边刷：服务端是通了就改 grp，前端轮询才能看见右侧换绑池增长
+        let pollTimer: ReturnType<typeof setInterval> | null = null;
+        const stopPoll = () => {
+            if (pollTimer != null) {
+                clearInterval(pollTimer);
+                pollTimer = null;
+            }
+        };
+        pollTimer = setInterval(() => {
+            loadRebindPool().then((next) => refreshStageGrp(next.groups, next.staging)).catch(() => {});
+        }, 1500);
+        try {
+            const r = await api.migrateToRebindGmailPool(ids);
+            applyRebindCounts(r);
+            const rej = r.skipped?.length || 0;
+            toast(rej
+                ? `迁入 ${r.count} 个，拒绝 ${rej}（${(r.skipped || []).slice(0, 3).map((s) => `${s.email || s.id}:${s.reason}`).join("；")}）`
+                : `已迁入换绑池 ${r.count} 个`);
+            setStagePick(new Set());
+            setReadyPick(new Set());
+        } catch (e: any) {
+            // 部分号可能已入池（边探边迁），仍提示并刷新
+            toast("迁入中断: " + (e?.message || e) + "（已成功的会留在换绑池，请看右侧）");
+        } finally {
+            stopPoll();
+            try {
+                const next = await loadRebindPool();
+                refreshStageGrp(next.groups, next.staging);
+            } catch { /* 最终刷新失败不挡 toast */ }
+            setBusy(false);
+        }
+    };
+    /** 从换绑池移回验证区 */
+    const doDemoteFromReady = async (ids: number[]) => {
+        if (!ids.length) { toast("请先勾选换绑池中的邮箱"); return; }
+        if (!confirm(`将 ${ids.length} 个移出「${rebindPool.poolGrp}」回到验证区？`)) return;
+        setBusy(true);
+        try {
+            const r = await api.demoteFromRebindGmailPool(ids, stageGrp || "");
+            applyRebindCounts(r);
+            toast(`已移出换绑池 ${r.count} 个`);
+            setReadyPick(new Set());
+            await loadRebindPool();
+        } catch (e: any) {
+            toast("移出失败: " + (e?.message || e));
+        } finally {
+            setBusy(false);
+        }
+    };
+    const doConfirmRebindGmail = async () => {
+        if (!rebindPool.readyCount) {
+            toast(`换绑池「${rebindPool.poolGrp}」为空，请先在左侧验证并迁入`);
+            return;
+        }
+        if (readyPick.size > 0) {
+            const emails = rebindPool.ready.filter((m) => readyPick.has(m.id)).map((m) => m.email);
+            if (!emails.length) { toast("勾选的邮箱已不在换绑池，请刷新"); return; }
+            if (!confirm(`用换绑池勾选的 ${emails.length} 个 Gmail，给 ${rebindIds.length} 个已付费号换绑？`)) return;
+            await submitRebind("gmail", {emails});
+            return;
+        }
+        if (!confirm(`从换绑池「${rebindPool.poolGrp}」自动领取（共 ${rebindPool.readyCount} 个），给 ${rebindIds.length} 个已付费号换绑？`)) return;
+        await submitRebind("gmail", {grp: rebindPool.poolGrp});
+    };
+    const stageVisible = useMemo(() => {
+        const q = stageSearch.trim().toLowerCase();
+        return rebindPool.staging.filter((m) => {
+            if ((m.grp || "") !== (stageGrp || "")) return false;
+            if (q && !m.email.toLowerCase().includes(q)) return false;
             return true;
         });
-    }, [rebindPool.list, rebindMode, rebindGrp, rebindSearch]);
+    }, [rebindPool.staging, stageGrp, stageSearch]);
+    const readyVisible = useMemo(() => {
+        const q = readySearch.trim().toLowerCase();
+        return rebindPool.ready.filter((m) => {
+            if (q && !m.email.toLowerCase().includes(q)) return false;
+            return true;
+        });
+    }, [rebindPool.ready, readySearch]);
+    const toggleIdSet = (setter: Dispatch<SetStateAction<Set<number>>>, id: number) => {
+        setter((prev) => {
+            const n = new Set(prev);
+            if (n.has(id)) n.delete(id); else n.add(id);
+            return n;
+        });
+    };
+    const selectAllIds = (setter: Dispatch<SetStateAction<Set<number>>>, rows: RebindGmailPoolItem[], allOn: boolean) => {
+        setter((prev) => {
+            const n = new Set(prev);
+            for (const m of rows) {
+                if (allOn) n.delete(m.id); else n.add(m.id);
+            }
+            return n;
+        });
+    };
+    const stageAllSel = stageVisible.length > 0 && stageVisible.every((m) => stagePick.has(m.id));
+    const readyAllSel = readyVisible.length > 0 && readyVisible.every((m) => readyPick.has(m.id));
 
     // 导出
     const downloadText = (text: string, filename: string) => {
@@ -558,34 +757,84 @@ export function RechargePanel({notify}: {notify?: (m: string) => void}) {
 
             {/* ====== 充值队列(核心) ====== */}
             <div className="bg-white rounded-lg border shadow-sm">
+                {/* 未交付 / 已交付 Tab */}
+                <div className="px-4 pt-3 flex items-center gap-1 border-b">
+                    <button
+                        type="button"
+                        onClick={() => setDeliveryTab("undelivered")}
+                        className={`px-3 py-2 text-sm font-medium border-b-2 -mb-px transition-colors ${
+                            !isDeliveredTab
+                                ? "border-blue-600 text-blue-700"
+                                : "border-transparent text-gray-500 hover:text-gray-800"
+                        }`}
+                    >
+                        未交付
+                        <span className={`ml-1.5 text-xs tabular-nums ${!isDeliveredTab ? "text-blue-600" : "text-gray-400"}`}>
+                            {qStats.undelivered ?? qStats.total}
+                        </span>
+                    </button>
+                    <button
+                        type="button"
+                        onClick={() => setDeliveryTab("delivered")}
+                        className={`px-3 py-2 text-sm font-medium border-b-2 -mb-px transition-colors ${
+                            isDeliveredTab
+                                ? "border-emerald-600 text-emerald-700"
+                                : "border-transparent text-gray-500 hover:text-gray-800"
+                        }`}
+                    >
+                        已交付
+                        <span className={`ml-1.5 text-xs tabular-nums ${isDeliveredTab ? "text-emerald-600" : "text-gray-400"}`}>
+                            {qStats.delivered ?? 0}
+                        </span>
+                    </button>
+                    <div className="flex-1"/>
+                    <span className="text-[11px] text-gray-400 pb-2 pr-1">
+                        {isDeliveredTab ? "已交付可查看换绑记录；可退回未交付" : "提交后默认为未交付；标记已交付后进入右侧"}
+                    </span>
+                </div>
+
                 <div className="px-4 py-3 border-b flex items-center gap-2 flex-wrap">
-                    <span className="text-sm font-semibold">充值队列</span>
-                    <Btn onClick={openPicker} className="bg-blue-600 text-white border-blue-600 hover:bg-blue-700">+ 选择账号入队</Btn>
-                    <Btn onClick={() => { setShowSetBatch(true); setBatchInput(""); }}>设置批次</Btn>
-                    <Btn onClick={doReset}>重置</Btn>
-                    <Btn onClick={doReclaimCards}>回收卡密</Btn>
-                    <Btn onClick={doRemoveFromQueue} className="bg-white border-red-200 text-red-600 hover:bg-red-50">移出队列</Btn>
-                    <div className="border-l mx-1 h-5"/>
-                    <Btn onClick={() => doSubmit(selQIds())} disabled={!hasKey || cStats.unused === 0} className="bg-green-600 text-white border-green-600 hover:bg-green-700">提交选中</Btn>
-                    <Btn onClick={() => doSubmit(filteredQueue.filter((q) => q.status === "pending").map((q) => q.id))} disabled={!hasKey || cStats.unused === 0}>全部提交</Btn>
-                    <Btn onClick={doPoll}>刷新状态</Btn>
-                    <Btn onClick={() => doRebind("gmail")} title="对已付费项换绑 Gmail：可选分组或指定邮箱，换绑前探 IMAP">换绑 Gmail</Btn>
-                    <Btn onClick={() => doRebind("mailcom")} title="对已付费项手动换绑 mail.com；旧邮箱标已售">换绑 mail.com</Btn>
-                    <Btn onClick={doStop} className="bg-white border-red-200 text-red-600 hover:bg-red-50">停止</Btn>
-                    <Btn onClick={doRelogin} title="重登取 session → 验卡 → 重置 → 用原卡密重提(卡密已消费则跳过)" className="bg-amber-500 text-white border-amber-500 hover:bg-amber-600">重登并提交</Btn>
-                    <Btn onClick={doStopRelogin} className="bg-white border-red-200 text-red-600 hover:bg-red-50">停止登录</Btn>
-                    <div className="border-l mx-1 h-5"/>
+                    <span className="text-sm font-semibold">{isDeliveredTab ? "已交付列表" : "充值队列"}</span>
+                    {!isDeliveredTab && (
+                        <>
+                            <Btn onClick={openPicker} className="bg-blue-600 text-white border-blue-600 hover:bg-blue-700">+ 选择账号入队</Btn>
+                            <Btn onClick={() => { setShowSetBatch(true); setBatchInput(""); }}>设置批次</Btn>
+                            <Btn onClick={doReset}>重置</Btn>
+                            <Btn onClick={doReclaimCards}>回收卡密</Btn>
+                            <Btn onClick={doRemoveFromQueue} className="bg-white border-emerald-200 text-emerald-700 hover:bg-emerald-50" title="标记已交付：保留账号与换绑记录，移入「已交付」">标记已交付</Btn>
+                            <div className="border-l mx-1 h-5"/>
+                            <Btn onClick={() => doSubmit(selQIds())} disabled={!hasKey || cStats.unused === 0} className="bg-green-600 text-white border-green-600 hover:bg-green-700">提交选中</Btn>
+                            <Btn onClick={() => doSubmit(filteredQueue.filter((q) => q.status === "pending").map((q) => q.id))} disabled={!hasKey || cStats.unused === 0}>全部提交</Btn>
+                            <Btn onClick={doPoll}>刷新状态</Btn>
+                            <Btn onClick={() => doRebind("gmail")} title="对已付费项换绑 Gmail（mail.com→Gmail 或 Gmail→Gmail 均可）；迁入时探 IMAP，换绑领号时探网页登录">换绑 Gmail</Btn>
+                            <Btn onClick={() => doRebind("mailcom")} title="对已付费项手动换绑 mail.com；旧邮箱标已售">换绑 mail.com</Btn>
+                            <Btn onClick={doStop} className="bg-white border-red-200 text-red-600 hover:bg-red-50">停止</Btn>
+                            <Btn onClick={doRelogin} title="重登取 session → 验卡 → 重置 → 用原卡密重提(卡密已消费则跳过)" className="bg-amber-500 text-white border-amber-500 hover:bg-amber-600">重登并提交</Btn>
+                            <Btn onClick={doStopRelogin} className="bg-white border-red-200 text-red-600 hover:bg-red-50">停止登录</Btn>
+                            <div className="border-l mx-1 h-5"/>
+                        </>
+                    )}
+                    {isDeliveredTab && (
+                        <>
+                            <Btn onClick={doUndeliver} className="bg-white border-blue-200 text-blue-700 hover:bg-blue-50">退回未交付</Btn>
+                            <div className="border-l mx-1 h-5"/>
+                        </>
+                    )}
                     <Btn onClick={() => doExport("account")}>导出账密</Btn>
                     <Btn onClick={() => doExport("full")}>导出含RT</Btn>
                     <Btn onClick={() => doExport("card")}>复制卡密</Btn>
                     <Btn onClick={() => doExport("session")}>复制session</Btn>
-                    <Btn onClick={() => setShowBatchRt(true)} className="bg-amber-600 text-white border-amber-600 hover:bg-amber-700">批量获取RT</Btn>
-                    <Btn onClick={openSub2json} className="bg-violet-600 text-white border-violet-600 hover:bg-violet-700" title="勾选后打开会自动填充；支持 Gmail（用 GPT 密码 + RT）">导出sub2json</Btn>
-                    <Btn onClick={doProbePlan}>查询套餐</Btn>
+                    {!isDeliveredTab && (
+                        <>
+                            <Btn onClick={() => setShowBatchRt(true)} className="bg-amber-600 text-white border-amber-600 hover:bg-amber-700">批量获取RT</Btn>
+                            <Btn onClick={openSub2json} className="bg-violet-600 text-white border-violet-600 hover:bg-violet-700" title="勾选后打开会自动填充；支持 Gmail（用 GPT 密码 + RT）">导出sub2json</Btn>
+                            <Btn onClick={doProbePlan}>查询套餐</Btn>
+                        </>
+                    )}
                     <div className="flex-1"/>
-                    {/* 筛选 */}
+                    {/* 筛选：已交付主要看批次；未交付看作业状态 */}
                     <div className="flex items-center gap-1 text-xs">
-                        {[{k: "all", l: "全部", n: qStats.total}, {k: "undone", l: "未完成", n: qStats.pending + qStats.submitted},
+                        {!isDeliveredTab && [{k: "all", l: "全部", n: qStats.total}, {k: "undone", l: "未完成", n: qStats.pending + qStats.submitted},
                           {k: "finished", l: "已完成", n: qStats.done + qStats.error},
                           {k: "pending", l: "待提交", n: qStats.pending},
                           {k: "submitted", l: "已提交", n: qStats.submitted}, {k: "done", l: "完成", n: qStats.done}, {k: "error", l: "失败", n: qStats.error}]
@@ -595,6 +844,9 @@ export function RechargePanel({notify}: {notify?: (m: string) => void}) {
                                 {l} {n}
                             </button>
                         ))}
+                        {isDeliveredTab && (
+                            <span className="text-gray-500 px-1">共 {queue.length} 条</span>
+                        )}
                         {qBatches.length > 0 && (
                             <select value={qBatchFilter} onChange={(e) => setQBatchFilter(e.target.value)}
                                     className="px-1.5 py-0.5 border rounded text-xs outline-none ml-1">
@@ -610,33 +862,46 @@ export function RechargePanel({notify}: {notify?: (m: string) => void}) {
                         <thead className="bg-gray-50 sticky top-0">
                             <tr>
                                 <th className="w-8 px-2 py-2"><input type="checkbox" checked={allQSel} onChange={toggleAllQ}/></th>
-                                <th className="text-left px-2 py-2 font-medium text-gray-500">邮箱</th>
+                                <th className="text-left px-2 py-2 font-medium text-gray-500">当前邮箱</th>
+                                {isDeliveredTab && <th className="text-left px-2 py-2 font-medium text-gray-500">换绑记录</th>}
                                 <th className="text-left px-2 py-2 font-medium text-gray-500">套餐</th>
                                 <th className="text-left px-2 py-2 font-medium text-gray-500">批次</th>
-                                <th className="text-left px-2 py-2 font-medium text-gray-500">实例</th>
+                                {!isDeliveredTab && <th className="text-left px-2 py-2 font-medium text-gray-500">实例</th>}
                                 <th className="text-left px-2 py-2 font-medium text-gray-500">状态</th>
                                 <th className="text-left px-2 py-2 font-medium text-gray-500">卡密</th>
                                 <th className="text-left px-2 py-2 font-medium text-gray-500">提交时间</th>
                                 <th className="text-left px-2 py-2 font-medium text-gray-500">完成时间</th>
-                                <th className="text-left px-2 py-2 font-medium text-gray-500">耗时</th>
+                                {isDeliveredTab && <th className="text-left px-2 py-2 font-medium text-gray-500">交付时间</th>}
+                                {!isDeliveredTab && <th className="text-left px-2 py-2 font-medium text-gray-500">耗时</th>}
                                 <th className="text-left px-2 py-2 font-medium text-gray-500">任务状态</th>
-                                <th className="text-left px-2 py-2 font-medium text-gray-500">换绑</th>
+                                {!isDeliveredTab && <th className="text-left px-2 py-2 font-medium text-gray-500">换绑</th>}
                                 <th className="text-left px-2 py-2 font-medium text-gray-500">消息</th>
-                                <th className="text-left px-2 py-2 font-medium text-gray-500">操作</th>
+                                {!isDeliveredTab && <th className="text-left px-2 py-2 font-medium text-gray-500">操作</th>}
                             </tr>
                         </thead>
                         <tbody>
-                            {filteredQueue.map((q) => (
+                            {filteredQueue.map((q) => {
+                                const rb = rebindLine(q);
+                                return (
                                 <tr key={q.id} className="border-t hover:bg-gray-50 cursor-pointer" onClick={() => toggleQSel(q.id)}>
                                     <td className="px-2 py-1.5 text-center" onClick={(e) => e.stopPropagation()}><input type="checkbox" checked={qSel.has(q.id)} onChange={() => toggleQSel(q.id)}/></td>
                                     <td className="px-2 py-1.5 text-gray-700">{q.email}</td>
+                                    {isDeliveredTab && (
+                                        <td className="px-2 py-1.5 max-w-[280px] truncate" title={rb.title || rb.text}>
+                                            {rb.ok ? <span className="text-green-700 font-mono text-[11px]">{rb.text}</span>
+                                                : rb.text !== "—" ? <span className="text-gray-500">{rb.text}</span>
+                                                : <span className="text-gray-300">未换绑</span>}
+                                        </td>
+                                    )}
                                     <td className="px-2 py-1.5 text-gray-500">{q.plan_type || q.plan || "—"}</td>
                                     <td className="px-2 py-1.5 text-gray-500">{q.batch || "—"}</td>
+                                    {!isDeliveredTab && (
                                     <td className="px-2 py-1.5 text-xs font-mono" title={q.instance_id || ""}>
                                         {!q.instance_id ? <span className="text-gray-300">—</span>
                                             : q.instance_id === instanceId ? <span className="text-blue-600">本机</span>
                                             : <span className="text-amber-600">{q.instance_id}</span>}
                                     </td>
+                                    )}
                                     <td className="px-2 py-1.5">
                                         <span className="inline-flex items-center gap-1 text-xs font-medium" style={{color: Q_COLOR[q.status] || "#6b7280"}}>
                                             <span className="w-1.5 h-1.5 rounded-full" style={{background: Q_COLOR[q.status] || "#6b7280"}}/>{Q_LABEL[q.status] || q.status}
@@ -646,18 +911,26 @@ export function RechargePanel({notify}: {notify?: (m: string) => void}) {
                                     <td className="px-2 py-1.5 font-mono text-gray-500">{q.card_code ? (q.card_code.length > 16 ? q.card_code.slice(0, 8) + "…" : q.card_code) : "—"}</td>
                                     <td className="px-2 py-1.5 text-gray-500 text-xs whitespace-nowrap">{fmtTime(q.submitted_at)}</td>
                                     <td className="px-2 py-1.5 text-gray-500 text-xs whitespace-nowrap">{fmtTime(q.finished_at)}</td>
+                                    {isDeliveredTab && (
+                                        <td className="px-2 py-1.5 text-gray-500 text-xs whitespace-nowrap">{fmtTime(q.delivered_at)}</td>
+                                    )}
+                                    {!isDeliveredTab && (
                                     <td className="px-2 py-1.5 text-gray-500 text-xs whitespace-nowrap" title={q.submitted_at && q.finished_at ? `${fmtTime(q.submitted_at)} → ${fmtTime(q.finished_at)}` : ""}>{fmtDur(q.submitted_at, q.finished_at)}</td>
+                                    )}
                                     <td className="px-2 py-1.5">{q.task_status ? <span style={{color: TASK_COLOR[q.task_status] || "#6b7280"}}>{q.task_status}</span> : "—"}</td>
-                                    <td className="px-2 py-1.5 max-w-[160px] truncate" title={q.rebind_error || q.rebind_email || ""}>
-                                        {q.rebind_status === "ok" ? <span className="text-green-600">{q.rebind_email || "已换绑"}</span>
-                                            : q.rebind_status === "pending" ? <span className="text-amber-600">换绑中{q.rebind_target === "mailcom" ? " mail.com" : q.rebind_target === "gmail" ? " Gmail" : ""}</span>
-                                            : q.rebind_status === "fail" ? <span className="text-red-500">{q.rebind_error || "失败"}</span>
-                                            : q.rebind_status === "skipped" ? <span className="text-gray-400">无需换绑</span>
+                                    {!isDeliveredTab && (
+                                    <td className="px-2 py-1.5 max-w-[200px] truncate" title={rb.title || q.rebind_error || q.rebind_email || ""}>
+                                        {rb.ok ? <span className="text-green-600" title={rb.title}>{rb.text}</span>
+                                            : q.rebind_status === "pending" ? <span className="text-amber-600">{rb.text}</span>
+                                            : q.rebind_status === "fail" ? <span className="text-red-500">{rb.text}</span>
+                                            : q.rebind_status === "skipped" ? <span className="text-gray-400">{rb.text}</span>
                                             : <span className="text-gray-300">—</span>}
                                     </td>
+                                    )}
                                     <td className="px-2 py-1.5 text-gray-500 max-w-[180px] truncate" title={q.task_message || q.error || ""}>
                                         {q.error ? <span className="text-red-500">{q.error}</span> : (q.task_message || "—")}
                                     </td>
+                                    {!isDeliveredTab && (
                                     <td className="px-2 py-1.5" onClick={(e) => e.stopPropagation()}>
                                         {q.status !== "done" && q.status !== "pending" && q.card_code && (
                                             <button onClick={() => { api.pollRecharge([q.id]).then(() => { toast(`已刷新 ${q.email}`); loadQueue(); }).catch((e: any) => toast(e.message)); }}
@@ -684,9 +957,17 @@ export function RechargePanel({notify}: {notify?: (m: string) => void}) {
                                                     className="text-red-500 hover:text-red-700 text-xs hover:underline ml-2">取消换绑</button>
                                         )}
                                     </td>
+                                    )}
                                 </tr>
-                            ))}
-                            {!filteredQueue.length && <tr><td colSpan={14} className="text-center py-8 text-gray-400">队列为空，点击「选择账号入队」添加</td></tr>}
+                                );
+                            })}
+                            {!filteredQueue.length && (
+                                <tr>
+                                    <td colSpan={isDeliveredTab ? 11 : 14} className="text-center py-8 text-gray-400">
+                                        {isDeliveredTab ? "暂无已交付账号；在「未交付」中点「标记已交付」后会出现在这里" : "队列为空，点击「选择账号入队」添加"}
+                                    </td>
+                                </tr>
+                            )}
                         </tbody>
                     </table>
                 </div>
@@ -858,70 +1139,178 @@ export function RechargePanel({notify}: {notify?: (m: string) => void}) {
                 </div>
             )}
 
-            {/* ====== 换绑 Gmail：选分组 / 选邮箱 ====== */}
+            {/* ====== 换绑 Gmail：验证区分组 → 迁入换绑池 → 从换绑池换绑 ====== */}
             {showRebindGmail && (
-                <div className="fixed inset-0 bg-black/30 flex items-center justify-center z-50" onClick={() => setShowRebindGmail(false)}>
-                    <div className="bg-white rounded-xl shadow-xl w-[560px] max-h-[85vh] flex flex-col" onClick={(e) => e.stopPropagation()}>
-                        <div className="px-5 py-3 border-b font-semibold text-sm">
-                            换绑 Gmail
-                            <div className="text-xs text-gray-400 font-normal mt-0.5">
-                                对 {rebindIds.length} 个已付费号。只领独立、未售、IMAP 通的可用 Gmail；不通换号。成功后新旧邮箱都标已售。
+                <div className="fixed inset-0 bg-black/30 flex items-center justify-center z-50" onClick={() => !busy && setShowRebindGmail(false)}>
+                    <div className="bg-white rounded-xl shadow-xl w-[960px] max-w-[96vw] max-h-[92vh] flex flex-col" onClick={(e) => e.stopPropagation()}>
+                        <div className="px-5 py-3 border-b font-semibold text-sm flex items-start gap-3">
+                            <div className="flex-1 min-w-0">
+                                换绑 Gmail
+                                <div className="text-xs text-gray-400 font-normal mt-0.5">
+                                    给 <b className="text-gray-600">{rebindIds.length}</b> 个已付费号（支持 mail.com→Gmail，也支持 Gmail→Gmail 再换一把）。
+                                    流程：① 左侧按分组选号 → ② 迁入「{rebindPool.poolGrp}」时并行探 IMAP（只探一次）→ ③ 换绑领号时只探网页登录。
+                                </div>
                             </div>
+                            <button type="button" disabled={busy}
+                                    onClick={() => loadRebindPool().then(() => toast("已刷新")).catch((e: any) => toast(e.message))}
+                                    className="text-xs px-2 py-1 border rounded text-gray-500 hover:bg-gray-50 disabled:opacity-40 shrink-0">
+                                刷新
+                            </button>
                         </div>
-                        <div className="px-5 py-3 space-y-3 text-xs overflow-auto">
-                            <div className="flex items-center gap-3 flex-wrap">
-                                {([
-                                    ["auto", "自动领取"],
-                                    ["grp", "指定分组"],
-                                    ["emails", "指定邮箱"],
-                                ] as const).map(([k, l]) => (
-                                    <label key={k} className="inline-flex items-center gap-1.5 cursor-pointer">
-                                        <input type="radio" name="rebind-src" checked={rebindMode === k} onChange={() => setRebindMode(k)}/>
-                                        {l}
-                                    </label>
-                                ))}
-                                <span className="text-gray-400 ml-auto">可换绑 {rebindPool.count}</span>
-                            </div>
-                            {rebindMode === "grp" && (
-                                <select value={rebindGrp} onChange={(e) => setRebindGrp(e.target.value)}
-                                        className="w-full px-2 py-1.5 border rounded outline-none">
-                                    <option value="__PICK__">选择分组</option>
+                        <div className="px-4 py-3 grid grid-cols-1 md:grid-cols-2 gap-3 min-h-0 flex-1 overflow-hidden text-xs">
+                            {/* —— 左：验证区 —— */}
+                            <div className="border rounded-lg flex flex-col min-h-0 overflow-hidden">
+                                <div className="px-3 py-2 bg-violet-50 border-b font-medium text-violet-900">
+                                    ① 验证区 <span className="font-normal text-violet-600">（需 2FA+IMAP；迁入并行探 IMAP）</span>
+                                    <span className="float-right text-violet-500 font-normal">{rebindPool.stagingCount} 个</span>
+                                </div>
+                                <div className="px-2 py-2 flex flex-wrap gap-1.5 border-b max-h-20 overflow-auto">
+                                    {rebindPool.groups.length === 0 && <span className="text-gray-400 px-1">暂无待验证 Gmail</span>}
                                     {rebindPool.groups.map((g) => (
-                                        <option key={g.grp || "__EMPTY__"} value={g.grp}>{g.grp || "(无分组)"} ({g.n})</option>
+                                        <button key={g.grp || "__EMPTY__"} type="button"
+                                                onClick={() => { setStageGrp(g.grp); setStagePick(new Set()); }}
+                                                className={`px-2 py-0.5 rounded border max-w-[140px] truncate ${stageGrp === g.grp ? "bg-violet-600 text-white border-violet-600" : "bg-white text-gray-600 border-gray-200"}`}
+                                                title={g.grp || "(无分组)"}>
+                                            {g.grp || "(无分组)"} ({g.n})
+                                        </button>
                                     ))}
-                                </select>
-                            )}
-                            {rebindMode === "emails" && (
-                                <textarea value={rebindText} onChange={(e) => setRebindText(e.target.value)}
-                                          placeholder={"粘贴 Gmail，每行一个，或 email----密码\n也可在下方列表勾选"}
-                                          className="w-full h-20 px-2 py-1.5 border rounded font-mono outline-none resize-y"/>
-                            )}
-                            <input value={rebindSearch} onChange={(e) => setRebindSearch(e.target.value)}
-                                   placeholder="搜索邮箱 / 分组"
-                                   className="w-full px-2 py-1.5 border rounded outline-none"/>
-                            <div className="border rounded max-h-[240px] overflow-auto">
-                                {rebindVisible.map((m) => (
-                                    <label key={m.id} className="flex items-center gap-2 px-2 py-1 border-b last:border-0 hover:bg-blue-50 cursor-pointer">
-                                        <input type="checkbox" checked={rebindPick.has(m.email)}
-                                               onChange={() => {
-                                                   setRebindMode("emails");
-                                                   setRebindPick((prev) => {
-                                                       const n = new Set(prev);
-                                                       if (n.has(m.email)) n.delete(m.email); else n.add(m.email);
-                                                       return n;
-                                                   });
-                                               }}/>
-                                        <span className="flex-1 font-mono text-gray-700 truncate">{m.email}</span>
-                                        <span className="text-gray-400">{m.grp || "无分组"}</span>
-                                    </label>
-                                ))}
-                                {!rebindVisible.length && <div className="px-3 py-6 text-center text-gray-400">没有可换绑的独立 Gmail</div>}
+                                </div>
+                                <div className="px-2 py-1.5 flex flex-wrap gap-1.5 border-b bg-gray-50/80">
+                                    <button type="button" disabled={!stageVisible.length}
+                                            onClick={() => copyRebindCreds(stageVisible, "（本组）")}
+                                            className="px-2 py-1 rounded border border-violet-300 text-violet-700 bg-white hover:bg-violet-50 disabled:opacity-40">
+                                        复制本组 ({stageVisible.length})
+                                    </button>
+                                    <button type="button" disabled={!stagePick.size}
+                                            onClick={() => copyRebindCreds(rebindPool.staging.filter((m) => stagePick.has(m.id)), "（勾选）")}
+                                            className="px-2 py-1 rounded border border-violet-300 text-violet-700 bg-white hover:bg-violet-50 disabled:opacity-40">
+                                        复制勾选 ({stagePick.size})
+                                    </button>
+                                    <button type="button" disabled={busy || !stagePick.size}
+                                            onClick={() => doMigrateToReady([...stagePick])}
+                                            className="px-2 py-1 rounded border border-emerald-400 text-emerald-800 bg-emerald-50 hover:bg-emerald-100 disabled:opacity-40 font-medium">
+                                        迁入换绑池 ({stagePick.size})
+                                    </button>
+                                    <button type="button" disabled={busy || !stagePick.size}
+                                            onClick={() => doMarkUnavailable([...stagePick])}
+                                            className="px-2 py-1 rounded border border-red-300 text-red-700 bg-red-50 hover:bg-red-100 disabled:opacity-40">
+                                        不可用 ({stagePick.size})
+                                    </button>
+                                </div>
+                                <input value={stageSearch} onChange={(e) => setStageSearch(e.target.value)} placeholder="搜索本组邮箱"
+                                       className="mx-2 mt-2 px-2 py-1 border rounded outline-none"/>
+                                <div className="flex-1 min-h-[180px] max-h-[340px] overflow-auto m-2 border rounded">
+                                    <table className="w-full">
+                                        <thead className="bg-gray-50 text-gray-500 sticky top-0">
+                                            <tr>
+                                                <th className="w-8 px-1 py-1">
+                                                    <input type="checkbox" checked={stageAllSel} disabled={!stageVisible.length}
+                                                           onChange={() => selectAllIds(setStagePick, stageVisible, stageAllSel)}/>
+                                                </th>
+                                                <th className="text-left px-1 py-1">邮箱</th>
+                                                <th className="w-10 px-1 py-1"></th>
+                                            </tr>
+                                        </thead>
+                                        <tbody>
+                                            {stageVisible.map((m) => (
+                                                <tr key={m.id} className="border-t hover:bg-violet-50/50">
+                                                    <td className="px-1 py-1 text-center">
+                                                        <input type="checkbox" checked={stagePick.has(m.id)}
+                                                               onChange={() => toggleIdSet(setStagePick, m.id)}/>
+                                                    </td>
+                                                    <td className="px-1 py-1 font-mono break-all">{m.email}</td>
+                                                    <td className="px-1 py-1 text-center">
+                                                        <button type="button" className="text-violet-600 hover:underline"
+                                                                onClick={() => copyRebindCreds([m], "")}>复制</button>
+                                                    </td>
+                                                </tr>
+                                            ))}
+                                        </tbody>
+                                    </table>
+                                    {!stageVisible.length && <div className="py-8 text-center text-gray-400">本组无待验证号</div>}
+                                </div>
+                                <div className="px-2 pb-2 text-gray-400">格式 邮箱----密码----TOTP----IMAP · 全选后可批量迁入</div>
                             </div>
-                            {rebindMode === "emails" && <div className="text-gray-400">已勾选 {rebindPick.size} 个</div>}
+
+                            {/* —— 右：换绑池 —— */}
+                            <div className="border rounded-lg flex flex-col min-h-0 overflow-hidden border-emerald-200">
+                                <div className="px-3 py-2 bg-emerald-50 border-b border-emerald-200 font-medium text-emerald-900">
+                                    ② {rebindPool.poolGrp} <span className="font-normal text-emerald-700">（已验证，换绑只从这里领）</span>
+                                    <span className="float-right text-emerald-600 font-normal">{rebindPool.readyCount} 个</span>
+                                </div>
+                                <div className="px-2 py-1.5 flex flex-wrap gap-1.5 border-b bg-gray-50/80">
+                                    <button type="button" disabled={!readyVisible.length}
+                                            onClick={() => copyRebindCreds(readyVisible, "（换绑池）")}
+                                            className="px-2 py-1 rounded border border-emerald-300 text-emerald-800 bg-white hover:bg-emerald-50 disabled:opacity-40">
+                                        复制全部 ({readyVisible.length})
+                                    </button>
+                                    <button type="button" disabled={!readyPick.size}
+                                            onClick={() => copyRebindCreds(rebindPool.ready.filter((m) => readyPick.has(m.id)), "（勾选）")}
+                                            className="px-2 py-1 rounded border border-emerald-300 text-emerald-800 bg-white hover:bg-emerald-50 disabled:opacity-40">
+                                        复制勾选 ({readyPick.size})
+                                    </button>
+                                    <button type="button" disabled={busy || !readyPick.size}
+                                            onClick={() => doDemoteFromReady([...readyPick])}
+                                            className="px-2 py-1 rounded border border-gray-300 text-gray-600 bg-white hover:bg-gray-50 disabled:opacity-40">
+                                        移回验证区 ({readyPick.size})
+                                    </button>
+                                    <button type="button" disabled={busy || !readyPick.size}
+                                            onClick={() => doMarkUnavailable([...readyPick])}
+                                            className="px-2 py-1 rounded border border-red-300 text-red-700 bg-red-50 hover:bg-red-100 disabled:opacity-40">
+                                        不可用 ({readyPick.size})
+                                    </button>
+                                </div>
+                                <input value={readySearch} onChange={(e) => setReadySearch(e.target.value)} placeholder="搜索换绑池邮箱"
+                                       className="mx-2 mt-2 px-2 py-1 border rounded outline-none"/>
+                                <div className="flex-1 min-h-[180px] max-h-[340px] overflow-auto m-2 border rounded border-emerald-100">
+                                    <table className="w-full">
+                                        <thead className="bg-emerald-50/80 text-gray-500 sticky top-0">
+                                            <tr>
+                                                <th className="w-8 px-1 py-1">
+                                                    <input type="checkbox" checked={readyAllSel} disabled={!readyVisible.length}
+                                                           onChange={() => selectAllIds(setReadyPick, readyVisible, readyAllSel)}/>
+                                                </th>
+                                                <th className="text-left px-1 py-1">邮箱</th>
+                                                <th className="w-10 px-1 py-1"></th>
+                                            </tr>
+                                        </thead>
+                                        <tbody>
+                                            {readyVisible.map((m) => (
+                                                <tr key={m.id} className="border-t hover:bg-emerald-50/60">
+                                                    <td className="px-1 py-1 text-center">
+                                                        <input type="checkbox" checked={readyPick.has(m.id)}
+                                                               onChange={() => toggleIdSet(setReadyPick, m.id)}/>
+                                                    </td>
+                                                    <td className="px-1 py-1 font-mono break-all">{m.email}</td>
+                                                    <td className="px-1 py-1 text-center">
+                                                        <button type="button" className="text-emerald-700 hover:underline"
+                                                                onClick={() => copyRebindCreds([m], "")}>复制</button>
+                                                    </td>
+                                                </tr>
+                                            ))}
+                                        </tbody>
+                                    </table>
+                                    {!readyVisible.length && (
+                                        <div className="py-8 text-center text-gray-400 px-3">
+                                            换绑池为空。请在左侧勾选后「迁入换绑池」（服务端并行探 IMAP）。
+                                        </div>
+                                    )}
+                                </div>
+                                <div className="px-2 pb-2 text-gray-400">
+                                    {readyPick.size
+                                        ? `已勾选 ${readyPick.size}，确认换绑将只用勾选`
+                                        : `未勾选则从整池 ${rebindPool.readyCount} 个里自动领`}
+                                </div>
+                            </div>
                         </div>
-                        <div className="px-5 py-3 border-t flex justify-end gap-2">
-                            <Btn onClick={() => setShowRebindGmail(false)}>取消</Btn>
-                            <Btn onClick={doConfirmRebindGmail} className="bg-blue-600 text-white border-blue-600 hover:bg-blue-700">确认换绑</Btn>
+                        <div className="px-5 py-3 border-t flex flex-wrap justify-end gap-2">
+                            <Btn onClick={() => setShowRebindGmail(false)} disabled={busy}>取消</Btn>
+                            <Btn onClick={doConfirmRebindGmail} disabled={busy || !rebindPool.readyCount}
+                                 className="bg-emerald-600 text-white border-emerald-600 hover:bg-emerald-700 disabled:opacity-40">
+                                {readyPick.size
+                                    ? `确认换绑（池内勾选 ${readyPick.size}）`
+                                    : `确认换绑（换绑池 ${rebindPool.readyCount}）`}
+                            </Btn>
                         </div>
                     </div>
                 </div>

@@ -1,7 +1,8 @@
 // @ts-nocheck
 // Gmail 老号 provider:用邮箱+密码(+TOTP/辅助邮箱)收 ChatGPT 验证码。
-// 先试 IMAP(未开 2FA 或有应用专用密码时快);失败再 Playwright 登录 mail.google.com 扒信。
-// 凭证来自 MAILCOM_TOKENS_FILE,扩展列: email----password----totp----recovery
+// 默认/GPT 注册：只走 IMAP（必须有应用专用密码）；无 IMAP 直接报错。
+// allowWebFallback=true 时才允许 Playwright 登录 mail.google.com 扒信。
+// 凭证来自 MAILCOM_TOKENS_FILE,扩展列: email----password----totp----recovery----imap
 import {readFileSync, existsSync} from "node:fs";
 import path from "node:path";
 import {chromium} from "playwright-core";
@@ -198,10 +199,13 @@ async function scrapeGmailWebOtp(page, email, excludeCode = "") {
     return "";
 }
 
-export async function launchGoogleBrowser({proxyUrl = ""} = {}) {
+export async function launchGoogleBrowser({proxyUrl = "", headless} = {}) {
     const launchOpts = {
         channel: "chrome",
-        headless: process.env.MAILCOM_HEADLESS === "1" && process.env.GOOGLE_HEADED !== "1",
+        // 显式 headless 优先；否则沿用环境变量（默认 headed 方便人工看窗）
+        headless: headless !== undefined
+            ? !!headless
+            : (process.env.MAILCOM_HEADLESS === "1" && process.env.GOOGLE_HEADED !== "1"),
         args: ["--disable-blink-features=AutomationControlled"],
     };
     const po = parseProxyOpt(proxyUrl || process.env.MAILCOM_PROXY || process.env.PROXY_URL || "");
@@ -213,10 +217,16 @@ export async function getGoogleEmailVerificationCode(email, options = {}) {
     const cred = resolveGoogleCred(email);
     const excludeCode = options.excludeCode || "";
     const minTimestampMs = options.minTimestampMs || 0;
+    // GPT 注册 / 默认：必须 IMAP；无应用密码直接报错，禁止悄悄改走网页收件箱
+    const allowWebFallback = options.allowWebFallback === true;
+    const hasImap = !!(cred.imapPassword && String(cred.imapPassword).trim());
 
-    const hasImap = !!(cred.imapPassword);
+    if (!hasImap) {
+        throw new Error(`Gmail 没有 IMAP 应用密码，不能收验证码（GPT 注册必须走 IMAP）: ${email}`);
+    }
+
     let imapErr = "";
-    for (let i = 0; i < (hasImap ? 12 : 1); i++) {
+    for (let i = 0; i < 12; i++) {
         try {
             const imapCode = await tryImapOtp(cred, {minTimestampMs, excludeCode});
             if (imapCode) {
@@ -225,12 +235,14 @@ export async function getGoogleEmailVerificationCode(email, options = {}) {
             }
         } catch (e) {
             imapErr = String(e?.message || e);
-            console.log(`[google] IMAP 不可用(${imapErr.slice(0, 80)})${hasImap ? "，稍后重试" : ",改走网页收件箱"}`);
-            if (!hasImap) break;
+            console.log(`[google] IMAP 不可用(${imapErr.slice(0, 80)})，稍后重试`);
         }
-        if (hasImap && i < 11) await new Promise((r) => setTimeout(r, 5000));
+        if (i < 11) await new Promise((r) => setTimeout(r, 5000));
     }
-    if (hasImap) throw new Error(`IMAP 未拿到 ChatGPT 验证码${imapErr ? `(${imapErr.slice(0, 80)})` : ""}: ${email}`);
+    if (!allowWebFallback) {
+        throw new Error(`IMAP 未拿到 ChatGPT 验证码${imapErr ? `(${imapErr.slice(0, 80)})` : ""}: ${email}`);
+    }
+    console.log(`[google] IMAP 失败，allowWebFallback 改走网页收件箱`);
 
     const reuse = livePage;
     let browser = null;
