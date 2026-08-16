@@ -93,19 +93,24 @@ async function main() {
     let mfaStatus = "";
     if (process.env.REG_TRY_MFA === "1") {
         emit({type: "progress", stage: "mfa", message: "注册后绑定 TOTP…"});
-        const accountId = decodeJwt(token)?.["https://api.openai.com/auth"]?.chatgpt_account_id || "";
-        const mfaCookie = String((client as any).lastSavedAuthRecord?.cookie || (client as any).cookie || "").trim();
-        const mfa = await enrollTotp(token, {
-            accountId,
-            proxyUrl: process.env.PROXY_URL || "",
-            cookie: mfaCookie,
-            retryAltProxy: true,
-            browserFallback: process.env.MFA_NO_BROWSER !== "1",
-            log: (m) => emit({type: "progress", stage: "mfa", message: m}),
-        });
-        if (mfa.ok && mfa.secret) { totpSecret = mfa.secret; mfaStatus = "✅已绑"; emit({type: "progress", stage: "mfa", message: `TOTP 已绑定(${mfa.via || "http"})`}); }
-        else if (mfa.ok && mfa.already) { mfaStatus = "⚠已有2FA缺密钥"; emit({type: "progress", stage: "mfa", message: "该号已有 2FA 但本次未拿到 secret"}); }
-        else { mfaStatus = "❌" + (mfa.reason || "绑定失败"); emit({type: "progress", stage: "mfa", message: "TOTP 绑定失败: " + (mfa.reason || "")}); }
+        try {
+            const accountId = decodeJwt(token)?.["https://api.openai.com/auth"]?.chatgpt_account_id || "";
+            const mfaCookie = String((client as any).lastSavedAuthRecord?.cookie || (client as any).cookie || "").trim();
+            const mfa = await enrollTotp(token, {
+                accountId,
+                proxyUrl: process.env.PROXY_URL || "",
+                cookie: mfaCookie,
+                retryAltProxy: true,
+                browserFallback: process.env.MFA_NO_BROWSER !== "1",
+                log: (m) => emit({type: "progress", stage: "mfa", message: m}),
+            });
+            if (mfa.ok && mfa.secret) { totpSecret = mfa.secret; mfaStatus = "✅已绑"; emit({type: "progress", stage: "mfa", message: `TOTP 已绑定(${mfa.via || "http"})`}); }
+            else if (mfa.ok && mfa.already) { mfaStatus = "⚠已有2FA缺密钥"; emit({type: "progress", stage: "mfa", message: "该号已有 2FA 但本次未拿到 secret"}); }
+            else { mfaStatus = "❌" + (mfa.reason || "绑定失败"); emit({type: "progress", stage: "mfa", message: "TOTP 未绑(不影响注册): " + (mfa.reason || "")}); }
+        } catch (e: any) {
+            mfaStatus = "❌" + String(e?.message || e).slice(0, 80);
+            emit({type: "progress", stage: "mfa", message: "TOTP 未绑(不影响注册): " + mfaStatus});
+        }
     }
 
     // [追加·不影响原流程] 注册成功后额外走一次 codex OAuth(client_id=app_EMo... + offline_access)拿可续期 refresh_token。

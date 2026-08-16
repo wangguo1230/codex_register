@@ -469,13 +469,27 @@ export async function enrollTotpViaBrowser(
         return {ok: false, reason: `playwright-core 不可用: ${String(e?.message || e).slice(0, 80)}`};
     }
 
+    // Playwright 不支持 socks5 user:pass；带着 kookeey 账密 launch 会直接抛，不能拖垮已注册成功的号
+    if (/^socks5?:\/\//i.test(String(proxyUrl || "")) && /@/.test(String(proxyUrl || "").split("#")[0])) {
+        return {ok: false, reason: "浏览器不支持 socks5 账密代理，跳过绑2FA", via: "browser"};
+    }
+
     log("2FA 走真浏览器请求 backend-api…");
-    const browser = await chromium.launch({
-        headless: headless !== false,
-        executablePath: exe,
-        proxy: parseProxyForPlaywright(proxyUrl || ""),
-        args: ["--disable-blink-features=AutomationControlled"],
-    });
+    let browser: any;
+    try {
+        browser = await chromium.launch({
+            headless: headless !== false,
+            executablePath: exe,
+            proxy: parseProxyForPlaywright(proxyUrl || ""),
+            args: ["--disable-blink-features=AutomationControlled"],
+        });
+    } catch (e: any) {
+        const msg = String(e?.message || e);
+        if (/socks5 proxy authentication/i.test(msg)) {
+            return {ok: false, reason: "浏览器不支持 socks5 账密代理，跳过绑2FA", via: "browser"};
+        }
+        return {ok: false, reason: `浏览器启动失败: ${msg.slice(0, 120)}`, via: "browser"};
+    }
     try {
         const context = await browser.newContext({
             userAgent: DEFAULT_USER_AGENT,
@@ -651,18 +665,26 @@ export async function enrollTotp(
     // 浏览器也绕不过「必须密码 reauth」的 401，仅网络类再降级
     const skipBrowser = /AT 失效|无 access_token|mfa 不可用\(404\)|需重新密码登录/i.test(last.reason || "");
     if (browserFallback && !skipBrowser) {
-        const viaBrowser = await enrollTotpViaBrowser(token, {
-            accountId: aid, proxyUrl, cookie: ck, headless, log,
-        });
-        if (viaBrowser.ok) return viaBrowser;
-        if (viaBrowser.needReauth || bodySaysReauth(viaBrowser.reason)) {
-            return {ok: false, reason: viaBrowser.reason || "需重新密码登录后再绑2FA", needReauth: true, via: "browser"};
+        try {
+            const viaBrowser = await enrollTotpViaBrowser(token, {
+                accountId: aid, proxyUrl, cookie: ck, headless, log,
+            });
+            if (viaBrowser.ok) return viaBrowser;
+            if (viaBrowser.needReauth || bodySaysReauth(viaBrowser.reason)) {
+                return {ok: false, reason: viaBrowser.reason || "需重新密码登录后再绑2FA", needReauth: true, via: "browser"};
+            }
+            return {
+                ok: false,
+                reason: `HTTP:${last.reason || "失败"} | 浏览器:${viaBrowser.reason || "失败"}`.slice(0, 200),
+                via: "browser",
+            };
+        } catch (e: any) {
+            return {
+                ok: false,
+                reason: `HTTP:${last.reason || "失败"} | 浏览器:${String(e?.message || e).slice(0, 80)}`.slice(0, 200),
+                via: "browser",
+            };
         }
-        return {
-            ok: false,
-            reason: `HTTP:${last.reason || "失败"} | 浏览器:${viaBrowser.reason || "失败"}`.slice(0, 200),
-            via: "browser",
-        };
     }
     return last;
 }

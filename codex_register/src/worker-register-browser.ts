@@ -211,8 +211,11 @@ async function main() {
                 emit({type: "progress", stage: "mfa", message: "该号已有 2FA 但本次未拿到 secret"});
             } else {
                 mfaStatus = "❌" + (mfa.reason || "绑定失败");
-                emit({type: "progress", stage: "mfa", message: "TOTP 绑定失败: " + (mfa.reason || "")});
+                emit({type: "progress", stage: "mfa", message: "TOTP 未绑(不影响注册): " + (mfa.reason || "")});
             }
+        } catch (e: any) {
+            mfaStatus = "❌" + String(e?.message || e).slice(0, 80);
+            emit({type: "progress", stage: "mfa", message: "TOTP 未绑(不影响注册): " + mfaStatus});
         } finally {
             try { mfaClose(); } catch { /* */ }
         }
