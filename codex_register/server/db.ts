@@ -517,12 +517,15 @@ export async function importFreeMailboxes(rows, grp = "", usage = "free", provid
     });
 }
 
+/** 人工登录验证通过后迁入此分组，换绑只从这里领号 */
+export const REBIND_GMAIL_POOL_GRP = "换绑池";
+
 const FREE_GOOGLE_IMAP_SQL = `
     m.usage='hold' AND m.deleted_at=0
     AND COALESCE(m.sold_at,0)=0
     AND m.provider='google'
     AND COALESCE(m.imap_password,'') <> ''
-    AND COALESCE(m.google_stage,'') NOT IN ('gpt_ok')
+    AND COALESCE(m.google_stage,'') NOT IN ('gpt_ok','login_fail','blocked')
     AND NOT EXISTS (SELECT 1 FROM gpt_accounts g WHERE g.mailbox_id=m.id AND COALESCE(g.deleted_at,0)=0)
     AND NOT EXISTS (SELECT 1 FROM claude_accounts c WHERE c.mailbox_id=m.id)
 `;
@@ -541,17 +544,32 @@ export async function countFreeGoogleImapMailboxes() {
     return rows[0]?.n || 0;
 }
 
-/** 可换绑 Gmail 池：独立未售、已开 IMAP、未挂 GPT/Claude。 */
+/**
+ * Gmail 两段池：
+ * - staging：各业务分组里待验证的可用 Gmail（不含「换绑池」）
+ * - ready：已人工确认可登录、grp=换绑池，换绑只从这里领
+ */
 export async function listRebindGmailPool() {
     const { rows } = await query(`
-        SELECT m.id, m.email, COALESCE(m.grp,'') AS grp
+        SELECT m.id, m.email, COALESCE(m.grp,'') AS grp,
+               COALESCE(m.password,'') AS password,
+               COALESCE(m.totp_secret,'') AS totp_secret,
+               COALESCE(m.imap_password,'') AS imap_password,
+               COALESCE(m.google_stage,'') AS google_stage
         FROM mailboxes m
         WHERE ${FREE_GOOGLE_IMAP_SQL}
         ORDER BY m.grp, m.id DESC
     `);
+    const poolName = REBIND_GMAIL_POOL_GRP;
+    const staging = [];
+    const ready = [];
+    for (const r of rows) {
+        if ((r.grp || "") === poolName) ready.push(r);
+        else staging.push(r);
+    }
     const groups = [];
     const map = new Map();
-    for (const r of rows) {
+    for (const r of staging) {
         const g = r.grp || "";
         if (!map.has(g)) {
             const rec = {grp: g, n: 0};
@@ -560,7 +578,68 @@ export async function listRebindGmailPool() {
         }
         map.get(g).n += 1;
     }
-    return {list: rows, groups, count: rows.length};
+    return {
+        poolGrp: poolName,
+        // 兼容旧字段：list=全部可领号（含换绑池）
+        list: rows,
+        groups,
+        count: rows.length,
+        staging,
+        stagingCount: staging.length,
+        ready,
+        readyCount: ready.length,
+    };
+}
+
+/** 验证通过 → 迁入「换绑池」分组（批量）。 */
+export async function moveMailboxesToRebindPool(ids) {
+    const list = [...new Set((ids || []).map(Number).filter(Number.isInteger))];
+    if (!list.length) return 0;
+    const { rowCount } = await query(
+        `UPDATE mailboxes m SET grp=$1
+         WHERE m.id = ANY($2)
+           AND ${FREE_GOOGLE_IMAP_SQL}
+           AND COALESCE(m.grp,'') <> $1`,
+        [REBIND_GMAIL_POOL_GRP, list],
+    );
+    return rowCount || 0;
+}
+
+/** 从换绑池移回指定分组（默认空分组）；仍保持独立未售。 */
+export async function moveMailboxesFromRebindPool(ids, backGrp = "") {
+    const list = [...new Set((ids || []).map(Number).filter(Number.isInteger))];
+    if (!list.length) return 0;
+    const g = String(backGrp || "");
+    const { rowCount } = await query(
+        `UPDATE mailboxes m SET grp=$1
+         WHERE m.id = ANY($2)
+           AND ${FREE_GOOGLE_IMAP_SQL}
+           AND COALESCE(m.grp,'') = $3`,
+        [g, list, REBIND_GMAIL_POOL_GRP],
+    );
+    return rowCount || 0;
+}
+
+/**
+ * 人工确认 Gmail 登不上：标 login_fail + 已售踢出池（不删号）。
+ */
+export async function markRebindGmailUnavailable(ids, reason = "登录不可用") {
+    const list = [...new Set((ids || []).map(Number).filter(Number.isInteger))];
+    if (!list.length) return 0;
+    let n = 0;
+    for (const id of list) {
+        const hit = await quarantineMailbox(id, reason);
+        if (!hit) continue;
+        try {
+            await refreshMailboxGoogleState(id, {
+                login: "fail",
+                stage: "login_fail",
+                last_error: String(reason || "登录不可用").slice(0, 120),
+            });
+        } catch { /* stage 写失败不影响踢出池 */ }
+        n += 1;
+    }
+    return n;
 }
 
 function googleImapClaimWhere({grp, emails, excludeIds} = {}) {
@@ -1826,6 +1905,14 @@ export async function mailJobsProgress(kind = "") {
     const remain = by.pending + by.running;
     const etaMs = avgMs && remain ? Math.round((avgMs * remain) / Math.max(1, by.running || 1)) : 0;
     const lastLine = current[0]?.last_line || (by.pending || by.running ? `排队 ${by.pending} · 执行 ${by.running}` : `结束 成功 ${ok}/${done}`);
+    const {rows: failRows} = await query(
+        `SELECT DISTINCT ON (mailbox_id) email
+         FROM mail_jobs
+         WHERE batch_id = ANY($1) AND status='error' ${kind ? "AND kind=$2" : ""}
+         ORDER BY mailbox_id, id DESC`,
+        kind ? [batchIds, kind] : [batchIds],
+    );
+    const failEmails = failRows.map((r) => String(r.email || "").trim()).filter(Boolean);
     return {
         running: live,
         kind: kind || "mail",
@@ -1853,5 +1940,6 @@ export async function mailJobsProgress(kind = "") {
         etaMs,
         hourly,
         hourNow,
+        failEmails,
     };
 }

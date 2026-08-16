@@ -760,6 +760,7 @@ function snapshotMailboxJob() {
         etaMs: Number(dbp.etaMs || 0) || 0,
         hourly: Array.isArray(dbp.hourly) ? dbp.hourly : [],
         hourNow: dbp.hourNow || null,
+        failEmails: Array.isArray(dbp.failEmails) ? dbp.failEmails : [],
     };
 }
 
@@ -1157,6 +1158,10 @@ app.post("/api/mailboxes/batch-google-harden/resume", async (req, res) => {
 app.post("/api/mailboxes/jobs/retry-failed", async (req, res) => {
     const ids = Array.isArray(req.body?.ids) ? req.body.ids.map(Number) : null;
     res.json(await resumeMailJobs({onlyError: true, ids}));
+});
+app.get("/api/mailboxes/jobs/latest-errors", async (_req, res) => {
+    const items = await db.listNewestBatchErrorJobs("harden").catch(() => []);
+    res.json({ok: true, emails: items.map((it) => it.email).filter(Boolean), count: items.length});
 });
 app.get("/api/mailboxes/job", async (req, res) => {
     await refreshMailboxJobWindows({listBit: false});
@@ -3347,7 +3352,11 @@ function enqueueGmailRebind(q, {force = false, target, pool} = {}) {
     gmailRebindCancelled.delete(id);
     gmailRebindQueued.add(id);
     gmailRebindTargets.set(id, dest);
-    const p = dest === "gmail" ? normalizeRebindPool(pool || q?.rebind_pool || {}) : {};
+    let p = dest === "gmail" ? normalizeRebindPool(pool || q?.rebind_pool || {}) : {};
+    // 未指定范围时，Gmail 换绑只从「换绑池」分组领（需先人工验证迁入）
+    if (dest === "gmail" && !p.emails?.length && p.grp === undefined) {
+        p = {grp: db.REBIND_GMAIL_POOL_GRP};
+    }
     if (p.emails || p.grp !== undefined) gmailRebindPool.set(id, p);
     else gmailRebindPool.delete(id);
     gmailRebindIds.push(id);
@@ -4273,11 +4282,72 @@ app.get("/api/recharge/rebind-gmail/pool", async (req, res) => {
     }
 });
 
+// 人工登录验证后标记 Gmail 不可用（踢出可换绑池）
+app.post("/api/recharge/rebind-gmail/mark-unavailable", async (req, res) => {
+    const ids = (req.body?.ids || []).map(Number).filter(Number.isInteger);
+    if (!ids.length) return res.status(400).json({error: "未选择邮箱"});
+    const reason = String(req.body?.reason || "登录不可用").slice(0, 80);
+    try {
+        const count = await db.markRebindGmailUnavailable(ids, reason);
+        rechargeLog(`Gmail 池：标记不可用 ${count} 个（${reason}）`);
+        res.json({
+            ok: true,
+            count,
+            gmailFreeImap: await db.countFreeGoogleImapMailboxes(),
+            mailcomFree: await db.countFreeMailcomMailboxes(),
+        });
+    } catch (e: any) {
+        res.status(500).json({error: String(e?.message || e)});
+    }
+});
+
+// 验证通过：批量迁入「换绑池」
+app.post("/api/recharge/rebind-gmail/migrate", async (req, res) => {
+    const ids = (req.body?.ids || []).map(Number).filter(Number.isInteger);
+    if (!ids.length) return res.status(400).json({error: "未选择邮箱"});
+    try {
+        const count = await db.moveMailboxesToRebindPool(ids);
+        rechargeLog(`Gmail 池：迁入「${db.REBIND_GMAIL_POOL_GRP}」 ${count} 个`);
+        res.json({
+            ok: true,
+            count,
+            poolGrp: db.REBIND_GMAIL_POOL_GRP,
+            gmailFreeImap: await db.countFreeGoogleImapMailboxes(),
+            mailcomFree: await db.countFreeMailcomMailboxes(),
+        });
+    } catch (e: any) {
+        res.status(500).json({error: String(e?.message || e)});
+    }
+});
+
+// 从换绑池移回（默认无分组），便于重验
+app.post("/api/recharge/rebind-gmail/demote", async (req, res) => {
+    const ids = (req.body?.ids || []).map(Number).filter(Number.isInteger);
+    if (!ids.length) return res.status(400).json({error: "未选择邮箱"});
+    const backGrp = req.body?.grp != null ? String(req.body.grp) : "";
+    try {
+        const count = await db.moveMailboxesFromRebindPool(ids, backGrp);
+        rechargeLog(`Gmail 池：移出「${db.REBIND_GMAIL_POOL_GRP}」 ${count} 个 →「${backGrp || "无分组"}」`);
+        res.json({
+            ok: true,
+            count,
+            gmailFreeImap: await db.countFreeGoogleImapMailboxes(),
+            mailcomFree: await db.countFreeMailcomMailboxes(),
+        });
+    } catch (e: any) {
+        res.status(500).json({error: String(e?.message || e)});
+    }
+});
+
 app.post("/api/recharge/rebind-gmail", async (req, res) => {
     const ids = (req.body?.ids || []).map(Number).filter(Number.isInteger);
     if (!ids.length) return res.status(400).json({error: "未选择队列项"});
     const target = normalizeRebindTarget(req.body?.target);
-    const pool = normalizeRebindPool(req.body || {});
+    // 换绑默认只从「换绑池」领；指定 emails 时仍可用勾选
+    let pool = normalizeRebindPool(req.body || {});
+    if (target !== "mailcom" && !pool.emails?.length && pool.grp === undefined) {
+        pool = {grp: db.REBIND_GMAIL_POOL_GRP};
+    }
     const skipped: {email: string; reason: string}[] = [];
     let queued = 0;
     for (const id of ids) {

@@ -131,6 +131,7 @@ export interface MailboxJob {
     etaMs?: number;
     hourly?: MailJobHourStat[];
     hourNow?: MailJobHourStat | null;
+    failEmails?: string[];
 }
 
 export interface Stats {
@@ -242,6 +243,29 @@ export interface RechargeQueueStats {
     done: number;
     error: number;
     total: number;
+}
+
+/** Gmail 验证池 / 换绑池 一行（含账密） */
+export interface RebindGmailPoolItem {
+    id: number;
+    email: string;
+    grp: string;
+    password?: string;
+    totp_secret?: string;
+    imap_password?: string;
+    google_stage?: string;
+}
+
+export interface RebindGmailPoolResponse {
+    ok: boolean;
+    poolGrp: string;
+    list: RebindGmailPoolItem[];
+    groups: {grp: string; n: number}[];
+    count: number;
+    staging: RebindGmailPoolItem[];
+    stagingCount: number;
+    ready: RebindGmailPoolItem[];
+    readyCount: number;
 }
 
 export interface XrayStatus {
@@ -423,6 +447,8 @@ export const api = {
         j<{ok: boolean; count: number; skipped?: number; skippedDone?: number; msg?: string}>("/api/mailboxes/batch-google-harden/resume", {method: "POST", body: JSON.stringify(ids?.length ? {ids} : {})}),
     retryFailedMailboxJobs: (ids?: number[]) =>
         j<{ok: boolean; count: number; skippedDone?: number; msg?: string}>("/api/mailboxes/jobs/retry-failed", {method: "POST", body: JSON.stringify(ids?.length ? {ids} : {})}),
+    latestJobErrors: () =>
+        j<{ok: boolean; emails: string[]; count: number}>("/api/mailboxes/jobs/latest-errors"),
     mailboxJob: () => j<{ok: boolean; batchHarden: MailboxJob; batchPw: MailboxJob; job: MailboxJob; instances?: MailFarmInstance[]}>("/api/mailboxes/job"),
     mailProxyPool: () => j<{ok: boolean; urls: string[]; lines?: string[]; jump?: string; total: number; slots: number; leased: number; free: number; items: {url: string; masked: string; leased: boolean; owner: string}[]}>("/api/mailboxes/proxy-pool"),
     setMailProxyPool: (text: string, opts?: {append?: boolean; copies?: number}) =>
@@ -520,8 +546,22 @@ export const api = {
         j<{ok: boolean; paired: number}>("/api/recharge/submit", {method: "POST", body: JSON.stringify({queueIds})}),
     stopRecharge: () => j<{ok: boolean}>("/api/recharge/stop", {method: "POST"}),
     pollRecharge: (ids?: number[]) => j<{ok: boolean; updated: number}>("/api/recharge/poll", {method: "POST", body: JSON.stringify({ids})}),
-    rebindGmailPool: () =>
-        j<{ok: boolean; list: {id: number; email: string; grp: string}[]; groups: {grp: string; n: number}[]; count: number}>("/api/recharge/rebind-gmail/pool"),
+    rebindGmailPool: () => j<RebindGmailPoolResponse>("/api/recharge/rebind-gmail/pool"),
+    markRebindGmailUnavailable: (ids: number[], reason?: string) =>
+        j<{ok: boolean; count: number; gmailFreeImap?: number; mailcomFree?: number}>(
+            "/api/recharge/rebind-gmail/mark-unavailable",
+            {method: "POST", body: JSON.stringify({ids, reason: reason || "登录不可用"})},
+        ),
+    migrateToRebindGmailPool: (ids: number[]) =>
+        j<{ok: boolean; count: number; poolGrp?: string; gmailFreeImap?: number; mailcomFree?: number}>(
+            "/api/recharge/rebind-gmail/migrate",
+            {method: "POST", body: JSON.stringify({ids})},
+        ),
+    demoteFromRebindGmailPool: (ids: number[], grp?: string) =>
+        j<{ok: boolean; count: number; gmailFreeImap?: number; mailcomFree?: number}>(
+            "/api/recharge/rebind-gmail/demote",
+            {method: "POST", body: JSON.stringify({ids, grp: grp ?? ""})},
+        ),
     rebindGmail: (ids: number[], target?: "gmail" | "mailcom", opts?: {emails?: string[]; grp?: string; text?: string}) =>
         j<{ok: boolean; queued: number; skipped: {email: string; reason: string}[]; gmailFreeImap?: number; mailcomFree?: number}>("/api/recharge/rebind-gmail", {method: "POST", body: JSON.stringify({ids, target, ...(opts || {})})}),
     cancelRebindGmail: (ids: number[]) =>

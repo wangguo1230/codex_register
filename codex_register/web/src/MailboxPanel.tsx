@@ -534,6 +534,17 @@ export function MailboxPanel({notify}: {notify?: (m: string) => void}) {
                 : (r.msg || `没有可${verb}的`));
         } catch (e: any) { toast(e.message); }
     };
+    const showBatchFails = async () => {
+        try {
+            const fromJob = (job.failEmails || []).filter(Boolean);
+            const r = fromJob.length ? {emails: fromJob, count: fromJob.length} : await api.latestJobErrors();
+            const emails = (r.emails || []).map((e) => String(e || "").trim()).filter(Boolean);
+            if (!emails.length) { toast("这次任务还没有失败记录"); return; }
+            setUsageFilter("");
+            setFEmail(emails.join("\n"));
+            toast(`已列出这次失败 ${emails.length} 个`);
+        } catch (e: any) { toast(e.message); }
+    };
     const doBatchUsage = async (usage: "free" | "hold") => {
         const ids = [...selected].filter((id) => filtered.some((m) => m.id === id));
         if (!ids.length) { toast("请先勾选邮箱"); return; }
@@ -674,7 +685,9 @@ export function MailboxPanel({notify}: {notify?: (m: string) => void}) {
                                 <span style={{fontSize: 12, color: "#b45309", fontVariantNumeric: "tabular-nums"}}>执行 {runN}</span>
                                 <span style={{fontSize: 12, color: "#374151", fontVariantNumeric: "tabular-nums"}}>{jobDone}/{jobTotal || "—"}</span>
                                 <span style={{fontSize: 12, color: "#059669"}}>成 {jobOk}</span>
-                                <span style={{fontSize: 12, color: jobFail ? "#dc2626" : "#9ca3af"}}>败 {jobFail}</span>
+                                <span role="button" onClick={() => { if (jobFail) void showBatchFails(); }}
+                                      title={jobFail ? "列出这次任务失败的邮箱" : ""}
+                                      style={{fontSize: 12, color: jobFail ? "#dc2626" : "#9ca3af", cursor: jobFail ? "pointer" : "default", textDecoration: jobFail ? "underline" : "none"}}>败 {jobFail}</span>
                                 <span style={{fontSize: 12, color: "#6b7280"}}>{jobDone ? `${jobRate}%` : "—"}</span>
                                 <span style={{fontSize: 12, color: "#4338ca"}}>{fmtDur(job.startedAt ? nowTick - job.startedAt : job.elapsedMs)}</span>
                                 {job.etaMs ? <span style={{fontSize: 12, color: "#9a3412"}}>余 {fmtDur(job.etaMs)}</span> : null}
@@ -723,6 +736,7 @@ export function MailboxPanel({notify}: {notify?: (m: string) => void}) {
                         <div style={{display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap"}}>
                             <span style={{fontSize: 13, color: "#6b7280"}}>上次{lastJob.kind}{lastJob.stopped ? "（已停）" : ""} {lastJob.done}/{lastJob.total} 成{lastJob.ok} 败{lastJob.fail}</span>
                             <button onClick={() => resumeMailboxJob(false)} style={{marginLeft: "auto", height: 28, padding: "0 12px", background: "#ea580c", color: "#fff", border: "none", borderRadius: 8, fontSize: 12, cursor: "pointer"}}>继续</button>
+                            <button onClick={() => void showBatchFails()} style={{height: 28, padding: "0 12px", background: "#fff", color: "#b91c1c", border: "1px solid #fecaca", borderRadius: 8, fontSize: 12, cursor: "pointer"}}>查看失败</button>
                             <button onClick={() => resumeMailboxJob(true)} style={{height: 28, padding: "0 12px", background: "#dc2626", color: "#fff", border: "none", borderRadius: 8, fontSize: 12, cursor: "pointer"}}>重试失败</button>
                             <button onClick={() => setLastJob(null)} style={{height: 28, padding: "0 10px", border: "1px solid #e5e7eb", borderRadius: 8, background: "#fff", fontSize: 12, color: "#6b7280", cursor: "pointer"}}>关闭</button>
                         </div>
