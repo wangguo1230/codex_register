@@ -226,6 +226,7 @@ async function tryClick(loc, timeout = 2500) {
 
 /** 只点当前看得见、已启用的 Next。不用 JS 伪造 click（isTrusted=false，Google 会当没点）。 */
 async function clickHostNext(page, hostSel) {
+    if (hostSel === "#identifierNext" && await googleSigninLoadingBarVisible(page)) return false;
     if (!await hostNextReady(page, hostSel)) return false;
     const host = page.locator(hostSel).first();
     if (!await host.isVisible({timeout: 400}).catch(() => false)) return false;
@@ -269,7 +270,28 @@ async function clickNext(page, _timeout = 800) {
     return clickStepNext(page);
 }
 
+/** Google 登录 SPA 顶上那条线性 Loading。框可能已经在 DOM 里，条子还在说明 JS/接口没好，这时点 Next 等于没点。 */
+async function googleSigninLoadingBarVisible(page) {
+    return page.evaluate(() => {
+        const bars = [
+            ...document.querySelectorAll('[role="progressbar"][aria-label="Loading"]'),
+            ...document.querySelectorAll(".TcuCfd [role=\"progressbar\"], .rxb0oe[data-progressvalue]"),
+        ];
+        for (const el of bars) {
+            const r = el.getBoundingClientRect();
+            const st = getComputedStyle(el);
+            if (r.width < 20 || r.height < 1) continue;
+            if (st.display === "none" || st.visibility === "hidden" || Number(st.opacity) === 0) continue;
+            const v = el.getAttribute("data-progressvalue");
+            if (v === "1") continue;
+            return true;
+        }
+        return false;
+    }).catch(() => false);
+}
+
 async function identifierStillLoading(page) {
+    if (await googleSigninLoadingBarVisible(page)) return true;
     const t = String(await page.innerText("body").catch(() => "")).replace(/\s+/g, " ").trim();
     if (!t || t.length < 8) return true;
     return /^(Loading\b)/i.test(t) || /\bLoading Sign in\b/i.test(t);
@@ -299,10 +321,15 @@ async function waitIdentifierUiReady(page, write, ms = 15000) {
             throw new Error("代理中断 Google 拒绝页 signin/rejected，换 session 重开窗");
         }
         const box = await findIdentifierBox(page);
-        // 框已经出来就填，不等 “Loading Sign in” 消掉，也不等 Next 变蓝。
-        if (box) return true;
+        const loading = await googleSigninLoadingBarVisible(page);
+        // 框出来且顶上 Loading 条没了，再填。条子还在时 Next 是假就绪。
+        if (box && !loading) return true;
         if (loginStep(url) === "password" || loginStep(url) === "totp") return true;
         await page.waitForTimeout(400);
+    }
+    if (await googleSigninLoadingBarVisible(page)) {
+        write("  登录页顶上 Loading 条一直不消，这个出口 SPA 没拉完");
+        throw new Error("代理中断 登录页一直 Loading，换 session 重开窗");
     }
     write("  邮箱页仍在 Loading 或 Next 未就绪");
     return false;
