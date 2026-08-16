@@ -55,3 +55,38 @@ export function formatHardenListReason(mb: {
     if (needTotp) return gap || "缺换2FA";
     return gap;
 }
+
+/** 列表一眼：可用=已换我们的 2FA + 有 IMAP。缺换 2FA 必须处理。 */
+export type GmailHealth = "ok" | "need_totp" | "need_imap" | "need_both" | "login_dead";
+
+export const GMAIL_HEALTH_LABEL: Record<GmailHealth, string> = {
+    ok: "可用",
+    need_totp: "缺换2FA",
+    need_imap: "缺IMAP",
+    need_both: "缺2FA和IMAP",
+    login_dead: "登不上",
+};
+
+export const GMAIL_HEALTH_COLOR: Record<GmailHealth, string> = {
+    ok: "#059669",
+    need_totp: "#c2410c",
+    need_imap: "#d97706",
+    need_both: "#b45309",
+    login_dead: "#dc2626",
+};
+
+export function gmailHealth(mb: {
+    google_stage?: string;
+    google_state?: {totp_rotated?: boolean; login?: string} | null;
+    imap_password?: string;
+} = {}): GmailHealth {
+    const st = mb.google_state && typeof mb.google_state === "object" ? mb.google_state : {};
+    const totp = !!st.totp_rotated;
+    const imap = !!String(mb.imap_password || "").trim();
+    if (String(mb.google_stage || "") === "gpt_ok" || (totp && imap)) return "ok";
+    if (imap && !totp) return "need_totp";
+    if (totp && !imap) return "need_imap";
+    const loginDead = st.login === "fail" || mb.google_stage === "login_fail" || mb.google_stage === "blocked";
+    if (loginDead) return "login_dead";
+    return "need_both";
+}

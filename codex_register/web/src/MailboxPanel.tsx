@@ -5,7 +5,7 @@
 //   - 邮箱密码校验工具(改密全归邮箱管理:导入后自动改密/手动/批量,注册流程不越界)
 import {useCallback, useEffect, useMemo, useRef, useState} from "react";
 import {api, connectStream, type Mailbox, type MailboxJob} from "./api";
-import {formatHardenListReason} from "./google-harden-reason";
+import {formatHardenListReason, gmailHealth, GMAIL_HEALTH_LABEL, GMAIL_HEALTH_COLOR, type GmailHealth} from "./google-harden-reason";
 import {MailCheckTool} from "./MailCheckTool";
 import {MailboxDetail} from "./MailboxDetail";
 import {ProxyPoolPanel} from "./ProxyPoolPanel";
@@ -48,9 +48,11 @@ const GOOGLE_STAGE_SEARCH: Record<string, string> = {
     blocked: "卡住 blocked",
 };
 const GOOGLE_STAGE_KEYWORD: Record<string, string> = {
-    整备的: "ready", 已整备: "ready", 整备完: "ready", 备完: "ready", 可取件: "ready", 整备: "ready",
-    整备未齐: "partial", 未整备: "partial",
-    刚导入: "imported", 能登录: "login_ok", 登不上: "login_fail", 卡住: "blocked",
+    整备的: "ok", 已整备: "ok", 整备完: "ok", 备完: "ok", 可取件: "ok", 整备: "ok", 可用: "ok", 好的: "ok",
+    有问题: "bad", 未整备: "bad", 整备未齐: "bad",
+    缺换2fa: "need_totp", 缺2fa: "need_totp",
+    缺imap: "need_imap",
+    登不上: "login_dead", 卡住: "login_dead",
 };
 const GOOGLE_STAGE_COLOR: Record<string, string> = {
     imported: "#6b7280", login_ok: "#2563eb", login_fail: "#dc2626",
@@ -141,7 +143,7 @@ export function MailboxPanel({notify}: {notify?: (m: string) => void}) {
     const [usageFilter, setUsageFilter] = useState<"" | "free" | "hold" | "gpt" | "claude" | "deleted">("");
     const [fGrp, setFGrp] = useState(""); // 筛选:分组
     const [fPw, setFPw] = useState<"" | "no" | "yes" | "fail">(""); // 筛选:改密状态(未改/已改/失败)
-    const [fGmail, setFGmail] = useState(""); // 筛选:Gmail 管理阶段
+    const [fGmail, setFGmail] = useState(""); // 筛选:Gmail 结果 ok/bad/need_totp/...
     const [fProvider, setFProvider] = useState<"" | "mailcom" | "google" | "icloud">("");
     const [fSold, setFSold] = useState<"" | "yes" | "no">("");
     const [fEmail, setFEmail] = useState(""); // 筛选:邮箱关键词
@@ -390,7 +392,13 @@ export function MailboxPanel({notify}: {notify?: (m: string) => void}) {
             if (fSold === "no" && m.sold_at) return false;
             if (fGrp === "__NONE__") { if (m.grp) return false; } else if (fGrp && (m.grp || "") !== fGrp) return false;
             if (fPw && pwState(m) !== fPw) return false;
-            if (fGmail && (m.google_stage || "") !== fGmail) return false;
+            if (fGmail && providerOf(m) === "google") {
+                const h = gmailHealth(m);
+                if (fGmail === "bad") { if (h === "ok") return false; }
+                else if (h !== fGmail) return false;
+            } else if (fGmail && providerOf(m) !== "google") {
+                return false;
+            }
             if (keywordQs.length) {
                 const hay = [
                     m.email,
@@ -408,6 +416,8 @@ export function MailboxPanel({notify}: {notify?: (m: string) => void}) {
                     m.imap_password ? "imap 有imap" : "",
                     formatHardenListReason(m),
                     m.google_state?.last_error || "",
+                    GMAIL_HEALTH_LABEL[gmailHealth(m)] || "",
+                    gmailHealth(m) === "ok" ? "可用 好的 已齐" : "有问题 未齐",
                 ].join(" ").toLowerCase();
                 if (!keywordQs.some((q) => hay.includes(q))) return false;
             }
@@ -442,11 +452,12 @@ export function MailboxPanel({notify}: {notify?: (m: string) => void}) {
         else if (fGrp && (m.grp || "") !== fGrp) return false;
         return true;
     }), [searchBase, fSold, fGrp]);
-    const gmailStageCounts = useMemo(() => {
-        const c: Record<string, number> = {};
+    const gmailHealthCounts = useMemo(() => {
+        const c: Record<string, number> = {ok: 0, need_totp: 0, need_imap: 0, need_both: 0, login_dead: 0, bad: 0};
         for (const m of gmailInView) {
-            const k = m.google_stage || "imported";
+            const k = gmailHealth(m);
             c[k] = (c[k] || 0) + 1;
+            if (k !== "ok") c.bad += 1;
         }
         return c;
     }, [gmailInView]);
@@ -819,13 +830,29 @@ export function MailboxPanel({notify}: {notify?: (m: string) => void}) {
                         <option value="fail">改密失败</option>
                     </select>
                     {fProvider !== "mailcom" && fProvider !== "icloud" && (
-                        <select value={fGmail} onChange={(e) => setFGmail(e.target.value)} style={sel}
-                                title="已整备=已换成我们的2FA且有IMAP。卖家密钥+IMAP仍算未齐。数字随当前分组变化。">
-                            <option value="">整备:全部({gmailInView.length})</option>
-                            {Object.entries(GOOGLE_STAGE_LABEL).map(([k, lab]) => (
-                                <option key={k} value={k}>{lab}({gmailStageCounts[k] || 0})</option>
+                        <>
+                            {([
+                                ["", `Gmail ${gmailInView.length}`],
+                                ["ok", `可用 ${gmailHealthCounts.ok}`],
+                                ["bad", `有问题 ${gmailHealthCounts.bad}`],
+                                ["need_totp", `缺换2FA ${gmailHealthCounts.need_totp}`],
+                                ["need_imap", `缺IMAP ${gmailHealthCounts.need_imap}`],
+                                ["need_both", `缺两项 ${gmailHealthCounts.need_both}`],
+                                ["login_dead", `登不上 ${gmailHealthCounts.login_dead}`],
+                            ] as const).map(([k, lab]) => (
+                                <button key={k || "all"} type="button" onClick={() => { setFGmail(k); if (k) setFProvider("google"); }}
+                                        title={k === "ok" ? "已换我们的 2FA 且有 IMAP" : k === "need_totp" ? "有 IMAP，必须再换成我们的 2FA" : k === "bad" ? "还不能当可用号" : ""}
+                                        style={{
+                                            height: 32, padding: "0 10px", borderRadius: 8, fontSize: 12, cursor: "pointer",
+                                            border: fGmail === k ? "1px solid transparent" : "1px solid #e5e7eb",
+                                            background: fGmail === k
+                                                ? (k === "ok" ? "#059669" : k === "bad" || k === "login_dead" || k === "need_totp" ? "#c2410c" : k ? "#d97706" : "#111827")
+                                                : "#fff",
+                                            color: fGmail === k ? "#fff" : (k === "ok" ? "#047857" : k === "bad" || k === "login_dead" || k === "need_totp" ? "#9a3412" : "#374151"),
+                                            fontWeight: 600,
+                                        }}>{lab}</button>
                             ))}
-                        </select>
+                        </>
                     )}
                     <div style={{flex: "1 1 240px", minWidth: 200, display: "flex", alignItems: "center", gap: 6}}>
                         {!batchSearch ? (
@@ -980,9 +1007,9 @@ export function MailboxPanel({notify}: {notify?: (m: string) => void}) {
                             <th style={{padding: "8px 10px"}}>密码</th>
                             <th style={{padding: "8px 10px"}}>类型</th>
                             <th style={{padding: "8px 10px"}}>2FA</th>
-                            <th style={{padding: "8px 10px"}}>Gmail 状态</th>
+                            <th style={{padding: "8px 10px"}}>结果</th>
                             <th style={{padding: "8px 10px"}}>归属</th>
-                            <th style={{padding: "8px 10px"}}>整备原因</th>
+                            <th style={{padding: "8px 10px"}}>问题</th>
                             <th style={{padding: "8px 10px"}}>分组</th>
                             <th style={{padding: "8px 10px"}}>操作</th>
                         </tr>
@@ -1010,10 +1037,13 @@ export function MailboxPanel({notify}: {notify?: (m: string) => void}) {
                                 </td>
                                 <td style={{padding: "6px 10px"}}>
                                     {m.provider === "google"
-                                        ? <span title={formatHardenListReason(m) || m.google_state?.last_error || ""}
-                                              style={{padding: "1px 8px", borderRadius: 10, fontSize: 12, color: "#fff", background: GOOGLE_STAGE_COLOR[m.google_stage || ""] || "#9ca3af"}}>
-                                            {GOOGLE_STAGE_LABEL[m.google_stage || ""] || "未记录"}
-                                          </span>
+                                        ? (() => {
+                                            const h = gmailHealth(m);
+                                            return <span title={formatHardenListReason(m) || GMAIL_HEALTH_LABEL[h]}
+                                                  style={{padding: "1px 8px", borderRadius: 10, fontSize: 12, color: "#fff", background: GMAIL_HEALTH_COLOR[h]}}>
+                                                {GMAIL_HEALTH_LABEL[h]}
+                                              </span>;
+                                        })()
                                         : <span style={{color: "#d1d5db"}}>—</span>}
                                 </td>
                                 <td style={{padding: "6px 10px"}}>
@@ -1031,10 +1061,9 @@ export function MailboxPanel({notify}: {notify?: (m: string) => void}) {
                                     return "#9ca3af";
                                 })()}} title={m.provider === "google" ? (formatHardenListReason(m) || m.google_state?.last_error || m.pw_status || "") : (m.pw_status || "")}>
                                     {m.provider === "google"
-                                        ? (formatHardenListReason(m)
-                                            || (["ready", "gpt_ok"].includes(m.google_stage || "")
-                                                ? (/^⚠/.test(m.pw_status || "") ? "✅整备" : (m.pw_status || "已齐"))
-                                                : (m.pw_status || "—")))
+                                        ? (gmailHealth(m) === "ok"
+                                            ? "—"
+                                            : (formatHardenListReason(m) || GMAIL_HEALTH_LABEL[gmailHealth(m)]))
                                         : (m.pw_status || "—")}
                                 </td>
                                 <td style={{padding: "6px 10px", color: "#6b7280"}}>{m.grp || "—"}</td>
