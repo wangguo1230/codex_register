@@ -226,6 +226,7 @@ async function tryClick(loc, timeout = 2500) {
 
 /** 只点当前看得见、已启用的 Next。不用 JS 伪造 click（isTrusted=false，Google 会当没点）。 */
 async function clickHostNext(page, hostSel) {
+    if (hostSel === "#identifierNext" && await isVerifyItsYouRecoveryPage(page)) return false;
     if (hostSel === "#identifierNext" && await googleSigninLoadingBarVisible(page)) return false;
     if (!await hostNextReady(page, hostSel)) return false;
     const host = page.locator(hostSel).first();
@@ -290,7 +291,16 @@ async function googleSigninLoadingBarVisible(page) {
     }).catch(() => false);
 }
 
+async function isVerifyItsYouRecoveryPage(page) {
+    const t = String(await page.innerText("body").catch(() => ""));
+    if (/verify it.?s you|confirm your recovery email|get a verification code at/i.test(t)) return true;
+    const rec = page.locator('[data-action="accountrecovery"]');
+    return rec.first().isVisible({timeout: 200}).catch(() => false);
+}
+
 async function identifierStillLoading(page) {
+    // Verify it's you 也带顶上 Loading 壳，不是邮箱页没加载完。
+    if (await isVerifyItsYouRecoveryPage(page)) return false;
     if (await googleSigninLoadingBarVisible(page)) return true;
     const t = String(await page.innerText("body").catch(() => "")).replace(/\s+/g, " ").trim();
     if (!t || t.length < 8) return true;
@@ -320,6 +330,7 @@ async function waitIdentifierUiReady(page, write, ms = 15000) {
             write("  Google 拒绝页 signin/rejected，这个出口已被风控");
             throw new Error("代理中断 Google 拒绝页 signin/rejected，换 session 重开窗");
         }
+        if (await isVerifyItsYouRecoveryPage(page)) return true;
         const box = await findIdentifierBox(page);
         const loading = await googleSigninLoadingBarVisible(page);
         // 框出来且顶上 Loading 条没了，再填。条子还在时 Next 是假就绪。
@@ -1019,14 +1030,32 @@ export async function googleLogin(page, emailOrOpts, password = "", totpSecret =
                 }
             }
             const recDomain = recovery.includes("@") ? recovery.split("@")[1] : "";
+            // Verify it's you：优先「Confirm your recovery email」手填库里的辅助邮箱。
+            // 不要先点「Get a verification code at qyh••••@…」，那是往辅助邮箱发码，我们收不到。
+            const confirmRec = page.locator('[data-action="accountrecovery"]').first()
+                .or(page.getByText(/^confirm your recovery email$/i).first())
+                .or(page.getByText(/确认.*恢复邮箱|确认.*辅助邮箱|confirme o e-mail de recupera/i).first());
+            if (await confirmRec.isVisible({timeout: 700}).catch(() => false)) {
+                await clickMaybeForce(confirmRec, 2500);
+                write(recovery
+                    ? `  选确认辅助邮箱（不发验证码） ${recovery}`
+                    : "  选确认辅助邮箱，但库里没有 recovery_email");
+                await page.waitForTimeout(2000);
+                continue;
+            }
             const recOpt = page.locator('[data-challengetype], li, [role="link"], [role="button"], div').filter({
-                hasText: /recovery email|辅助邮箱|e-mail de recupera|correo de recupera|email de récupér|confirm.*email|verification code at|codigo.*correo|fastmail/i,
+                hasText: /recovery email|辅助邮箱|e-mail de recupera|correo de recupera|email de récupér|confirm.*email|codigo.*correo|fastmail/i,
             }).first();
             if (recovery && await recOpt.isVisible({timeout: 800}).catch(() => false)) {
-                await recOpt.click({force: true}).catch(() => {});
-                write("  选择辅助邮箱验证");
-                await page.waitForTimeout(3000);
-                continue;
+                const label = String(await recOpt.innerText().catch(() => ""));
+                if (/get a verification code|发送验证码|enviar.*c[oó]digo/i.test(label)) {
+                    write("  跳过「往辅助邮箱发验证码」，改走确认邮箱或其它方式");
+                } else {
+                    await recOpt.click({force: true}).catch(() => {});
+                    write("  选择辅助邮箱验证");
+                    await page.waitForTimeout(3000);
+                    continue;
+                }
             }
             if (recovery && recDomain) {
                 const byDomain = page.getByText(new RegExp(recDomain.replace(/\./g, "\\."), "i")).first();
