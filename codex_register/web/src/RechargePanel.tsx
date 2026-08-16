@@ -371,6 +371,65 @@ export function RechargePanel({notify}: {notify?: (m: string) => void}) {
         const a = Object.assign(document.createElement("a"), {href: url, download: filename});
         a.click(); URL.revokeObjectURL(url);
     };
+    /** 解析 sub2json 输入行：末段为 RT；≥5 段时 GPT 密码为倒数第 3 段（兼容含 IMAP 的 Gmail 全字段导出） */
+    const parseSub2jsonLine = (l: string): {email: string; password: string; rt: string} => {
+        for (const sep of ["----", "\t", "|", ";"]) {
+            if (!l.includes(sep) && sep !== "\t") continue;
+            const p = l.split(sep).map((s) => s.trim());
+            while (p.length && p[p.length - 1] === "") p.pop();
+            if (p.length < 3) continue;
+            const email = p[0];
+            const rt = p[p.length - 1];
+            // 3 段: email----pw----rt
+            // 含 IMAP 的 full: email----mailPw----2fa----imap----gptPw----gpt2fa----rt（≥5 时 GPT 密码=倒数第 3）
+            const password = p.length >= 5 ? p[p.length - 3] : p[1];
+            if (email && rt) return {email, password: password || "", rt};
+        }
+        const cp = l.split(":").map((s) => s.trim());
+        if (cp.length >= 3) {
+            const email = cp[0];
+            const rt = cp[cp.length - 1];
+            const password = cp.length >= 5 ? cp[cp.length - 3] : cp[1];
+            if (email && rt) return {email, password: password || "", rt};
+        }
+        return {email: "", password: "", rt: ""};
+    };
+    /** 从勾选队列项（或当前批次）拉取 email----gpt密码----rt，Gmail 用 gpt_password */
+    const fillSub2jsonFromSelection = async (opts?: {silent?: boolean}) => {
+        const ids = selQIds();
+        try {
+            const r = await api.exportRechargeQueue({
+                ids: ids.length ? ids : undefined,
+                batch: !ids.length && qBatchFilter ? qBatchFilter : undefined,
+                format: "sub2json",
+            });
+            if (!r.text) {
+                if (!opts?.silent) toast("无可导出数据");
+                return false;
+            }
+            setSub2jsonInput(r.text);
+            setSub2jsonResults([]);
+            const miss = r.missingRt || 0;
+            const withRt = r.withRt ?? 0;
+            const total = r.total ?? r.text.split("\n").filter(Boolean).length;
+            if (!opts?.silent) {
+                if (miss > 0) toast(`已填充 ${total} 行（有 RT ${withRt}，缺 RT ${miss}；缺 RT 请先「批量获取RT」）`);
+                else toast(`已从${ids.length ? `勾选 ${ids.length} 项` : qBatchFilter ? `批次 ${qBatchFilter}` : "队列"}填充 ${total} 行`);
+            }
+            return true;
+        } catch (e: any) {
+            if (!opts?.silent) toast("填充失败: " + (e?.message || e));
+            return false;
+        }
+    };
+    const openSub2json = async () => {
+        setShowSub2json(true);
+        setSub2jsonResults([]);
+        const ids = selQIds();
+        if (ids.length || qBatchFilter) {
+            await fillSub2jsonFromSelection({silent: false});
+        }
+    };
     const doExport = async (format: "account" | "full" | "card" | "session") => {
         const ids = selQIds();
         try {
@@ -521,7 +580,7 @@ export function RechargePanel({notify}: {notify?: (m: string) => void}) {
                     <Btn onClick={() => doExport("card")}>复制卡密</Btn>
                     <Btn onClick={() => doExport("session")}>复制session</Btn>
                     <Btn onClick={() => setShowBatchRt(true)} className="bg-amber-600 text-white border-amber-600 hover:bg-amber-700">批量获取RT</Btn>
-                    <Btn onClick={() => setShowSub2json(true)} className="bg-violet-600 text-white border-violet-600 hover:bg-violet-700">导出sub2json</Btn>
+                    <Btn onClick={openSub2json} className="bg-violet-600 text-white border-violet-600 hover:bg-violet-700" title="勾选后打开会自动填充；支持 Gmail（用 GPT 密码 + RT）">导出sub2json</Btn>
                     <Btn onClick={doProbePlan}>查询套餐</Btn>
                     <div className="flex-1"/>
                     {/* 筛选 */}
@@ -945,28 +1004,36 @@ export function RechargePanel({notify}: {notify?: (m: string) => void}) {
                 <div className="fixed inset-0 bg-black/40 flex items-center justify-center z-30" onClick={() => { if (!sub2jsonRefreshing) setShowSub2json(false); }}>
                     <div className="bg-white rounded-xl w-[700px] max-h-[85vh] flex flex-col shadow-2xl" onClick={(e) => e.stopPropagation()}>
                         <div className="px-5 py-3 border-b flex items-center justify-between">
-                            <span className="font-medium text-sm">导出 sub2json <span className="text-xs text-gray-400 font-normal">粘贴账密+RT → 刷新token → 生成 sub2api 导入文件</span></span>
+                            <span className="font-medium text-sm">导出 sub2json <span className="text-xs text-gray-400 font-normal">勾选填充 / 粘贴 → 刷新 token → sub2api JSON（Gmail 通用）</span></span>
                             <button onClick={() => { if (!sub2jsonRefreshing) setShowSub2json(false); }} className="text-gray-400 hover:text-gray-700 text-lg leading-none">&times;</button>
                         </div>
                         <div className="px-5 py-4 space-y-3 text-sm overflow-auto">
-                            <div className="text-xs text-gray-500">每行 <span className="font-mono">邮箱----密码----refresh_token</span> 或 <span className="font-mono">邮箱:密码:rt</span>，支持多种分隔符。</div>
+                            <div className="text-xs text-gray-500 space-y-1">
+                                <div>每行 <span className="font-mono">邮箱----密码----refresh_token</span>；Gmail 全字段（含 IMAP）粘贴时末段为 RT、GPT 密码取倒数第 3 段。</div>
+                                <div>也可点「从勾选填充」：用队列里的 <span className="font-mono">gpt_password</span>（Gmail）或邮箱密码 + 已存 RT。</div>
+                            </div>
+                            <div className="flex flex-wrap items-center gap-2">
+                                <button type="button" disabled={sub2jsonRefreshing}
+                                        onClick={() => fillSub2jsonFromSelection()}
+                                        className="px-3 py-1 rounded text-xs font-medium border border-violet-300 text-violet-700 bg-violet-50 hover:bg-violet-100 disabled:opacity-40">
+                                    从勾选填充{selQIds().length ? ` (${selQIds().length})` : qBatchFilter ? ` (批次)` : ""}
+                                </button>
+                                <span className="text-xs text-gray-400">未勾选时按当前批次/全队列导出预备行</span>
+                            </div>
                             <textarea value={sub2jsonInput} onChange={(e) => setSub2jsonInput(e.target.value)}
-                                      placeholder={"a@mail.com----password1----rt_xxx\nb@mail.com:password2:rt_yyy"}
+                                      placeholder={"勾选后点「从勾选填充」，或粘贴：\na@gmail.com----gptPassword----rt_xxx\nb@mail.com----password2----rt_yyy"}
                                       className="w-full h-32 px-2 py-1.5 border rounded text-xs font-mono resize-y" disabled={sub2jsonRefreshing}/>
                             <div className="flex items-center gap-3">
                                 <button disabled={sub2jsonRefreshing} onClick={async () => {
-                                    const parseLine = (l: string) => {
-                                        for (const sep of ["----", "\t", "|", ";"]) {
-                                            const p = l.split(sep).map(s => s.trim()).filter(Boolean);
-                                            if (p.length >= 3) return {email: p[0], password: p[1], rt: p.slice(2).join(sep)};
-                                        }
-                                        const cp = l.split(":");
-                                        if (cp.length >= 3) return {email: cp[0].trim(), password: cp[1].trim(), rt: cp.slice(2).join(":").trim()};
-                                        return {email: "", password: "", rt: ""};
-                                    };
                                     const lines = sub2jsonInput.split("\n").map(l => l.trim()).filter(Boolean);
-                                    const items = lines.map(parseLine).filter(it => it.email && it.rt);
-                                    if (!items.length) { toast("未解析到有效行(需邮箱+密码+rt)"); return; }
+                                    const parsed = lines.map(parseSub2jsonLine);
+                                    const items = parsed.filter(it => it.email && it.rt);
+                                    const missingRt = parsed.filter(it => it.email && !it.rt).length;
+                                    if (!items.length) {
+                                        toast(missingRt ? `有 ${missingRt} 行缺 RT，请先「批量获取RT」或粘贴含 RT 的行` : "未解析到有效行(需邮箱+rt)");
+                                        return;
+                                    }
+                                    if (missingRt) toast(`已跳过 ${missingRt} 行缺 RT`);
                                     setSub2jsonRefreshing(true);
                                     setSub2jsonResults([]);
                                     try {
@@ -1004,7 +1071,12 @@ export function RechargePanel({notify}: {notify?: (m: string) => void}) {
                                     {sub2jsonRefreshing ? "刷新 token 中..." : "刷新并导出"}
                                 </button>
                                 <span className="text-xs text-gray-400">
-                                    {(() => { const n = sub2jsonInput.split("\n").map(l => l.trim()).filter(Boolean).length; return n > 0 ? `${n} 行` : ""; })()}
+                                    {(() => {
+                                        const lines = sub2jsonInput.split("\n").map(l => l.trim()).filter(Boolean);
+                                        if (!lines.length) return "";
+                                        const withRt = lines.map(parseSub2jsonLine).filter(it => it.email && it.rt).length;
+                                        return `${lines.length} 行 / 含 RT ${withRt}`;
+                                    })()}
                                 </span>
                             </div>
                             {sub2jsonResults.length > 0 && (

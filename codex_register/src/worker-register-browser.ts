@@ -189,14 +189,27 @@ async function main() {
                 mfaProxy = wrapped.url;
                 mfaClose = wrapped.close;
             }
-            let mfa = await enrollTotp(r.token, {accountId, proxyUrl: mfaProxy});
-            if (!mfa.ok && /fetch failed|ECONN|timeout|UND_ERR/i.test(String(mfa.reason || ""))) {
-                emit({type: "progress", stage: "mfa", message: "2FA 经代理失败，直连再试一次"});
-                mfa = await enrollTotp(r.token, {accountId, proxyUrl: ""});
+            const mfaCookie = cookieString(r.cookies) || record.cookie || "";
+            const mfa = await enrollTotp(r.token, {
+                accountId,
+                proxyUrl: mfaProxy,
+                cookie: mfaCookie,
+                retryAltProxy: true,
+                browserFallback: process.env.MFA_NO_BROWSER !== "1",
+                headless: process.env.CHAT_HEADLESS === "1" || process.env.MAILCOM_HEADLESS === "1",
+                log: (m) => emit({type: "progress", stage: "mfa", message: m}),
+            });
+            if (mfa.ok && mfa.secret) {
+                totpSecret = mfa.secret;
+                mfaStatus = "✅已绑";
+                emit({type: "progress", stage: "mfa", message: `TOTP 已绑定(${mfa.via || "http"})`});
+            } else if (mfa.ok && mfa.already) {
+                mfaStatus = "⚠已有2FA缺密钥";
+                emit({type: "progress", stage: "mfa", message: "该号已有 2FA 但本次未拿到 secret"});
+            } else {
+                mfaStatus = "❌" + (mfa.reason || "绑定失败");
+                emit({type: "progress", stage: "mfa", message: "TOTP 绑定失败: " + (mfa.reason || "")});
             }
-            if (mfa.ok && mfa.secret) { totpSecret = mfa.secret; mfaStatus = "✅已绑"; emit({type: "progress", stage: "mfa", message: "TOTP 已绑定"}); }
-            else if (mfa.ok && mfa.already) { mfaStatus = "⚠已有2FA缺密钥"; emit({type: "progress", stage: "mfa", message: "该号已有 2FA 但本次未拿到 secret"}); }
-            else { mfaStatus = "❌" + (mfa.reason || "绑定失败"); emit({type: "progress", stage: "mfa", message: "TOTP 绑定失败: " + (mfa.reason || "")}); }
         } finally {
             try { mfaClose(); } catch { /* */ }
         }

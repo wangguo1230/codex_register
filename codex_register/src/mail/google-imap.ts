@@ -247,6 +247,21 @@ function attachImapErrorSink(client) {
     return client;
 }
 
+/** ImapFlow 认证失败时 message 只有 "Command failed"，真正原因在 responseText。 */
+function formatImapError(e) {
+    if (!e) return "IMAP 失败";
+    const text = String(e.responseText || e.response || e.message || e).replace(/\s+/g, " ").trim();
+    const authFail = e.authenticationFailed
+        || /Invalid credentials|LOGIN failed|AUTHENTICATIONFAILED|\[AUTHENTICATIONFAILED\]/i.test(text);
+    if (authFail) {
+        return "IMAP 应用密码无效/已吊销（Invalid credentials），请重新整备生成应用专用密码";
+    }
+    if (/Command failed/i.test(String(e.message || "")) && text && !/^Command failed$/i.test(text)) {
+        return text.slice(0, 160);
+    }
+    return text.slice(0, 160) || "IMAP 失败";
+}
+
 async function probeImapOnce(email, imapPassword, via = "") {
     const client = attachImapErrorSink(new ImapFlow({
         host: "imap.gmail.com", port: 993, secure: true,
@@ -268,7 +283,7 @@ async function probeImapOnce(email, imapPassword, via = "") {
     } catch (e) {
         try { client.close(); } catch { /* */ }
         try { await client.logout(); } catch { /* */ }
-        return {ok: false, error: String(e?.message || e).replace(/\s+/g, " ").slice(0, 160)};
+        return {ok: false, error: formatImapError(e)};
     }
 }
 
@@ -368,10 +383,11 @@ async function withGmailImap(email, imapPassword, fn, {proxy = ""} = {}) {
             try { client.close(); } catch { /* */ }
             try { await client.logout(); } catch { /* */ }
             if (via || !jump) break;
-            if (/ERR_SSL|bad record mac|decryption failed|authentication|Invalid credentials|LOGIN failed/i.test(String(e?.message || e))) break;
+            const msg = formatImapError(e);
+            if (/ERR_SSL|bad record mac|decryption failed|authentication|Invalid credentials|LOGIN failed|应用密码无效/i.test(msg)) break;
         }
     }
-    throw new Error(String(lastErr?.message || lastErr || "IMAP 失败").replace(/\s+/g, " ").slice(0, 160));
+    throw new Error(formatImapError(lastErr));
 }
 
 /** 拉 Gmail INBOX 最近 amount 封（头信息），供邮箱管理收件箱。 */

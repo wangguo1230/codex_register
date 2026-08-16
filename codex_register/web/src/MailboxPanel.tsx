@@ -343,10 +343,8 @@ export function MailboxPanel({notify}: {notify?: (m: string) => void}) {
         if (extractedEmails.length) return [] as string[];
         return fEmail.toLowerCase().split(/[\s,;|]+/).map((s) => s.trim()).filter(Boolean);
     }, [fEmail, extractedEmails]);
-    useEffect(() => {
-        if (extractedEmails.length && usageFilter) setUsageFilter("");
-        // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [extractedEmails.join("\n")]);
+    // 完整邮箱精确查找：跨 free/hold/gpt/deleted 用 lookup 补全，不再清掉「已删除」等归属筛选
+    // （以前会 setUsageFilter("")，导致离开已删除列表；且已售/分组等次级筛选会把 lookup 结果再滤掉）
     useEffect(() => {
         if (extractedEmails.length || !keywordQs.length) return;
         const map: Record<string, "" | "free" | "hold" | "gpt" | "claude" | "deleted"> = {
@@ -364,6 +362,7 @@ export function MailboxPanel({notify}: {notify?: (m: string) => void}) {
         if (!extractedEmails.length) { setLookupExtra([]); return; }
         const have = new Set(list.map((m) => m.email.toLowerCase()));
         const missing = extractedEmails.filter((e) => !have.has(e));
+        // 当前列表没有的邮箱（含已删除）一律走 lookup；即使 missing 为空也清掉过期 extra
         if (!missing.length) { setLookupExtra([]); return; }
         let live = true;
         api.lookupMailboxes(missing).then((r) => { if (live) setLookupExtra(r.list || []); }).catch(() => {});
@@ -384,13 +383,14 @@ export function MailboxPanel({notify}: {notify?: (m: string) => void}) {
         const usageLabelOf = (m: Mailbox) => m.deleted_at ? "已删除" : (USAGE_LABEL[m.usage] || m.usage);
         const emailSet = extractedEmails.length ? new Set(extractedEmails) : null;
         return searchBase.filter((m) => {
+            // 粘贴/输入完整邮箱：只按邮箱精确匹配（lookup 已含已删除），不受已售/分组/整备等次级筛选拦截
+            if (emailSet) return emailSet.has(m.email.toLowerCase());
             if (fProvider && providerOf(m) !== fProvider) return false;
             if (fSold === "yes" && !m.sold_at) return false;
             if (fSold === "no" && m.sold_at) return false;
             if (fGrp === "__NONE__") { if (m.grp) return false; } else if (fGrp && (m.grp || "") !== fGrp) return false;
             if (fPw && pwState(m) !== fPw) return false;
             if (fGmail && (m.google_stage || "") !== fGmail) return false;
-            if (emailSet) return emailSet.has(m.email.toLowerCase());
             if (keywordQs.length) {
                 const hay = [
                     m.email,
@@ -398,6 +398,7 @@ export function MailboxPanel({notify}: {notify?: (m: string) => void}) {
                     m.usage,
                     m.usage === "hold" ? "独立" : "",
                     m.usage === "free" ? "待分配 未分配" : "",
+                    m.deleted_at ? "已删除 已删 deleted" : "",
                     providerOf(m) === "google" ? "gmail google" : providerOf(m) === "icloud" ? "icloud" : "mail.com mailcom",
                     m.sold_at ? "已售 售出 sold" : "未售",
                     m.grp || "",

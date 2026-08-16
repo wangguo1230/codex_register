@@ -1,18 +1,18 @@
 // @ts-nocheck
 // 邮箱域统一服务(架构 v2:职责归一化的邮箱域入口)
 //   - 资源池:按 usage(free/gpt/claude)查询/统计 + CAS 隔离分配(★不能串)
-//   - 邮箱能力:登录验证/收信/取OTP/改密 —— 委托底层 provider(当前全为 mailcom)
+//   - 邮箱能力:登录验证/收信/取OTP/改密 —— 按 mailbox.provider 路由
 // 设计:上层(server/scheduler)只依赖本服务,不再直接 import 具体 provider 文件,满足 DIP。
-//   将来接入多 provider 时,在此按 mailbox.provider 路由,上层无感。
 import * as db from "../db.js";
 import {
     changeMailcomPassword,
     verifyMailcomLogin,
-    fetchInboxList,
-    fetchMailBodyFor,
+    fetchInboxList as fetchMailcomInboxList,
+    fetchMailBodyFor as fetchMailcomBodyFor,
     setMailProxy,
     getMailProxy,
 } from "../../src/mail/mailcom.js";
+import {fetchGmailImapInbox, fetchGmailImapBody} from "../../src/mail/google-imap.js";
 import {getEmailVerificationCode} from "../../src/mailbox.js";
 
 // ---- 资源池(隔离核心) ----
@@ -28,10 +28,69 @@ export const importFreeMailboxes = (rows, grp) => db.importFreeMailboxes(rows, g
 export const deleteMailbox = (id) => db.deleteMailbox(id);
 export const setMailboxPassword = (id, pw, pwStatus) => db.setMailboxPassword(id, pw, pwStatus);
 
-// ---- 邮箱能力(委托 provider;函数名保持稳定,便于上层平滑切换到本服务) ----
-export {changeMailcomPassword, verifyMailcomLogin, fetchInboxList, fetchMailBodyFor, setMailProxy, getMailProxy};
+// ---- 邮箱能力 ----
+export {changeMailcomPassword, verifyMailcomLogin, setMailProxy, getMailProxy};
 /** 取邮箱验证码(注册/绑定用);支持 minTimestampMs 只取新码、excludeCode 排除旧码 */
 export const getOtp = (email, opts) => getEmailVerificationCode(email, opts);
+
+function isGoogleMailbox(mb) {
+    if (!mb) return false;
+    if (mb.provider === "google") return true;
+    return /@(gmail|googlemail)\.com$/i.test(String(mb.email || ""));
+}
+
+/**
+ * 拉收件箱列表。
+ * - Gmail / google: 必须用 IMAP 应用专用密码（不是登录 mail.com）
+ * - mail.com 等: Playwright 登录 maillist
+ * 兼容旧调用: fetchInboxList(email, password, amount)
+ * 新调用: fetchInboxList(mailboxRow | {email,password,provider,imap_password}, amount?)
+ */
+export async function fetchInboxList(emailOrMb, passwordOrAmount, amountMaybe) {
+    // 对象形态
+    if (emailOrMb && typeof emailOrMb === "object") {
+        const mb = emailOrMb;
+        const amount = Number(passwordOrAmount) || 30;
+        if (isGoogleMailbox(mb)) {
+            const imap = String(mb.imap_password || mb.mailbox_imap || "").trim();
+            if (!imap) throw new Error("Gmail 没有 IMAP 应用专用密码，请先整备开通后再看收件箱");
+            return fetchGmailImapInbox(mb.email, imap, amount);
+        }
+        return fetchMailcomInboxList(mb.email, mb.password, amount);
+    }
+    // (email, password, amount) 旧签名: 按域名猜 provider
+    const email = String(emailOrMb || "");
+    const password = String(passwordOrAmount || "");
+    const amount = Number(amountMaybe) || 20;
+    if (/@(gmail|googlemail)\.com$/i.test(email)) {
+        throw new Error("Gmail 收件箱请传完整 mailbox（含 imap_password），或先开通 IMAP 应用专用密码");
+    }
+    return fetchMailcomInboxList(email, password, amount);
+}
+
+/**
+ * 拉单封正文。
+ * - Gmail: IMAP UID；需 imapPassword 或缓存会话
+ * - mail.com: 复用 maillist 会话
+ * 兼容: fetchMailBodyFor(email, mailId) | fetchMailBodyFor(mb, mailId)
+ */
+export async function fetchMailBodyFor(emailOrMb, mailId, imapPassword = "") {
+    if (emailOrMb && typeof emailOrMb === "object") {
+        const mb = emailOrMb;
+        if (isGoogleMailbox(mb)) {
+            const imap = String(mb.imap_password || mb.mailbox_imap || imapPassword || "").trim();
+            if (!imap) throw new Error("Gmail 没有 IMAP 应用专用密码");
+            return fetchGmailImapBody(mb.email, mailId, imap);
+        }
+        return fetchMailcomBodyFor(mb.email, mailId);
+    }
+    const email = String(emailOrMb || "");
+    if (/@(gmail|googlemail)\.com$/i.test(email)) {
+        if (!imapPassword) throw new Error("Gmail 正文需要 IMAP 应用专用密码");
+        return fetchGmailImapBody(email, mailId, imapPassword);
+    }
+    return fetchMailcomBodyFor(email, mailId);
+}
 
 // 发件人:Anthropic/Claude 官方(禁用/封号通知一般来自 @anthropic.com)
 const CLAUDE_SENDER_RE = /anthropic|claude/i;
@@ -42,14 +101,23 @@ const CLAUDE_DISABLED_RE = /(account|access)\b[^.]{0,48}(disabled|deactivat|susp
  * 轻量(复用缓存会话,秒级):先按发件人/主题筛候选,主题命中直接判定,否则取正文再判。
  * @returns {hit:true, subject, from, via} 命中禁用通知 | {hit:false, scanned} 未命中
  */
-export async function scanClaudeDisabledMail(email, password, {amount = 30, log = () => {}} = {}) {
-    const mails = await fetchInboxList(email, password, amount);
+export async function scanClaudeDisabledMail(email, password, {amount = 30, log = () => {}, mailbox = null} = {}) {
+    let mb = mailbox;
+    if (!mb) {
+        try { mb = await db.getMailboxByEmail(email); } catch { /* */ }
+    }
+    if (!mb) {
+        mb = {email, password, provider: /@(gmail|googlemail)\.com$/i.test(email) ? "google" : "mailcom"};
+    } else if (password && !mb.password) {
+        mb = {...mb, password};
+    }
+    const mails = await fetchInboxList(mb, amount);
     const candidates = (Array.isArray(mails) ? mails : []).filter((m) => CLAUDE_SENDER_RE.test(`${m.from || ""} ${m.subject || ""}`));
     log(`收件箱 ${Array.isArray(mails) ? mails.length : 0} 封,其中 Anthropic/Claude 相关 ${candidates.length} 封`);
     for (const m of candidates) {
         if (CLAUDE_DISABLED_RE.test(m.subject || "")) return {hit: true, subject: m.subject || "", from: m.from || "", via: "subject"};
         let body = "";
-        try { body = await fetchMailBodyFor(email, m.id); } catch { /* 正文取不到就跳过该封 */ }
+        try { body = await fetchMailBodyFor(mb, m.id); } catch { /* 正文取不到就跳过该封 */ }
         if (body && CLAUDE_DISABLED_RE.test(body)) return {hit: true, subject: m.subject || "", from: m.from || "", via: "body"};
     }
     return {hit: false, scanned: candidates.length};

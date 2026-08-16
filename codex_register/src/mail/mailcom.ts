@@ -29,23 +29,38 @@ export function getMailProxy() { return mailProxy; }
 function parseProxyOpt(url) {
     if (!url) return undefined;
     try {
-        const u = new URL(url);
+        // 去掉 hash 段（池 URL 常带 #session）
+        const cleaned = String(url).trim().replace(/#.*$/, "");
+        const u = new URL(cleaned);
+        // Chromium/Playwright：socks5 不支持 user:pass 鉴权；无账密的本地 socks 可直接用
+        if (u.protocol.startsWith("socks") && (u.username || u.password)) {
+            throw new Error("Browser does not support socks5 proxy authentication（请用无账密的充值代理/本地转发）");
+        }
         const opt: any = {server: `${u.protocol}//${u.host}`};
         if (u.username) opt.username = decodeURIComponent(u.username);
         if (u.password) opt.password = decodeURIComponent(u.password);
         return opt;
-    } catch { return {server: url}; }
+    } catch (e: any) {
+        if (/socks5 proxy authentication/i.test(String(e?.message || e))) throw e;
+        return {server: String(url).trim().replace(/#.*$/, "")};
+    }
 }
 const POLL_ATTEMPTS = Number(process.env.MAILCOM_POLL_ATTEMPTS || 24);
 const POLL_INTERVAL_MS = Number(process.env.MAILCOM_POLL_INTERVAL_MS || 5000);
 
 const MAILLIST_BASE = "https://maillist.mail.com/Mailbox/Mail";
+// HAR 里 secret 被脱敏成 *******；passport+sid 下客户端用 Basic(clientId:secret)。
+// 同时试多个 client（list/sidebar/root），任一成功即可。
 const MAILBOX_OAUTH = {
     url: "https://oauthbridge.navigator-lxa.mail.com/navigator/oauth2/token",
-    clientId: "mailcom_webmailermaillist_passport_live",
-    clientSecret: "*******",
-    scope: "mail_mailbox_r",
     grant: "urn:mam:oauth:grant-type:spa",
+    scope: "mail_mailbox_r",
+    clients: [
+        {clientId: "mailcom_webmailermaillist_passport_live", secret: "*******", xUiApp: "mailcom.webmailer.mail-list/6.6.3"},
+        {clientId: "mailcom_mailsidebar_passport_live", secret: "*******", xUiApp: "mailcom.webmailer.mail-sidebar/3.24.0"},
+        {clientId: "mailcom_webmailermailroot_live", secret: "*******", xUiApp: "mailcom.webmailer.mail-root/2.38.0"},
+        {clientId: "mailcom_webmailermaillist_passport_live", secret: "", xUiApp: "mailcom.webmailer.mail-list/6.6.3"},
+    ],
 };
 const COMMON_HDR = {
     origin: "https://webmailer.mail.com",
@@ -143,49 +158,86 @@ async function readNavsid(page) {
 async function mintMailboxToken(session, navsid) {
     if (!navsid) return "";
     const url = `${MAILBOX_OAUTH.url}?sid=${encodeURIComponent(navsid)}`;
-    const basic = Buffer.from(`${MAILBOX_OAUTH.clientId}:${MAILBOX_OAUTH.clientSecret}`).toString("base64");
-    const headers = {
-        "content-type": "application/x-www-form-urlencoded",
-        authorization: `Basic ${basic}`,
-        "x-ui-app": COMMON_HDR["x-ui-app"],
-        origin: COMMON_HDR.origin,
-        referer: COMMON_HDR.referer,
-    };
-    const body = `grant_type=${MAILBOX_OAUTH.grant}&scope=${MAILBOX_OAUTH.scope}`;
-    const tryParse = (status, text) => {
+    const body = `grant_type=${encodeURIComponent(MAILBOX_OAUTH.grant)}&scope=${encodeURIComponent(MAILBOX_OAUTH.scope)}`;
+    const tryParse = (status, text, tag) => {
         if (status >= 400) {
-            console.warn(`[mailcom] mint mailbox token HTTP ${status} ${String(text).slice(0, 120)}`);
+            console.warn(`[mailcom] mint ${tag} HTTP ${status} ${String(text).slice(0, 100)}`);
             return "";
         }
         try {
             const data = JSON.parse(text);
-            if (data?.access_token && /mail_mailbox/i.test(String(data.scope || MAILBOX_OAUTH.scope))) {
-                return `Bearer ${data.access_token}`;
+            // 响应里可能不回 echo scope，有 access_token 即视为该次请求的 scope
+            if (data?.access_token) {
+                const sc = String(data.scope || MAILBOX_OAUTH.scope);
+                if (/mail_mailbox/i.test(sc) || !data.scope) {
+                    return `Bearer ${data.access_token}`;
+                }
+                console.warn(`[mailcom] mint ${tag} scope=${sc.slice(0, 60)}`);
             }
-            console.warn(`[mailcom] mint token 无 mailbox scope: ${String(data?.scope || "").slice(0, 80)}`);
         } catch (e) {
-            console.warn(`[mailcom] mint token 解析失败: ${String(e?.message || e).slice(0, 80)}`);
+            console.warn(`[mailcom] mint ${tag} 解析失败: ${String(e?.message || e).slice(0, 60)}`);
         }
         return "";
     };
-    try {
-        const res = await session.context.request.post(url, {headers, data: body});
-        const minted = tryParse(res.status(), await res.text());
-        if (minted) return minted;
-    } catch (e) {
-        console.warn(`[mailcom] mint token context.request: ${String(e?.message || e).slice(0, 80)}`);
+
+    for (const c of MAILBOX_OAUTH.clients) {
+        const basic = Buffer.from(`${c.clientId}:${c.secret || ""}`).toString("base64");
+        const headers = {
+            "content-type": "application/x-www-form-urlencoded",
+            authorization: `Basic ${basic}`,
+            "x-ui-app": c.xUiApp || COMMON_HDR["x-ui-app"],
+            origin: COMMON_HDR.origin,
+            referer: COMMON_HDR.referer,
+        };
+        const tag = c.clientId.replace(/^mailcom_/, "").slice(0, 28);
+        try {
+            const res = await session.context.request.post(url, {headers, data: body, timeout: 15000});
+            const minted = tryParse(res.status(), await res.text(), tag);
+            if (minted) {
+                console.log(`[mailcom] mint 成功 client=${tag}`);
+                return minted;
+            }
+        } catch (e) {
+            console.warn(`[mailcom] mint ${tag} request: ${String(e?.message || e).slice(0, 80)}`);
+        }
+        if (session.page) {
+            try {
+                const inPage = await session.page.evaluate(async ({url, headers, body}) => {
+                    const res = await fetch(url, {method: "POST", credentials: "include", headers, body});
+                    return {status: res.status, text: await res.text()};
+                }, {url, headers, body});
+                const minted = tryParse(inPage.status, inPage.text, `${tag}/page`);
+                if (minted) {
+                    console.log(`[mailcom] mint 成功 client=${tag} (in-page)`);
+                    return minted;
+                }
+            } catch (e) {
+                console.warn(`[mailcom] mint ${tag} in-page: ${String(e?.message || e).slice(0, 80)}`);
+            }
+        }
     }
-    if (!session.page) return "";
+    return "";
+}
+
+/** 等页面网络里出现 mail_mailbox token（webmailer 列表真正加载时会发）。 */
+async function waitForMailboxTokenResponse(page, session, timeoutMs = 25000) {
+    if (!page || session.bearer) return !!session.bearer;
     try {
-        const inPage = await session.page.evaluate(async ({url, headers, body}) => {
-            const res = await fetch(url, {method: "POST", credentials: "include", headers, body});
-            return {status: res.status, text: await res.text()};
-        }, {url, headers, body});
-        return tryParse(inPage.status, inPage.text);
-    } catch (e) {
-        console.warn(`[mailcom] mint token in-page: ${String(e?.message || e).slice(0, 80)}`);
-        return "";
-    }
+        const resp = await page.waitForResponse((r) => {
+            if (!/oauth2\/token/i.test(r.url()) || !r.ok()) return false;
+            const post = r.request().postData() || "";
+            return /mail_mailbox_r/i.test(post);
+        }, {timeout: timeoutMs});
+        try {
+            const data = await resp.json();
+            if (data?.access_token) {
+                session.bearer = `Bearer ${data.access_token}`;
+                console.log(`[mailcom] 截获 oauth2 响应 mailbox token`);
+                return true;
+            }
+        } catch { /* */ }
+    } catch { /* timeout */ }
+    return !!session.bearer;
 }
 
 function htmlToText(s) {
@@ -284,23 +336,78 @@ async function dismissPopups(page) {
 }
 
 async function forceShowLoginLayer(page) {
-    await page.evaluate(() => {
+    return page.evaluate(() => {
         try { location.hash = "navlogin"; } catch { /* */ }
-        const layer = document.querySelector(".login-layer");
-        if (!layer) return;
-        layer.classList.add("open");
-        const s = layer.style;
-        s.setProperty("display", "block", "important");
-        s.setProperty("top", "0px", "important");
-        s.setProperty("visibility", "visible", "important");
-        s.setProperty("overflow", "visible", "important");
-        s.setProperty("z-index", "99999", "important");
-        s.setProperty("height", "auto", "important");
-    }).catch(() => {});
+        // 触发官网 hash 逻辑（部分版本监听 hashchange 才加 open）
+        try { window.dispatchEvent(new HashChangeEvent("hashchange")); } catch { /* */ }
+        try { window.dispatchEvent(new Event("hashchange")); } catch { /* */ }
+
+        const layers = Array.from(document.querySelectorAll(".login-layer, [data-mod-name='header'] .login-layer"));
+        for (const layer of layers) {
+            layer.classList.add("open");
+            layer.removeAttribute("hidden");
+            const s = layer.style;
+            s.setProperty("display", "block", "important");
+            s.setProperty("top", "96px", "important");
+            s.setProperty("left", "0", "important");
+            s.setProperty("right", "0", "important");
+            s.setProperty("visibility", "visible", "important");
+            s.setProperty("opacity", "1", "important");
+            s.setProperty("overflow", "visible", "important");
+            s.setProperty("z-index", "2147483000", "important");
+            s.setProperty("height", "auto", "important");
+            s.setProperty("min-height", "240px", "important");
+            s.setProperty("position", "fixed", "important");
+            s.setProperty("pointer-events", "auto", "important");
+        }
+        // 输入框本身偶发 display:none / 父级 overflow 裁切
+        for (const id of ["login-email", "login-password"]) {
+            const el = document.getElementById(id);
+            if (!el) continue;
+            el.removeAttribute("hidden");
+            el.classList.remove("hidden");
+            el.style.setProperty("display", "block", "important");
+            el.style.setProperty("visibility", "visible", "important");
+            el.style.setProperty("opacity", "1", "important");
+            let p = el.parentElement;
+            for (let i = 0; i < 6 && p; i++, p = p.parentElement) {
+                p.style?.setProperty("display", "block", "important");
+                p.style?.setProperty("visibility", "visible", "important");
+                p.style?.setProperty("overflow", "visible", "important");
+            }
+        }
+        const email = document.getElementById("login-email");
+        const pwd = document.getElementById("login-password");
+        return {
+            layers: layers.length,
+            hasEmail: !!email,
+            hasPwd: !!pwd,
+            emailDisplay: email ? getComputedStyle(email).display : "",
+            layerOpen: layers.some((l) => l.classList.contains("open")),
+        };
+    }).catch(() => ({layers: 0, hasEmail: false, hasPwd: false}));
+}
+
+/** DOM 里有表单即可，不依赖 isVisible（.login-layer 默认 display:none）。 */
+async function loginFormAttached(page) {
+    const n = await page.locator("#login-email").count().catch(() => 0);
+    return n > 0;
 }
 
 async function inboxAlready(page) {
-    return /navigator-lxa|3c\.mail\.com|webmailer/i.test(page.url() || "");
+    const u = page.url() || "";
+    // 真正进壳：带 sid/navsid，或 webmailer/3c；纯 /login 中间跳转不算成功
+    if (/[?&](?:sid|navsid)=[0-9a-f]{32,}/i.test(u)) return true;
+    if (/3c\.mail\.com|webmailer\.mail\.com/i.test(u)) return true;
+    return false;
+}
+
+function isLoginFailedUrl(url) {
+    return /\/logout|loginFailed|ls=wd|ls=te|invalid/i.test(String(url || ""));
+}
+
+function isMarketingHome(url) {
+    return /^https:\/\/www\.mail\.com\/?(?:\?|#|$)/i.test(String(url || ""));
 }
 
 async function waitForFormOrInbox(page, emailBox, seconds, why) {
@@ -310,6 +417,10 @@ async function waitForFormOrInbox(page, emailBox, seconds, why) {
     while (Date.now() < deadline) {
         if (await inboxAlready(page)) return "inbox";
         if (await emailBox.isVisible({timeout: 400}).catch(() => false)) return "form";
+        if (await loginFormAttached(page)) {
+            await forceShowLoginLayer(page);
+            if (await emailBox.isVisible({timeout: 400}).catch(() => false) || await loginFormAttached(page)) return "form";
+        }
         await page.waitForTimeout(2000);
         n += 1;
         if (n % 5 === 0) console.log(`[mailcom] 窗口还开着，等手点 Login，已 ${n * 2}s`);
@@ -317,9 +428,50 @@ async function waitForFormOrInbox(page, emailBox, seconds, why) {
     return "";
 }
 
+/** 不依赖可见性：直接写 input 并 submit 首页 loginform。 */
+async function forceFillAndSubmitLogin(page, email, password) {
+    await forceShowLoginLayer(page);
+    const r = await page.evaluate(({email: em, password: pw}) => {
+        const emailEl = document.querySelector("#login-email")
+            || document.querySelector("input[name='username']")
+            || document.querySelector("form[data-mod-name='loginform'] input[type='text']");
+        const passEl = document.querySelector("#login-password")
+            || document.querySelector("input[name='password']")
+            || document.querySelector("form[data-mod-name='loginform'] input[type='password']");
+        if (!emailEl || !passEl) {
+            return {ok: false, reason: `no fields email=${!!emailEl} pwd=${!!passEl} html=${document.body?.innerText?.slice(0, 40) || ""}`};
+        }
+        const setVal = (el, v) => {
+            el.focus();
+            el.value = v;
+            el.setAttribute("value", v);
+            el.dispatchEvent(new Event("input", {bubbles: true}));
+            el.dispatchEvent(new Event("change", {bubbles: true}));
+        };
+        setVal(emailEl, em);
+        setVal(passEl, pw);
+        const form = emailEl.closest("form")
+            || document.querySelector("form[data-mod-name='loginform']")
+            || document.querySelector("form[action*='login.mail.com']");
+        if (!form) return {ok: false, reason: "no form"};
+        try {
+            if (typeof form.requestSubmit === "function") form.requestSubmit();
+            else form.submit();
+        } catch {
+            form.submit();
+        }
+        return {ok: true, action: form.getAttribute("action") || ""};
+    }, {email, password}).catch((e) => ({ok: false, reason: String(e?.message || e)}));
+    return r;
+}
+
 async function openMailcomLoginForm(page, {headed = false} = {}) {
     const emailBox = page.locator("#login-email").first();
-    if (await emailBox.isVisible({timeout: 800}).catch(() => false)) return emailBox;
+    // 已 attach 即可用（可见性靠 forceShow / force fill）
+    if (await loginFormAttached(page)) {
+        await forceShowLoginLayer(page);
+        return emailBox;
+    }
     if (await inboxAlready(page)) return emailBox;
 
     await dismissPopups(page);
@@ -330,41 +482,102 @@ async function openMailcomLoginForm(page, {headed = false} = {}) {
         "a[href*='navlogin']",
         "a[title='Login']",
         "[data-mod-name='header'] a.button-login",
+        "header a.button-login",
+        "text=Login",
     ]) {
         const el = page.locator(sel).first();
         if (await el.count().catch(() => 0)) {
             await el.click({force: true, timeout: 3000}).catch(() => {});
-            if (await emailBox.isVisible({timeout: 2500}).catch(() => false)) return emailBox;
+            await page.waitForTimeout(500);
+            await forceShowLoginLayer(page);
+            if (await loginFormAttached(page)) return emailBox;
+            if (await emailBox.isVisible({timeout: 1500}).catch(() => false)) return emailBox;
         }
     }
     console.log("[mailcom] 点击没展开，强制显示 .login-layer + #navlogin");
-    await page.goto("https://www.mail.com/#navlogin", {waitUntil: "domcontentloaded", timeout: 30000}).catch(() => {});
-    await page.waitForTimeout(800);
-    await forceShowLoginLayer(page);
-    if (await emailBox.isVisible({timeout: 4000}).catch(() => false)) return emailBox;
+    // 优先原地 force；失败再带 hash 刷新
+    let snap = await forceShowLoginLayer(page);
+    console.log(`[mailcom] forceShow layers=${snap.layers} email=${snap.hasEmail} open=${snap.layerOpen}`);
+    if (await loginFormAttached(page)) return emailBox;
+
+    await page.goto("https://www.mail.com/#navlogin", {waitUntil: "domcontentloaded", timeout: 45000}).catch(() => {});
+    await page.waitForTimeout(1200);
+    await dismissPopups(page);
+    snap = await forceShowLoginLayer(page);
+    console.log(`[mailcom] forceShow#2 layers=${snap.layers} email=${snap.hasEmail} open=${snap.layerOpen}`);
+    if (await loginFormAttached(page)) return emailBox;
+    if (await emailBox.isVisible({timeout: 3000}).catch(() => false)) return emailBox;
     if (headed) {
         const got = await waitForFormOrInbox(page, emailBox, 180, "自动没点开登录层");
         if (got === "form" || got === "inbox") return emailBox;
     }
-    throw new Error("mail.com 首页登录层没展开，#login-email 不可见（不要走 /login/ 404）");
+    // 最后兜底：看 body 是否整页失败
+    const body = String(await page.innerText("body").catch(() => "")).replace(/\s+/g, " ").slice(0, 80);
+    throw new Error(`mail.com 首页登录层没展开，#login-email 不可见（不要走 /login/ 404） body=${body}`);
+}
+
+async function gotoMailcomHome(page, {retries = 3} = {}) {
+    let lastErr = null;
+    for (let i = 0; i < retries; i++) {
+        try {
+            if (i) {
+                console.log(`[mailcom] 首页打开失败，重试 ${i + 1}/${retries}: ${String(lastErr || "").slice(0, 80)}`);
+                await page.waitForTimeout(800 + i * 700);
+            }
+            // networkidle 在广告站易超时；domcontentloaded 更稳，再补等表单
+            const resp = await page.goto("https://www.mail.com/", {
+                waitUntil: "domcontentloaded",
+                timeout: 60000,
+            });
+            const status = resp?.status?.() || 0;
+            console.log(`[mailcom] 首页已开 status=${status} url=${page.url().slice(0, 80)}`);
+            // 等 loginform 进 DOM（静态 HTML 里就有，失败则多等一会儿）
+            await page.waitForSelector("#login-email, form[data-mod-name='loginform'], a.button-login", {
+                timeout: 15000,
+                state: "attached",
+            }).catch(() => {});
+            if (await loginFormAttached(page) || await page.locator("a.button-login, a.nav-login").count().catch(() => 0)) {
+                return;
+            }
+            // 可能是中间页/consent，再等一轮
+            await page.waitForTimeout(2000);
+            if (await loginFormAttached(page)) return;
+            lastErr = `首页无登录表单 status=${status}`;
+        } catch (e) {
+            lastErr = e;
+            const msg = String(e?.message || e);
+            // 连接被关/重置：换一次空白页再试
+            if (/ERR_CONNECTION|ECONN|RESET|TIMED_OUT|NS_ERROR|net::/i.test(msg)) {
+                await page.goto("about:blank").catch(() => {});
+                continue;
+            }
+            if (i === retries - 1) throw e;
+        }
+    }
+    if (lastErr) throw (lastErr instanceof Error ? lastErr : new Error(String(lastErr)));
 }
 
 async function loginMailcom(email, password, opts = {}) {
     const launchOpts: any = {
         channel: "chrome",
         headless: opts.headless ?? HEADLESS,
-        args: ["--disable-blink-features=AutomationControlled"],
+        args: [
+            "--disable-blink-features=AutomationControlled",
+            "--disable-dev-shm-usage",
+        ],
     };
-    const proxyOpt = parseProxyOpt(mailProxy);
+    const proxyRaw = (opts.proxy != null ? opts.proxy : mailProxy) || "";
+    const proxyOpt = parseProxyOpt(proxyRaw);
     if (proxyOpt) launchOpts.proxy = proxyOpt;
     const headed = !(launchOpts.headless);
     const browser = await chromium.launch(launchOpts);
     let page = null;
     try {
         const context = await browser.newContext({
-            viewport: {width: 1139, height: 974},
+            viewport: {width: 1280, height: 900},
             locale: "en-US",
             timezoneId: "America/New_York",
+            userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
         });
         const session = {browser, context, page: null, bearer: null, lastList: null};
         page = await context.newPage();
@@ -393,7 +606,9 @@ async function loginMailcom(email, password, opts = {}) {
             if (/oauth2\/token/i.test(url) && res.ok()) {
                 try {
                     const data = await res.json();
-                    if (data?.access_token && /mail_mailbox/i.test(String(data.scope || ""))) {
+                    const post = res.request().postData() || "";
+                    // 响应体常不带 scope；靠 POST body 的 scope= 判断
+                    if (data?.access_token && (/mail_mailbox/i.test(String(data.scope || "")) || /scope=mail_mailbox/i.test(post))) {
                         grabBearer(`Bearer ${data.access_token}`, url);
                     }
                 } catch { /* not json */ }
@@ -404,21 +619,32 @@ async function loginMailcom(email, password, opts = {}) {
         });
         page.setDefaultTimeout(20000);
 
-        console.log(`[mailcom] 登录 ${email} ... 打开首页 ${headed ? "可见 Chrome" : "无头"}`);
-        await page.goto("https://www.mail.com/", {waitUntil: "commit", timeout: 90000});
-        console.log(`[mailcom] 首页已开 url=${page.url().slice(0, 80)}`);
-        await page.waitForTimeout(4000);
+        console.log(`[mailcom] 登录 ${email} ... 打开首页 ${headed ? "可见 Chrome" : "无头"}${proxyRaw ? " · 经代理" : " · 直连"}`);
+        await gotoMailcomHome(page, {retries: 3});
+        await page.waitForTimeout(1200);
 
-        // consent
-        for (const name of [/Continue to Mail/i, /Accept All/i, /Accept/i, /Agree/i]) {
-            try {
-                const btn = page.getByRole("button", {name});
-                if (await btn.count()) {
-                    await btn.first().click({timeout: 4000});
-                    await page.waitForTimeout(1500);
-                    break;
-                }
-            } catch { /* ignore */ }
+        // consent / cookie（mail.com 常先落 /consentpage，无登录层）
+        for (let c = 0; c < 3; c++) {
+            await dismissCookieBanners(page);
+            await dismissPopups(page);
+            const onConsent = /consent|privacy|cookie/i.test(page.url())
+                || /consent|cookie settings|privacy preference/i.test(String(await page.innerText("body").catch(() => "")).slice(0, 400));
+            if (!onConsent && await loginFormAttached(page)) break;
+            for (const name of [/Continue to Mail/i, /Accept All/i, /Accept all/i, /Accept/i, /Agree/i, /I agree/i, /Allow all/i]) {
+                try {
+                    const btn = page.getByRole("button", {name}).first();
+                    if (await btn.isVisible({timeout: 600}).catch(() => false)) {
+                        await btn.click({timeout: 4000}).catch(() => {});
+                        await page.waitForTimeout(1200);
+                        break;
+                    }
+                } catch { /* ignore */ }
+            }
+            if (/consent/i.test(page.url())) {
+                // 仍卡 consent：回首页再试
+                await page.goto("https://www.mail.com/", {waitUntil: "domcontentloaded", timeout: 30000}).catch(() => {});
+                await page.waitForTimeout(1000);
+            }
         }
         await dismissPopups(page);
 
@@ -428,97 +654,160 @@ async function loginMailcom(email, password, opts = {}) {
             console.log(`[mailcom] 填库内当前密码 ${pwHint}（首页下拉，不走 /login/ 404）`);
             if (/\/login\/?(\?|$)/i.test(page.url())) {
                 console.log("[mailcom] 当前是 /login/ 404 壳，回到首页再开下拉");
-                await page.goto("https://www.mail.com/", {waitUntil: "domcontentloaded", timeout: 30000});
-                await page.waitForTimeout(1000);
+                await gotoMailcomHome(page, {retries: 2});
+                await page.waitForTimeout(800);
             }
-            const emailBox = await openMailcomLoginForm(page, {headed});
-            if (await inboxAlready(page)) {
-                console.log(`[mailcom] 已在收件箱 url=${page.url().slice(0, 80)}`);
-            } else {
-                await emailBox.fill(email, {timeout: 8000});
-                const pwdBox = page.locator("#login-password").first();
-                await pwdBox.waitFor({state: "visible", timeout: 8000});
-                await pwdBox.fill(password, {timeout: 8000});
-                let submitted = false;
-                for (const sel of [
-                    "button.login-submit",
-                    "#header-login-box button[type='submit']",
-                    "form[action*='login.mail.com'] button[type='submit']",
-                    ".login-layer button[type='submit']",
-                ]) {
-                    if (await clickIfVisible(page, sel, 800)) { submitted = true; break; }
-                }
-                if (!submitted) {
-                    submitted = await page.locator("form[action*='login.mail.com']").first()
-                        .evaluate((f) => { f.requestSubmit(); return true; }).catch(() => false);
-                }
-                if (!submitted) {
-                    await pwdBox.press("Enter").catch(() => {});
-                }
-                console.log(`[mailcom] 已点登录 submitted=${submitted} url=${page.url().slice(0, 80)}`);
-                if (/\/login\/?(\?|$)/i.test(page.url()) && !submitted) {
-                    throw new Error("mail.com 还停在 /login/ 404，表单没提交成功");
-                }
-            }
-        }
-        console.log(`[mailcom] 等跳转收件箱（最多 45s）`);
-        try {
-            await page.waitForURL("**navigator-lxa.mail.com**", {timeout: 45000, waitUntil: "commit"});
-            console.log(`[mailcom] 已进 navigator url=${page.url().slice(0, 80)}`);
-        } catch {
-            console.log(`[mailcom] 未跳到 navigator，当前 url=${page.url().slice(0, 90)}`);
-        }
 
-        // 账密无效会跳 logout 页，提前识别、快速失败
-        if (!session.bearer && /\/logout/i.test(page.url())) {
+            let submitted = false;
+            try {
+                const emailBox = await openMailcomLoginForm(page, {headed});
+                if (await inboxAlready(page)) {
+                    console.log(`[mailcom] 已在收件箱 url=${page.url().slice(0, 80)}`);
+                    submitted = true;
+                } else {
+                    // 优先可见填写；失败则 DOM 强制提交
+                    const visible = await emailBox.isVisible({timeout: 2000}).catch(() => false);
+                    if (visible) {
+                        await emailBox.fill(email, {timeout: 8000});
+                        const pwdBox = page.locator("#login-password").first();
+                        await forceShowLoginLayer(page);
+                        await pwdBox.waitFor({state: "attached", timeout: 8000});
+                        await pwdBox.fill(password, {force: true, timeout: 8000}).catch(async () => {
+                            await pwdBox.evaluate((el, v) => { el.value = v; el.dispatchEvent(new Event("input", {bubbles: true})); }, password);
+                        });
+                        for (const sel of [
+                            "button.login-submit",
+                            "#header-login-box button[type='submit']",
+                            "form[action*='login.mail.com'] button[type='submit']",
+                            ".login-layer button[type='submit']",
+                            "form[data-mod-name='loginform'] button[type='submit']",
+                        ]) {
+                            if (await clickIfVisible(page, sel, 800)) { submitted = true; break; }
+                        }
+                        if (!submitted) {
+                            submitted = await page.locator("form[action*='login.mail.com'], form[data-mod-name='loginform']").first()
+                                .evaluate((f) => { f.requestSubmit(); return true; }).catch(() => false);
+                        }
+                        if (!submitted) {
+                            await pwdBox.press("Enter").catch(() => {});
+                            submitted = true;
+                        }
+                    } else {
+                        console.log("[mailcom] 输入框不可见，改用 DOM 强制填提交");
+                        const fr = await forceFillAndSubmitLogin(page, email, password);
+                        if (!fr?.ok) throw new Error(fr?.reason || "强制提交失败");
+                        submitted = true;
+                    }
+                }
+            } catch (uiErr) {
+                console.log(`[mailcom] 常规打开登录层失败，DOM 强制提交: ${String(uiErr?.message || uiErr).slice(0, 100)}`);
+                const fr = await forceFillAndSubmitLogin(page, email, password);
+                if (!fr?.ok) throw uiErr;
+                submitted = true;
+            }
+            console.log(`[mailcom] 已点登录 submitted=${submitted} url=${page.url().slice(0, 80)}`);
+            if (/\/login\/?(\?|$)/i.test(page.url()) && !submitted) {
+                throw new Error("mail.com 还停在 /login/ 404，表单没提交成功");
+            }
+        }
+        // 等登录结果：真正成功是 sid/webmailer/3c；中间页 /login 不算；logout/首页回落=失败
+        console.log(`[mailcom] 等登录结果（最多 40s）`);
+        const waitStart = Date.now();
+        let sawNavigator = false;
+        while (Date.now() - waitStart < 40_000 && !session.bearer) {
+            const u = page.url() || "";
+            if (isLoginFailedUrl(u)) break;
+            if (/navigator-lxa\.mail\.com/i.test(u)) sawNavigator = true;
+            if (await inboxAlready(page)) {
+                console.log(`[mailcom] 登录壳就绪 url=${u.slice(0, 90)}`);
+                break;
+            }
+            // 提交后几秒仍停在首页且能看见登录框 → 提交没生效或被弹回
+            if (Date.now() - waitStart > 10_000 && isMarketingHome(u) && await loginFormAttached(page)) {
+                console.log(`[mailcom] 已回首页登录层，判定未登录成功`);
+                break;
+            }
+            await page.waitForTimeout(500);
+        }
+        console.log(`[mailcom] 当前 url=${page.url().slice(0, 100)} sawNavigator=${sawNavigator}`);
+
+        if (!session.bearer && isLoginFailedUrl(page.url())) {
             throw new Error(`mail.com 账密无效或账号已停用(登录被拒, 跳转 logout): ${email}`);
         }
 
-        // 等 webmailer 自己去换 mail_mailbox_r。先到的几乎一定是 LPS 的 ppc_permission_r，那个票打 maillist 会 403。
-        for (let i = 0; i < 30 && !session.bearer; i += 1) {
-            if (i === 0 || i === 10 || i === 20) {
-                console.log(`[mailcom] 等 mailbox 票 ${i}/30 url=${page.url().slice(0, 70)}`);
-            }
-            await page.waitForTimeout(1000);
-            if (i === 3 || i === 10) await dismissPopups(page);
-            if (i === 5 || i === 15) {
-                const body = await page.innerText("body").catch(() => "");
-                if (/blocked your account|irregular activity|contact.*support/i.test(body)) break;
-            }
-            if (i === 8 || i === 18) {
-                const navsid = await readNavsid(page);
-                if (navsid) {
+        // 有 sid 后：先直接 mint mailbox 票；失败再打开 webmailer/3c 等网络拦截
+        let navsid = await readNavsid(page);
+        if (!navsid) {
+            navsid = extractNavsid(page) || "";
+        }
+        if (navsid && !session.bearer) {
+            console.log(`[mailcom] 已有 sid=${navsid.slice(0, 12)}… 直接 mint mailbox 票`);
+            const minted = await mintMailboxToken(session, navsid);
+            if (minted) session.bearer = minted;
+        }
+
+        if (!session.bearer && navsid) {
+            // 带 sid 打开 webmailer，等 list 组件自己换票
+            const dests = [
+                `https://webmailer.mail.com/?navsid=${encodeURIComponent(navsid)}`,
+                `https://3c.mail.com/?sid=${encodeURIComponent(navsid)}`,
+                `https://navigator-lxa.mail.com/?sid=${encodeURIComponent(navsid)}`,
+            ];
+            for (const dest of dests) {
+                if (session.bearer) break;
+                console.log(`[mailcom] 打开 ${dest.slice(0, 60)}… 等 mailbox 票`);
+                const waitP = waitForMailboxTokenResponse(page, session, 20000);
+                await page.goto(dest, {waitUntil: "domcontentloaded", timeout: 35000}).catch(() => {});
+                await dismissPopups(page);
+                await waitP;
+                if (!session.bearer) {
                     const minted = await mintMailboxToken(session, navsid);
-                    if (minted) {
-                        session.bearer = minted;
-                        console.log(`[mailcom] oauthbridge 换到 mailbox token sid=${navsid.slice(0, 8)}…`);
-                        break;
-                    }
-                    console.log(`[mailcom] oauthbridge 换票未成 sid=${navsid.slice(0, 8)}…`);
+                    if (minted) session.bearer = minted;
+                }
+                if (!session.bearer) await page.waitForTimeout(2500);
+            }
+        }
+
+        // 兜底再等一会儿（拦截请求头 Authorization）
+        for (let i = 0; i < 12 && !session.bearer; i += 1) {
+            const u = page.url() || "";
+            if (i === 0 || i === 6) console.log(`[mailcom] 等 mailbox 票 ${i}/12 url=${u.slice(0, 70)}`);
+            if (isLoginFailedUrl(u) || (i >= 3 && isMarketingHome(u) && await loginFormAttached(page))) break;
+            await page.waitForTimeout(1000);
+            if (i === 2 || i === 7) {
+                const sid = (await readNavsid(page)) || navsid;
+                if (sid) {
+                    const minted = await mintMailboxToken(session, sid);
+                    if (minted) { session.bearer = minted; break; }
                 }
             }
         }
         if (session.bearer) {
             console.log(`[mailcom] 打开 3c 收件箱`);
-            await page.goto("https://3c.mail.com/", {waitUntil: "domcontentloaded", timeout: 45000}).catch(() => {});
-            await page.waitForTimeout(2500);
+            if (!/3c\.mail\.com|webmailer/i.test(page.url())) {
+                await page.goto("https://3c.mail.com/", {waitUntil: "domcontentloaded", timeout: 45000}).catch(() => {});
+            }
+            await page.waitForTimeout(1500);
             await dismissPopups(page);
         }
         if (!session.bearer) {
-            let reason = "登录后未拿到 mail_mailbox 票(截到 LPS 票打 maillist 会 403)";
+            let reason = "登录后未拿到 mail_mailbox 票(会话未完成或只截到 LPS 票)";
             let body = "";
             try {
                 body = await page.innerText("body").catch(() => "");
+                const u = page.url() || "";
                 if (/blocked your account|irregular activity|contact.*support|precautionary measure/i.test(body)) {
                     reason = "mail.com 账号被风控封禁(irregular activity blocked)";
                 } else if (/invalid email address|password combination/i.test(body)) {
                     reason = "mail.com 账密无效(邮箱/密码组合错误)";
-                } else if (/\/login/i.test(page.url())) {
-                    reason = "mail.com 还停在登录页(表单没提交成功)，不是确认账密错";
+                } else if (isLoginFailedUrl(u)) {
+                    reason = "mail.com 账密无效或账号已停用(登录被拒)";
+                } else if (isMarketingHome(u) && /log in|sign up|sign in/i.test(body)) {
+                    reason = "mail.com 登录未成功(已回首页，可能账密错或会话未建立)";
                 } else if (/password/i.test(body) && /try again/i.test(body)) {
                     reason = "mail.com 登录失败(页面提示再试，可能账密或验证码)";
-                } else if (/\/logout/i.test(page.url())) {
-                    reason = "mail.com 账密无效或账号已停用(登录被拒)";
+                } else if (/navigator-lxa\.mail\.com\/login/i.test(u) && !/[?&](?:sid|navsid)=/i.test(u)) {
+                    reason = "mail.com 卡在登录中间页(无 sid)，会话未建立";
                 }
             } catch { /* ignore */ }
             console.log(`[mailcom] 登录失败 ${reason} url=${page.url().slice(0, 90)} body=${String(body || "").replace(/\s+/g, " ").slice(0, 160)}`);
@@ -526,9 +815,13 @@ async function loginMailcom(email, password, opts = {}) {
         }
         return session;
     } catch (e) {
-        if (headed && page && !page.isClosed()) {
-            console.log(`[mailcom] 失败，窗口先留 90s 给你看，先别关: ${e?.message || e}`);
+        // 仅手动调试 headed 时留窗；自动化/无头不卡 90s
+        const keepOpen = headed && process.env.MAILCOM_KEEP_FAIL_WINDOW === "1" && page && !page.isClosed();
+        if (keepOpen) {
+            console.log(`[mailcom] 失败，窗口先留 90s 给你看(MAILCOM_KEEP_FAIL_WINDOW=1): ${e?.message || e}`);
             await page.waitForTimeout(90_000).catch(() => {});
+        } else if (headed) {
+            console.log(`[mailcom] 失败即关窗: ${e?.message || e}`);
         }
         await browser.close().catch(() => {});
         throw e;
@@ -682,22 +975,35 @@ export async function changeMailcomPassword(email, oldPassword, newPassword, log
 /**
  * 校验 mail.com 邮箱密码是否正确:用该密码登录(截获 Bearer=成功)。返回 {ok, reason?}。
  * 独立小工具用,不改任何状态;验证用无头(快、不弹窗)。
+ * opts.proxy 可覆盖全局 mailProxy；网络/UI 抖动会自动重试 1 次。
  */
-export async function verifyMailcomLogin(email, password, log = (m) => {}) {
+export async function verifyMailcomLogin(email, password, log = (m) => {}, opts = {}) {
     const key = normalizeEmail(email);
-    let session;
-    try {
-        session = await loginMailcom(key, password, {headless: true});
-        log(`${key} 登录成功(密码正确)`);
-        return {ok: true};
-    } catch (e) {
-        const msg = String(e?.message || e);
-        // 区分:明确"账密无效/跳 logout"=密码确实错;其它(page.fill timeout/网络/浏览器崩)=页面异常,不能当密码错
-        const wrongPassword = /账密无效|账号已停用|登录被拒|跳转.*logout|invalid.*(email|password)|wrong.*password/i.test(msg);
-        return {ok: false, reason: msg.slice(0, 120), wrongPassword};
-    } finally {
-        if (session) { try { await session.browser.close(); } catch { /* ignore */ } }
+    const tries = Math.max(1, Number(opts.tries || 2));
+    let last = {ok: false, reason: "未尝试", wrongPassword: false};
+    for (let i = 0; i < tries; i++) {
+        let session;
+        try {
+            if (i) log(`${key} 验密重试 ${i + 1}/${tries}…`);
+            session = await loginMailcom(key, password, {
+                headless: opts.headless ?? true,
+                proxy: opts.proxy,
+            });
+            log(`${key} 登录成功(密码正确)`);
+            return {ok: true};
+        } catch (e) {
+            const msg = String(e?.message || e);
+            // 区分:明确"账密无效/跳 logout"=密码确实错;其它(page.fill timeout/网络/浏览器崩)=页面异常,不能当密码错
+            const wrongPassword = /账密无效|账号已停用|登录被拒|跳转.*logout|invalid.*(email|password)|wrong.*password/i.test(msg);
+            const retryable = !wrongPassword && /登录层|不可见|ERR_CONNECTION|ECONN|timeout|Timeout|net::|强制提交|无登录表单|首页/i.test(msg);
+            last = {ok: false, reason: msg.slice(0, 160), wrongPassword};
+            log(`${key} 验密失败: ${last.reason.slice(0, 100)}${retryable && i + 1 < tries ? "（将重试）" : ""}`);
+            if (!retryable) return last;
+        } finally {
+            if (session) { try { await session.browser.close(); } catch { /* ignore */ } }
+        }
     }
+    return last;
 }
 
 function parseMailListPayload(data) {

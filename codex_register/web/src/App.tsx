@@ -172,10 +172,27 @@ export default function App() {
     const toastTimer = useRef<any>(null);
     const notify = (m: string, ms = 2600) => { if (toastTimer.current) clearTimeout(toastTimer.current); setToast(m); toastTimer.current = setTimeout(() => setToast(""), ms); };
 
+    // 列表 ~7MB 时全量 reload 极贵：合并成 600ms 内一次
+    const reloadAccountsTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+    const reloadAccounts = (immediate = false, deleted?: boolean) => {
+        const del = deleted ?? showDeletedRef.current;
+        const run = () => {
+            reloadAccountsTimer.current = null;
+            api.listAccounts(!!del).then(setAccounts).catch(() => {});
+        };
+        if (immediate) {
+            if (reloadAccountsTimer.current) clearTimeout(reloadAccountsTimer.current);
+            run();
+            return;
+        }
+        if (reloadAccountsTimer.current) return;
+        reloadAccountsTimer.current = setTimeout(run, 600);
+    };
+
     // 初次加载 + SSE
     useEffect(() => {
         api.state().then((s) => { setPaused(s.state.paused); setInstanceId(s.state.instanceId || ""); setConcurrency(s.state.concurrency); setOtpSingle(s.state.otpSingle); setChatSim(s.state.simulateChat); setSmsEnabled(s.state.smsEnabled); setRtEnabled(s.state.rtEnabled); setMfaEnabled(s.state.mfaEnabled !== false); setDaily(s.state.daily); setRegEngine(s.state.regEngine || "http"); setBitBrowser(!!s.state.bitBrowser); setSmsLinkTemplate(s.state.smsLinkTemplate || ""); setSmsMaxBind(s.state.smsMaxBind ?? 3); if (s.state.defaultPassword) setDefaultGptPw(s.state.defaultPassword); setStats(s.stats); const snap = (s.state as any).gptProxyPoolSnap; if (snap) setPoolMeta({total: snap.total || 0, leased: snap.leased || 0, jump: String((s.state as any).gptProxyJump || "")}); }).catch(() => {});
-        api.listAccounts().then(setAccounts).catch(() => {});
+        reloadAccounts(true, false);
         // 批次数据来自数据库(筛选/导出用;导入已迁至邮箱管理)
         api.batches().then(setBatches).catch(() => {});
         api.listSms().then(setSmsData).catch(() => {});
@@ -183,12 +200,13 @@ export default function App() {
         const disconnect = connectStream((event, data) => {
             if (event === "sms") { api.listSms().then(setSmsData).catch(() => {}); return; }
             if (event === "daily") { setDaily(data); return; }
-            if (event === "batchAt") { setBatchAt(data); if (!data.running && !showDeletedRef.current) api.listAccounts().then(setAccounts).catch(() => {}); return; }
+            if (event === "batchAt") { setBatchAt(data); if (!data.running) reloadAccounts(false); return; }
             if (event === "refreshAt") { setRefreshAtResults(data.results.map((r: any) => ({...r, status: r.status || "done"}))); if (data.done) setRefreshAtRunning(false); return; }
             if (event === "batchRtAcquire") { setAcquireRtResults(data.results.map((r: any) => ({...r, status: r.status || "done"}))); if (data.done) setAcquireRtRunning(false); return; }
             if (event === "batchPw") {
                 setMailJobOn((on) => !!data?.running || on);
-                if (!showDeletedRef.current) api.listAccounts().then(setAccounts).catch(() => {});
+                // 改密会影响列表里的 pw_status，结束后轻量刷新（防抖）
+                if (!data?.running) reloadAccounts(false);
                 return;
             }
             if (event === "batchHarden") {
@@ -197,7 +215,10 @@ export default function App() {
                 return;
             }
             if (event === "stats") setStats(data);
-            else if (event === "snapshot") { if (!showDeletedRef.current) setAccounts(data); }
+            else if (event === "snapshot") {
+                // 服务端 snapshot 已是无 token 的轻量列表；合并防抖避免连发
+                if (!showDeletedRef.current && Array.isArray(data)) setAccounts(data);
+            }
             else if (event === "hello") {
                 setStats(data.stats); setPaused(data.state.paused); setConcurrency(data.state.concurrency); setOtpSingle(data.state.otpSingle); setChatSim(data.state.simulateChat);
                 if (data.state?.gptProxyPoolSnap) setPoolMeta({total: data.state.gptProxyPoolSnap.total || 0, leased: data.state.gptProxyPoolSnap.leased || 0, jump: String(data.state.gptProxyJump || "")});
@@ -206,7 +227,8 @@ export default function App() {
                 const bh = data.state?.batchHarden;
                 const open = (bh?.windows || []).some((w: any) => w.status === 1);
                 setMailJobOn(!!bh?.running || !!data.state?.batchPw?.running || open);
-                if (!showDeletedRef.current) api.listAccounts().then(setAccounts).catch(() => {});
+                // 重连后补一次列表，保证业务状态齐全
+                reloadAccounts(false);
             }
             else if (event === "status") {
                 setAccounts((prev) => {
@@ -222,11 +244,14 @@ export default function App() {
                 }
             }
         });
-        return disconnect;
+        return () => {
+            disconnect();
+            if (reloadAccountsTimer.current) clearTimeout(reloadAccountsTimer.current);
+        };
     }, []);
 
     // 切换「已删除」视图时重新拉取账号列表
-    useEffect(() => { api.listAccounts(showDeleted).then(setAccounts).catch(() => {}); }, [showDeleted]);
+    useEffect(() => { reloadAccounts(true, showDeleted); }, [showDeleted]);
 
     // 默认视图下一旦开始搜索,顺带拉一次已删除账号并入候选:删号是软删,邮箱仍能搜出历史数据
     useEffect(() => {
@@ -237,10 +262,13 @@ export default function App() {
     // 删号后作废缓存:下次搜索重新拉,新删的号才搜得到
     const invalidateDeleted = () => { delLoadedRef.current = false; setDelAccounts([]); };
 
-    // 选中账号 → 拉历史日志
+    // 选中账号 → 历史日志 + 详情全量（补 token 等列表未下发字段）
     useEffect(() => {
         if (selectedId == null) { setLogs([]); return; }
         api.logs(selectedId).then((rows) => setLogs(rows.map((r) => ({ts: r.ts, line: r.line})))).catch(() => setLogs([]));
+        api.getAccount(selectedId).then((full) => {
+            setAccounts((prev) => prev.map((a) => (a.id === full.id ? {...a, ...full} : a)));
+        }).catch(() => {});
     }, [selectedId]);
 
     useEffect(() => { logEndRef.current?.scrollIntoView({behavior: "smooth"}); }, [logs, allLogs, logMode]);
@@ -343,7 +371,7 @@ export default function App() {
     async function saveEdit(id: number) {
         try {
             await api.updateAccount(id, editForm);
-            await api.listAccounts().then(setAccounts);
+            reloadAccounts(true);
             setEditMode(false);
             notify("已保存");
         } catch (e: any) { notify("保存失败：" + e.message); }
@@ -405,7 +433,7 @@ export default function App() {
                 notify(`已分配 ${r.allocated ?? 0} 个进 GPT 注册队列${skip ? `（跳过 ${skip}）` : ""}`);
             }
             setShowPicker(false);
-            await api.listAccounts().then(setAccounts);
+            reloadAccounts(true);
             api.batches().then(setBatches).catch(() => {});
         } catch (e: any) { notify("分配失败: " + e.message); }
     }
@@ -434,7 +462,7 @@ export default function App() {
             const ext = exportFormat === "csv" ? "csv" : exportFormat === "jsonl" ? "jsonl" : "txt";
             const blob = new Blob([text], {type: exportFormat === "csv" ? "text/csv;charset=utf-8" : "text/plain;charset=utf-8"});
             const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = `export-${exportFormat}.${ext}`; a.click(); URL.revokeObjectURL(a.href);
-            if (exportMarkSold) await api.listAccounts().then(setAccounts);
+            if (exportMarkSold) reloadAccounts(true);
             notify(`已导出 ${exportCount} 条${exportMarkSold ? "并标记已售出" : ""}`);
             setShowExport(false);
         } catch (e: any) { notify("导出失败: " + e.message); }
@@ -446,7 +474,7 @@ export default function App() {
         if (!window.confirm(`给 ${selectedIds.size ? "选中" : "当前列表"} ${ids.length} 个号设置批次「${b || "(清空批次)"}」？`)) return;
         try {
             await api.setBatch(ids, b);
-            await api.listAccounts().then(setAccounts);
+            reloadAccounts(true);
             api.batches().then(setBatches).catch(() => {});
             notify(`已给 ${ids.length} 个号设置批次${b ? `「${b}」` : "(清空)"}`);
         } catch (e: any) { notify(e.message); }
@@ -504,9 +532,21 @@ export default function App() {
                 <DomainTab active={domain === "claude"} onClick={() => setDomain("claude")}>🧠 Claude 注册</DomainTab>
                 <DomainTab active={domain === "recharge"} onClick={() => setDomain("recharge")}>💳 充值提交</DomainTab>
             </nav>
-            {domain === "mailbox" && <MailboxPanel notify={notify}/>}
-            {domain === "claude" && <ClaudePanel notify={notify}/>}
-            {domain === "recharge" && <RechargePanel notify={notify}/>}
+            {domain === "mailbox" && (
+                <div className="flex-1 min-h-0 flex flex-col overflow-hidden">
+                    <MailboxPanel notify={notify}/>
+                </div>
+            )}
+            {domain === "claude" && (
+                <div className="flex-1 min-h-0 flex flex-col overflow-hidden">
+                    <ClaudePanel notify={notify}/>
+                </div>
+            )}
+            {domain === "recharge" && (
+                <div className="flex-1 min-h-0 flex flex-col overflow-hidden">
+                    <RechargePanel notify={notify}/>
+                </div>
+            )}
             {domain === "gpt" && (<>
             {/* 顶栏 */}
             <header className="bg-white border-b px-6 py-3 flex items-center gap-4 flex-wrap shadow-sm">
@@ -567,7 +607,7 @@ export default function App() {
                     </div>
                 </div>
                 <div className="flex-1"/>
-                <div className="flex items-center gap-2">
+                <div className="flex items-center gap-2 flex-wrap justify-end">
                     <label className="text-sm text-gray-500">引擎</label>
                     <button onClick={() => { const v = regEngine === "http" ? "browser" : "http"; setRegEngine(v); api.setEngine(v).then(() => notify(v === "browser" ? "注册引擎:浏览器(真Chrome过CF,headed,并发≤2)" : "注册引擎:HTTP(sentinel模拟)")).catch((e: any) => notify(e.message)); }}
                             title="http=HTTP模拟(sentinel)；browser=真Chrome过CF(headed,需能过CF的注册代理,自动限并发≤2)"
@@ -609,9 +649,7 @@ export default function App() {
                     <button onClick={ctrl(api.stop, "已停止本实例注册，未完成任务退回队列（其他实例可接着跑）")} className="px-3 py-1.5 bg-red-500 text-white rounded-lg text-sm hover:bg-red-600" title="只停本机。正在跑的号退回等待，其他实例会认领">⏹ 停止</button>
                     <button onClick={ctrl(api.retryFailed, "已把失败项重置为等待")} className="px-3 py-1.5 bg-gray-200 rounded-lg text-sm hover:bg-gray-300">↻ 重试失败</button>
                     <button onClick={() => { setShowProxy(true); notify("代理池已在下方展开"); }} className="px-3 py-1.5 bg-gray-200 rounded-lg text-sm hover:bg-gray-300">⚙ 代理池</button>
-                    {/* 从待分配邮箱选号 → 设批次 → 可选先改密 → 进注册队列(补邮箱管理按数量盲分、无法设批次的缺口) */}
                     <button onClick={openPicker} title="从待分配(free)邮箱里勾选具体账号,设批次、可选先改密后分配进 GPT 注册队列" className="px-3 py-1.5 bg-emerald-600 text-white rounded-lg text-sm hover:bg-emerald-700">📥 从邮箱选号</button>
-                    {/* ★唯一导出入口:范围×格式×标记已售出全在弹窗里。打开时按 选中>批次筛选>全部 智能预选范围 */}
                     <button onClick={() => { setExportRange(selectedIds.size ? "selected" : batchFilter ? "batch" : "all"); setExportBatch(batchFilter); setShowExport(true); }} className="px-3 py-1.5 bg-indigo-600 text-white rounded-lg text-sm hover:bg-indigo-700">⬇ 导出…</button>
                     <button onClick={() => setShowRefreshAt(true)} className="px-3 py-1.5 bg-cyan-600 text-white rounded-lg text-sm hover:bg-cyan-700" title="粘贴邮箱列表,走浏览器登录重新获取 accessToken">🔄 批量刷新AT</button>
                     <button onClick={() => setShowAcquireRt(true)} className="px-3 py-1.5 bg-amber-600 text-white rounded-lg text-sm hover:bg-amber-700" title="粘贴邮箱----密码,走 OAuth 获取全新 refresh_token(Pro号无需接码)">🔑 批量获取RT</button>
@@ -747,7 +785,8 @@ export default function App() {
             <div className="flex-1 flex min-h-0">
                 <div className="flex-1 flex flex-col min-h-0">
                     <div className="flex items-center gap-2 px-4 py-2 border-b bg-gray-50 text-sm flex-wrap shrink-0">
-                        <span className="text-gray-500">共 <b className="text-gray-700">{filtered.length}</b> 条{delHits > 0 ? <>（含已删除 <b className="text-gray-500">{delHits}</b> 条，只读）</> : null}{selectedIds.size > 0 ? <> · 已选 <b className="text-indigo-600">{selectedIds.size}</b> 个</> : "（未选则对当前列表全部执行）"}</span>
+                        <span className="text-gray-500">共 <b className="text-gray-700">{filtered.length}</b> 条{delHits > 0 ? <>（含已删除 <b className="text-gray-500">{delHits}</b> 条，只读）</> : null}{selectedIds.size > 0 ? <> · 已选 <b className="text-indigo-600">{selectedIds.size}</b> 个</> : null}</span>
+                        <span className="text-gray-400 text-xs">（未选则对当前列表全部执行）</span>
                         <button onClick={() => api.batchTestAt(selectedIds.size ? [...selectedIds] : actionable.map((a) => a.id)).then((r) => notify(`批量测 at：${r.count} 个`)).catch((e) => notify(e.message))} className="px-2 py-1 bg-blue-600 text-white rounded text-xs">批量测 at</button>
                         {batchAt.running
                             ? <button onClick={() => api.stopBatchAt().then(() => notify("已请求停止(当前号跑完即停)")).catch((e) => notify(e.message))} className="px-2 py-1 bg-red-600 text-white rounded text-xs animate-pulse">⏹ 停止重登 {batchAt.done}/{batchAt.total}</button>
@@ -765,7 +804,7 @@ export default function App() {
                             try {
                                 const r = await api.setSold(ids, false);
                                 setSelectedIds(new Set());
-                                await api.listAccounts().then(setAccounts);
+                                reloadAccounts(true);
                                 notify(`已把 ${r.count} 个账号改回未售出`);
                             } catch (e: any) { notify(e.message); }
                         }} title="把选中(或当前列表)里已售出的号改回未售出,误标/退回时用" className="px-2 py-1 bg-amber-500 text-white rounded text-xs">改回未售出</button>
@@ -778,7 +817,7 @@ export default function App() {
                             if (!ids.length) { notify("无可删除的账号"); return; }
                             const who = selectedIds.size ? `选中的 ${ids.length} 个` : `当前列表全部 ${ids.length} 个`;
                             if (!window.confirm(`确认删除${who}账号？邮箱将一并删除。运行中的会跳过。`)) return;
-                            try { const r = await api.batchDelete(ids); setSelectedIds(new Set()); invalidateDeleted(); await api.listAccounts(showDeleted).then(setAccounts); notify(`已删除 ${r.count} 个${r.skipped ? `（跳过运行中 ${r.skipped}）` : ""}`); }
+                            try { const r = await api.batchDelete(ids); setSelectedIds(new Set()); invalidateDeleted(); reloadAccounts(true, showDeleted); notify(`已删除 ${r.count} 个${r.skipped ? `（跳过运行中 ${r.skipped}）` : ""}`); }
                             catch (e: any) { notify(e.message); }
                         }} title="删除选中(或当前列表全部)的号" className="px-2 py-1 bg-red-600 text-white rounded text-xs">🗑 删除选中</button>
                         <span className="mx-1 text-gray-300">|</span>
@@ -970,7 +1009,7 @@ export default function App() {
                                     <span className="text-gray-400">注册</span><span className="text-gray-600">{selected.finished_at ? <>{fmtDateTime(selected.finished_at)} <span className={selected.dead_at ? "text-red-500" : "text-green-600"}>· 存活{aliveDays(selected.finished_at, selected.dead_at, selected.created_at)}{selected.dead_at ? "(已失效)" : ""}</span>{selected.sold_at ? <span className="ml-1 px-1 rounded bg-amber-100 text-amber-700 text-xs">已售</span> : null}</> : "—"}</span>
                                     <span className="text-gray-400">耗时</span><span className="text-gray-600 text-xs" title="注册开始→完成的花费时长(started_at→finished_at)">{fmtDuration(selected.started_at, selected.finished_at)}</span>
                                     <span className="text-gray-400">创建</span><span className="text-gray-500 text-xs">{fmtDateTime(selected.created_at)}</span>
-                                    <span className="text-gray-400">at令牌</span><span className="font-mono text-xs break-all text-gray-500 select-text cursor-text">{selected.token ? selected.token.slice(0, 48) + "…" : "—"}</span>
+                                    <span className="text-gray-400">at令牌</span><span className="font-mono text-xs break-all text-gray-500 select-text cursor-text">{selected.token ? selected.token.slice(0, 48) + "…" : (selected.has_token || selected.auth_file ? "有（点行后加载）" : "—")}</span>
                                     <span className="text-gray-400">at文件</span><span className="font-mono text-[11px] break-all text-gray-400 select-text">{selected.auth_file || "—"}</span>
                                     <span className="text-gray-400">rt文件</span><span className="font-mono text-[11px] break-all text-gray-400 select-text">{selected.rt_file || "—"}</span>
                                     {selected.error && <><span className="text-gray-400">错误</span><span className="text-red-500 text-xs break-all">{selected.error}</span></>}
@@ -999,7 +1038,7 @@ export default function App() {
                                         : <>
                                     {(selected.status === "failed" || selected.status === "success") &&
                                         <button onClick={() => api.retry(selected.id).then(() => notify("已重新排队")).catch((e) => notify(e.message))} className="px-2.5 py-1 bg-indigo-500 hover:bg-indigo-600 text-white rounded text-xs">重跑</button>}
-                                    <button onClick={() => { if (!window.confirm(`删除 ${selected.email}？邮箱将一并删除。`)) return; api.remove(selected.id).then(() => { setSelectedId(null); setLogMode("all"); invalidateDeleted(); api.listAccounts(showDeleted).then(setAccounts); }).catch((e) => notify(e.message)); }} className="px-2.5 py-1 bg-red-500 hover:bg-red-600 text-white rounded text-xs">删除</button>
+                                    <button onClick={() => { if (!window.confirm(`删除 ${selected.email}？邮箱将一并删除。`)) return; api.remove(selected.id).then(() => { setSelectedId(null); setLogMode("all"); invalidateDeleted(); reloadAccounts(true, showDeleted); }).catch((e) => notify(e.message)); }} className="px-2.5 py-1 bg-red-500 hover:bg-red-600 text-white rounded text-xs">删除</button>
                                           </>}
                                 </div>
                               </>
@@ -1062,11 +1101,11 @@ export default function App() {
                             </label>
                             <label className="flex items-center gap-2"><span className="w-14 text-gray-400 shrink-0">格式</span>
                                 <select value={exportFormat} onChange={(e) => setExportFormat(e.target.value as any)} className="flex-1 px-2 py-1.5 border rounded">
-                                    <option value="full">账号(邮箱----邮箱密码----邮箱2FA[----GPT密码----GPT2FA----rt])</option>
+                                    <option value="full">账号(Gmail:邮箱----密码----2FA----IMAP[----GPT密码----GPT2FA----rt])</option>
                                     <option value="at">账号+AT(邮箱--邮箱密码--accessToken)</option>
                                     <option value="session">session(邮箱--邮箱密码--session json)</option>
-                                    <option value="jsonl">JSONL(含 accessToken)</option>
-                                    <option value="csv">CSV(统一列, 含 rt/卡密)</option>
+                                    <option value="jsonl">JSONL(含 IMAP/accessToken/rt)</option>
+                                    <option value="csv">CSV(邮箱/密码/2FA/IMAP/GPT/rt)</option>
                                 </select>
                             </label>
                             <label className="flex items-center gap-2 cursor-pointer text-amber-700 pt-1">

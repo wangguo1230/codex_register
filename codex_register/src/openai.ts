@@ -1,6 +1,8 @@
+import {closeSync, openSync, unlinkSync, writeFileSync, statSync} from "node:fs";
 import {mkdir, writeFile} from "node:fs/promises";
 import {createInterface} from "node:readline/promises";
 import net from "node:net";
+import os from "node:os";
 import {stdin as input, stdout as output} from "node:process";
 import tls from "node:tls";
 import {URLSearchParams} from "node:url";
@@ -37,8 +39,20 @@ import {ISMSActivationBroker} from "./sms/activation-broker.js";
 type FetchLike = typeof fetch;
 
 const DEFAULT_INSECURE_TLS = true;
-const FETCH_RETRY_COUNT = 3;
-const FETCH_RETRY_DELAY_MS = 1500;
+const FETCH_RETRY_COUNT = 4;
+const FETCH_RETRY_DELAY_MS = 2000;
+/** 全进程 / 跨 worker authorize 节流：同一出口连打 auth.openai.com 易 429 */
+let lastAuthorizeAtMs = 0;
+/** 正常最小间隔；遇 429 后临时抬高 */
+let authorizeMinGapMs = 6_000;
+let authorizeCooldownUntilMs = 0;
+const AUTHORIZE_LOCK_PATH = path.join(os.tmpdir(), "codex-openai-authorize.lock");
+const AUTHORIZE_LOCK_STALE_MS = 120_000;
+/** ChatGPT 网页 OAuth client（抓包 session.client_id） */
+const CHATGPT_WEB_CLIENT_ID = "app_X8zY6vW2pQ9tR3dE7nK1jL5gH";
+const CHATGPT_WEB_SCOPES =
+    "openid email profile offline_access model.request model.read organization.read organization.write";
+const CHATGPT_WEB_REDIRECT = `${CHATGPT_BASE_URL}/api/auth/callback/openai`;
 
 function resolveProxyUrl(): string {
     // 注册代理：worker 传 env PROXY_URL 优先，否则 config.defaultProxyUrl
@@ -101,6 +115,7 @@ async function createSocksSocket(
     const proxyPort = Number(proxyUrl.port || (proxyUrl.protocol.startsWith("socks5") ? 1080 : 1080));
     const proxyType = proxyUrl.protocol.startsWith("socks4") ? 4 : 5;
 
+    // 经跳板→kookeey 时握手偏慢，给足 timeout；默认过短易 ECONNRESET 后整段 fetch failed
     const connection = await SocksClient.createConnection({
         proxy: {
             host: proxyUrl.hostname,
@@ -114,9 +129,16 @@ async function createSocksSocket(
             host: destinationHost,
             port: destinationPort,
         },
+        timeout: 25_000,
     });
 
     const socket = connection.socket;
+    try {
+        socket.setKeepAlive(true, 15_000);
+        socket.setNoDelay(true);
+    } catch {
+        /* ignore */
+    }
     if (options.protocol !== "https:") {
         return socket;
     }
@@ -127,9 +149,22 @@ async function createSocksSocket(
             host: String(options.servername ?? destinationHost),
             servername: String(options.servername ?? destinationHost),
             rejectUnauthorized: !allowInsecureTLS,
+            // 与浏览器更接近，部分出口对裸 Node TLS 会直接掐 RST
+            minVersion: "TLSv1.2",
+            maxVersion: "TLSv1.3",
         });
-        tlsSocket.once("secureConnect", () => resolve(tlsSocket));
-        tlsSocket.once("error", reject);
+        const timer = setTimeout(() => {
+            try { tlsSocket.destroy(); } catch { /* */ }
+            reject(new Error(`TLS 握手超时 ${destinationHost}:${destinationPort}`));
+        }, 25_000);
+        tlsSocket.once("secureConnect", () => {
+            clearTimeout(timer);
+            resolve(tlsSocket);
+        });
+        tlsSocket.once("error", (err) => {
+            clearTimeout(timer);
+            reject(err);
+        });
     });
 }
 
@@ -1750,19 +1785,40 @@ export class OpenAIClient {
     }
 
     private async bootChatGPTSession(): Promise<void> {
-        const response = await this.fetch(`${CHATGPT_BASE_URL}/`, {
-            method: "GET",
-            redirect: "follow",
-            headers: this.createBrowserHeaders({
-                "accept-encoding": "gzip, deflate, br",
-                "sec-fetch-dest": "document",
-                "sec-fetch-mode": "navigate",
-                "sec-fetch-site": "none",
-            }),
+        const homeHeaders = this.createBrowserHeaders({
+            "accept-encoding": "gzip, deflate, br",
+            accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "sec-fetch-dest": "document",
+            "sec-fetch-mode": "navigate",
+            "sec-fetch-site": "none",
+            "upgrade-insecure-requests": "1",
         });
-        if (!response.ok) {
-            throw new Error(`打开 chatgpt.com 失败: ${response.status}`);
+        let lastErr: Error | null = null;
+        for (let attempt = 0; attempt < 3; attempt++) {
+            if (attempt) await sleep(800 * attempt + Math.random() * 400);
+            try {
+                const response = await this.fetch(`${CHATGPT_BASE_URL}/`, {
+                    method: "GET",
+                    redirect: "follow",
+                    headers: homeHeaders,
+                });
+                if (response.ok) {
+                    lastErr = null;
+                    break;
+                }
+                // 403=CF 拦指纹/出口；429/5xx 临时。都抛给外层换代理或重试。
+                lastErr = new Error(`打开 chatgpt.com 失败: ${response.status}`);
+                if (response.status !== 403 && response.status !== 429 && response.status < 500) {
+                    throw lastErr;
+                }
+            } catch (e) {
+                lastErr = e instanceof Error ? e : new Error(String(e));
+                if (!isRetryableFetchError(e) && !/chatgpt\.com 失败: (403|429|5\d\d)/.test(lastErr.message)) {
+                    throw lastErr;
+                }
+            }
         }
+        if (lastErr) throw lastErr;
 
         this.deviceID =
             (await this.readCookie(CHATGPT_BASE_URL, "oai-did")) ||
@@ -1786,12 +1842,85 @@ export class OpenAIClient {
         );
     }
 
+    /**
+     * 打开 ChatGPT 登录授权页。
+     * 主路径：NextAuth POST /api/auth/signin/openai → 跟跳 auth.openai.com。
+     * 备路径：直接 GET auth.openai.com/api/accounts/authorize（与最新网页 client 一致）。
+     * 429 时跨进程串行 + 长退避 + 清 cookie 重 boot，避免同一 socks 出口连撞限流。
+     */
     private async openSignupPage(email: string): Promise<void> {
+        const maxAttempts = 8;
+        let lastStatus = 0;
+        let lastDetail = "";
+
+        for (let attempt = 0; attempt < maxAttempts; attempt++) {
+            if (attempt) {
+                // 429：12s → 22s → 40s → 70s → 90s…（加抖动），并打心跳避免父进程 idle 杀
+                const base = lastStatus === 429
+                    ? Math.min(90_000, 12_000 * Math.pow(1.7, attempt - 1))
+                    : 2_500 * attempt;
+                const wait = Math.floor(base + Math.random() * 2_500);
+                console.log(
+                    `authorize 页 ${lastStatus}${lastDetail ? ` ${lastDetail}` : ""}，${wait}ms 后重试 ${attempt + 1}/${maxAttempts}`,
+                );
+                await sleepWithHeartbeat(wait, (left) => {
+                    console.log(`authorize 429 冷却中，还剩约 ${Math.ceil(left / 1000)}s…`);
+                });
+                // 429 后整段重来：清 cookie + 重新拿 oai-did / csrf
+                try {
+                    await this.jar.removeAllCookies();
+                    this.deviceID = "";
+                    await this.bootChatGPTSession();
+                } catch (e) {
+                    console.log(`authorize 重试前刷新会话: ${String((e as Error)?.message || e).slice(0, 80)}`);
+                }
+            }
+
+            // 偶数次：NextAuth；奇数次(≥1)或多次 429 后：网页直连 authorize（不同入口，限流桶常不同）
+            const useDirect =
+                lastStatus === 429 && attempt >= 1 && attempt % 2 === 1;
+
+            try {
+                if (useDirect) {
+                    lastDetail = "direct/accounts/authorize";
+                    console.log(`authorize 改走网页直连入口（attempt ${attempt + 1}）`);
+                    lastStatus = await withAuthorizeSlot(async () => this.openAuthorizeViaWebClient(email, attempt));
+                } else {
+                    lastDetail = "signin/openai";
+                    lastStatus = await withAuthorizeSlot(async () => this.openAuthorizeViaNextAuth(email, attempt));
+                }
+            } catch (e) {
+                const msg = String((e as Error)?.message || e);
+                const m = msg.match(/status=(\d+)/);
+                lastStatus = m ? Number(m[1]) : 0;
+                lastDetail = msg.slice(0, 80);
+                if (lastStatus === 429 || lastStatus >= 500 || /429|ECONN|ETIMEDOUT|fetch failed/i.test(msg)) {
+                    if (lastStatus === 429) noteAuthorize429();
+                    continue;
+                }
+                throw e instanceof Error ? e : new Error(msg);
+            }
+
+            if (lastStatus === 0 || (lastStatus >= 200 && lastStatus < 400)) {
+                return;
+            }
+            if (lastStatus === 429) {
+                noteAuthorize429();
+                continue;
+            }
+            if (lastStatus >= 500) continue;
+            throw new Error(`打开 OpenAI authorize 页失败: ${lastStatus}${lastDetail ? ` (${lastDetail})` : ""}`);
+        }
+        throw new Error(`打开 OpenAI authorize 页失败: ${lastStatus}${lastDetail ? ` (${lastDetail})` : ""}`);
+    }
+
+    /** NextAuth：POST chatgpt.com/api/auth/signin/openai → GET 返回的 authorize URL */
+    private async openAuthorizeViaNextAuth(email: string, attempt: number): Promise<number> {
         const csrfCookie = await this.readCookie(
             CHATGPT_BASE_URL,
             "__Host-next-auth.csrf-token",
         );
-        const csrfToken = decodeURIComponent(csrfCookie).split("|")[0] ?? "";
+        const csrfToken = decodeURIComponent(csrfCookie || "").split("|")[0] ?? "";
         if (!csrfToken) {
             throw new Error("未找到 __Host-next-auth.csrf-token，无法打开注册页");
         }
@@ -1801,7 +1930,8 @@ export class OpenAIClient {
             "ext-oai-did": this.deviceID,
             auth_session_logging_id: globalThis.crypto.randomUUID(),
             "ext-passkey-client-capabilities": "0111",
-            screen_hint: "login_or_signup",
+            // 换绑/重登优先 login；重试时交替 login_or_signup
+            screen_hint: attempt % 2 === 0 ? "login" : "login_or_signup",
             login_hint: email,
         });
         const body = new URLSearchParams({
@@ -1828,7 +1958,7 @@ export class OpenAIClient {
             },
         );
         if (!response.ok) {
-            throw new Error(`打开注册页失败: ${response.status}`);
+            throw new Error(`打开注册页失败: status=${response.status}`);
         }
 
         const payload = (await response.json()) as { url?: string };
@@ -1841,15 +1971,89 @@ export class OpenAIClient {
             redirect: "follow",
             headers: this.createBrowserHeaders({
                 "accept-encoding": "gzip, deflate, br",
+                accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
                 referer: `${CHATGPT_BASE_URL}/`,
                 "sec-fetch-dest": "document",
                 "sec-fetch-mode": "navigate",
                 "sec-fetch-site": "same-site",
+                "upgrade-insecure-requests": "1",
             }),
         });
-        if (!authorizeResp.ok) {
-            throw new Error(`打开 OpenAI authorize 页失败: ${authorizeResp.status}`);
+        const retryAfter = authorizeResp.headers.get("retry-after");
+        if (authorizeResp.ok) return authorizeResp.status;
+        if (authorizeResp.status === 429 && retryAfter) {
+            const sec = Number(retryAfter);
+            if (Number.isFinite(sec) && sec > 0 && sec < 180) {
+                console.log(`authorize 429，按 Retry-After 再等 ${sec}s`);
+                await sleepWithHeartbeat(sec * 1000, (left) => {
+                    console.log(`authorize Retry-After 冷却，还剩约 ${Math.ceil(left / 1000)}s…`);
+                });
+            }
         }
+        if (authorizeResp.status === 429 || authorizeResp.status >= 500) {
+            throw new Error(`打开 OpenAI authorize 页失败: status=${authorizeResp.status}`);
+        }
+        throw new Error(`打开 OpenAI authorize 页失败: status=${authorizeResp.status}`);
+    }
+
+    /**
+     * 网页直连：auth.openai.com/api/accounts/authorize
+     * client_id / scope / redirect 与抓包 session 一致（app_X8zY6vW2pQ9tR3dE7nK1jL5gH）。
+     */
+    private async openAuthorizeViaWebClient(email: string, attempt: number): Promise<number> {
+        if (!this.deviceID) {
+            this.deviceID =
+                (await this.readCookie(CHATGPT_BASE_URL, "oai-did")) ||
+                (await this.readCookie("https://openai.com", "oai-did")) ||
+                randomUrlSafeString(36);
+        }
+        const query = new URLSearchParams({
+            client_id: CHATGPT_WEB_CLIENT_ID,
+            scope: CHATGPT_WEB_SCOPES,
+            response_type: "code",
+            redirect_uri: CHATGPT_WEB_REDIRECT,
+            audience: "https://api.openai.com/v1",
+            device_id: this.deviceID,
+            prompt: "login",
+            "ext-oai-did": this.deviceID,
+            screen_hint: attempt % 2 === 0 ? "login" : "login_or_signup",
+            login_hint: email,
+        });
+        const authorizeResp = await this.fetch(
+            `${AUTH_BASE_URL}/api/accounts/authorize?${query.toString()}`,
+            {
+                method: "GET",
+                redirect: "follow",
+                headers: this.createBrowserHeaders({
+                    "accept-encoding": "gzip, deflate, br",
+                    accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    referer: `${CHATGPT_BASE_URL}/`,
+                    "sec-fetch-dest": "document",
+                    "sec-fetch-mode": "navigate",
+                    "sec-fetch-site": "cross-site",
+                    "upgrade-insecure-requests": "1",
+                }),
+            },
+        );
+        const retryAfter = authorizeResp.headers.get("retry-after");
+        if (authorizeResp.ok) {
+            // 同步 oai-did（若服务端下发了新值）
+            this.deviceID =
+                (await this.readCookie(CHATGPT_BASE_URL, "oai-did")) ||
+                (await this.readCookie("https://openai.com", "oai-did")) ||
+                this.deviceID;
+            return authorizeResp.status;
+        }
+        if (authorizeResp.status === 429 && retryAfter) {
+            const sec = Number(retryAfter);
+            if (Number.isFinite(sec) && sec > 0 && sec < 180) {
+                console.log(`authorize 直连 429，按 Retry-After 再等 ${sec}s`);
+                await sleepWithHeartbeat(sec * 1000, (left) => {
+                    console.log(`authorize Retry-After 冷却，还剩约 ${Math.ceil(left / 1000)}s…`);
+                });
+            }
+        }
+        throw new Error(`打开 OpenAI authorize 页失败: status=${authorizeResp.status}`);
     }
 
     private async postJSON(
@@ -2051,4 +2255,99 @@ function collectErrorMessages(error: unknown): string[] {
 
 function sleep(ms: number): Promise<void> {
     return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** 长等待时周期性回调，避免父进程把“安静”当卡死 */
+async function sleepWithHeartbeat(ms: number, onTick?: (leftMs: number) => void): Promise<void> {
+    const end = Date.now() + Math.max(0, ms);
+    while (true) {
+        const left = end - Date.now();
+        if (left <= 0) return;
+        const chunk = Math.min(left, 12_000);
+        await sleep(chunk);
+        const still = end - Date.now();
+        if (still > 0) onTick?.(still);
+    }
+}
+
+function noteAuthorize429(): void {
+    // 429 后抬高全局间隔，并设冷却窗（同出口多 worker 共用文件锁时也能拉开）
+    authorizeMinGapMs = Math.min(45_000, Math.max(authorizeMinGapMs * 1.5, 15_000));
+    authorizeCooldownUntilMs = Math.max(authorizeCooldownUntilMs, Date.now() + 20_000);
+    console.log(
+        `authorize 触发 429：最小间隔→${Math.round(authorizeMinGapMs / 1000)}s，冷却至 ${new Date(authorizeCooldownUntilMs).toISOString().slice(11, 19)}`,
+    );
+}
+
+function tryAcquireAuthorizeLock(): number | null {
+    try {
+        const fd = openSync(AUTHORIZE_LOCK_PATH, "wx");
+        writeFileSync(fd, `${process.pid}\n${Date.now()}\n`);
+        return fd;
+    } catch {
+        try {
+            const st = statSync(AUTHORIZE_LOCK_PATH);
+            if (Date.now() - st.mtimeMs > AUTHORIZE_LOCK_STALE_MS) {
+                unlinkSync(AUTHORIZE_LOCK_PATH);
+                const fd = openSync(AUTHORIZE_LOCK_PATH, "wx");
+                writeFileSync(fd, `${process.pid}\n${Date.now()}\n`);
+                return fd;
+            }
+        } catch {
+            /* ignore */
+        }
+        return null;
+    }
+}
+
+function releaseAuthorizeLock(fd: number): void {
+    try {
+        closeSync(fd);
+    } catch {
+        /* ignore */
+    }
+    try {
+        unlinkSync(AUTHORIZE_LOCK_PATH);
+    } catch {
+        /* ignore */
+    }
+}
+
+/**
+ * 跨 worker 进程串行打开 authorize（文件锁 + 间隔）。
+ * 换绑/重登多开时，否则同一 socks 出口会连拿 429。
+ */
+async function withAuthorizeSlot<T>(fn: () => Promise<T>): Promise<T> {
+    const deadline = Date.now() + 180_000;
+    let fd: number | null = null;
+    while (Date.now() < deadline) {
+        const cool = authorizeCooldownUntilMs - Date.now();
+        if (cool > 0) {
+            console.log(`authorize 全局冷却中，等待 ${Math.ceil(cool / 1000)}s…`);
+            await sleepWithHeartbeat(cool, (left) => {
+                console.log(`authorize 全局冷却，还剩约 ${Math.ceil(left / 1000)}s…`);
+            });
+        }
+        fd = tryAcquireAuthorizeLock();
+        if (fd == null) {
+            await sleep(400 + Math.random() * 600);
+            continue;
+        }
+        try {
+            const gap = lastAuthorizeAtMs + authorizeMinGapMs - Date.now();
+            if (gap > 0) {
+                console.log(`authorize 节流，间隔 ${Math.ceil(gap / 1000)}s…`);
+                await sleep(gap);
+            }
+            const result = await fn();
+            lastAuthorizeAtMs = Date.now();
+            // 成功后慢慢把间隔收回正常
+            authorizeMinGapMs = Math.max(6_000, Math.floor(authorizeMinGapMs * 0.85));
+            return result;
+        } finally {
+            releaseAuthorizeLock(fd);
+            fd = null;
+        }
+    }
+    throw new Error("authorize 全局锁等待超时(180s)");
 }
