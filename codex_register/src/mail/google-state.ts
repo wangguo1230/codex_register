@@ -42,15 +42,27 @@ export const GOOGLE_LOGIN_ERROR_LABEL = {
 
 const HARDEN_IP_RE = /代理中断|换 session|signin\/rejected|拒绝页|SSL\/代理|ERR_PROXY|ERR_SSL|ERR_CONNECTION|ERR_TUNNEL|邮箱页卡住/i;
 const HARDEN_LOGIN_DEAD_RE = /登录失败|Wrong password|密码错误|Senha incorreta|找不到您的 Google|Couldn't find your Google|帐号已被停用|账号已停用|account has been disabled|尝试次数过多|Too many failed|This account cannot be accessed|账号已停用/i;
+const HARDEN_CRED_DEAD_RE = /Wrong password|密码错误|Senha incorreta|Kata sandi salah|找不到您的 Google|Couldn't find your Google|帐号已被停用|账号已停用|account has been disabled|尝试次数过多|Too many failed|This account cannot be accessed/i;
 
 export function isHardenIpError(msg = "") {
     return HARDEN_IP_RE.test(String(msg || ""));
+}
+
+/** 真把号判死：错密 / 找不到 / 停用 / 试太多次。笼统「登录失败」不算。 */
+export function isCredentialDead(msg = "") {
+    return HARDEN_CRED_DEAD_RE.test(String(msg || ""));
 }
 
 export function isHardenLoginDead(msg = "") {
     const s = String(msg || "");
     if (isHardenIpError(s)) return false;
     return HARDEN_LOGIN_DEAD_RE.test(s);
+}
+
+/** 已经登进去并做成过改密/换 2FA 的号，后一轮笼统失败不能再打成登不上。 */
+export function hardenAlreadyProven(mb = {}, st = {}) {
+    const s = st && typeof st === "object" ? st : {};
+    return !!(s.totp_rotated || s.login === "ok" || s.password === "ok" || /^✅/.test(String(mb.pw_status || "")));
 }
 
 export function classifyHardenLoginError(msg = "") {
@@ -89,10 +101,11 @@ function hasText(v) {
 function pickStage(s) {
     if (s.gpt === "ok") return "gpt_ok";
     if (s.login === "fail") return s.login_error || s.last_error ? "blocked" : "login_fail";
-    if (s.stage === "blocked") return "blocked";
     if (s.imap === "ok" && s.totp_rotated) return "ready";
-    if (s.login === "ok" && (s.password === "ok" || s.recovery === "ok" || s.phone === "ok" || s.imap === "ok" || s.totp_rotated)) return "partial";
+    if (s.totp_rotated || s.password === "ok") return "partial";
+    if (s.login === "ok" && (s.recovery === "ok" || s.phone === "ok" || s.imap === "ok")) return "partial";
     if (s.login === "ok") return "login_ok";
+    if (s.stage === "blocked") return "blocked";
     return "imported";
 }
 
@@ -120,8 +133,18 @@ export function deriveGoogleState(facts = {}, overlay = {}) {
 
     Object.assign(s, overlay || {});
     if (overlay?.login_error && !overlay.login) s.login = "fail";
+    const proven = hardenAlreadyProven(facts, s);
+    if (s.login === "fail" && proven && !isCredentialDead(s.login_error || s.last_error || "")) {
+        s.login = "ok";
+        s.login_error = "";
+    }
     if (s.login === "fail" && !s.last_error) {
         s.last_error = GOOGLE_LOGIN_ERROR_LABEL[s.login_error] || s.login_error || "登录失败";
+    }
+    if (proven && s.login !== "fail" && /登录失败|^登不上/.test(String(s.last_error || ""))) {
+        s.last_error = hasText(facts.imap_password)
+            ? (s.totp_rotated ? "" : "缺换2FA")
+            : (s.totp_rotated ? "缺IMAP" : "缺2FA和IMAP");
     }
     if (s.gpt === "fail" && facts.gpt_error && !overlay.last_error) {
         s.last_error = s.last_error || String(facts.gpt_error).slice(0, 160);
@@ -196,18 +219,18 @@ export function formatHardenListReason(mb = {}) {
     const skip = planHardenSkip(mb);
     if (String(mb.google_stage || "") === "gpt_ok" || skip.usable) return "";
     const classified = classifyHardenIssue(st.last_error || "") || classifyHardenIssue(st.login_error || "");
-    if (st.login === "fail" || mb.google_stage === "login_fail" || mb.google_stage === "blocked") {
-        return classified || GOOGLE_LOGIN_ERROR_LABEL[st.login_error] || "登不上";
-    }
+    const loginDead = st.login === "fail" || mb.google_stage === "login_fail" || mb.google_stage === "blocked";
+    if (loginDead) return classified || GOOGLE_LOGIN_ERROR_LABEL[st.login_error] || "登不上";
+    const gap = classified.startsWith("登不上") ? "" : classified;
     const left = skip.requiredLeft || [];
-    if (left.includes("imap") && left.includes("totp")) return classified || "缺2FA和IMAP";
+    if (left.includes("imap") && left.includes("totp")) return (gap.startsWith("缺") ? gap : "") || "缺2FA和IMAP";
     if (left.includes("imap")) {
         if (Number(st.imap_gen_fail || 0) >= 3) return "缺IMAP·拒发应用密码(已停自动)";
-        if (Number(st.imap_next_try || 0) > Date.now()) return classified || "缺IMAP·拒发后冷却中";
-        return classified.startsWith("缺IMAP") ? classified : (classified || "缺IMAP");
+        if (Number(st.imap_next_try || 0) > Date.now()) return gap || "缺IMAP·拒发后冷却中";
+        return gap.startsWith("缺IMAP") ? gap : (gap || "缺IMAP");
     }
-    if (left.includes("totp")) return classified || "缺换2FA";
-    return classified;
+    if (left.includes("totp")) return gap || "缺换2FA";
+    return gap;
 }
 
 /** 继续完成：还缺 2FA/IMAP 才进队。登录失败判死不再扣；出口被拒只换有限次 IP。 */

@@ -37,17 +37,17 @@ export function formatHardenListReason(mb: {
     const usable = !!(st.totp_rotated && String(mb.imap_password || "").trim());
     if (String(mb.google_stage || "") === "gpt_ok" || usable) return "";
     const classified = classifyHardenIssue(st.last_error || "") || classifyHardenIssue(st.login_error || "");
-    if (st.login === "fail" || mb.google_stage === "login_fail" || mb.google_stage === "blocked") {
-        return classified || "登不上";
-    }
+    const loginDead = st.login === "fail" || mb.google_stage === "login_fail" || mb.google_stage === "blocked";
+    if (loginDead) return classified || "登不上";
+    const gap = classified.startsWith("登不上") ? "" : classified;
     const needTotp = !st.totp_rotated;
     const needImap = !String(mb.imap_password || "").trim();
-    if (needImap && needTotp) return classified || "缺2FA和IMAP";
+    if (needImap && needTotp) return (gap.startsWith("缺") ? gap : "") || "缺2FA和IMAP";
     if (needImap) {
         if (Number(st.imap_gen_fail || 0) >= 3) return "缺IMAP·拒发应用密码(已停自动)";
-        if (Number(st.imap_next_try || 0) > Date.now()) return classified || "缺IMAP·拒发后冷却中";
-        return classified.startsWith("缺IMAP") ? classified : (classified || "缺IMAP");
+        if (Number(st.imap_next_try || 0) > Date.now()) return gap || "缺IMAP·拒发后冷却中";
+        return gap.startsWith("缺IMAP") ? gap : (gap || "缺IMAP");
     }
-    if (needTotp) return classified || "缺换2FA";
-    return classified;
+    if (needTotp) return gap || "缺换2FA";
+    return gap;
 }

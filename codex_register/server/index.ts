@@ -449,9 +449,11 @@ async function applyGoogleHardenResult(id, mb, r) {
         recovery_email: r.recoveryCleared ? "" : undefined,
     });
     const brief = (r.errors || [r.error]).filter(Boolean).map((e) => String(e).split("\n")[0]).join("; ").slice(0, 160);
-    const {isHardenLoginDead, classifyHardenLoginError, classifyHardenIssue} = await import("../src/mail/google-state.js");
-    const loginDead = r.login === false || isHardenLoginDead(brief) || isHardenLoginDead(r.error || "");
+    const {isHardenLoginDead, classifyHardenLoginError, classifyHardenIssue, isCredentialDead, hardenAlreadyProven} = await import("../src/mail/google-state.js");
     const st = mb.google_state && typeof mb.google_state === "object" ? mb.google_state : {};
+    const proven = alreadyUsable || hardenAlreadyProven(mb, st);
+    const credDead = isCredentialDead(brief) || isCredentialDead(r.error || "");
+    const loginDead = credDead || (!proven && (r.login === false || isHardenLoginDead(brief) || isHardenLoginDead(r.error || "")));
     const refuseImap = /拒绝生成应用密码|error generating your app password/i.test(brief);
     const genFail = refuseImap ? Number(st.imap_gen_fail || 0) + 1 : st.imap_gen_fail;
     await db.refreshMailboxGoogleState(id, {
@@ -552,16 +554,18 @@ async function runOneGoogleHarden(id, opts = {}) {
         const stopped = batchHardenStop || isMailboxJobStopped() || ac.signal.aborted || (/已停止/.test(msg) && !closed);
         const err = stopped ? "已停止" : (closed ? "比特窗口被关掉（未登录或被限频踢下线）" : msg);
         logStep(`[整备] ${stopped ? "已停止" : "异常"}: ${err}`);
-        const {isHardenIpError, isHardenLoginDead, classifyHardenLoginError, classifyHardenIssue, HARDEN_PROXY_ROTATE_MAX} = await import("../src/mail/google-state.js");
+        const {isHardenIpError, isHardenLoginDead, classifyHardenLoginError, classifyHardenIssue, isCredentialDead, hardenAlreadyProven, HARDEN_PROXY_ROTATE_MAX} = await import("../src/mail/google-state.js");
         const st = mb.google_state && typeof mb.google_state === "object" ? mb.google_state : {};
         const shortErr = classifyHardenIssue(err) || err.slice(0, 160);
+        const proven = hardenAlreadyProven(mb, st);
+        const credDead = isCredentialDead(err) || /账号已停用/.test(err);
         if (!stopped && isHardenIpError(err)) {
             await db.setMailboxProxy(id, "", "");
             mb.proxy_url = "";
             mb.proxy_ip = "";
             const rotates = Number(st.proxy_rotates || 0) + 1;
             const overlay = {proxy_rotates: rotates, last_error: shortErr};
-            if (rotates >= HARDEN_PROXY_ROTATE_MAX) {
+            if (rotates >= HARDEN_PROXY_ROTATE_MAX && !proven) {
                 overlay.login = "fail";
                 overlay.login_error = "rejected";
                 logStep(`[整备] 出口已换 ${rotates} 次仍过不去，判失败`);
@@ -569,7 +573,7 @@ async function runOneGoogleHarden(id, opts = {}) {
                 logStep(`[整备] 出口不行，丢掉粘性 IP，再换 ${HARDEN_PROXY_ROTATE_MAX - rotates} 次`);
             }
             await db.refreshMailboxGoogleState(id, overlay).catch(() => {});
-        } else if (!stopped && (isHardenLoginDead(err) || /账号已停用/.test(err))) {
+        } else if (!stopped && (credDead || (!proven && isHardenLoginDead(err)))) {
             await db.refreshMailboxGoogleState(id, {
                 login: "fail",
                 login_error: classifyHardenLoginError(err),
