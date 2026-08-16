@@ -990,7 +990,7 @@ async function tickMailJobs() {
             if (swept) console.log(`[指纹] 本轮清超额 ${swept} 个`);
         }
         await db.reclaimStaleMailJobs(3 * 60 * 1000);
-        const timed = await db.failTimedOutMailJobs(12 * 60 * 1000);
+        const timed = await db.failTimedOutMailJobs(22 * 60 * 1000);
         for (const t of timed) {
             if (t.instance_id === db.instanceId) {
                 const ac = hardenAbort.get(t.mailbox_id);

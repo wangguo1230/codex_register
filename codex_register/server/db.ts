@@ -1663,14 +1663,16 @@ export async function cancelPendingMailJobs(kind = "") {
     return r.rowCount || 0;
 }
 
-export async function failTimedOutMailJobs(maxMs = 12 * 60 * 1000) {
-    const cutoff = Date.now() - Math.max(60_000, maxMs);
+export async function failTimedOutMailJobs(maxMs = 22 * 60 * 1000) {
+    const claimedCutoff = Date.now() - Math.max(60_000, maxMs);
+    const beatCutoff = Date.now() - 3 * 60 * 1000;
     const {rows} = await query(
         `UPDATE mail_jobs
          SET status='error', ok=FALSE, error='单任务超时', finished_at=$1, last_line='超时失败'
-         WHERE status='running' AND claimed_at>0 AND claimed_at<$2
+         WHERE status='running' AND claimed_at>0
+           AND (claimed_at<$2 OR heartbeat_at IS NULL OR heartbeat_at=0 OR heartbeat_at<$3)
          RETURNING id, mailbox_id, instance_id, kind`,
-        [Date.now(), cutoff],
+        [Date.now(), claimedCutoff, beatCutoff],
     );
     return rows;
 }

@@ -7,7 +7,7 @@ import {randomBytes} from "node:crypto";
 import {mkdirSync} from "node:fs";
 import path from "node:path";
 import {generateTotp, totpRemainSec, waitNextTotpWindow, waitTotpSafeWindow} from "../mfa.js";
-import {ensureGoogleLoggedIn, googleReauthPassword, isVerifyItsYouText, submitGoogleTotp, bounceOffSslOrSid, preferEnglishGoogleUi, recoverSslOrSlowPage, googleSslDead} from "./google-auth.js";
+import {ensureGoogleLoggedIn, googleReauthPassword, isVerifyItsYouText, submitGoogleTotp, bounceOffSslOrSid, preferEnglishGoogleUi, recoverSslOrSlowPage, googleSslDead, clickMaybeForce} from "./google-auth.js";
 import {launchGoogleBrowser} from "./google-account.js";
 
 const PASSWORD_URL = "https://myaccount.google.com/signinoptions/password?hl=en";
@@ -684,7 +684,7 @@ async function findDialogCodeInput(dlg, page) {
 
 async function typeDialogTotp(el, page, code) {
     await el.scrollIntoViewIfNeeded().catch(() => {});
-    await el.click({timeout: 2000}).catch(() => el.click({force: true}));
+    await el.click({timeout: 2000}).catch(() => el.click({force: true, timeout: 2000}));
     await page.waitForTimeout(120);
     await el.fill("").catch(() => {});
     await el.pressSequentially(String(code), {delay: 35}).catch(() => {});
@@ -956,7 +956,7 @@ async function clickCantScanByDom(page, log) {
     await page.waitForTimeout(400);
     const box = await el.boundingBox().catch(() => null);
     if (box) await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
-    else await el.click({timeout: 2500, noWaitAfter: true}).catch(() => el.click({force: true}));
+    else await el.click({timeout: 2500, noWaitAfter: true}).catch(() => el.click({force: true, timeout: 2500}));
     log("[2FA] 点了 Can't scan it?");
     const t0 = Date.now();
     while (Date.now() - t0 < 8000) {
@@ -1194,9 +1194,10 @@ export async function change2faOnPage(page, {
                 const named = changeAuthenticatorBtn(page).or(page.getByText(/^change authenticator app$/i));
                 if (await named.first().isVisible({timeout: 600}).catch(() => false)) {
                     await named.first().scrollIntoViewIfNeeded().catch(() => {});
-                    await named.first().click().catch(() => named.first().click({force: true}));
-                    clickedAction = true;
-                    log("[2FA] 点了 Change authenticator app 文案");
+                    if (await clickMaybeForce(named.first(), 2500)) {
+                        clickedAction = true;
+                        log("[2FA] 点了 Change authenticator app 文案");
+                    }
                 }
             }
             if (!clickedAction) {
@@ -1243,9 +1244,10 @@ export async function change2faOnPage(page, {
                     .or(page.getByRole("link", {name: /change authenticator app/i}))
                     .or(page.getByText(/^change authenticator app$/i));
                 if (await named.first().isVisible({timeout: 600}).catch(() => false)) {
-                    await named.first().click().catch(() => named.first().click({force: true}));
-                    clickedAction = true;
-                    log("[2FA] 点了 Change authenticator app 文案");
+                    if (await clickMaybeForce(named.first(), 2500)) {
+                        clickedAction = true;
+                        log("[2FA] 点了 Change authenticator app 文案");
+                    }
                 }
             }
             if (!clickedAction) break;
@@ -1268,6 +1270,15 @@ export async function change2faOnPage(page, {
                 await clickAuthenticatorChangeByDom(page, log);
                 setup = await waitAuthenticatorSetup(page, 20000);
             }
+        }
+    }
+    if (!["qr", "secret"].includes(setup) && !await findChangeTotpDialog(page)) {
+        log("[2FA] 确认后没出密钥，回 Authenticator 再点一次 Change");
+        try { await page.goto(AUTHENTICATOR_URL, {waitUntil: "domcontentloaded", timeout: 20000}); } catch { /* */ }
+        await page.waitForTimeout(1500);
+        if (await onBoundAuthenticatorOverview(page)) {
+            await clickAuthenticatorChangeByDom(page, log);
+            setup = await waitAuthenticatorSetup(page, 25000);
         }
     }
     if (!["qr", "secret"].includes(setup) && !await findChangeTotpDialog(page)) {

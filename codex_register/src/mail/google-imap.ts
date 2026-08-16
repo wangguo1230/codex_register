@@ -4,7 +4,7 @@
  * 买来的老号做不了官方 Gmail OAuth（要 Cloud 项目 + 验证应用），
  * 开了 2FA 之后官方允许的取件方式就是「应用专用密码 + IMAP」。
  */
-import {googleReauthPassword, googleSslDead, recoverSslOrSlowPage, isVerifyItsYouText, ensureGoogleLoggedIn} from "./google-auth.js";
+import {googleReauthPassword, googleSslDead, recoverSslOrSlowPage, isVerifyItsYouText, ensureGoogleLoggedIn, clickMaybeForce} from "./google-auth.js";
 import {ImapFlow} from "imapflow";
 
 const IMAP_SETTINGS = "https://mail.google.com/mail/u/0/#settings/fwdandpop";
@@ -86,9 +86,9 @@ async function clickCreateAppPassword(page, log) {
         .or(page.getByRole("button", {name: /create|generate|创建|生成/i}));
     if (await named.first().isVisible({timeout: 800}).catch(() => false)) {
         await named.first().scrollIntoViewIfNeeded().catch(() => {});
-        await named.first().click({timeout: 2500}).catch(() => named.first().click({force: true}));
-        log("[取件] 点了 Create");
-        return true;
+        const hit = await clickMaybeForce(named.first(), 2500);
+        if (hit) log("[取件] 点了 Create");
+        return hit;
     }
     const hit = await clickFirst(page, [
         'button:has-text("Create")',
