@@ -604,6 +604,7 @@ export async function googleLogin(page, emailOrOpts, password = "", totpSecret =
         let passwordNextClicks = 0;
         let tryAnotherClicks = 0;
         let sslRetries = 0;
+        let pageGlitchTries = 0;
         write("  等登录页就绪（动态代理可能较慢）");
         await recoverSslOrSlowPage(page, write, identifierEntryUrl(page), 2);
         await waitIdentifierUiReady(page, write, 15000);
@@ -630,7 +631,13 @@ export async function googleLogin(page, emailOrOpts, password = "", totpSecret =
             let acted = false;
 
             const url = page.url();
-            if (await dismissGoogleGlitch(page, write)) continue;
+            if (await dismissGoogleGlitch(page, write)) {
+                pageGlitchTries += 1;
+                if (pageGlitchTries >= 3) {
+                    throw new Error("代理中断 页面 Something went wrong 消不掉，换 session 重开窗");
+                }
+                continue;
+            }
             if (await dismissGoogleConsent(page, write)) continue;
             if (await dismissRecoveryPrompt(page, write)) continue;
 
@@ -1029,6 +1036,13 @@ export async function googleLogin(page, emailOrOpts, password = "", totpSecret =
                     continue;
                 }
             }
+            const hear = String(await page.innerText("body").catch(() => ""));
+            if (/type the text you hear|type the characters you see|hear a set of numbers|输入你听到的/i.test(hear)
+                || await page.locator('input[name="ca"], input[aria-label*="Type the text you hear" i]').first().isVisible({timeout: 250}).catch(() => false)) {
+                write("  登录页要听写/图片验证，换出口再试");
+                throw new Error("代理中断 登不上·听写验证，换 session 重开窗");
+            }
+
             const recDomain = recovery.includes("@") ? recovery.split("@")[1] : "";
             // Verify it's you：优先「Confirm your recovery email」手填库里的辅助邮箱。
             // 不要先点「Get a verification code at qyh••••@…」，那是往辅助邮箱发码，我们收不到。

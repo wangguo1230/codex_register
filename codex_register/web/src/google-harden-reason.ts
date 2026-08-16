@@ -1,6 +1,10 @@
 /** 列表一眼能看的整备原因。只认邮箱对象上已有字段，不引服务端模块。 */
 export function classifyHardenIssue(raw = "") {
     const s = String(raw || "");
+    if (/听写验证|type the text you hear/i.test(s)) return "登不上·听写验证";
+    if (/页面故障|Something went wrong 消不掉/i.test(s)) return "登不上·页面故障";
+    if (/要验证辅助邮箱|Confirm your recovery/i.test(s)) return "登不上·要验证辅助邮箱";
+    if (/密码页过不去|Loading Welcome/i.test(s)) return "登不上·密码页过不去";
     if (/拒绝生成应用密码|error generating your app password/i.test(s)) return "缺IMAP·Google拒发应用密码";
     if (/未能提取应用专用密码/i.test(s)) return "缺IMAP·页面没抽出密码";
     if (/应用专用密码页二次验证未过|二次验证未过/i.test(s)) return "缺IMAP·二次验证未过";

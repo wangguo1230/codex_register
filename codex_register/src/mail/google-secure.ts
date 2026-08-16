@@ -38,6 +38,19 @@ const SIGNOUT_WORDS = [
     "登出", "退出", "退出其它设备", "退出其他设备", "Sign out of other sessions",
 ];
 
+function summarizeLoginFail(raw = "") {
+    const s = String(raw || "");
+    if (/听写|type the text you hear|type the characters/i.test(s)) return "登不上·听写验证";
+    if (/Something went wrong|故障弹窗/i.test(s)) return "登不上·页面故障";
+    if (/Verify it|确认辅助|recovery email/i.test(s)) return "登不上·要验证辅助邮箱";
+    if (/signin\/rejected|拒绝页/i.test(s)) return "登不上·出口被拒";
+    if (/登录页一直空白|一直 Loading/i.test(s)) return "登不上·登录页空白";
+    if (/challenge\/pwd|密码页过不去|Loading Welcome|Enter your password/i.test(s)) return "登不上·密码页过不去";
+    if (/邮箱页提交|仍在邮箱页|identifier/i.test(s)) return "登不上·邮箱页不走";
+    if (/代理中断|SSL/i.test(s)) return s.split("\n")[0].slice(0, 120);
+    return (s || "登录失败").split("\n")[0].slice(0, 120);
+}
+
 async function dump(page, name, log) {
     try {
         const dir = path.resolve(process.cwd(), "captures", "screenshots");
@@ -378,6 +391,10 @@ export async function hardenGoogleAccountOnPage(page, cred, log = () => {}, onCh
         } else {
             noteErr(t?.error, "换 2FA 失败");
             log(`[邮箱管理] 换 2FA 失败: ${t?.error || ""}`);
+            if (out.imapPassword || skip.imap) {
+                log("[邮箱管理] IMAP 已有，换 2FA 失败就收工，不再改密以免重登");
+                return finalize();
+            }
         }
     }
     if (gone("换2FA")) return finalize();
@@ -634,12 +651,14 @@ export async function runGoogleHardenWithBit(acc, {proxyUrl = "", jumpUrl = "", 
         cred.skip = planHardenSkip(cred);
         let loginFail = "";
         const ok = await ensureGoogleLoggedIn(page, "https://myaccount.google.com/security?hl=en", {...cred, requireInbox: false}, (m) => {
-            const s = String(m || "");
-            if (/登录失败|reCAPTCHA|人机|密码框空|邮箱页|拒绝页/i.test(s)) loginFail = s.replace(/^\s+/, "");
+            const s = String(m || "").replace(/^\s+/, "");
+            if (/登录失败|登录未完成|reCAPTCHA|人机|听写|密码框|邮箱页|拒绝页|Something went wrong|故障弹窗|Verify it|辅助邮箱|代理中断|Loading Welcome|challenge\/pwd/i.test(s)) {
+                loginFail = s;
+            }
             log(m);
         });
         if (!ok) {
-            const why = loginFail || "登录失败";
+            const why = summarizeLoginFail(loginFail);
             return {ok: false, error: why, errors: [why], login: false};
         }
         sess?.markLoggedIn?.();
