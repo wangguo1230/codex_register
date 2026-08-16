@@ -76,6 +76,8 @@ export function classifyHardenLoginError(msg = "") {
 }
 
 export const HARDEN_PROXY_ROTATE_MAX = 2;
+/** 同一号整备最多开窗登录次数，避免反复撞 Google。 */
+export const HARDEN_ATTEMPT_MAX = 3;
 
 export function emptyGoogleState() {
     return {
@@ -240,6 +242,7 @@ export function needsHardenRetry(mb = {}) {
     if (String(mb.google_stage || "") === "login_fail") return false;
     const st = mb.google_state && typeof mb.google_state === "object" ? mb.google_state : {};
     if (st.login === "fail") return false;
+    if (Number(st.harden_attempts || 0) >= HARDEN_ATTEMPT_MAX) return false;
     if (Number(st.proxy_rotates || 0) >= HARDEN_PROXY_ROTATE_MAX) return false;
     const skip = planHardenSkip(mb);
     if (skip.usable) return false;

@@ -477,8 +477,13 @@ async function runOneGoogleHarden(id, opts = {}) {
     if (!mb) return {ok: false, error: "邮箱不存在"};
     if (mb.provider !== "google") return {ok: false, error: "仅 Gmail 老号可整备"};
     if (batchHardenStop || isMailboxJobStopped()) return {ok: false, error: "已停止"};
-    const {planHardenSkip} = await import("../src/mail/google-state.js");
+    const {planHardenSkip, HARDEN_ATTEMPT_MAX} = await import("../src/mail/google-state.js");
     const skip = planHardenSkip(mb);
+    const st0 = mb.google_state && typeof mb.google_state === "object" ? mb.google_state : {};
+    if (Number(st0.harden_attempts || 0) >= HARDEN_ATTEMPT_MAX) {
+        logMailbox(id, `[整备] 已试满 ${HARDEN_ATTEMPT_MAX} 次，不再登录`);
+        return {ok: false, error: `已试满${HARDEN_ATTEMPT_MAX}次，不再登录`};
+    }
     if (skip.all || skip.usable) {
         logMailbox(id, skip.all ? "[整备] 缺口已齐，不再开窗" : "[整备] 2FA+IMAP 已齐，不再开窗补加分项");
         await db.refreshMailboxGoogleState(id, {login: "ok", last_error: "", imap: "ok", totp_rotated: true}).catch(() => {});
@@ -488,7 +493,9 @@ async function runOneGoogleHarden(id, opts = {}) {
             imapPassword: mb.imap_password, recoveryCleared: true, passwordChanged: true, devicesDone: true,
         };
     }
-    logMailbox(id, `[整备] 续跑 ${skip.left.join("/")}${skip.usable ? "（底线已齐，补加分项）" : ""}`);
+    const attemptNo = Number(st0.harden_attempts || 0) + 1;
+    await db.refreshMailboxGoogleState(id, {harden_attempts: attemptNo}).catch(() => {});
+    logMailbox(id, `[整备] 第 ${attemptNo}/${HARDEN_ATTEMPT_MAX} 次 · 续跑 ${skip.left.join("/")}${skip.usable ? "（底线已齐，补加分项）" : ""}`);
     const ac = new AbortController();
     hardenAbort.set(id, ac);
     hardenCurrent.set(id, {id, email: mb.email, lastLine: "开始整备"});
