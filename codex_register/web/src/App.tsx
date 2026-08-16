@@ -15,12 +15,26 @@ const STATUS_STYLE: Record<string, string> = {
 const STATUS_LABEL: Record<string, string> = {
     pending: "等待", running: "运行中", success: "成功", failed: "失败",
 };
-// 时间戳 → "MM-DD HH:mm"；存活天数 = 距注册完成的整天数
+// 时间戳 → 北京时间 "MM-DD HH:mm"；存活天数 = 距注册完成的整天数
 const pad = (n: number) => String(n).padStart(2, "0");
 function fmtDateTime(ts?: number | null): string {
     if (!ts) return "—";
-    const d = new Date(ts);
-    return `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+    const parts = new Intl.DateTimeFormat("en-CA", {
+        timeZone: "Asia/Shanghai",
+        month: "2-digit", day: "2-digit",
+        hour: "2-digit", minute: "2-digit",
+        hour12: false,
+    }).formatToParts(new Date(ts));
+    const g = (t: string) => parts.find((p) => p.type === t)?.value || "00";
+    return `${g("month")}-${g("day")} ${g("hour")}:${g("minute")}`;
+}
+function fmtBjClock(ts?: number | null): string {
+    if (!ts) return "";
+    return new Intl.DateTimeFormat("en-GB", {
+        timeZone: "Asia/Shanghai",
+        hour: "2-digit", minute: "2-digit", second: "2-digit",
+        hour12: false,
+    }).format(new Date(ts));
 }
 // 存活天数：账号确认死亡(deadAt)后定格 = 死亡时间 - 注册时间；否则 = 现在 - 注册时间。ts=finished_at 优先,无则回退 createdAt
 function aliveDays(ts?: number | null, deadAt?: number | null, createdAt?: number | null): string {
@@ -47,6 +61,11 @@ function accountGptPw(a: {gpt_password?: string}, fallback = "") {
 }
 function isGoogleMailbox(a: {provider?: string; email?: string}) {
     return a.provider === "google" || /@(gmail|googlemail)\.com$/i.test(a.email || "");
+}
+function mailboxKind(a: {provider?: string; email?: string}): "google" | "icloud" | "mailcom" {
+    if (isGoogleMailbox(a)) return "google";
+    if (a.provider === "icloud" || /@icloud\.com$/i.test(a.email || "")) return "icloud";
+    return "mailcom";
 }
 function exportableAccount(a: Account) {
     if (isGoogleMailbox(a) && String(a.gpt_password || "").trim()) return true;
@@ -139,6 +158,7 @@ export default function App() {
     const [delAccounts, setDelAccounts] = useState<Account[]>([]); // 已删除账号:搜索时惰性加载,让按邮箱回查能命中软删数据
     const toggleFacet = (k: string) => setFacets((prev) => { const s = new Set(prev); s.has(k) ? s.delete(k) : s.add(k); return s; });
     const [search, setSearch] = useState(""); // 邮箱名搜索
+    const [accKind, setAccKind] = useState<"" | "google" | "mailcom" | "icloud">(""); // GPT 列表按邮箱类型筛
     const [selectedId, setSelectedId] = useState<number | null>(null);
     const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set());
     const toggleSel = (id: number) => setSelectedIds((prev) => { const s = new Set(prev); s.has(id) ? s.delete(id) : s.add(id); return s; });
@@ -196,6 +216,10 @@ export default function App() {
         // 批次数据来自数据库(筛选/导出用;导入已迁至邮箱管理)
         api.batches().then(setBatches).catch(() => {});
         api.listSms().then(setSmsData).catch(() => {});
+        // 刷新页面后恢复批量重登状态，否则「停止」按钮会消失
+        api.batchAtStatus().then((s) => {
+            if (s?.running) setBatchAt({running: true, done: s.done || 0, total: s.total || 0});
+        }).catch(() => {});
 
         const disconnect = connectStream((event, data) => {
             if (event === "sms") { api.listSms().then(setSmsData).catch(() => {}); return; }
@@ -316,12 +340,18 @@ export default function App() {
         const base = qs.length && !showDeleted ? [...accounts, ...delAccounts] : accounts;
         let list = statusFilter === "all" ? base : base.filter((a) => a.status === statusFilter); // ①注册状态
         list = applyFacets(list, facets); // ②质量 facet(跨组 AND、组内 OR)
-        if (qs.length) list = list.filter((a) => { const e = a.email.toLowerCase(); return qs.some((q) => e.includes(q)); });
+        if (accKind) list = list.filter((a) => mailboxKind(a) === accKind);
+        if (qs.length) list = list.filter((a) => {
+            const e = a.email.toLowerCase();
+            const kind = mailboxKind(a);
+            const kindHit = qs.some((q) => q === "gmail" || q === "google" ? kind === "google" : q === "mail.com" || q === "mailcom" ? kind === "mailcom" : q === "icloud" ? kind === "icloud" : false);
+            return kindHit || qs.some((q) => e.includes(q));
+        });
         if (batchFilter) list = list.filter((a) => (a.batch || "") === batchFilter); // 批次筛选
         if (soldFilter === "sold") list = list.filter((a) => a.sold_at);        // ③售出:仅已售
         else if (soldFilter === "unsold") list = list.filter((a) => !a.sold_at); // ③售出:仅未售
         return list;
-    }, [accounts, delAccounts, showDeleted, statusFilter, facets, FACET_DEFS, expDays, search, batchFilter, soldFilter]);
+    }, [accounts, delAccounts, showDeleted, statusFilter, facets, FACET_DEFS, expDays, search, batchFilter, soldFilter, accKind]);
     // 批量操作/导出的作用域:剔除搜索带出的已删除号,避免误跑/误导出
     const actionable = useMemo(() => (showDeleted ? filtered : filtered.filter((a) => !a.deleted_at)), [filtered, showDeleted]);
     const delHits = filtered.length - actionable.length;
@@ -570,13 +600,32 @@ export default function App() {
                                    className="w-52 pl-2 pr-6 py-1 border rounded-lg text-sm"/>
                             {search && <button onClick={() => setSearch("")} title="清除" className="absolute right-1.5 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-600 text-sm">✕</button>}
                         </div>
+                        {(() => {
+                            const g = accounts.filter((a) => mailboxKind(a) === "google").length;
+                            const m = accounts.filter((a) => mailboxKind(a) === "mailcom").length;
+                            const i = accounts.filter((a) => mailboxKind(a) === "icloud").length;
+                            const chip = (k: "" | "google" | "mailcom" | "icloud", lab: string, n: number, on: string, off: string) => (
+                                <button type="button" onClick={() => setAccKind(k)}
+                                        className={`px-2.5 py-1 rounded-md text-xs font-semibold border ${accKind === k ? on : off}`}>
+                                    {lab} {n}
+                                </button>
+                            );
+                            return (
+                                <span className="inline-flex items-center gap-1">
+                                    {chip("", "全部", accounts.length, "bg-gray-800 text-white border-gray-800", "bg-white text-gray-500 border-gray-200")}
+                                    {chip("google", "Gmail", g, "bg-red-600 text-white border-red-600", "bg-white text-red-700 border-red-200")}
+                                    {chip("mailcom", "mail.com", m, "bg-slate-600 text-white border-slate-600", "bg-white text-slate-600 border-gray-200")}
+                                    {i > 0 ? chip("icloud", "iCloud", i, "bg-sky-600 text-white border-sky-600", "bg-white text-sky-700 border-sky-200") : null}
+                                </span>
+                            );
+                        })()}
                         {batches.length > 0 &&
                             <select value={batchFilter} onChange={(e) => setBatchFilter(e.target.value)} title="按批次筛选" className="px-2 py-1 border rounded-lg text-sm">
                                 <option value="">全部批次</option>
                                 {batches.map((b) => <option key={b.name} value={b.name}>{b.name} ({b.count})</option>)}
                             </select>}
-                        {(facets.size > 0 || soldFilter !== "all") &&
-                            <button onClick={() => { setFacets(new Set()); setSoldFilter("all"); }} className="text-xs text-gray-400 hover:text-gray-600 underline">清除筛选</button>}
+                        {(facets.size > 0 || soldFilter !== "all" || accKind) &&
+                            <button onClick={() => { setFacets(new Set()); setSoldFilter("all"); setAccKind(""); }} className="text-xs text-gray-400 hover:text-gray-600 underline">清除筛选</button>}
                         {batchStats &&
                             <span className="text-xs px-2 py-1 rounded bg-slate-100 text-slate-700 whitespace-nowrap" title="该批次:成功/失败/进行中 + 成功率(成功占已完成的比例)">
                                 共{batchStats.total} · <b className="text-green-600">成{batchStats.success}</b> <b className="text-red-500">败{batchStats.failed}</b>{batchStats.busy > 0 ? ` ⏳${batchStats.busy}` : ""}{batchStats.dead > 0 ? ` 停用${batchStats.dead}` : ""} · 成功率<b>{batchStats.rate}%</b>
@@ -788,9 +837,54 @@ export default function App() {
                         <span className="text-gray-500">共 <b className="text-gray-700">{filtered.length}</b> 条{delHits > 0 ? <>（含已删除 <b className="text-gray-500">{delHits}</b> 条，只读）</> : null}{selectedIds.size > 0 ? <> · 已选 <b className="text-indigo-600">{selectedIds.size}</b> 个</> : null}</span>
                         <span className="text-gray-400 text-xs">（未选则对当前列表全部执行）</span>
                         <button onClick={() => api.batchTestAt(selectedIds.size ? [...selectedIds] : actionable.map((a) => a.id)).then((r) => notify(`批量测 at：${r.count} 个`)).catch((e) => notify(e.message))} className="px-2 py-1 bg-blue-600 text-white rounded text-xs">批量测 at</button>
-                        {batchAt.running
-                            ? <button onClick={() => api.stopBatchAt().then(() => notify("已请求停止(当前号跑完即停)")).catch((e) => notify(e.message))} className="px-2 py-1 bg-red-600 text-white rounded text-xs animate-pulse">⏹ 停止重登 {batchAt.done}/{batchAt.total}</button>
-                            : <button onClick={() => { const ids = selectedIds.size ? [...selectedIds] : actionable.map((a) => a.id); if (!ids.length) { notify("无账号"); return; } if (!window.confirm(`对 ${ids.length} 个号【串行】测 at，失效的走浏览器登录重新获取(一次一个、每个约1-2分钟、可停止)。开始？`)) return; api.batchTestAt(ids, true).then((r) => notify(`已开始串行重登 ${r.count} 个`)).catch((e) => notify(e.message)); }} title="批量测 at,失效的号串行(一次一个)走浏览器登录重新获取 at" className="px-2 py-1 bg-blue-700 text-white rounded text-xs">批量重登at(串行)</button>}
+                        <button
+                            disabled={batchAt.running}
+                            onClick={() => {
+                                const ids = selectedIds.size ? [...selectedIds] : actionable.map((a) => a.id);
+                                if (!ids.length) { notify("无账号"); return; }
+                                if (!window.confirm(`对 ${ids.length} 个号批量测 at，失效的走协议重登(并发≈注册并发)。开始？`)) return;
+                                setBatchAt({running: true, done: 0, total: ids.length});
+                                api.batchTestAt(ids, true).then((r) => {
+                                    setBatchAt((p) => ({...p, running: true, total: r.count || ids.length}));
+                                    notify(`已开始批量重登 ${r.count} 个`);
+                                }).catch(async (e) => {
+                                    const msg = String(e?.message || e);
+                                    if (/已有批量重登|在跑/.test(msg)) {
+                                        if (window.confirm(`${msg}\n\n点「确定」强制结束旧任务；需要重新开跑请再点一次「批量重登at」。`)) {
+                                            await api.stopBatchAt(true);
+                                            setBatchAt({running: false, done: 0, total: 0});
+                                            notify("已强制结束，可再点「批量重登at」");
+                                        } else {
+                                            setBatchAt((p) => ({...p, running: true}));
+                                        }
+                                    } else {
+                                        setBatchAt({running: false, done: 0, total: 0});
+                                        notify(msg);
+                                    }
+                                });
+                            }}
+                            title="批量测 at，失效的号走登录重新获取 at"
+                            className={`px-2 py-1 text-white rounded text-xs ${batchAt.running ? "bg-blue-300 cursor-not-allowed" : "bg-blue-700"}`}
+                        >批量重登at</button>
+                        <button
+                            onClick={() => api.stopBatchAt(false).then((r) => {
+                                notify(r.msg || "已请求停止");
+                                if (r.running === false) setBatchAt({running: false, done: 0, total: 0});
+                            }).catch((e) => notify(e.message))}
+                            title="请求停止：当前正在跑的号结束后停"
+                            className={`px-2 py-1 rounded text-xs text-white ${batchAt.running ? "bg-red-600 animate-pulse" : "bg-red-400 hover:bg-red-500"}`}
+                        >⏹ 停止重登{batchAt.running && batchAt.total ? ` ${batchAt.done}/${batchAt.total}` : ""}</button>
+                        <button
+                            onClick={() => {
+                                if (!window.confirm("强制结束批量重登？（立刻清锁，可马上重新开始）")) return;
+                                api.stopBatchAt(true).then((r) => {
+                                    setBatchAt({running: false, done: 0, total: 0});
+                                    notify(r.msg || "已强制结束");
+                                }).catch((e) => notify(e.message));
+                            }}
+                            title="卡死/刷新后没停止按钮时用：立刻清锁"
+                            className="px-2 py-1 bg-red-900 text-white rounded text-xs"
+                        >强制结束</button>
                         <button onClick={() => api.batchTestRt(selectedIds.size ? [...selectedIds] : actionable.map((a) => a.id)).then((r) => notify(`批量测 rt：${r.count} 个(只刷新有效的)`)).catch((e) => notify(e.message))} title="只刷新有效 rt、标记失效的;不重登、不耗接码" className="px-2 py-1 bg-teal-600 text-white rounded text-xs">批量测 rt</button>
                         <button onClick={() => { const ids = selectedIds.size ? [...selectedIds] : actionable.map((a) => a.id); if (!ids.length) { notify("无账号"); return; } if (!window.confirm(`对 ${ids.length} 个号批量测 rt，过期/无rt 的会【重登获取 rt】(走 codex OAuth + add-phone 接码，每号消耗一个接码号、有成本、较慢)。开始？`)) return; api.batchTestRt(ids, true).then((r) => notify(`已开始批量重取 rt ${r.count} 个(过期/无rt 会重登获取)`)).catch((e) => notify(e.message)); }} title="过期/无rt 的号重登获取 rt(codex OAuth+接码,有成本)" className="px-2 py-1 bg-teal-700 text-white rounded text-xs">批量重取rt(耗接码)</button>
                         <button onClick={() => api.batchTestChat(selectedIds.size ? [...selectedIds] : actionable.map((a) => a.id)).then((r) => notify(`批量测聊天：${r.count} 个（逐个开浏览器）`)).catch((e) => notify(e.message))} className="px-2 py-1 bg-fuchsia-600 text-white rounded text-xs">批量测聊天</button>
@@ -855,6 +949,11 @@ export default function App() {
                                 </td>
                                 <td className="px-4 py-2 text-gray-400" title={`账号ID ${a.id}`}>{i + 1}</td>
                                 <td className="px-4 py-2 font-mono">
+                                    {mailboxKind(a) === "google"
+                                        ? <span className="mr-1 px-1.5 py-0.5 rounded bg-red-50 text-red-700 text-[11px] font-semibold align-middle">Gmail</span>
+                                        : mailboxKind(a) === "icloud"
+                                            ? <span className="mr-1 px-1.5 py-0.5 rounded bg-sky-50 text-sky-700 text-[11px] font-semibold align-middle">iCloud</span>
+                                            : <span className="mr-1 px-1.5 py-0.5 rounded bg-slate-100 text-slate-500 text-[11px] align-middle">mail.com</span>}
                                     {a.email}
                                     {a.sold_at ? <span className="ml-1 px-1 rounded bg-amber-100 text-amber-700 text-xs">已售</span> : null}
                                     {a.deleted_at && !showDeleted ? <span className="ml-1 px-1 rounded bg-gray-200 text-gray-500 text-xs" title={`已删除 ${fmtDateTime(a.deleted_at)}`}>已删除</span> : null}
@@ -927,7 +1026,7 @@ export default function App() {
                                     ? <div className="text-gray-500">（开始注册后，这里实时显示所有号的进度；点左侧某行看该号详情）</div>
                                     : allLogs.map((l, i) => (
                                         <div key={i} className="whitespace-pre-wrap break-all">
-                                            <span className="text-gray-600">{new Date(l.ts).toLocaleTimeString()} </span>
+                                            <span className="text-gray-600">{fmtBjClock(l.ts)} </span>
                                             <span className="text-amber-300">{l.email.split("@")[0]}</span>
                                             <span className="text-gray-700"> │ </span>
                                             <span className={l.line.includes("✅") ? "text-green-400" : l.line.includes("❌") ? "text-red-400" : ""}>{l.line}</span>
@@ -941,7 +1040,7 @@ export default function App() {
                         <>
                             <div className="px-4 py-3 border-b flex items-center gap-2">
                                 <button onClick={() => { setSelectedId(null); setLogMode("all"); }} title="返回全局日志" className="text-gray-400 hover:text-gray-700">◀</button>
-                                <span onClick={() => setInfoOpen((v) => !v)} title={infoOpen ? "点击邮箱收起账户信息(给日志/收件箱更多空间)" : "点击邮箱展开账户信息"} className="font-mono text-sm truncate flex-1 cursor-pointer hover:text-indigo-600 select-none"><span className="text-gray-400 mr-1">{infoOpen ? "▾" : "▸"}</span>{selected.email}</span>
+                                <span onClick={() => setInfoOpen((v) => !v)} title={infoOpen ? "点击邮箱收起账户信息(给日志/收件箱更多空间)" : "点击邮箱展开账户信息"} className="font-mono text-sm truncate flex-1 cursor-pointer hover:text-indigo-600 select-none"><span className="text-gray-400 mr-1">{infoOpen ? "▾" : "▸"}</span>{isGoogleMailbox(selected) ? <span className="mr-1 px-1 rounded bg-red-50 text-red-700 text-[10px] font-semibold">Gmail</span> : null}{selected.email}</span>
                                 <span className={`px-2 py-0.5 rounded text-xs font-medium ${STATUS_STYLE[selected.status]}`}>{STATUS_LABEL[selected.status]}</span>
                                 <button onClick={() => setPanelOpen(false)} title="收起面板" className="text-gray-400 hover:text-gray-700">⟩</button>
                             </div>
@@ -1053,7 +1152,7 @@ export default function App() {
                                         ? <div className="text-gray-500">（暂无该号日志）</div>
                                         : logs.map((l, i) => (
                                             <div key={i} className="whitespace-pre-wrap break-all">
-                                                <span className="text-gray-600">{new Date(l.ts).toLocaleTimeString()} </span>
+                                                <span className="text-gray-600">{fmtBjClock(l.ts)} </span>
                                                 <span className={l.line.includes("✅") ? "text-green-400" : l.line.includes("❌") ? "text-red-400" : ""}>{l.line}</span>
                                             </div>
                                         ))}
@@ -1304,6 +1403,9 @@ export default function App() {
                                     : pickerVisible.map((m) => (
                                         <label key={m.id} className="flex items-center gap-2 px-3 py-1.5 border-b last:border-0 hover:bg-gray-50 cursor-pointer">
                                             <input type="checkbox" checked={pickerSel.has(m.id)} onChange={() => setPickerSel((prev) => { const s = new Set(prev); s.has(m.id) ? s.delete(m.id) : s.add(m.id); return s; })}/>
+                                            {m.provider === "google" || /@(gmail|googlemail)\.com$/i.test(m.email)
+                                                ? <span className="px-1 rounded bg-red-50 text-red-700 text-[10px] font-semibold">Gmail</span>
+                                                : <span className="px-1 rounded bg-slate-100 text-slate-500 text-[10px]">mail.com</span>}
                                             <span className="font-mono text-gray-700 flex-1 truncate">{m.email}</span>
                                             {m.grp ? <span className="text-xs px-1 rounded bg-gray-100 text-gray-500">{m.grp}</span> : null}
                                             {String(m.pw_status || "").includes("✅") ? <span className="text-xs text-green-600" title={m.pw_status}>已改密</span> : null}
