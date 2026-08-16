@@ -47,6 +47,59 @@ async function assertPageUsable(page, log) {
     throw new Error(`代理中断 ${hit.why}，换 session 重开窗`);
 }
 
+/** 原生 GET 交空邮箱：https://chatgpt.com/auth/login?email= */
+function loginHasEmptyEmailQuery(url = "") {
+    try {
+        const u = new URL(url);
+        if (!/chatgpt\.com$/i.test(u.hostname)) return false;
+        if (!/\/auth\/login\/?$/i.test(u.pathname)) return false;
+        if (!u.searchParams.has("email")) return false;
+        return !String(u.searchParams.get("email") || "").trim();
+    } catch {
+        return false;
+    }
+}
+
+/** 登录页 React 没起来：?email= 白屏，或 body 几乎空、没有邮箱框 */
+async function isLoginWhiteScreen(page) {
+    const url = page.url();
+    if (!/chatgpt\.com\/auth\/login/i.test(url)) return false;
+    const hasEmail = await page.locator("#email, input[type='email'], input[name='email']").first().isVisible().catch(() => false);
+    if (hasEmail) return false;
+    const hasNext = await page.locator('input[type="password"], input[autocomplete="one-time-code"]').first().isVisible().catch(() => false);
+    if (hasNext) return false;
+    const text = (await page.innerText("body").catch(() => "")).replace(/\s+/g, " ").trim();
+    if (text.length < 40) return true;
+    if (loginHasEmptyEmailQuery(url) && !/Log in or sign up|登录或注册|Continue with|使用 Google|email/i.test(text)) return true;
+    return false;
+}
+
+/** 白屏刷新；仍白则重开干净 /auth/login。返回 true 表示处理过（调用方应重新填邮箱）。 */
+async function recoverLoginWhiteScreen(page, log, {maxTries = 2} = {}) {
+    if (!(await isLoginWhiteScreen(page))) return false;
+    for (let i = 0; i < maxTries; i++) {
+        log(`登录页白屏 url=${page.url().slice(0, 80)}，刷新 ${i + 1}/${maxTries}`);
+        try {
+            await page.reload({waitUntil: "domcontentloaded", timeout: 30_000});
+        } catch {
+            await page.goto(AUTH_URL, {waitUntil: "domcontentloaded", timeout: 60_000}).catch(() => {});
+        }
+        await page.waitForTimeout(1200);
+        if (!(await isLoginWhiteScreen(page))) {
+            log("刷新后登录页已出来");
+            return true;
+        }
+        log("刷新仍白屏，重开干净登录页");
+        await page.goto(AUTH_URL, {waitUntil: "domcontentloaded", timeout: 60_000}).catch(() => {});
+        await page.waitForTimeout(1200);
+        if (!(await isLoginWhiteScreen(page))) {
+            log("重开登录页后已出来");
+            return true;
+        }
+    }
+    return true;
+}
+
 function parseProxyOpt(url) {
     if (!url) return undefined;
     try {
@@ -423,6 +476,7 @@ export async function registerViaBrowser(email, {password = "", totpSecret = "",
         }
         if (!opened) throw new Error("多次打开 auth/login 失败(代理/网络不稳，ERR_CONNECTION_CLOSED)");
         await assertPageUsable(page, log);
+        await recoverLoginWhiteScreen(page, log);
         // 一打开就撞身份验证限流 → 冷却/点重试后再继续
         await recoverAuthRateLimit(page, log);
         const useGoogleSso = !!preferGoogleSso;
@@ -449,6 +503,7 @@ export async function registerViaBrowser(email, {password = "", totpSecret = "",
                     if (await recoverAuthRateLimit(page, log)) continue;
                     if (alreadyNext() || isAlreadyIn()) return;
                     if (await emailEl.isVisible().catch(() => false)) { sawEmail = true; break; }
+                    if (await recoverLoginWhiteScreen(page, log)) continue;
                     if (w === 8) {
                         log("登录页还没有邮箱框，刷新一次等 CF…");
                         await page.reload({waitUntil: "domcontentloaded", timeout: 30000}).catch(() => {});
@@ -480,11 +535,18 @@ export async function registerViaBrowser(email, {password = "", totpSecret = "",
                 if (!await clickContinue(page, log)) {
                     await emailEl.press("Enter").catch(() => {});
                 }
+                await page.waitForTimeout(700);
+                // 原生 GET 交成 ?email= 白屏：立刻刷新，别等 8s 当已经离开登录页
+                if (loginHasEmptyEmailQuery(page.url()) || await isLoginWhiteScreen(page)) {
+                    if (await recoverLoginWhiteScreen(page, log)) continue;
+                }
                 await page.waitForURL(
-                    (u) => /email-verification|about-you|create-account|mfa-challenge|chatgpt\.com\/?($|\?|#)/i.test(String(u)),
+                    (u) => /email-verification|about-you|create-account|mfa-challenge|chatgpt\.com\/?($|\?|#)/i.test(String(u))
+                        && !/auth\/login/i.test(String(u)),
                     {timeout: 8000},
                 ).catch(() => {});
                 await assertPageUsable(page, log);
+                if (await recoverLoginWhiteScreen(page, log)) continue;
                 // 提交邮箱后常出「身份验证错误 / rate_limit_exceeded」→ 冷却后整段重填
                 if (await recoverAuthRateLimit(page, log)) {
                     log("限流恢复，重新填邮箱提交…");
@@ -501,15 +563,18 @@ export async function registerViaBrowser(email, {password = "", totpSecret = "",
                         await el2.pressSequentially(email, {delay: 30}).catch(() => {});
                         await page.waitForTimeout(400);
                         await clickContinue(page, log);
+                        if (await recoverLoginWhiteScreen(page, log)) continue;
                         if (await recoverAuthRateLimit(page, log)) continue;
                     }
                 }
                 await page.waitForTimeout(600);
                 if (alreadyNext() || isAlreadyIn()) return;
+                if (await recoverLoginWhiteScreen(page, log)) continue;
                 const stillOnLogin = /auth\/login/.test(page.url())
                     && !(await page.locator('input[autocomplete="one-time-code"], input[type="password"]').first().isVisible().catch(() => false))
                     && /Continue with (Google|Apple|phone)|使用\s*(Google|Apple|电话)|Log in or sign up|登录或注册/i.test((await page.innerText("body").catch(() => "")).replace(/\s+/g, " "));
-                if (!stillOnLogin) return;
+                // 还停在 /auth/login（含 ?email= 白屏）不能当已经走下一步
+                if (!stillOnLogin && !/auth\/login/i.test(page.url())) return;
                 if (useGoogleSso && await tryGoogleSso(page, email, log)) return;
                 if (loginAttempt < LOGIN_MAX_RETRY - 1) {
                     log(`降级为原生表单(第 ${loginAttempt + 1}/${LOGIN_MAX_RETRY} 次)，重载页面重试…`);
@@ -567,6 +632,10 @@ export async function registerViaBrowser(email, {password = "", totpSecret = "",
             }
             for (let i = 0; i < 12 && !stage; i++) {
                 await assertPageUsable(page, log);
+                if (await recoverLoginWhiteScreen(page, log)) {
+                    stage = "";
+                    break; // 白屏刷回登录页，外层重填邮箱
+                }
                 if (await recoverAuthRateLimit(page, log)) {
                     await page.waitForTimeout(800);
                     stage = await detect();
