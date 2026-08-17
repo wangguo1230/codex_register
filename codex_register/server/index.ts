@@ -3330,7 +3330,16 @@ async function precheckRechargeMailbox(q) {
         const probe = await testGmailImap(acc.email, imap, {
             log: (m) => rechargeLog(`预检 ${acc.email}: ${m}`),
         });
-        if (!probe.ok) return {ok: false, reason: `Gmail IMAP 不可用 (${probe.error || "不通"})`};
+        if (!probe.ok) {
+            if (isImapTransientError(probe.error)) {
+                return {
+                    ok: false,
+                    transient: true,
+                    reason: `Gmail IMAP 线路抖动 (${probe.error || "Unexpected close"})，未配卡，可再提交`,
+                };
+            }
+            return {ok: false, reason: `Gmail IMAP 不可用 (${probe.error || "不通"})`};
+        }
         rechargeLog(`预检 ${acc.email}: IMAP 通（收件箱 ${probe.messages ?? 0} 封）`);
         return {ok: true};
     }
@@ -4592,6 +4601,11 @@ app.post("/api/recharge/submit", async (req, res) => {
                 return;
             }
             if (!pre.ok) {
+                if (pre.transient) {
+                    rechargeLog(`预检 抖动 ${n}/${items.length} ${q.email}: ${pre.reason}`);
+                    await queueSync();
+                    return;
+                }
                 failed++;
                 await db.updateQueueItem(q.id, {status: "error", error: pre.reason, instance_id: "", finished_at: Date.now()});
                 rechargeLog(`预检 ✗ ${n}/${items.length} ${q.email}: ${pre.reason}，不配卡、不提交`);
