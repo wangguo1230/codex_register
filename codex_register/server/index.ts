@@ -4246,6 +4246,16 @@ app.post("/api/recharge/queue/reset", async (req, res) => {
     res.json({ok: true, ...info});
 });
 
+app.post("/api/recharge/queue/mark-error", async (req, res) => {
+    const ids = (req.body?.ids || []).map(Number).filter(Number.isInteger);
+    if (!ids.length) return res.status(400).json({error: "未选择队列项"});
+    const reason = String(req.body?.error || req.body?.reason || "").trim();
+    const info = await db.markRechargeQueueError(ids, reason);
+    await queueSync(); await rechargeSync();
+    if (info.count) rechargeLog(`人工标记失败 ${info.count} 个${info.reclaimed ? `，收回卡密 ${info.reclaimed}` : ""}${reason ? `：${reason}` : ""}`);
+    res.json({ok: true, ...info});
+});
+
 app.post("/api/recharge/queue/reclaim-cards", async (req, res) => {
     const ids: number[] = (req.body?.ids || []).map(Number).filter(Number.isInteger);
     if (!ids.length) return res.status(400).json({error: "未选择队列项"});
@@ -4535,6 +4545,11 @@ app.post("/api/recharge/submit", async (req, res) => {
         };
         const submitPassed = async (q0) => {
             if (rechargeStop) return;
+            const live0 = await db.getRechargeQueueItem(q0.id);
+            if (!live0 || live0.status === "error") {
+                rechargeLog(`跳过 ${q0.email}：已人工标记失败`);
+                return;
+            }
             const cards = await db.claimUnusedCards(1);
             if (!cards.length) {
                 failed++;
@@ -4564,9 +4579,18 @@ app.post("/api/recharge/submit", async (req, res) => {
             if (rechargeStop) return;
             const q = await db.getRechargeQueueItem(item.id);
             if (!q) { failed++; return; }
+            if (q.status === "error") {
+                rechargeLog(`跳过 ${q.email}：已人工标记失败`);
+                return;
+            }
             rechargeLog(`[预检] ${q.email}`);
             const pre = await precheckRechargeMailbox(q);
             const n = ++preDone;
+            const after = await db.getRechargeQueueItem(q.id);
+            if (after?.status === "error") {
+                rechargeLog(`跳过 ${q.email}：预检期间已人工标记失败`);
+                return;
+            }
             if (!pre.ok) {
                 failed++;
                 await db.updateQueueItem(q.id, {status: "error", error: pre.reason, instance_id: "", finished_at: Date.now()});

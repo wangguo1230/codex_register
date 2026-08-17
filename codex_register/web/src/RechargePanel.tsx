@@ -125,6 +125,8 @@ export function RechargePanel({notify}: {notify?: (m: string) => void}) {
 
     const toast = (m: string) => notify?.(m);
     const isDeliveredTab = deliveryTab === "delivered";
+    /** SSE 异步导出 RT 完成后回调（ref 避免 effect 闭包拿不到最新 deliver） */
+    const deliverExportTextRef = useRef<(text: string, format: "account" | "full" | "card" | "session") => Promise<void>>(async () => {});
 
     const loadQueue = () => {
         const d = deliveryTabRef.current;
@@ -156,10 +158,7 @@ export function RechargePanel({notify}: {notify?: (m: string) => void}) {
             }
             if (ev === "batchRtAcquire") { setBatchRtResults(data.results.map((r: any) => ({...r, status: r.status || "done"}))); if (data.done) setBatchRtRunning(false); }
             if (ev === "rechargeExportReady" && data?.text) {
-                const blob = new Blob([data.text], {type: "text/plain;charset=utf-8"});
-                const url = URL.createObjectURL(blob);
-                const a = Object.assign(document.createElement("a"), {href: url, download: "recharge-full.txt"});
-                a.click(); URL.revokeObjectURL(url);
+                void deliverExportTextRef.current(String(data.text), "full");
             }
         });
         // SSE 重连会丢中间事件；换绑卡在 mail.com 时也要靠轮询把磁盘日志刷出来
@@ -313,7 +312,7 @@ export function RechargePanel({notify}: {notify?: (m: string) => void}) {
         const pendingIds = ids.filter((id) => { const q = queue.find((x) => x.id === id); return q && q.status === "pending"; });
         if (!pendingIds.length) { toast("所选项中无待提交状态的账号"); return; }
         if (cStats.unused < pendingIds.length) { toast(`可用卡密不足(需 ${pendingIds.length} 个,仅有 ${cStats.unused} 个)`); return; }
-        if (!confirm(`确认提交 ${pendingIds.length} 个账号充值?\n先预检：Gmail 探 IMAP，mail.com 验密码。不通的不配卡、不提交。`)) return;
+        if (!confirm(`确认提交 ${pendingIds.length} 个账号充值?\n预检并发：Gmail 探 IMAP，mail.com 验密码。通过一个就立刻配卡提交，不通的不配卡。`)) return;
         setBusy(true);
         try {
             await api.submitRecharge(pendingIds);
@@ -325,6 +324,19 @@ export function RechargePanel({notify}: {notify?: (m: string) => void}) {
         const ids = selQIds();
         if (!ids.length) { toast("请先选择队列项"); return; }
         try { await api.resetRechargeQueue(ids); setQSel(new Set()); loadQueue(); toast("已重置为待提交"); } catch (e: any) { toast(e.message); }
+    };
+    const doMarkError = async (ids?: number[]) => {
+        const pick = ids && ids.length ? ids : selQIds();
+        if (!pick.length) { toast("请先选择要标记的账号"); return; }
+        const typed = window.prompt(`把选中 ${pick.length} 个标为失败（不会提交、已配对卡密会收回）\n原因：`, "人工标记失败");
+        if (typed == null) return;
+        const reason = typed.trim() || "人工标记失败";
+        try {
+            const r = await api.markRechargeQueueError(pick, reason);
+            setQSel(new Set());
+            loadQueue();
+            toast(r.count ? `已标记失败 ${r.count} 个${r.reclaimed ? `，收回卡密 ${r.reclaimed}` : ""}${r.skipped ? `，跳过 ${r.skipped} 个已提交/已完成` : ""}` : (r.skipped ? "所选都已提交或完成，不能改标" : "没有可标记的"));
+        } catch (e: any) { toast(e.message); }
     };
     const doStop = async () => { try { await api.stopRecharge(); toast("已发送停止信号"); } catch (e: any) { toast(e.message); } };
     const doRelogin = async () => {
@@ -386,9 +398,13 @@ export function RechargePanel({notify}: {notify?: (m: string) => void}) {
         setRebindPool(next);
         return next;
     };
+    /**
+     * 打开换绑 Gmail 弹窗。
+     * - 可不勾选充值队列：只管理验证区 / 迁入换绑池（独立 Gmail，不需要 GPT 队列项）
+     * - 勾选了已付费队列项：可同时「确认换绑」把池里的 Gmail 绑到这些号上
+     */
     const openRebindGmail = async (ids?: number[]) => {
         const pick = ids && ids.length ? ids : selQIds();
-        if (!pick.length) { toast("请先选择已付费的队列项"); return; }
         setRebindIds(pick);
         setStagePick(new Set());
         setReadyPick(new Set());
@@ -399,13 +415,16 @@ export function RechargePanel({notify}: {notify?: (m: string) => void}) {
             const {groups} = await loadRebindPool();
             const top = [...groups].sort((a, b) => (b.n || 0) - (a.n || 0))[0];
             setStageGrp(top ? top.grp : "");
+            if (!pick.length) {
+                toast("已打开 Gmail 换绑池：可先迁入独立号；要对队列换绑请先勾选已付费项再点「确认换绑」");
+            }
         } catch (e: any) {
             toast("加载 Gmail 池失败: " + e.message);
         }
     };
     const submitRebind = async (target: "gmail" | "mailcom", opts?: {emails?: string[]; grp?: string; text?: string}) => {
         const ids = target === "gmail" && rebindIds.length ? rebindIds : selQIds();
-        if (!ids.length) { toast("请先选择已付费的队列项"); return; }
+        if (!ids.length) { toast("请先在充值队列勾选要换绑的已付费项"); return; }
         const label = target === "mailcom" ? "mail.com" : "Gmail";
         setBusy(true);
         try {
@@ -418,6 +437,7 @@ export function RechargePanel({notify}: {notify?: (m: string) => void}) {
         } catch (e: any) { toast(e.message); } finally { setBusy(false); }
     };
     const doRebind = async (target: "gmail" | "mailcom") => {
+        // Gmail：始终可开池子管理；是否执行换绑看 rebindIds
         if (target === "gmail") return openRebindGmail();
         const ids = selQIds();
         if (!ids.length) { toast("请先选择已付费的队列项"); return; }
@@ -515,6 +535,8 @@ export function RechargePanel({notify}: {notify?: (m: string) => void}) {
         }
     };
     const doConfirmRebindGmail = async () => {
+        // 仅「确认换绑」需要充值队列目标号；迁入换绑池不需要
+        if (!rebindIds.length) { toast("请先在充值队列勾选要换绑的已付费项"); return; }
         if (!rebindPool.readyCount) {
             toast(`换绑池「${rebindPool.poolGrp}」为空，请先在左侧验证并迁入`);
             return;
@@ -629,20 +651,24 @@ export function RechargePanel({notify}: {notify?: (m: string) => void}) {
             await fillSub2jsonFromSelection({silent: false});
         }
     };
+    const deliverExportText = async (text: string, format: "account" | "full" | "card" | "session") => {
+        const lines = text.split("\n").filter((l) => l.trim()).length;
+        if (format === "card" || format === "session" || lines < 200) {
+            await navigator.clipboard.writeText(text);
+            toast(`已复制 ${lines} 行到剪切板`);
+        } else {
+            const names: Record<string, string> = {account: "recharge-accounts.txt", full: "recharge-full.txt"};
+            downloadText(text, names[format] || "recharge-export.txt");
+            toast(`已导出 ${lines} 行`);
+        }
+    };
+    deliverExportTextRef.current = deliverExportText;
     const doExport = async (format: "account" | "full" | "card" | "session") => {
         const ids = selQIds();
         try {
             const r = await api.exportRechargeQueue({ids: ids.length ? ids : undefined, batch: qBatchFilter || undefined, format});
             if (r.text) {
-                const lines = r.text.split("\n").filter((l: string) => l.trim()).length;
-                if (format === "card" || format === "session" || lines < 200) {
-                    await navigator.clipboard.writeText(r.text);
-                    toast(`已复制 ${lines} 行到剪切板`);
-                } else {
-                    const names: Record<string, string> = {account: "recharge-accounts.txt", full: "recharge-full.txt"};
-                    downloadText(r.text, names[format] || "recharge-export.txt");
-                    toast(`已导出 ${lines} 行`);
-                }
+                await deliverExportText(r.text, format);
             } else if (r.async) {
                 toast(`${r.needRt} 个账号缺少 RT，正在自动获取，完成后自动下载...`);
             }
@@ -800,6 +826,7 @@ export function RechargePanel({notify}: {notify?: (m: string) => void}) {
                             <Btn onClick={openPicker} className="bg-blue-600 text-white border-blue-600 hover:bg-blue-700">+ 选择账号入队</Btn>
                             <Btn onClick={() => { setShowSetBatch(true); setBatchInput(""); }}>设置批次</Btn>
                             <Btn onClick={doReset}>重置</Btn>
+                            <Btn onClick={() => doMarkError()} className="bg-white border-red-200 text-red-600 hover:bg-red-50" title="把选中号标失败：不提交，已配对卡密收回；已提交/已完成的不动">标记失败</Btn>
                             <Btn onClick={doReclaimCards}>回收卡密</Btn>
                             <Btn onClick={doRemoveFromQueue} className="bg-white border-emerald-200 text-emerald-700 hover:bg-emerald-50" title="标记已交付：保留账号与换绑记录，移入「已交付」">标记已交付</Btn>
                             <div className="border-l mx-1 h-5"/>
@@ -935,6 +962,10 @@ export function RechargePanel({notify}: {notify?: (m: string) => void}) {
                                         {q.status !== "done" && q.status !== "pending" && q.card_code && (
                                             <button onClick={() => { api.pollRecharge([q.id]).then(() => { toast(`已刷新 ${q.email}`); loadQueue(); }).catch((e: any) => toast(e.message)); }}
                                                     className="text-blue-500 hover:text-blue-700 text-xs hover:underline">刷新</button>
+                                        )}
+                                        {(q.status === "pending" || q.status === "paired" || q.status === "submitting") && (
+                                            <button onClick={() => doMarkError([q.id])}
+                                                    className="text-red-500 hover:text-red-700 text-xs hover:underline ml-2">标记失败</button>
                                         )}
                                         {(q.status === "error" || q.status === "paired") && (
                                             <button onClick={() => { api.resetRechargeQueue([q.id]).then(() => { loadQueue(); toast("已重置"); }).catch((e: any) => toast(e.message)); }}

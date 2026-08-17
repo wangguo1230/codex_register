@@ -1476,6 +1476,37 @@ export async function updateQueueItem(id, fields) {
     await query(`UPDATE recharge_queue SET ${sets.join(",")} WHERE id=$${vals.length}`, vals);
 }
 
+/** 人工把队列项标失败：不碰已提交/已完成；已配对未提交的卡密收回。 */
+export async function markRechargeQueueError(ids, reason = "") {
+    const why = String(reason || "人工标记失败").trim().slice(0, 200);
+    const now = Date.now();
+    let count = 0, reclaimed = 0, skipped = 0;
+    await withTransaction(async (client) => {
+        for (const id of (ids || [])) {
+            const { rows: [item] } = await client.query(`SELECT * FROM recharge_queue WHERE id=$1`, [id]);
+            if (!item) { skipped++; continue; }
+            if (item.status === "submitted" || item.status === "done") { skipped++; continue; }
+            if (item.card_id && !item.task_no) {
+                const { rows: [card] } = await client.query(`SELECT * FROM recharge_cards WHERE id=$1`, [item.card_id]);
+                if (card && (card.status === "paired" || card.status === "submitting")) {
+                    await client.query(
+                        `UPDATE recharge_cards SET status='unused', account_id=0, account_email='', error='', updated_at=$1 WHERE id=$2`,
+                        [now, item.card_id],
+                    );
+                    reclaimed++;
+                }
+            }
+            await client.query(
+                `UPDATE recharge_queue SET status='error', error=$1, instance_id='', card_id=0, card_code='',
+                 finished_at=$2 WHERE id=$3`,
+                [why, now, id],
+            );
+            count++;
+        }
+    });
+    return {count, reclaimed, skipped};
+}
+
 export async function resetRechargeQueue(ids) {
     const reclaimInfo: {reclaimed: number; kept: number} = {reclaimed: 0, kept: 0};
     await withTransaction(async (client) => {

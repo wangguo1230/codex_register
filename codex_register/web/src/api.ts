@@ -550,6 +550,8 @@ export const api = {
         j<{ok: boolean}>("/api/recharge/queue/set-batch", {method: "POST", body: JSON.stringify({ids, batch})}),
     resetRechargeQueue: (ids: number[]) =>
         j<{ok: boolean}>("/api/recharge/queue/reset", {method: "POST", body: JSON.stringify({ids})}),
+    markRechargeQueueError: (ids: number[], reason?: string) =>
+        j<{ok: boolean; count: number; reclaimed?: number; skipped?: number}>("/api/recharge/queue/mark-error", {method: "POST", body: JSON.stringify({ids, error: reason || ""})}),
     rechargeQueueRelogin: (ids: number[]) =>
         j<{ok: boolean; count: number; claimed?: number; skipped?: number; instanceId?: string}>("/api/recharge/queue/relogin", {method: "POST", body: JSON.stringify({ids})}),
     // 一条龙:浏览器重登刷新 session → 验卡 → 重置任务 → 用同一张卡密重提(卡密非 unused 则跳过)
