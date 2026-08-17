@@ -837,8 +837,8 @@ export function RechargePanel({notify}: {notify?: (m: string) => void}) {
                     <div className="flex-1"/>
                     <span className="text-[11px] text-gray-400 pb-2 pr-1">
                         {isDeliveredTab ? "已交付可查看换绑记录；可退回未交付"
-                            : isFailedTab ? "失败号单独在这里；重置可退回未交付"
-                            : "标记失败进中间页；标记已交付进右侧"}
+                            : isFailedTab ? "只有点过「标记失败」的号；提交失败不会自动进来"
+                            : "提交失败仍留在未交付；只有点「标记失败」才进中间页"}
                     </span>
                 </div>
 
@@ -894,7 +894,8 @@ export function RechargePanel({notify}: {notify?: (m: string) => void}) {
                         {isWorkingTab && [{k: "all", l: "全部", n: qStats.total}, {k: "undone", l: "未完成", n: qStats.pending + qStats.submitted},
                           {k: "pending", l: "待提交", n: qStats.pending},
                           {k: "submitted", l: "已提交", n: qStats.submitted},
-                          {k: "done", l: "完成", n: qStats.done}]
+                          {k: "done", l: "完成", n: qStats.done},
+                          {k: "error", l: "提交失败", n: qStats.error}]
                           .map(({k, l, n}) => (
                             <button key={k} onClick={() => setQFilter(k)}
                                     className={`px-2 py-0.5 rounded border text-xs ${qFilter === k ? "bg-gray-800 text-white border-gray-800" : "bg-gray-50 text-gray-600 border-gray-200 hover:bg-gray-100"}`}>
@@ -1034,7 +1035,7 @@ export function RechargePanel({notify}: {notify?: (m: string) => void}) {
                                 <tr>
                                     <td colSpan={isDeliveredTab ? 11 : isFailedTab ? 12 : 14} className="text-center py-8 text-gray-400">
                                         {isDeliveredTab ? "暂无已交付账号；在「未交付」中点「标记已交付」后会出现在这里"
-                                            : isFailedTab ? "没有失败项。点「标记失败」后会从作业队列挪到这里"
+                                            : isFailedTab ? "没有人工标记失败的号。提交失败仍在「未交付」"
                                             : "队列为空，点击「选择账号入队」添加"}
                                     </td>
                                 </tr>

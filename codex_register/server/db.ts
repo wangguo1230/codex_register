@@ -1327,13 +1327,13 @@ function rechargeQueueDeliveryKind(delivery = "undelivered") {
 function rechargeQueueWhere(kind) {
     if (kind === "all") return "";
     if (kind === "delivered") return `WHERE COALESCE(delivery_status,'undelivered')='delivered'`;
-    if (kind === "error") return `WHERE COALESCE(delivery_status,'undelivered')<>'delivered' AND status='error'`;
-    return `WHERE COALESCE(delivery_status,'undelivered')<>'delivered' AND status<>'error'`;
+    if (kind === "error") return `WHERE COALESCE(delivery_status,'undelivered')='failed'`;
+    return `WHERE COALESCE(delivery_status,'undelivered')='undelivered'`;
 }
 
 /**
  * 充值队列列表。
- * delivery: undelivered（作业中，不含失败）| error（失败页）| delivered（已交付）| all
+ * delivery: undelivered（作业中，含提交失败）| error（仅人工标记失败）| delivered（已交付）| all
  */
 export async function listRechargeQueue(delivery = "undelivered") {
     const kind = rechargeQueueDeliveryKind(delivery);
@@ -1344,16 +1344,16 @@ export async function listRechargeQueue(delivery = "undelivered") {
     const out = { pending: 0, paired: 0, submitting: 0, submitted: 0, done: 0, error: 0, total: 0, undelivered: 0, delivered: 0, failed: 0 };
     const { rows: statsRows } = await query(
         `SELECT status, COUNT(*)::int AS n FROM recharge_queue
-         WHERE COALESCE(delivery_status,'undelivered')<>'delivered' AND status<>'error' GROUP BY status`,
+         WHERE COALESCE(delivery_status,'undelivered')='undelivered' GROUP BY status`,
     );
     for (const r of statsRows) { out[r.status] = r.n; out.total += r.n; }
     out.undelivered = out.total;
     const { rows: [failRow] } = await query(
         `SELECT COUNT(*)::int AS n FROM recharge_queue
-         WHERE COALESCE(delivery_status,'undelivered')<>'delivered' AND status='error'`,
+         WHERE COALESCE(delivery_status,'undelivered')='failed'`,
     );
-    out.error = failRow?.n || 0;
-    out.failed = out.error;
+    out.failed = failRow?.n || 0;
+    out.error = statsRows.find((r) => r.status === "error")?.n || 0;
     const { rows: [delRow] } = await query(
         `SELECT COUNT(*)::int AS n FROM recharge_queue WHERE COALESCE(delivery_status,'undelivered')='delivered'`,
     );
@@ -1434,7 +1434,7 @@ export async function claimRechargeQueueItems(ids, instId = instanceId) {
             `SELECT * FROM recharge_queue
              WHERE id = ANY($1)
                AND status NOT IN ('submitted', 'done', 'error')
-               AND COALESCE(delivery_status,'undelivered')<>'delivered'
+               AND COALESCE(delivery_status,'undelivered')='undelivered'
                AND instance_id = ''
              FOR UPDATE SKIP LOCKED`,
             [idList]
@@ -1451,6 +1451,8 @@ export async function claimRechargeQueueItems(ids, instId = instanceId) {
             instance_id: r.instance_id,
             reason: r.delivery_status === "delivered"
                 ? "已交付"
+                : r.delivery_status === "failed"
+                ? "已人工标记失败"
                 : r.status === "submitted" || r.status === "done" || r.status === "error"
                 ? `状态 ${r.status}`
                 : (r.instance_id ? `实例 ${r.instance_id} 处理中` : "无法认领"),
@@ -1538,6 +1540,7 @@ export async function markRechargeQueueError(ids, reason = "") {
             }
             await client.query(
                 `UPDATE recharge_queue SET status='error', error=$1, instance_id='', card_id=0, card_code=$2,
+                 delivery_status='failed',
                  finished_at=CASE WHEN COALESCE(finished_at,0)>0 THEN finished_at ELSE $3 END WHERE id=$4`,
                 [why, cardCode, now, id],
             );
@@ -1566,7 +1569,9 @@ export async function resetRechargeQueue(ids) {
             const freshAuthFile = acc?.auth_file || item.auth_file;
             const freshAuthData = acc?.auth_data || item.auth_data;
             await client.query(
-                `UPDATE recharge_queue SET status='pending', card_id=0, card_code='', task_no='', task_status='', task_message='', error='', submitted_at=0, finished_at=0, auth_file=$1, auth_data=$2 WHERE id=$3`,
+                `UPDATE recharge_queue SET status='pending', card_id=0, card_code='', task_no='', task_status='', task_message='', error='', submitted_at=0, finished_at=0,
+                 delivery_status=CASE WHEN COALESCE(delivery_status,'undelivered')='failed' THEN 'undelivered' ELSE delivery_status END,
+                 auth_file=$1, auth_data=$2 WHERE id=$3`,
                 [freshAuthFile, freshAuthData ? JSON.stringify(freshAuthData) : null, id]
             );
         }
