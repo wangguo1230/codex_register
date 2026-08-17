@@ -3323,6 +3323,68 @@ function isMailcomMailbox(r) {
     return p === "mailcom" || p === "mail.com" || p === "";
 }
 
+function isLocalProxyHost(raw) {
+    try {
+        const u = new URL(/^[a-z][a-z0-9+.-]*:\/\//i.test(String(raw || "")) ? String(raw).split("#")[0] : `socks5://${raw}`);
+        return u.hostname === "127.0.0.1" || u.hostname === "localhost";
+    } catch { return false; }
+}
+
+/** 充值 Gmail IMAP：租邮箱/GPT 池出口（经跳板），失败再换 2 条；最后才回退 10808/10811。 */
+async function probeGmailImapWithPool(email, imapPassword, log = () => {}) {
+    const pool = mailProxyPool.urls.length ? mailProxyPool : gptProxyPool;
+    const jump = mailProxyPool.urls.length
+        ? (scheduler.mailProxyJump || "")
+        : (scheduler.gptProxyJump || scheduler.mailProxyJump || "");
+    const poolName = mailProxyPool.urls.length ? "邮箱代理池" : "GPT 代理池";
+    const maxExits = pool.urls.length ? 3 : 0;
+    let last = {ok: false, error: "IMAP 失败"};
+    for (let i = 0; i < maxExits; i++) {
+        let lease = null;
+        let wrapped = null;
+        try {
+            lease = await pool.lease(`imap-precheck:${email}`, {
+                fallback: "",
+                maxPerTemplate: 4,
+                freshSession: true,
+                timeoutMs: 8_000,
+            });
+            const exit = String(lease?.url || "").trim();
+            if (!exit) break;
+            let via = exit;
+            if (jump && !isLocalProxyHost(exit)) {
+                try {
+                    const {wrapExitThroughJump} = await import("../src/mail/proxy-chain.js");
+                    wrapped = await wrapExitThroughJump(exit, jump);
+                    via = wrapped.url;
+                    log(`[imap] ${poolName} ${i + 1}/${maxExits} ${maskProxyUrl(exit)} + 跳板 :${wrapped.localPort}`);
+                } catch (e) {
+                    log(`[imap] ${poolName} ${i + 1}/${maxExits} ${maskProxyUrl(exit)} 跳板封装失败，直出 (${String(e?.message || e).slice(0, 60)})`);
+                }
+            } else {
+                log(`[imap] ${poolName} ${i + 1}/${maxExits} ${maskProxyUrl(exit)}`);
+            }
+            last = await testGmailImap(email, imapPassword, {
+                extraProxies: [via], skipDirect: true, includeLocals: false, log,
+            });
+            if (last.ok) return last;
+            if (!isImapTransientError(last.error)
+                && /invalid credentials|AUTHENTICATIONFAILED|应用密码无效|LOGIN failed/i.test(String(last.error || ""))) {
+                return last;
+            }
+        } catch (e) {
+            last = {ok: false, error: String(e?.message || e).slice(0, 160)};
+            log(`[imap] ${poolName} 第 ${i + 1} 条租约失败: ${last.error}`);
+            if (/代理池全忙|等待超时|租约空/i.test(last.error)) break;
+        } finally {
+            try { wrapped?.close(); } catch { /* */ }
+            try { lease?.release(); } catch { /* */ }
+        }
+    }
+    log(`[imap] 代理池未通，回退本机 10808/10811`);
+    return testGmailImap(email, imapPassword, {skipDirect: true, log});
+}
+
 /** 充值提交前预检：Gmail 探 IMAP，mail.com 验邮箱密码。不通的不配卡。 */
 async function precheckRechargeMailbox(q) {
     const acc = await db.getAccount(q.account_id);
@@ -3330,10 +3392,8 @@ async function precheckRechargeMailbox(q) {
     if (isGoogleMailbox(acc)) {
         const imap = String(acc.mailbox_imap || acc.imap_password || "").trim();
         if (!imap) return {ok: false, reason: "Gmail 没有 IMAP 应用密码"};
-        rechargeLog(`预检 ${acc.email}: 探 Gmail IMAP`);
-        const probe = await testGmailImap(acc.email, imap, {
-            log: (m) => rechargeLog(`预检 ${acc.email}: ${m}`),
-        });
+        rechargeLog(`预检 ${acc.email}: 探 Gmail IMAP（先代理池，不通再换出口）`);
+        const probe = await probeGmailImapWithPool(acc.email, imap, (m) => rechargeLog(`预检 ${acc.email}: ${m}`));
         if (!probe.ok) {
             if (isImapTransientError(probe.error)) {
                 return {

@@ -333,7 +333,9 @@ function collectImapFallbackProxies(explicit = "") {
     return out;
 }
 
-export async function testGmailImap(email, imapPassword, {proxy = "", log = (m) => {}} = {}) {
+export async function testGmailImap(email, imapPassword, {
+    proxy = "", extraProxies = [], skipDirect = false, includeLocals = true, log = (m) => {},
+} = {}) {
     let jump = "";
     try {
         const {getMailProxyJump} = await import("./proxy-pool.js");
@@ -342,31 +344,42 @@ export async function testGmailImap(email, imapPassword, {proxy = "", log = (m) 
         jump = String(proxy || "").trim();
     }
 
-    log(`[imap] ${email} 直连探活（瞬断会重试，最多约 3 次）`);
-    const direct = await probeImapWithRetry(email, imapPassword, "", {tries: 3, log, label: "直连"});
-    if (direct.ok) {
-        log(`[imap] 直连通，收件箱 ${direct.messages ?? 0} 封`);
-        return direct;
+    let last = {ok: false, error: "IMAP 失败"};
+    if (!skipDirect) {
+        log(`[imap] ${email} 直连探活（瞬断会重试）`);
+        last = await probeImapWithRetry(email, imapPassword, "", {tries: 2, log, label: "直连"});
+        if (last.ok) {
+            log(`[imap] 直连通，收件箱 ${last.messages ?? 0} 封`);
+            return last;
+        }
+        if (!isImapTransientError(last.error)
+            && /invalid credentials|AUTHENTICATIONFAILED|应用密码无效|LOGIN failed/i.test(String(last.error || ""))) {
+            log(`[imap] 直连认证失败 ${last.error}`);
+            return last;
+        }
     }
 
-    // 认证类错误：别换代理瞎撞
-    if (!isImapTransientError(direct.error)
-        && /invalid credentials|AUTHENTICATIONFAILED|应用密码无效|LOGIN failed/i.test(String(direct.error || ""))) {
-        log(`[imap] 直连认证失败 ${direct.error}`);
-        return direct;
-    }
-
-    const proxies = collectImapFallbackProxies(jump);
-    let last = direct;
+    const extras = [];
+    const push = (u) => {
+        const s = String(u || "").trim();
+        if (s && !extras.includes(s)) extras.push(s);
+    };
+    for (const u of (Array.isArray(extraProxies) ? extraProxies : [])) push(u);
+    const locals = includeLocals ? collectImapFallbackProxies(jump).filter((u) => !extras.includes(u)) : [];
+    const proxies = [...extras, ...locals];
     for (const via of proxies) {
         const mask = via.replace(/\/\/([^/@]+)@/, "//***@");
-        log(`[imap] 上一路失败 ${last.error}，改经 ${mask} 再探`);
+        log(`[imap] ${last.error ? `上一路 ${last.error}，` : ""}改经 ${mask} 再探`);
         const r = await probeImapWithRetry(email, imapPassword, via, {tries: 2, log, label: "代理"});
         if (r.ok) {
             log(`[imap] 经代理通，收件箱 ${r.messages ?? 0} 封`);
             return r;
         }
         last = r;
+        if (!isImapTransientError(r.error)
+            && /invalid credentials|AUTHENTICATIONFAILED|应用密码无效|LOGIN failed/i.test(String(r.error || ""))) {
+            return r;
+        }
     }
     log(`[imap] 全部出口失败 ${last.error}（若是 Unexpected close 多半是线路抖动，不一定是应用密码废）`);
     return last;
