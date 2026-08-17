@@ -2346,13 +2346,13 @@ async function runReloginAtWorker(acc, {proxy, jump = "", timeoutMs = 0, allowBr
 
 /** 可换出口再试：网络抖动 / CF 403 / 429 / TLS 掐断 / fetch failed 等 */
 function isReloginRetryable(reason) {
-    return /429|403|authorize|chatgpt\.com|打开 OpenAI|Proxy connection|timed out|timeout|ECONN|ENOTFOUND|EPIPE|EHOST|network|socket|TLS|fetch failed|disconnected|secure TLS|超时|限流|Cloudflare|Just a moment/i
+    return /429|403|authorize|chatgpt\.com|打开 OpenAI|Proxy connection|timed out|timeout|ECONN|ENOTFOUND|EPIPE|EHOST|network|socket|TLS|fetch failed|disconnected|secure TLS|超时|限流|Cloudflare|Just a moment|rate_limit|请求过多|身份验证错误|too many requests/i
         .test(String(reason || ""));
 }
 
 /** authorize 出口被限流时才值得换 kookeey 池（换 IP）；纯网络/TLS/403 优先本地 10808 */
 function isAuthorizeRateLimited(reason) {
-    return /429|authorize 页|打开 OpenAI authorize|Retry-After|限流/i.test(String(reason || ""));
+    return /429|authorize 页|打开 OpenAI authorize|Retry-After|限流|rate_limit|请求过多|身份验证错误|too many requests/i.test(String(reason || ""));
 }
 
 /**
@@ -2360,6 +2360,7 @@ function isAuthorizeRateLimited(reason) {
  * ① 充值代理 10808（rtProxy）
  * ② GPT 代理池 + 跳板（网络超时/429 多换几次出口）
  * ③ 无账密代理浏览器回退
+ * preferPool：充值重登不要先挤 10808（同一出口会 rate_limit_exceeded）
  */
 async function runReloginAtWorkerPooled(acc, {
     proxy,
@@ -2369,6 +2370,7 @@ async function runReloginAtWorkerPooled(acc, {
     skipMfa = false,
     onProgress,
     usePool = true,
+    preferPool = false,
 } = {}) {
     const note = (m) => {
         // onProgress 通常已带 [at] 前缀落库；无回调时自己写
@@ -2393,9 +2395,11 @@ async function runReloginAtWorkerPooled(acc, {
     }
 
     let last = {ok: false, reason: "未尝试"};
-    // ① 充值代理 10808
     const localProxy = rechargeProxy();
-    if (localProxy) {
+    // ① 充值代理 10808（充值批量重登跳过：同一出口会身份验证限流）
+    if (preferPool) {
+        note("① 跳过 10808，充值重登直接 GPT 池换出口");
+    } else if (localProxy) {
         note(`① 协议重登走充值代理 ${maskProxyUrl(localProxy)}`);
         last = await runReloginAtWorker(acc, {
             proxy: localProxy,
@@ -4320,9 +4324,11 @@ app.post("/api/recharge/queue/relogin", async (req, res) => {
             if (queueReloginStop) { rechargeLog(`[重登] 已停止`); break; }
             const acc = await db.getAccount(q.account_id);
             if (!acc) { fail++; rechargeLog(`[重登] [${idx + 1}/${items.length}] ${q.email}: ❌ 账号不存在`); continue; }
-            rechargeLog(`[重登] [${idx + 1}/${items.length}] ${q.email}: 协议重登（GPT 代理池）…`);
+            rechargeLog(`[重登] [${idx + 1}/${items.length}] ${q.email}: 协议重登（GPT 池换出口，不挤 10808）…`);
             try {
                 const re = await runReloginAtWorkerPooled(acc, {
+                    preferPool: true,
+                    allowBrowser: false,
                     onProgress: (m) => rechargeLog(`[重登] ${q.email}: ${String(m || "").slice(0, 140)}`),
                 });
                 if (re.ok && re.authFile) {
@@ -4389,9 +4395,11 @@ app.post("/api/recharge/queue/relogin-submit", async (req, res) => {
             // ① 浏览器重登刷新 session
             const acc = await db.getAccount(q0.account_id);
             if (!acc) { fail++; rechargeLog(`${tag}${q0.email}: ❌ 账号不存在`); continue; }
-            rechargeLog(`${tag}${q0.email}: 协议重登（GPT 代理池）…`);
+            rechargeLog(`${tag}${q0.email}: 协议重登（GPT 池换出口，不挤 10808）…`);
             try {
                 const re = await runReloginAtWorkerPooled(acc, {
+                    preferPool: true,
+                    allowBrowser: false,
                     onProgress: (m) => rechargeLog(`${tag}${q0.email}: ${String(m || "").slice(0, 140)}`),
                 });
                 if (!re.ok || !re.authFile) { fail++; rechargeLog(`${tag}${q0.email}: ❌ 登录失败: ${(re as any).reason || "未知"}`); continue; }
