@@ -280,10 +280,12 @@ export function RechargePanel({notify}: {notify?: (m: string) => void}) {
     const doRemoveFromQueue = async () => {
         const ids = selQIds();
         if (!ids.length) return;
-        if (!confirm(`确认将 ${ids.length} 个账号标记为已交付？\n会从「未交付」队列移出，可在「已交付」查看换绑记录；不会删除 GPT 账号或邮箱。`)) return;
+        if (!confirm(`确认将选中项里「已充上」的号标记为已交付？\n失败 / 退回 / 待提交的不会搬走。`)) return;
         try {
             const r = await api.deliverRechargeQueue(ids);
-            setQSel(new Set()); loadQueue(); toast(`已交付 ${r.count ?? ids.length} 个`);
+            setQSel(new Set()); loadQueue();
+            const skip = r.skipped ? `，跳过 ${r.skipped} 个未成功` : "";
+            toast(r.count ? `已交付 ${r.count} 个${skip}` : (r.skipped ? "所选都还没充上，没有搬走" : "没有可交付的"));
         } catch (e: any) { toast("标记已交付失败: " + e.message); }
     };
 

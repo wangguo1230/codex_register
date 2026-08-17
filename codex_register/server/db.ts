@@ -1348,21 +1348,29 @@ export async function removeFromRechargeQueue(ids) {
     return deliverRechargeQueue(ids);
 }
 
-/** 标记为已交付 */
+/** 标记为已交付。只收已充上的（status=done / paid），失败/退回/待提交一律不搬。 */
 export async function deliverRechargeQueue(ids) {
     const list = [...new Set((ids || []).map(Number).filter(Number.isInteger))];
-    if (!list.length) return { count: 0 };
+    if (!list.length) return { count: 0, skipped: 0 };
     const now = Date.now();
+    const { rows: skipRows } = await query(
+        `SELECT COUNT(*)::int AS n FROM recharge_queue
+         WHERE id = ANY($1)
+           AND COALESCE(delivery_status,'undelivered')<>'delivered'
+           AND NOT (status='done' OR task_status='paid')`,
+        [list],
+    );
     const { rowCount } = await query(
         `UPDATE recharge_queue
          SET delivery_status='delivered',
              delivered_at=CASE WHEN COALESCE(delivered_at,0)>0 THEN delivered_at ELSE $1 END,
              instance_id=''
          WHERE id = ANY($2)
-           AND COALESCE(delivery_status,'undelivered')<>'delivered'`,
+           AND COALESCE(delivery_status,'undelivered')<>'delivered'
+           AND (status='done' OR task_status='paid')`,
         [now, list],
     );
-    return { count: rowCount || 0 };
+    return { count: rowCount || 0, skipped: Number(skipRows[0]?.n || 0) };
 }
 
 /** 已交付 → 退回未交付（误点恢复） */

@@ -542,7 +542,7 @@ export const api = {
     removeFromRechargeQueue: (ids: number[]) =>
         j<{ok: boolean; count: number}>("/api/recharge/queue/remove", {method: "POST", body: JSON.stringify({ids})}),
     deliverRechargeQueue: (ids: number[]) =>
-        j<{ok: boolean; count: number}>("/api/recharge/queue/deliver", {method: "POST", body: JSON.stringify({ids})}),
+        j<{ok: boolean; count: number; skipped?: number}>("/api/recharge/queue/deliver", {method: "POST", body: JSON.stringify({ids})}),
     /** 已交付 → 退回未交付（误点恢复） */
     undeliverRechargeQueue: (ids: number[]) =>
         j<{ok: boolean; count: number}>("/api/recharge/queue/undeliver", {method: "POST", body: JSON.stringify({ids})}),
