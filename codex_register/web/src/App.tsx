@@ -1220,7 +1220,7 @@ export default function App() {
                             </label>
                             <label className="flex items-center gap-2"><span className="w-14 text-gray-400 shrink-0">格式</span>
                                 <select value={exportFormat} onChange={(e) => setExportFormat(e.target.value as any)} className="flex-1 px-2 py-1.5 border rounded">
-                                    <option value="full">账号(Gmail:邮箱----密码----2FA----IMAP[----GPT密码----GPT2FA----rt])</option>
+                                    <option value="full">账号(Gmail:邮箱----密码----2FA[----GPT密码----GPT2FA----rt])</option>
                                     <option value="at">账号+AT(邮箱--邮箱密码--accessToken)</option>
                                     <option value="session">session(邮箱--邮箱密码--session json)</option>
                                     <option value="jsonl">JSONL(含 IMAP/accessToken/rt)</option>

@@ -3307,7 +3307,7 @@ function runRtWorkerStandalone(email, mailPassword, gptPassword, onProgress): Pr
 //   可导:success 且未失效;另外「有 GPT 密码的谷歌邮箱」全部导出(不要求 success/未失效)。
 //   scope=all|hasRt|atOnly 再按 rt 细分。
 //   格式 format:
-//     full   : Gmail=邮箱----邮箱密码----谷歌2FA----IMAP[----GPT密码----GPT2FA----rt]
+//     full   : Gmail=邮箱----邮箱密码----谷歌2FA[----GPT密码----GPT2FA----rt]
 //              其它=邮箱----邮箱密码----IMAP[----GPT密码----GPT2FA----rt]
 //     at     : 邮箱----邮箱密码----accessToken(从 auth_file 解析)
 //     session: 邮箱----邮箱密码----session json(可恢复登录态)
@@ -3589,7 +3589,7 @@ function exportableAccount(r) {
     if (isGoogleMailbox(r) && String(r?.gpt_password || "").trim()) return true;
     return r?.status === "success" && !r?.dead_at;
 }
-// Gmail: 邮箱----邮箱密码----谷歌2FA----IMAP[----GPT密码----GPT2FA----rt]
+// Gmail: 邮箱----邮箱密码----谷歌2FA[----GPT密码----GPT2FA----rt]（不再带 IMAP）
 // 其它: 邮箱----邮箱密码----IMAP[----GPT密码----GPT2FA----rt]（无 IMAP 时该段为空）
 function formatAccountExportLine(r, {rt = "", sep = "----", withRt = false, withGpt = false} = {}) {
     const email = r.email || "";
@@ -3598,7 +3598,7 @@ function formatAccountExportLine(r, {rt = "", sep = "----", withRt = false, with
     const imap = String(r.mailbox_imap || r.imap_password || r.imap || "").trim();
     const gptPw = String(r.gpt_password || "").trim();
     const gpt2fa = String(r.totp_secret || r.gpt2fa || "").trim();
-    const parts = isGoogleMailbox(r) ? [email, mailPw, mail2fa, imap] : [email, mailPw, imap];
+    const parts = isGoogleMailbox(r) ? [email, mailPw, mail2fa] : [email, mailPw, imap];
     // 充值导出固定带 GPT 密码/2FA；其它导出有值才补尾部
     if (gptPw || gpt2fa || rt || withRt || withGpt) {
         parts.push(gptPw, gpt2fa);

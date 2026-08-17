@@ -608,7 +608,8 @@ export function RechargePanel({notify}: {notify?: (m: string) => void}) {
             const email = p[0];
             const rt = p[p.length - 1];
             // 3 段: email----pw----rt
-            // 含 IMAP 的 full: email----mailPw----2fa----imap----gptPw----gpt2fa----rt（≥5 时 GPT 密码=倒数第 3）
+            // Gmail 新: email----mailPw----2fa----gptPw----gpt2fa----rt
+            // 旧含 IMAP: email----mailPw----2fa----imap----gptPw----gpt2fa----rt（≥5 时 GPT 密码=倒数第 3）
             const password = p.length >= 5 ? p[p.length - 3] : p[1];
             if (email && rt) return {email, password: password || "", rt};
         }
@@ -1473,7 +1474,7 @@ export function RechargePanel({notify}: {notify?: (m: string) => void}) {
                         </div>
                         <div className="px-5 py-4 space-y-3 text-sm overflow-auto">
                             <div className="text-xs text-gray-500 space-y-1">
-                                <div>每行 <span className="font-mono">邮箱----密码----refresh_token</span>；Gmail 全字段（含 IMAP）粘贴时末段为 RT、GPT 密码取倒数第 3 段。</div>
+                                <div>每行 <span className="font-mono">邮箱----密码----refresh_token</span>；Gmail 全字段粘贴时末段为 RT、GPT 密码取倒数第 3 段。</div>
                                 <div>也可点「从勾选填充」：用队列里的 <span className="font-mono">gpt_password</span>（Gmail）或邮箱密码 + 已存 RT。</div>
                             </div>
                             <div className="flex flex-wrap items-center gap-2">
