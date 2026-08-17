@@ -183,7 +183,7 @@ export function RechargePanel({notify}: {notify?: (m: string) => void}) {
     const filteredQueue = useMemo(() => {
         return queue.filter((q) => {
             if (qFilter === "undone") { if (q.status === "done" || q.status === "error") return false; }
-            else if (qFilter === "finished") { if (q.status !== "done" && q.status !== "error") return false; }
+            else if (qFilter === "finished" || qFilter === "done") { if (q.status !== "done") return false; }
             else if (qFilter !== "all" && q.status !== qFilter) return false;
             if (qBatchFilter && (q.batch || "") !== qBatchFilter) return false;
             return true;
@@ -864,9 +864,10 @@ export function RechargePanel({notify}: {notify?: (m: string) => void}) {
                     {/* 筛选：已交付主要看批次；未交付看作业状态 */}
                     <div className="flex items-center gap-1 text-xs">
                         {!isDeliveredTab && [{k: "all", l: "全部", n: qStats.total}, {k: "undone", l: "未完成", n: qStats.pending + qStats.submitted},
-                          {k: "finished", l: "已完成", n: qStats.done + qStats.error},
                           {k: "pending", l: "待提交", n: qStats.pending},
-                          {k: "submitted", l: "已提交", n: qStats.submitted}, {k: "done", l: "完成", n: qStats.done}, {k: "error", l: "失败", n: qStats.error}]
+                          {k: "submitted", l: "已提交", n: qStats.submitted},
+                          {k: "done", l: "完成", n: qStats.done},
+                          {k: "error", l: "失败", n: qStats.error}]
                           .map(({k, l, n}) => (
                             <button key={k} onClick={() => setQFilter(k)}
                                     className={`px-2 py-0.5 rounded border text-xs ${qFilter === k ? "bg-gray-800 text-white border-gray-800" : "bg-gray-50 text-gray-600 border-gray-200 hover:bg-gray-100"}`}>
