@@ -784,12 +784,16 @@ async function loginMailcom(email, password, opts = {}) {
             }
         }
         if (session.bearer) {
-            console.log(`[mailcom] 打开 3c 收件箱`);
-            if (!/3c\.mail\.com|webmailer/i.test(page.url())) {
-                await page.goto("https://3c.mail.com/", {waitUntil: "domcontentloaded", timeout: 45000}).catch(() => {});
+            if (opts.skipInbox) {
+                console.log(`[mailcom] 验密已拿到 mailbox 票，跳过 3c 收件箱`);
+            } else {
+                console.log(`[mailcom] 打开 3c 收件箱`);
+                if (!/3c\.mail\.com|webmailer/i.test(page.url())) {
+                    await page.goto("https://3c.mail.com/", {waitUntil: "domcontentloaded", timeout: 20000}).catch(() => {});
+                }
+                await page.waitForTimeout(800);
+                await dismissPopups(page);
             }
-            await page.waitForTimeout(1500);
-            await dismissPopups(page);
         }
         if (!session.bearer) {
             let reason = "登录后未拿到 mail_mailbox 票(会话未完成或只截到 LPS 票)";
@@ -989,6 +993,7 @@ export async function verifyMailcomLogin(email, password, log = (m) => {}, opts 
             session = await loginMailcom(key, password, {
                 headless: opts.headless ?? true,
                 proxy: opts.proxy,
+                skipInbox: true,
             });
             log(`${key} 登录成功(密码正确)`);
             return {ok: true};
@@ -1001,7 +1006,13 @@ export async function verifyMailcomLogin(email, password, log = (m) => {}, opts 
             log(`${key} 验密失败: ${last.reason.slice(0, 100)}${retryable && i + 1 < tries ? "（将重试）" : ""}`);
             if (!retryable) return last;
         } finally {
-            if (session) { try { await session.browser.close(); } catch { /* ignore */ } }
+            if (session?.browser) {
+                await Promise.race([
+                    session.browser.close().catch(() => {}),
+                    new Promise((r) => setTimeout(r, 4000)),
+                ]);
+                try { session.browser.process()?.kill("SIGKILL"); } catch { /* */ }
+            }
         }
     }
     return last;

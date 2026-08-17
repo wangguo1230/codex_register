@@ -3415,12 +3415,15 @@ async function precheckRechargeMailbox(q) {
         // 不要用 mail 代理池(kookeey 带 user:pass，Playwright Chrome 不支持 socks5 鉴权)。
         const proxy = rechargeProxy();
         rechargeLog(`预检 ${acc.email}: 验 mail.com 密码（代理=${proxy ? maskProxyUrl(proxy) : "直连"}）`);
-        const v = await verifyMailcomLogin(
-            acc.email,
-            pw,
-            (m) => rechargeLog(`预检 ${acc.email}: ${m}`),
-            {proxy, tries: 2, headless: true},
-        );
+        const v = await Promise.race([
+            verifyMailcomLogin(
+                acc.email,
+                pw,
+                (m) => rechargeLog(`预检 ${acc.email}: ${m}`),
+                {proxy, tries: 2, headless: true},
+            ),
+            new Promise((resolve) => setTimeout(() => resolve({ok: false, reason: "验密超时(50s)"}), 50_000)),
+        ]);
         if (!v.ok) return {ok: false, reason: `mail.com 密码不可用 (${String(v.reason || "登录失败").slice(0, 100)})`};
         rechargeLog(`预检 ${acc.email}: mail.com 密码可用`);
         return {ok: true};
