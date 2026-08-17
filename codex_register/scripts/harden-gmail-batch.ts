@@ -77,7 +77,13 @@ async function persist(mb, r) {
         await db.query(`UPDATE mailboxes SET pw_status=$1 WHERE id=$2`, [r.ok ? `✅整备 ${stamp()}` : `⚠整备部分 ${stamp()}`, mb.id]);
     }
     if (r.totpSecret) {
-        await db.query(`UPDATE mailboxes SET totp_secret=$1 WHERE id=$2`, [r.totpSecret, mb.id]);
+        await db.query(
+            `UPDATE mailboxes SET
+                totp_secret_orig=CASE WHEN COALESCE(totp_secret_orig,'')<>'' THEN totp_secret_orig WHEN COALESCE(totp_secret,'')<>'' AND totp_secret IS DISTINCT FROM $1 THEN totp_secret ELSE totp_secret_orig END,
+                totp_secret=$1
+             WHERE id=$2`,
+            [r.totpSecret, mb.id],
+        );
         mb.totp_secret = r.totpSecret;
     }
     if (r.imapPassword) await db.query(`UPDATE mailboxes SET imap_password=$1 WHERE id=$2`, [r.imapPassword, mb.id]);
@@ -109,8 +115,12 @@ async function runOne(mb, proxyUrl, idx, total) {
     const log = (m) => console.log(`[${idx}/${total} ${short}] ${m}`);
     const straight = straightenGoogleCreds({totpSecret: mb.totp_secret, recoveryEmail: mb.recovery_email});
     if (straight.swapped) {
-        await db.query(`UPDATE mailboxes SET totp_secret=$1, recovery_email=$2 WHERE id=$3`,
-            [straight.totpSecret, straight.recoveryEmail, mb.id]);
+        await db.query(
+            `UPDATE mailboxes SET totp_secret=$1, recovery_email=$2,
+                totp_secret_orig=CASE WHEN COALESCE(totp_secret_orig,'')<>'' THEN totp_secret_orig ELSE $1 END
+             WHERE id=$3`,
+            [straight.totpSecret, straight.recoveryEmail, mb.id],
+        );
         mb.totp_secret = straight.totpSecret;
         mb.recovery_email = straight.recoveryEmail;
         log("导入字段对调已写回库");
@@ -133,7 +143,13 @@ async function runOne(mb, proxyUrl, idx, total) {
             log(`[落库] 新密码已写入 ${patch.password}`);
         }
         if (patch.totpSecret) {
-            await db.query(`UPDATE mailboxes SET totp_secret=$1 WHERE id=$2`, [patch.totpSecret, mb.id]);
+            await db.query(
+                `UPDATE mailboxes SET
+                    totp_secret_orig=CASE WHEN COALESCE(totp_secret_orig,'')<>'' THEN totp_secret_orig WHEN COALESCE(totp_secret,'')<>'' AND totp_secret IS DISTINCT FROM $1 THEN totp_secret ELSE totp_secret_orig END,
+                    totp_secret=$1
+                 WHERE id=$2`,
+                [patch.totpSecret, mb.id],
+            );
             mb.totp_secret = patch.totpSecret;
             acc.totpSecret = patch.totpSecret;
             acc.totp_secret = patch.totpSecret;

@@ -99,9 +99,13 @@ export function MailboxDetail({mailbox, onClose}: {mailbox: Mailbox; onClose: ()
                         {mailbox.password || "—"}
                         {mailbox.password && <button onClick={copyPw} className="text-indigo-600 hover:underline shrink-0">{copied ? "✓ 已复制" : "复制"}</button>}
                     </span>
-                    {mailbox.provider === "google" || mailbox.totp_secret ? <>
+                    {mailbox.provider === "google" || mailbox.totp_secret || mailbox.totp_secret_orig ? <>
                         <span className="text-gray-400">Google 2FA</span>
                         <span className="font-mono text-gray-800 break-all">{mailbox.totp_secret || "—"}</span>
+                        {mailbox.totp_secret_orig && mailbox.totp_secret_orig !== mailbox.totp_secret ? <>
+                            <span className="text-gray-400">导入时 2FA</span>
+                            <span className="font-mono text-gray-800 break-all" title="卖家密钥，换 2FA 后仍保留">{mailbox.totp_secret_orig}</span>
+                        </> : null}
                         <span className="text-gray-400">辅助邮箱</span>
                         <span className="font-mono text-gray-800 break-all">{mailbox.recovery_email || "已删除"}</span>
                         <span className="text-gray-400">IMAP</span>

@@ -43,7 +43,7 @@ const CLAUDE_COLS_LIST = `c.id, c.mailbox_id, c.status, c.session_key, c.org_id,
            m.email, m.password, m.provider, m.pw_status, m.grp`;
 const CLAUDE_COLS_FULL = `${CLAUDE_COLS_LIST}, c.auth_data`;
 
-const MAILBOX_FIELDS = ["email", "password", "pw_status", "recovery_email", "totp_secret", "imap_password"];
+const MAILBOX_FIELDS = ["email", "password", "pw_status", "recovery_email", "totp_secret", "totp_secret_orig", "imap_password"];
 const GPT_FIELDS = ["status", "plan", "phone", "card", "at_status", "rt_status", "chat_status", "error", "dead_at", "sold_at", "finished_at", "batch", "auth_file", "token", "rt_file", "engine", "auth_data", "rt_data", "gpt_password", "totp_secret", "mfa_status"];
 
 // 启动初始化：重置中断状态（原 SQLite 版在模块加载时同步执行）
@@ -90,10 +90,11 @@ export async function importAccounts(rows, batch = "", provider = "mailcom") {
             const email = r.email.toLowerCase();
             const {straightenImportRow} = await import("../src/mfa.js");
             const row = straightenImportRow(r);
+            const totp = row.totp_secret || "";
             const { rows: ins } = await client.query(
-                `INSERT INTO mailboxes(email,password,provider,usage,grp,created_at,recovery_email,totp_secret)
-                 VALUES($1,$2,$3,'gpt',$4,$5,$6,$7) ON CONFLICT(email) DO NOTHING RETURNING id`,
-                [email, r.password, prov, grp, now, row.recovery_email || "", row.totp_secret || ""]
+                `INSERT INTO mailboxes(email,password,provider,usage,grp,created_at,recovery_email,totp_secret,totp_secret_orig)
+                 VALUES($1,$2,$3,'gpt',$4,$5,$6,$7,$7) ON CONFLICT(email) DO NOTHING RETURNING id`,
+                [email, r.password, prov, grp, now, row.recovery_email || "", totp]
             );
             if (!ins.length) continue;
             await insertOrReviveGpt(client, ins[0].id, grp, now);
@@ -388,7 +389,7 @@ async function insertOrReviveGpt(client, mailboxId, batch, now) {
 // 详情/改密/整备仍走 getMailbox 全量行。
 const MAILBOX_LIST_COLS = `
     id, email, password, provider, usage, grp, pw_status, google_stage,
-    totp_secret, imap_password, recovery_email, sold_at, deleted_at, created_at, note,
+    totp_secret, totp_secret_orig, imap_password, recovery_email, sold_at, deleted_at, created_at, note,
     CASE
       WHEN google_state IS NULL OR google_state = '{}'::jsonb THEN NULL
       ELSE jsonb_build_object(
@@ -498,17 +499,20 @@ export async function importFreeMailboxes(rows, grp = "", usage = "free", provid
             const email = r.email.toLowerCase();
             const {straightenImportRow} = await import("../src/mfa.js");
             const row = straightenImportRow(r);
+            const totp = row.totp_secret || "";
             const { rows: ins } = await client.query(
-                `INSERT INTO mailboxes(email,password,provider,usage,grp,created_at,recovery_email,totp_secret)
-                 VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT(email) DO NOTHING RETURNING id`,
-                [email, r.password, prov, u, g, now, row.recovery_email || "", row.totp_secret || ""]
+                `INSERT INTO mailboxes(email,password,provider,usage,grp,created_at,recovery_email,totp_secret,totp_secret_orig)
+                 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$8) ON CONFLICT(email) DO NOTHING RETURNING id`,
+                [email, r.password, prov, u, g, now, row.recovery_email || "", totp]
             );
             if (ins[0]?.id) {
                 ids.push(ins[0].id);
             } else {
                 const { rows: upd } = await client.query(
-                    `UPDATE mailboxes SET deleted_at=0, usage=$1, password=$2, provider=$3, grp=$4, recovery_email=$5, totp_secret=$6 WHERE email=$7 AND deleted_at>0 RETURNING id`,
-                    [u, r.password, prov, g, row.recovery_email || "", row.totp_secret || "", email]
+                    `UPDATE mailboxes SET deleted_at=0, usage=$1, password=$2, provider=$3, grp=$4, recovery_email=$5, totp_secret=$6,
+                        totp_secret_orig=CASE WHEN COALESCE(totp_secret_orig,'')<>'' THEN totp_secret_orig WHEN COALESCE(totp_secret,'')<>'' THEN totp_secret ELSE $6 END
+                     WHERE email=$7 AND deleted_at>0 RETURNING id`,
+                    [u, r.password, prov, g, row.recovery_email || "", totp, email]
                 );
                 if (upd[0]?.id) ids.push(upd[0].id);
             }
@@ -1012,7 +1016,18 @@ export async function setMailboxProxy(id, url, ip = "") {
 }
 
 export async function setMailboxTotp(id, totpSecret) {
-    await query(`UPDATE mailboxes SET totp_secret=$1 WHERE id=$2`, [totpSecret || "", id]);
+    const next = String(totpSecret || "");
+    await query(
+        `UPDATE mailboxes SET
+            totp_secret_orig=CASE
+              WHEN COALESCE(totp_secret_orig,'')<>'' THEN totp_secret_orig
+              WHEN COALESCE(totp_secret,'')<>'' AND totp_secret IS DISTINCT FROM $1 THEN totp_secret
+              ELSE totp_secret_orig
+            END,
+            totp_secret=$1
+         WHERE id=$2`,
+        [next, id],
+    );
     await refreshMailboxGoogleState(id).catch(() => {});
 }
 
@@ -1027,7 +1042,12 @@ export async function applyMailboxUpdate(email, patch = {}) {
     const sets = [];
     const vals = [];
     if (patch.password != null) { sets.push(`password=$${sets.length + 1}`); vals.push(patch.password); }
-    if (patch.totp_secret != null) { sets.push(`totp_secret=$${sets.length + 1}`); vals.push(patch.totp_secret); }
+    if (patch.totp_secret != null) {
+        const p = sets.length + 1;
+        sets.push(`totp_secret_orig=CASE WHEN COALESCE(totp_secret_orig,'')<>'' THEN totp_secret_orig WHEN COALESCE(totp_secret,'')<>'' AND totp_secret IS DISTINCT FROM $${p} THEN totp_secret ELSE totp_secret_orig END`);
+        sets.push(`totp_secret=$${p}`);
+        vals.push(patch.totp_secret);
+    }
     if (patch.imap_password != null) { sets.push(`imap_password=$${sets.length + 1}`); vals.push(patch.imap_password); }
     if (patch.recovery_email != null) { sets.push(`recovery_email=$${sets.length + 1}`); vals.push(patch.recovery_email); }
     if (sets.length) {

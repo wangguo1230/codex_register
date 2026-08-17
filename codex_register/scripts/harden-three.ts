@@ -40,7 +40,15 @@ async function persist(mb, r) {
     } else {
         await pool.query(`UPDATE mailboxes SET pw_status=$1 WHERE id=$2`, [r.ok ? `✅整备 ${stamp()}` : `⚠整备部分 ${stamp()}`, mb.id]);
     }
-    if (r.totpSecret) await pool.query(`UPDATE mailboxes SET totp_secret=$1 WHERE id=$2`, [r.totpSecret, mb.id]);
+    if (r.totpSecret) {
+        await pool.query(
+            `UPDATE mailboxes SET
+                totp_secret_orig=CASE WHEN COALESCE(totp_secret_orig,'')<>'' THEN totp_secret_orig WHEN COALESCE(totp_secret,'')<>'' AND totp_secret IS DISTINCT FROM $1 THEN totp_secret ELSE totp_secret_orig END,
+                totp_secret=$1
+             WHERE id=$2`,
+            [r.totpSecret, mb.id],
+        );
+    }
     if (r.imapPassword) await pool.query(`UPDATE mailboxes SET imap_password=$1 WHERE id=$2`, [r.imapPassword, mb.id]);
     if (r.recoveryCleared) await pool.query(`UPDATE mailboxes SET recovery_email='' WHERE id=$1`, [mb.id]);
     const {rows: [fresh]} = await pool.query(`SELECT * FROM mailboxes WHERE id=$1`, [mb.id]);

@@ -36,15 +36,16 @@ for (const line of lines) {
     if (exist) {
         await pool.query(
             `UPDATE mailboxes SET deleted_at=0, usage=CASE WHEN usage='deleted' THEN 'hold' ELSE usage END,
-             password=$1, provider='google', grp=$2, recovery_email=$3, totp_secret=$4, note=$5
+             password=$1, provider='google', grp=$2, recovery_email=$3, totp_secret=$4, note=$5,
+             totp_secret_orig=CASE WHEN COALESCE(totp_secret_orig,'')<>'' THEN totp_secret_orig WHEN COALESCE(totp_secret,'')<>'' THEN totp_secret ELSE $4 END
              WHERE id=$6`,
             [password, grp, recovery, totp, note, exist.id],
         );
         updated += 1;
     } else {
         const {rows: [ins]} = await pool.query(
-            `INSERT INTO mailboxes(email,password,provider,usage,grp,note,created_at,recovery_email,totp_secret)
-             VALUES($1,$2,'google','hold',$3,$4,$5,$6,$7) RETURNING id`,
+            `INSERT INTO mailboxes(email,password,provider,usage,grp,note,created_at,recovery_email,totp_secret,totp_secret_orig)
+             VALUES($1,$2,'google','hold',$3,$4,$5,$6,$7,$7) RETURNING id`,
             [email, password, grp, note, now, recovery, totp],
         );
         id = ins.id;

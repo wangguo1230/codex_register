@@ -206,7 +206,16 @@ export async function ensureSchema() {
         // Gmail 老号:辅助邮箱 + Google 自身 TOTP(收 ChatGPT 码/改密/换 2FA 用)
         await client.query(`ALTER TABLE mailboxes ADD COLUMN IF NOT EXISTS recovery_email TEXT DEFAULT ''`);
         await client.query(`ALTER TABLE mailboxes ADD COLUMN IF NOT EXISTS totp_secret TEXT DEFAULT ''`);
+        // 导入时的卖家 2FA：换密钥只改 totp_secret，这份永远不覆盖
+        await client.query(`ALTER TABLE mailboxes ADD COLUMN IF NOT EXISTS totp_secret_orig TEXT DEFAULT ''`);
         await client.query(`ALTER TABLE mailboxes ADD COLUMN IF NOT EXISTS imap_password TEXT DEFAULT ''`);
+        await client.query(`
+            UPDATE mailboxes
+            SET totp_secret_orig = totp_secret
+            WHERE COALESCE(totp_secret_orig,'')=''
+              AND COALESCE(totp_secret,'')<>''
+              AND COALESCE(google_state->>'totp_rotated','') <> 'true'
+        `);
         await client.query(`ALTER TABLE mailboxes ADD COLUMN IF NOT EXISTS google_state JSONB DEFAULT '{}'::jsonb`);
         await client.query(`ALTER TABLE mailboxes ADD COLUMN IF NOT EXISTS google_stage TEXT DEFAULT ''`);
         await client.query(`ALTER TABLE mailboxes ADD COLUMN IF NOT EXISTS sold_at BIGINT DEFAULT 0`);

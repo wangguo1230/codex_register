@@ -44,6 +44,7 @@ export interface Mailbox {
     note?: string;
     recovery_email?: string;
     totp_secret?: string;
+    totp_secret_orig?: string;
     imap_password?: string;
     deleted_at?: number;
     sold_at?: number;
