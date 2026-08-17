@@ -964,7 +964,15 @@ export function RechargePanel({notify}: {notify?: (m: string) => void}) {
                                             {q.status === "done" && " ✓"}
                                         </span>
                                     </td>
-                                    <td className="px-2 py-1.5 font-mono text-gray-500">{q.card_code ? (q.card_code.length > 16 ? q.card_code.slice(0, 8) + "…" : q.card_code) : "—"}</td>
+                                    <td className="px-2 py-1.5 font-mono text-gray-800 whitespace-nowrap select-all" title={q.card_code ? "点击复制完整卡密" : ""}
+                                        onClick={(e) => {
+                                            if (!q.card_code) return;
+                                            e.stopPropagation();
+                                            navigator.clipboard?.writeText(q.card_code);
+                                            toast("卡密已复制");
+                                        }}>
+                                        {q.card_code || <span className="text-gray-300">—</span>}
+                                    </td>
                                     <td className="px-2 py-1.5 text-gray-500 text-xs whitespace-nowrap">{fmtTime(q.submitted_at)}</td>
                                     <td className="px-2 py-1.5 text-gray-500 text-xs whitespace-nowrap">{fmtTime(q.finished_at)}</td>
                                     {isDeliveredTab && (
@@ -1062,7 +1070,12 @@ export function RechargePanel({notify}: {notify?: (m: string) => void}) {
                             {cards.map((c) => (
                                 <tr key={c.id} className="border-t hover:bg-gray-50 cursor-pointer" onClick={() => toggleCSel(c.id)}>
                                     <td className="px-2 py-1.5 text-center" onClick={(e) => e.stopPropagation()}><input type="checkbox" checked={cSel.has(c.id)} onChange={() => toggleCSel(c.id)}/></td>
-                                    <td className="px-2 py-1.5 font-mono text-gray-700">{c.code.length > 20 ? c.code.slice(0, 8) + "…" + c.code.slice(-4) : c.code}</td>
+                                    <td className="px-2 py-1.5 font-mono text-gray-800 whitespace-nowrap select-all" title="点击复制完整卡密"
+                                        onClick={(e) => {
+                                            e.stopPropagation();
+                                            navigator.clipboard?.writeText(c.code);
+                                            toast("卡密已复制");
+                                        }}>{c.code}</td>
                                     <td className="px-2 py-1.5 text-gray-500">{c.plan_name || c.plan_type || "—"}</td>
                                     <td className="px-2 py-1.5"><span style={{color: Q_COLOR[c.status] || "#6b7280"}} className="text-xs">{c.status === "unused" ? "未使用" : c.status}</span></td>
                                     <td className="px-2 py-1.5 text-gray-500">{c.account_email || "—"}</td>

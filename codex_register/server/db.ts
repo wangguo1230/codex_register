@@ -1509,7 +1509,7 @@ export async function markRechargeQueueError(ids, reason = "") {
             if (!item) { skipped++; continue; }
             if (item.status === "done" || item.task_status === "paid") { skipped++; continue; }
             let cardId = item.card_id || 0;
-            let cardCode = item.card_code || "";
+            const cardCode = String(item.card_code || "").trim();
             if (item.card_id && !item.task_no) {
                 const { rows: [card] } = await client.query(`SELECT * FROM recharge_cards WHERE id=$1`, [item.card_id]);
                 if (card && (card.status === "paired" || card.status === "submitting")) {
@@ -1519,7 +1519,6 @@ export async function markRechargeQueueError(ids, reason = "") {
                     );
                     reclaimed++;
                     cardId = 0;
-                    cardCode = "";
                 }
             }
             await client.query(
