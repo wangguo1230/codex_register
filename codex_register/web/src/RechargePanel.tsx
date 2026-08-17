@@ -222,6 +222,8 @@ export function RechargePanel({notify}: {notify?: (m: string) => void}) {
         atNone: {group: "AT", label: "未测at", pred: (a) => !a.at_status},
         pwOk: {group: "改密", label: "已改密", pred: (a) => String(a.pw_status || "").includes("✅")},
         noPw: {group: "改密", label: "未改密", pred: (a) => !String(a.pw_status || "").includes("✅")},
+        has2fa: {group: "2FA", label: "带2FA", pred: (a) => !!(a.totp_secret || "").trim() || /✅/.test(a.mfa_status || "")},
+        no2fa: {group: "2FA", label: "无2FA", pred: (a) => !(a.totp_secret || "").trim() && !/✅/.test(a.mfa_status || "")},
     }), []);
 
     const openPicker = async () => {

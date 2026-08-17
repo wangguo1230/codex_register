@@ -3531,7 +3531,7 @@ function exportableAccount(r) {
 }
 // Gmail: 邮箱----邮箱密码----谷歌2FA----IMAP[----GPT密码----GPT2FA----rt]
 // 其它: 邮箱----邮箱密码----IMAP[----GPT密码----GPT2FA----rt]（无 IMAP 时该段为空）
-function formatAccountExportLine(r, {rt = "", sep = "----"} = {}) {
+function formatAccountExportLine(r, {rt = "", sep = "----", withRt = false} = {}) {
     const email = r.email || "";
     const mailPw = r.password || r.mailPw || "";
     const mail2fa = String(r.mailbox_totp || r.mail2fa || "").trim();
@@ -3539,8 +3539,11 @@ function formatAccountExportLine(r, {rt = "", sep = "----"} = {}) {
     const gptPw = String(r.gpt_password || "").trim();
     const gpt2fa = String(r.totp_secret || r.gpt2fa || "").trim();
     const parts = isGoogleMailbox(r) ? [email, mailPw, mail2fa, imap] : [email, mailPw, imap];
-    // 有 GPT 密码或 rt 时补齐尾部三段，方便「导出含 RT」固定位解析
-    if (gptPw || rt) parts.push(gptPw, gpt2fa, rt || "");
+    // 有 GPT 密码 / 2FA / rt 时补齐尾部
+    if (gptPw || gpt2fa || rt || withRt) {
+        parts.push(gptPw, gpt2fa);
+        if (withRt || rt) parts.push(rt || "");
+    }
     return parts.join(sep);
 }
 
@@ -3621,7 +3624,7 @@ app.post("/api/export/full", async (req, res) => {
         return res.send(head + body);
     }
     // full: Gmail 邮箱----邮箱密码----谷歌2FA----IMAP[----GPT密码----GPT2FA----rt]
-    const lines = recs.map((r) => formatAccountExportLine(r, {rt: r.rt}));
+    const lines = recs.map((r) => formatAccountExportLine(r, {rt: r.rt, withRt: true}));
     res.set("Content-Type", "text/plain; charset=utf-8");
     res.send(lines.join("\n"));
 });
@@ -5034,7 +5037,7 @@ app.post("/api/recharge/queue/export", async (req, res) => {
     const sep = "----";
 
     if (format === "account") {
-        const text = rows.map((r: any) => `${r.email}${sep}${r.password}${r.card_code ? sep + r.card_code : ""}`).join("\n");
+        const text = rows.map((r: any) => formatAccountExportLine(r)).join("\n");
         return res.set("Content-Type", "text/plain; charset=utf-8").send(text);
     }
     if (format === "card") {
