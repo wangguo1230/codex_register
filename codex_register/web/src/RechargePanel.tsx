@@ -214,9 +214,17 @@ export function RechargePanel({notify}: {notify?: (m: string) => void}) {
 
     // 选号入队(搬 GPT 面板筛选条件:批次 + 质量 facet)
     const [pickerFacets, setPickerFacets] = useState<Set<string>>(new Set());
+    const [pickerTakeN, setPickerTakeN] = useState("20");
     const togglePickerFacet = (k: string) => setPickerFacets((s) => { const n = new Set(s); n.has(k) ? n.delete(k) : n.add(k); return n; });
 
+    const isGmailAcc = (a: Account) => a.provider === "google" || /@(gmail|googlemail)\.com$/i.test(a.email || "");
+    const isMailcomAcc = (a: Account) => !isGmailAcc(a) && (a.provider === "mailcom" || a.provider === "mail.com" || /@mail\.com$/i.test(a.email || ""));
+    const accKindLabel = (a: Account) => isGmailAcc(a) ? "Gmail" : isMailcomAcc(a) ? "mail.com" : (a.provider || "其他");
+
     const PICKER_FACETS: Record<string, {group: string; label: string; pred: (a: Account) => boolean}> = useMemo(() => ({
+        kindGmail: {group: "邮箱", label: "Gmail", pred: (a) => isGmailAcc(a)},
+        kindMailcom: {group: "邮箱", label: "mail.com", pred: (a) => isMailcomAcc(a)},
+        kindOther: {group: "邮箱", label: "其他", pred: (a) => !isGmailAcc(a) && !isMailcomAcc(a)},
         hasRt: {group: "令牌", label: "带rt", pred: (a) => !!a.rt_file},
         atOnly: {group: "令牌", label: "只有at", pred: (a) => !a.rt_file},
         atOk: {group: "AT", label: "at有效", pred: (a) => /✅/.test(a.at_status || "")},
@@ -231,7 +239,7 @@ export function RechargePanel({notify}: {notify?: (m: string) => void}) {
     const openPicker = async () => {
         try {
             const accs = await api.rechargeableAccounts();
-            setAccounts(accs); setPickerSel(new Set()); setPickerSearch(""); setPickerBatch(""); setRechargeBatch(""); setPickerFacets(new Set()); setShowPicker(true);
+            setAccounts(accs); setPickerSel(new Set()); setPickerSearch(""); setPickerBatch(""); setRechargeBatch(""); setPickerFacets(new Set()); setPickerTakeN("20"); setShowPicker(true);
         } catch (e: any) { toast("获取账号列表失败: " + e.message); }
     };
 
@@ -267,14 +275,26 @@ export function RechargePanel({notify}: {notify?: (m: string) => void}) {
     const pickerToggle = (id: number) => setPickerSel((s) => { const n = new Set(s); n.has(id) ? n.delete(id) : n.add(id); return n; });
     const pickerAllSel = pickerFiltered.length > 0 && pickerFiltered.every((a) => pickerSel.has(a.id));
     const pickerToggleAll = () => setPickerSel(pickerAllSel ? new Set() : new Set(pickerFiltered.map((a) => a.id)));
+    const pickerSliceIds = (dir: "first" | "last") => {
+        const n = Math.max(0, Math.min(pickerFiltered.length, Math.floor(Number(pickerTakeN) || 0)));
+        if (!n) return [];
+        const rows = dir === "first" ? pickerFiltered.slice(0, n) : pickerFiltered.slice(-n);
+        return rows.map((a) => a.id);
+    };
+    const pickerSelectSlice = (dir: "first" | "last") => {
+        const ids = pickerSliceIds(dir);
+        if (!ids.length) { toast("请先填有效的 N，且当前列表不能为空"); return; }
+        setPickerSel(new Set(ids));
+        toast(`已勾选${dir === "first" ? "前" : "后"} ${ids.length} 个`);
+    };
 
-    const doAddToQueue = async () => {
-        const ids = [...pickerSel];
-        if (!ids.length) return;
-        if (!confirm(`确认将 ${ids.length} 个账号加入充值队列?\n这些账号将在 GPT 面板中标记为已售出。`)) return;
+    const doAddToQueue = async (ids?: number[]) => {
+        const pick = ids && ids.length ? ids : [...pickerSel];
+        if (!pick.length) return;
+        if (!confirm(`确认将 ${pick.length} 个账号加入充值队列?\n这些账号将在 GPT 面板中标记为已售出。`)) return;
         setBusy(true); setShowPicker(false);
         try {
-            const r = await api.addToRechargeQueue(ids, rechargeBatch);
+            const r = await api.addToRechargeQueue(pick, rechargeBatch);
             toast(`已入队 ${r.added} 个账号`);
             loadQueue();
         } catch (e: any) { toast("入队失败: " + e.message); } finally { setBusy(false); }
@@ -1139,7 +1159,7 @@ export function RechargePanel({notify}: {notify?: (m: string) => void}) {
             {/* ====== 选择账号入队弹窗 ====== */}
             {showPicker && (
                 <div className="fixed inset-0 bg-black/30 flex items-center justify-center z-50" onClick={() => setShowPicker(false)}>
-                    <div className="bg-white rounded-xl shadow-xl w-[700px] max-h-[80vh] flex flex-col" onClick={(e) => e.stopPropagation()}>
+                    <div className="bg-white rounded-xl shadow-xl w-[780px] max-h-[80vh] flex flex-col" onClick={(e) => e.stopPropagation()}>
                         <div className="px-5 py-3 border-b font-semibold text-sm flex items-center gap-3">
                             <span>选择账号入队</span>
                             <span className="text-xs text-gray-500 font-normal tabular-nums">
@@ -1182,6 +1202,19 @@ export function RechargePanel({notify}: {notify?: (m: string) => void}) {
                                     <button onClick={() => setPickerFacets(new Set())} className="text-xs text-blue-500 hover:underline ml-1">清除筛选</button>
                                 )}
                             </div>
+                            <div className="flex items-center gap-1.5 flex-wrap">
+                                <span className="text-[11px] text-gray-400">按当前列表</span>
+                                <span className="text-xs text-gray-500">N</span>
+                                <input value={pickerTakeN} onChange={(e) => setPickerTakeN(e.target.value.replace(/[^\d]/g, ""))}
+                                       className="w-14 px-1.5 py-0.5 text-xs border rounded outline-none tabular-nums" placeholder="20"/>
+                                <Btn onClick={() => pickerSelectSlice("first")}>勾选前 N</Btn>
+                                <Btn onClick={() => pickerSelectSlice("last")}>勾选后 N</Btn>
+                                <Btn onClick={() => doAddToQueue(pickerSliceIds("first"))} disabled={!pickerSliceIds("first").length}
+                                     className="bg-blue-600 text-white border-blue-600 hover:bg-blue-700">前 N 入队</Btn>
+                                <Btn onClick={() => doAddToQueue(pickerSliceIds("last"))} disabled={!pickerSliceIds("last").length}
+                                     className="bg-blue-600 text-white border-blue-600 hover:bg-blue-700">后 N 入队</Btn>
+                                <span className="text-[11px] text-gray-400">当前 {pickerFiltered.length} 条</span>
+                            </div>
                         </div>
                         <div className="flex-1 overflow-auto max-h-[400px]">
                             <table className="w-full text-xs">
@@ -1189,6 +1222,7 @@ export function RechargePanel({notify}: {notify?: (m: string) => void}) {
                                     <tr>
                                         <th className="w-8 px-2 py-2"><input type="checkbox" checked={pickerAllSel} onChange={pickerToggleAll}/></th>
                                         <th className="text-left px-2 py-2 font-medium text-gray-500">邮箱</th>
+                                        <th className="text-left px-2 py-2 font-medium text-gray-500">类别</th>
                                         <th className="text-left px-2 py-2 font-medium text-gray-500">套餐</th>
                                         <th className="text-left px-2 py-2 font-medium text-gray-500">AT</th>
                                         <th className="text-left px-2 py-2 font-medium text-gray-500">改密</th>
@@ -1200,13 +1234,14 @@ export function RechargePanel({notify}: {notify?: (m: string) => void}) {
                                         <tr key={a.id} className="border-t hover:bg-blue-50 cursor-pointer" onClick={() => pickerToggle(a.id)}>
                                             <td className="px-2 py-1.5 text-center" onClick={(e) => e.stopPropagation()}><input type="checkbox" checked={pickerSel.has(a.id)} onChange={() => pickerToggle(a.id)}/></td>
                                             <td className="px-2 py-1.5 text-gray-700">{a.email}</td>
+                                            <td className="px-2 py-1.5 text-gray-500">{accKindLabel(a)}</td>
                                             <td className="px-2 py-1.5 text-gray-500">{a.plan || "—"}</td>
                                             <td className="px-2 py-1.5">{a.at_status ? <span className={/✅/.test(a.at_status) ? "text-green-600" : /❌/.test(a.at_status) ? "text-red-500" : "text-gray-400"}>{a.at_status}</span> : <span className="text-gray-300">未测</span>}</td>
                                             <td className="px-2 py-1.5">{a.pw_status ? <span className={String(a.pw_status).includes("✅") ? "text-green-600" : "text-red-500"}>{a.pw_status}</span> : <span className="text-gray-300">—</span>}</td>
                                             <td className="px-2 py-1.5 text-gray-400">{a.batch || "—"}</td>
                                         </tr>
                                     ))}
-                                    {!pickerFiltered.length && <tr><td colSpan={6} className="text-center py-8 text-gray-400">无可充值的账号</td></tr>}
+                                    {!pickerFiltered.length && <tr><td colSpan={7} className="text-center py-8 text-gray-400">无可充值的账号</td></tr>}
                                 </tbody>
                             </table>
                         </div>
