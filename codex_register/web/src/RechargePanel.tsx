@@ -853,8 +853,9 @@ export function RechargePanel({notify}: {notify?: (m: string) => void}) {
                             <Btn onClick={doReclaimCards}>回收卡密</Btn>
                             <Btn onClick={doRemoveFromQueue} className="bg-white border-emerald-200 text-emerald-700 hover:bg-emerald-50" title="标记已交付：保留账号与换绑记录，移入「已交付」">标记已交付</Btn>
                             <div className="border-l mx-1 h-5"/>
-                            <Btn onClick={() => doSubmit(selQIds())} disabled={!hasKey || cStats.unused === 0} className="bg-green-600 text-white border-green-600 hover:bg-green-700">提交选中</Btn>
-                            <Btn onClick={() => doSubmit(filteredQueue.filter((q) => q.status === "pending").map((q) => q.id))} disabled={!hasKey || cStats.unused === 0}>全部提交</Btn>
+                            <span className="text-xs text-gray-500 tabular-nums">已选 <b className="text-blue-600">{selQIds().length}</b> / {filteredQueue.length}</span>
+                            <Btn onClick={() => doSubmit(selQIds())} disabled={!hasKey || cStats.unused === 0} className="bg-green-600 text-white border-green-600 hover:bg-green-700">提交选中 ({selQIds().length})</Btn>
+                            <Btn onClick={() => doSubmit(filteredQueue.filter((q) => q.status === "pending").map((q) => q.id))} disabled={!hasKey || cStats.unused === 0}>全部提交 ({filteredQueue.filter((q) => q.status === "pending").length})</Btn>
                             <Btn onClick={doPoll}>刷新状态</Btn>
                             <Btn onClick={() => doRebind("gmail")} title="对已付费项换绑 Gmail（mail.com→Gmail 或 Gmail→Gmail 均可）；迁入时探 IMAP，换绑领号时探网页登录">换绑 Gmail</Btn>
                             <Btn onClick={() => doRebind("mailcom")} title="对已付费项手动换绑 mail.com；旧邮箱标已售">换绑 mail.com</Btn>
@@ -1141,7 +1142,13 @@ export function RechargePanel({notify}: {notify?: (m: string) => void}) {
                     <div className="bg-white rounded-xl shadow-xl w-[700px] max-h-[80vh] flex flex-col" onClick={(e) => e.stopPropagation()}>
                         <div className="px-5 py-3 border-b font-semibold text-sm flex items-center gap-3">
                             <span>选择账号入队</span>
-                            <span className="text-xs text-gray-400 font-normal">可选: {accounts.length} 个 (成功+未售出+有session)</span>
+                            <span className="text-xs text-gray-500 font-normal tabular-nums">
+                                当前 <b className="text-gray-800">{pickerFiltered.length}</b>
+                                <span className="text-gray-300 mx-1">/</span>
+                                可选 {accounts.length}
+                                <span className="text-gray-300 mx-1">·</span>
+                                已选 <b className="text-blue-600">{pickerSel.size}</b>
+                            </span>
                         </div>
                         <div className="px-5 py-2 border-b space-y-2">
                             <div className="flex items-center gap-2">
@@ -1204,7 +1211,7 @@ export function RechargePanel({notify}: {notify?: (m: string) => void}) {
                             </table>
                         </div>
                         <div className="px-5 py-3 border-t flex items-center justify-between">
-                            <span className="text-xs text-gray-500">已选 <b className="text-blue-600">{pickerSel.size}</b> 个</span>
+                            <span className="text-xs text-gray-500 tabular-nums">当前 <b>{pickerFiltered.length}</b> · 已选 <b className="text-blue-600">{pickerSel.size}</b></span>
                             <div className="flex gap-2">
                                 <Btn onClick={() => setShowPicker(false)}>取消</Btn>
                                 <Btn onClick={doAddToQueue} disabled={pickerSel.size === 0} className="bg-blue-600 text-white border-blue-600 hover:bg-blue-700">
