@@ -1304,35 +1304,49 @@ export async function addToRechargeQueue(accountIds, batch = "") {
     });
 }
 
+function rechargeQueueDeliveryKind(delivery = "undelivered") {
+    const d = String(delivery || "undelivered").toLowerCase();
+    if (d === "all") return "all";
+    if (d === "delivered") return "delivered";
+    if (d === "error" || d === "failed") return "error";
+    return "undelivered";
+}
+
+function rechargeQueueWhere(kind) {
+    if (kind === "all") return "";
+    if (kind === "delivered") return `WHERE COALESCE(delivery_status,'undelivered')='delivered'`;
+    if (kind === "error") return `WHERE COALESCE(delivery_status,'undelivered')<>'delivered' AND status='error'`;
+    return `WHERE COALESCE(delivery_status,'undelivered')<>'delivered' AND status<>'error'`;
+}
+
 /**
  * 充值队列列表。
- * delivery: undelivered（默认，作业中）| delivered（已交付/已移除）| all
+ * delivery: undelivered（作业中，不含失败）| error（失败页）| delivered（已交付）| all
  */
 export async function listRechargeQueue(delivery = "undelivered") {
-    const d = String(delivery || "undelivered").toLowerCase();
-    const where = d === "all"
-        ? ""
-        : d === "delivered"
-            ? `WHERE COALESCE(delivery_status,'undelivered')='delivered'`
-            : `WHERE COALESCE(delivery_status,'undelivered')<>'delivered'`;
+    const kind = rechargeQueueDeliveryKind(delivery);
+    const where = rechargeQueueWhere(kind);
     const { rows: list } = await query(
-        `SELECT * FROM recharge_queue ${where} ORDER BY ${d === "delivered" ? "delivered_at DESC NULLS LAST, id DESC" : "id"}`,
+        `SELECT * FROM recharge_queue ${where} ORDER BY ${kind === "delivered" ? "delivered_at DESC NULLS LAST, id DESC" : kind === "error" ? "finished_at DESC NULLS LAST, id DESC" : "id"}`,
     );
-    // 状态统计只算未交付（作业面板）
-    const out = { pending: 0, paired: 0, submitting: 0, submitted: 0, done: 0, error: 0, total: 0, undelivered: 0, delivered: 0 };
+    const out = { pending: 0, paired: 0, submitting: 0, submitted: 0, done: 0, error: 0, total: 0, undelivered: 0, delivered: 0, failed: 0 };
     const { rows: statsRows } = await query(
         `SELECT status, COUNT(*)::int AS n FROM recharge_queue
-         WHERE COALESCE(delivery_status,'undelivered')<>'delivered' GROUP BY status`,
+         WHERE COALESCE(delivery_status,'undelivered')<>'delivered' AND status<>'error' GROUP BY status`,
     );
     for (const r of statsRows) { out[r.status] = r.n; out.total += r.n; }
-    const { rows: delRows } = await query(
-        `SELECT COALESCE(delivery_status,'undelivered') AS d, COUNT(*)::int AS n FROM recharge_queue GROUP BY 1`,
+    out.undelivered = out.total;
+    const { rows: [failRow] } = await query(
+        `SELECT COUNT(*)::int AS n FROM recharge_queue
+         WHERE COALESCE(delivery_status,'undelivered')<>'delivered' AND status='error'`,
     );
-    for (const r of delRows) {
-        if (r.d === "delivered") out.delivered = r.n;
-        else out.undelivered = r.n;
-    }
-    return { list, stats: out, delivery: d === "delivered" ? "delivered" : d === "all" ? "all" : "undelivered" };
+    out.error = failRow?.n || 0;
+    out.failed = out.error;
+    const { rows: [delRow] } = await query(
+        `SELECT COUNT(*)::int AS n FROM recharge_queue WHERE COALESCE(delivery_status,'undelivered')='delivered'`,
+    );
+    out.delivered = delRow?.n || 0;
+    return { list, stats: out, delivery: kind };
 }
 
 export async function getRechargeQueueItem(id) {
@@ -1407,7 +1421,7 @@ export async function claimRechargeQueueItems(ids, instId = instanceId) {
         const { rows } = await client.query(
             `SELECT * FROM recharge_queue
              WHERE id = ANY($1)
-               AND status NOT IN ('submitted', 'done')
+               AND status NOT IN ('submitted', 'done', 'error')
                AND COALESCE(delivery_status,'undelivered')<>'delivered'
                AND instance_id = ''
              FOR UPDATE SKIP LOCKED`,
@@ -1425,7 +1439,7 @@ export async function claimRechargeQueueItems(ids, instId = instanceId) {
             instance_id: r.instance_id,
             reason: r.delivery_status === "delivered"
                 ? "已交付"
-                : r.status === "submitted" || r.status === "done"
+                : r.status === "submitted" || r.status === "done" || r.status === "error"
                 ? `状态 ${r.status}`
                 : (r.instance_id ? `实例 ${r.instance_id} 处理中` : "无法认领"),
         }));
@@ -1484,7 +1498,7 @@ export async function updateQueueItem(id, fields) {
     await query(`UPDATE recharge_queue SET ${sets.join(",")} WHERE id=$${vals.length}`, vals);
 }
 
-/** 人工把队列项标失败：不碰已提交/已完成；已配对未提交的卡密收回。 */
+/** 人工把队列项标失败：进失败页。已充上(done/paid)不动；未提交配对卡密收回。 */
 export async function markRechargeQueueError(ids, reason = "") {
     const why = String(reason || "人工标记失败").trim().slice(0, 200);
     const now = Date.now();
@@ -1493,7 +1507,9 @@ export async function markRechargeQueueError(ids, reason = "") {
         for (const id of (ids || [])) {
             const { rows: [item] } = await client.query(`SELECT * FROM recharge_queue WHERE id=$1`, [id]);
             if (!item) { skipped++; continue; }
-            if (item.status === "submitted" || item.status === "done") { skipped++; continue; }
+            if (item.status === "done" || item.task_status === "paid") { skipped++; continue; }
+            let cardId = item.card_id || 0;
+            let cardCode = item.card_code || "";
             if (item.card_id && !item.task_no) {
                 const { rows: [card] } = await client.query(`SELECT * FROM recharge_cards WHERE id=$1`, [item.card_id]);
                 if (card && (card.status === "paired" || card.status === "submitting")) {
@@ -1502,12 +1518,14 @@ export async function markRechargeQueueError(ids, reason = "") {
                         [now, item.card_id],
                     );
                     reclaimed++;
+                    cardId = 0;
+                    cardCode = "";
                 }
             }
             await client.query(
-                `UPDATE recharge_queue SET status='error', error=$1, instance_id='', card_id=0, card_code='',
-                 finished_at=$2 WHERE id=$3`,
-                [why, now, id],
+                `UPDATE recharge_queue SET status='error', error=$1, instance_id='', card_id=$2, card_code=$3,
+                 finished_at=CASE WHEN COALESCE(finished_at,0)>0 THEN finished_at ELSE $4 END WHERE id=$5`,
+                [why, cardId, cardCode, now, id],
             );
             count++;
         }
@@ -1583,12 +1601,11 @@ export async function listQueueSubmittedPending() {
 }
 
 export async function rechargeQueueBatches(delivery = "undelivered") {
-    const d = String(delivery || "undelivered").toLowerCase();
-    const where = d === "all"
-        ? `batch!=''`
-        : d === "delivered"
-            ? `batch!='' AND COALESCE(delivery_status,'undelivered')='delivered'`
-            : `batch!='' AND COALESCE(delivery_status,'undelivered')<>'delivered'`;
+    const kind = rechargeQueueDeliveryKind(delivery);
+    const scope = rechargeQueueWhere(kind);
+    const where = scope
+        ? `batch!='' AND ${scope.replace(/^WHERE\s+/, "")}`
+        : `batch!=''`;
     const { rows } = await query(
         `SELECT batch AS name, COUNT(*)::int AS n FROM recharge_queue WHERE ${where} GROUP BY batch ORDER BY MAX(id) DESC`,
     );

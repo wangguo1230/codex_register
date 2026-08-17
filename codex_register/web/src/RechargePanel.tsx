@@ -30,7 +30,7 @@ const fmtDur = (start?: number, end?: number) => {
 const Q_LABEL: Record<string, string> = {pending: "待提交", paired: "已配对", submitting: "提交中", submitted: "已提交", done: "完成", error: "失败"};
 const Q_COLOR: Record<string, string> = {pending: "#6b7280", paired: "#2563eb", submitting: "#f59e0b", submitted: "#8b5cf6", done: "#16a34a", error: "#dc2626"};
 const TASK_COLOR: Record<string, string> = {pending: "#6b7280", leased: "#2563eb", running: "#2563eb", paid: "#16a34a", failed: "#dc2626", canceled: "#dc2626", returned: "#f59e0b", manual_review: "#f59e0b"};
-const EMPTY_Q: RechargeQueueStats = {pending: 0, paired: 0, submitting: 0, submitted: 0, done: 0, error: 0, total: 0, undelivered: 0, delivered: 0};
+const EMPTY_Q: RechargeQueueStats = {pending: 0, paired: 0, submitting: 0, submitted: 0, done: 0, error: 0, total: 0, undelivered: 0, delivered: 0, failed: 0};
 const EMPTY_C: RechargeCardStats = {unused: 0, paired: 0, submitting: 0, submitted: 0, done: 0, error: 0, total: 0};
 
 /** 换绑展示：原邮箱 → 现邮箱 */
@@ -51,9 +51,9 @@ function rebindLine(q: RechargeQueueItem): {text: string; title: string; ok: boo
 }
 
 export function RechargePanel({notify}: {notify?: (m: string) => void}) {
-    // 队列：未交付=作业中；已交付=移除后的历史（含换绑记录）
-    const [deliveryTab, setDeliveryTab] = useState<"undelivered" | "delivered">("undelivered");
-    const deliveryTabRef = useRef<"undelivered" | "delivered">("undelivered");
+    // 队列：未交付=作业中；失败=标失败/预检失败；已交付=移除后的历史
+    const [deliveryTab, setDeliveryTab] = useState<"undelivered" | "error" | "delivered">("undelivered");
+    const deliveryTabRef = useRef<"undelivered" | "error" | "delivered">("undelivered");
     deliveryTabRef.current = deliveryTab;
     const [queue, setQueue] = useState<RechargeQueueItem[]>([]);
     const [qStats, setQStats] = useState<RechargeQueueStats>(EMPTY_Q);
@@ -125,6 +125,8 @@ export function RechargePanel({notify}: {notify?: (m: string) => void}) {
 
     const toast = (m: string) => notify?.(m);
     const isDeliveredTab = deliveryTab === "delivered";
+    const isFailedTab = deliveryTab === "error";
+    const isWorkingTab = deliveryTab === "undelivered";
     /** SSE 异步导出 RT 完成后回调（ref 避免 effect 闭包拿不到最新 deliver） */
     const deliverExportTextRef = useRef<(text: string, format: "account" | "full" | "card" | "session") => Promise<void>>(async () => {});
 
@@ -332,14 +334,14 @@ export function RechargePanel({notify}: {notify?: (m: string) => void}) {
     const doMarkError = async (ids?: number[]) => {
         const pick = ids && ids.length ? ids : selQIds();
         if (!pick.length) { toast("请先选择要标记的账号"); return; }
-        const typed = window.prompt(`把选中 ${pick.length} 个标为失败（不会提交、已配对卡密会收回）\n原因：`, "人工标记失败");
+        const typed = window.prompt(`把选中 ${pick.length} 个标为失败，立刻移入「失败」页\n已配对未提交的卡密会收回；已充上的不动\n原因：`, "人工标记失败");
         if (typed == null) return;
         const reason = typed.trim() || "人工标记失败";
         try {
             const r = await api.markRechargeQueueError(pick, reason);
             setQSel(new Set());
             loadQueue();
-            toast(r.count ? `已标记失败 ${r.count} 个${r.reclaimed ? `，收回卡密 ${r.reclaimed}` : ""}${r.skipped ? `，跳过 ${r.skipped} 个已提交/已完成` : ""}` : (r.skipped ? "所选都已提交或完成，不能改标" : "没有可标记的"));
+            toast(r.count ? `已标失败 ${r.count} 个，已移入失败页${r.reclaimed ? `，收回卡密 ${r.reclaimed}` : ""}${r.skipped ? `，跳过 ${r.skipped} 个已充上` : ""}` : (r.skipped ? "所选都已充上，不能改标失败" : "没有可标记的"));
         } catch (e: any) { toast(e.message); }
     };
     const doStop = async () => { try { await api.stopRecharge(); toast("已发送停止信号"); } catch (e: any) { toast(e.message); } };
@@ -793,14 +795,28 @@ export function RechargePanel({notify}: {notify?: (m: string) => void}) {
                         type="button"
                         onClick={() => setDeliveryTab("undelivered")}
                         className={`px-3 py-2 text-sm font-medium border-b-2 -mb-px transition-colors ${
-                            !isDeliveredTab
+                            isWorkingTab
                                 ? "border-blue-600 text-blue-700"
                                 : "border-transparent text-gray-500 hover:text-gray-800"
                         }`}
                     >
                         未交付
-                        <span className={`ml-1.5 text-xs tabular-nums ${!isDeliveredTab ? "text-blue-600" : "text-gray-400"}`}>
+                        <span className={`ml-1.5 text-xs tabular-nums ${isWorkingTab ? "text-blue-600" : "text-gray-400"}`}>
                             {qStats.undelivered ?? qStats.total}
+                        </span>
+                    </button>
+                    <button
+                        type="button"
+                        onClick={() => setDeliveryTab("error")}
+                        className={`px-3 py-2 text-sm font-medium border-b-2 -mb-px transition-colors ${
+                            isFailedTab
+                                ? "border-red-600 text-red-700"
+                                : "border-transparent text-gray-500 hover:text-gray-800"
+                        }`}
+                    >
+                        失败
+                        <span className={`ml-1.5 text-xs tabular-nums ${isFailedTab ? "text-red-600" : "text-gray-400"}`}>
+                            {qStats.failed ?? qStats.error ?? 0}
                         </span>
                     </button>
                     <button
@@ -819,18 +835,20 @@ export function RechargePanel({notify}: {notify?: (m: string) => void}) {
                     </button>
                     <div className="flex-1"/>
                     <span className="text-[11px] text-gray-400 pb-2 pr-1">
-                        {isDeliveredTab ? "已交付可查看换绑记录；可退回未交付" : "提交后默认为未交付；标记已交付后进入右侧"}
+                        {isDeliveredTab ? "已交付可查看换绑记录；可退回未交付"
+                            : isFailedTab ? "失败号单独在这里；重置可退回未交付"
+                            : "标记失败进中间页；标记已交付进右侧"}
                     </span>
                 </div>
 
                 <div className="px-4 py-3 border-b flex items-center gap-2 flex-wrap">
-                    <span className="text-sm font-semibold">{isDeliveredTab ? "已交付列表" : "充值队列"}</span>
-                    {!isDeliveredTab && (
+                    <span className="text-sm font-semibold">{isDeliveredTab ? "已交付列表" : isFailedTab ? "失败列表" : "充值队列"}</span>
+                    {isWorkingTab && (
                         <>
                             <Btn onClick={openPicker} className="bg-blue-600 text-white border-blue-600 hover:bg-blue-700">+ 选择账号入队</Btn>
                             <Btn onClick={() => { setShowSetBatch(true); setBatchInput(""); }}>设置批次</Btn>
                             <Btn onClick={doReset}>重置</Btn>
-                            <Btn onClick={() => doMarkError()} className="bg-white border-red-200 text-red-600 hover:bg-red-50" title="把选中号标失败：不提交，已配对卡密收回；已提交/已完成的不动">标记失败</Btn>
+                            <Btn onClick={() => doMarkError()} className="bg-white border-red-200 text-red-600 hover:bg-red-50" title="标失败并移入「失败」页；已配对未提交卡密收回；已充上的不动">标记失败</Btn>
                             <Btn onClick={doReclaimCards}>回收卡密</Btn>
                             <Btn onClick={doRemoveFromQueue} className="bg-white border-emerald-200 text-emerald-700 hover:bg-emerald-50" title="标记已交付：保留账号与换绑记录，移入「已交付」">标记已交付</Btn>
                             <div className="border-l mx-1 h-5"/>
@@ -845,6 +863,13 @@ export function RechargePanel({notify}: {notify?: (m: string) => void}) {
                             <div className="border-l mx-1 h-5"/>
                         </>
                     )}
+                    {isFailedTab && (
+                        <>
+                            <Btn onClick={doReset} title="退回未交付，重新待提交">重置回队列</Btn>
+                            <Btn onClick={doReclaimCards}>回收卡密</Btn>
+                            <div className="border-l mx-1 h-5"/>
+                        </>
+                    )}
                     {isDeliveredTab && (
                         <>
                             <Btn onClick={doUndeliver} className="bg-white border-blue-200 text-blue-700 hover:bg-blue-50">退回未交付</Btn>
@@ -855,7 +880,7 @@ export function RechargePanel({notify}: {notify?: (m: string) => void}) {
                     <Btn onClick={() => doExport("full")}>导出含RT</Btn>
                     <Btn onClick={() => doExport("card")}>复制卡密</Btn>
                     <Btn onClick={() => doExport("session")}>复制session</Btn>
-                    {!isDeliveredTab && (
+                    {isWorkingTab && (
                         <>
                             <Btn onClick={() => setShowBatchRt(true)} className="bg-amber-600 text-white border-amber-600 hover:bg-amber-700">批量获取RT</Btn>
                             <Btn onClick={openSub2json} className="bg-violet-600 text-white border-violet-600 hover:bg-violet-700" title="勾选后打开会自动填充；支持 Gmail（用 GPT 密码 + RT）">导出sub2json</Btn>
@@ -865,18 +890,17 @@ export function RechargePanel({notify}: {notify?: (m: string) => void}) {
                     <div className="flex-1"/>
                     {/* 筛选：已交付主要看批次；未交付看作业状态 */}
                     <div className="flex items-center gap-1 text-xs">
-                        {!isDeliveredTab && [{k: "all", l: "全部", n: qStats.total}, {k: "undone", l: "未完成", n: qStats.pending + qStats.submitted},
+                        {isWorkingTab && [{k: "all", l: "全部", n: qStats.total}, {k: "undone", l: "未完成", n: qStats.pending + qStats.submitted},
                           {k: "pending", l: "待提交", n: qStats.pending},
                           {k: "submitted", l: "已提交", n: qStats.submitted},
-                          {k: "done", l: "完成", n: qStats.done},
-                          {k: "error", l: "失败", n: qStats.error}]
+                          {k: "done", l: "完成", n: qStats.done}]
                           .map(({k, l, n}) => (
                             <button key={k} onClick={() => setQFilter(k)}
                                     className={`px-2 py-0.5 rounded border text-xs ${qFilter === k ? "bg-gray-800 text-white border-gray-800" : "bg-gray-50 text-gray-600 border-gray-200 hover:bg-gray-100"}`}>
                                 {l} {n}
                             </button>
                         ))}
-                        {isDeliveredTab && (
+                        {(isDeliveredTab || isFailedTab) && (
                             <span className="text-gray-500 px-1">共 {queue.length} 条</span>
                         )}
                         {qBatches.length > 0 && (
@@ -898,17 +922,17 @@ export function RechargePanel({notify}: {notify?: (m: string) => void}) {
                                 {isDeliveredTab && <th className="text-left px-2 py-2 font-medium text-gray-500">换绑记录</th>}
                                 <th className="text-left px-2 py-2 font-medium text-gray-500">套餐</th>
                                 <th className="text-left px-2 py-2 font-medium text-gray-500">批次</th>
-                                {!isDeliveredTab && <th className="text-left px-2 py-2 font-medium text-gray-500">实例</th>}
+                                {isWorkingTab && <th className="text-left px-2 py-2 font-medium text-gray-500">实例</th>}
                                 <th className="text-left px-2 py-2 font-medium text-gray-500">状态</th>
                                 <th className="text-left px-2 py-2 font-medium text-gray-500">卡密</th>
                                 <th className="text-left px-2 py-2 font-medium text-gray-500">提交时间</th>
                                 <th className="text-left px-2 py-2 font-medium text-gray-500">完成时间</th>
                                 {isDeliveredTab && <th className="text-left px-2 py-2 font-medium text-gray-500">交付时间</th>}
-                                {!isDeliveredTab && <th className="text-left px-2 py-2 font-medium text-gray-500">耗时</th>}
+                                {(isWorkingTab || isFailedTab) && <th className="text-left px-2 py-2 font-medium text-gray-500">耗时</th>}
                                 <th className="text-left px-2 py-2 font-medium text-gray-500">任务状态</th>
-                                {!isDeliveredTab && <th className="text-left px-2 py-2 font-medium text-gray-500">换绑</th>}
+                                {isWorkingTab && <th className="text-left px-2 py-2 font-medium text-gray-500">换绑</th>}
                                 <th className="text-left px-2 py-2 font-medium text-gray-500">消息</th>
-                                {!isDeliveredTab && <th className="text-left px-2 py-2 font-medium text-gray-500">操作</th>}
+                                {(isWorkingTab || isFailedTab) && <th className="text-left px-2 py-2 font-medium text-gray-500">操作</th>}
                             </tr>
                         </thead>
                         <tbody>
@@ -927,7 +951,7 @@ export function RechargePanel({notify}: {notify?: (m: string) => void}) {
                                     )}
                                     <td className="px-2 py-1.5 text-gray-500">{q.plan_type || q.plan || "—"}</td>
                                     <td className="px-2 py-1.5 text-gray-500">{q.batch || "—"}</td>
-                                    {!isDeliveredTab && (
+                                    {isWorkingTab && (
                                     <td className="px-2 py-1.5 text-xs font-mono" title={q.instance_id || ""}>
                                         {!q.instance_id ? <span className="text-gray-300">—</span>
                                             : q.instance_id === instanceId ? <span className="text-blue-600">本机</span>
@@ -946,11 +970,11 @@ export function RechargePanel({notify}: {notify?: (m: string) => void}) {
                                     {isDeliveredTab && (
                                         <td className="px-2 py-1.5 text-gray-500 text-xs whitespace-nowrap">{fmtTime(q.delivered_at)}</td>
                                     )}
-                                    {!isDeliveredTab && (
+                                    {(isWorkingTab || isFailedTab) && (
                                     <td className="px-2 py-1.5 text-gray-500 text-xs whitespace-nowrap" title={q.submitted_at && q.finished_at ? `${fmtTime(q.submitted_at)} → ${fmtTime(q.finished_at)}` : ""}>{fmtDur(q.submitted_at, q.finished_at)}</td>
                                     )}
                                     <td className="px-2 py-1.5">{q.task_status ? <span style={{color: TASK_COLOR[q.task_status] || "#6b7280"}}>{q.task_status}</span> : "—"}</td>
-                                    {!isDeliveredTab && (
+                                    {isWorkingTab && (
                                     <td className="px-2 py-1.5 max-w-[200px] truncate" title={rb.title || q.rebind_error || q.rebind_email || ""}>
                                         {rb.ok ? <span className="text-green-600" title={rb.title}>{rb.text}</span>
                                             : q.rebind_status === "pending" ? <span className="text-amber-600">{rb.text}</span>
@@ -962,19 +986,19 @@ export function RechargePanel({notify}: {notify?: (m: string) => void}) {
                                     <td className="px-2 py-1.5 text-gray-500 max-w-[180px] truncate" title={q.task_message || q.error || ""}>
                                         {q.error ? <span className="text-red-500">{q.error}</span> : (q.task_message || "—")}
                                     </td>
-                                    {!isDeliveredTab && (
+                                    {(isWorkingTab || isFailedTab) && (
                                     <td className="px-2 py-1.5" onClick={(e) => e.stopPropagation()}>
                                         {q.status !== "done" && q.status !== "pending" && q.card_code && (
                                             <button onClick={() => { api.pollRecharge([q.id]).then(() => { toast(`已刷新 ${q.email}`); loadQueue(); }).catch((e: any) => toast(e.message)); }}
                                                     className="text-blue-500 hover:text-blue-700 text-xs hover:underline">刷新</button>
                                         )}
-                                        {(q.status === "pending" || q.status === "paired" || q.status === "submitting") && (
+                                        {isWorkingTab && q.status !== "done" && q.task_status !== "paid" && (
                                             <button onClick={() => doMarkError([q.id])}
                                                     className="text-red-500 hover:text-red-700 text-xs hover:underline ml-2">标记失败</button>
                                         )}
                                         {(q.status === "error" || q.status === "paired") && (
-                                            <button onClick={() => { api.resetRechargeQueue([q.id]).then(() => { loadQueue(); toast("已重置"); }).catch((e: any) => toast(e.message)); }}
-                                                    className="text-amber-500 hover:text-amber-700 text-xs hover:underline ml-2">重置</button>
+                                            <button onClick={() => { api.resetRechargeQueue([q.id]).then(() => { loadQueue(); toast(q.status === "error" ? "已退回未交付" : "已重置"); }).catch((e: any) => toast(e.message)); }}
+                                                    className="text-amber-500 hover:text-amber-700 text-xs hover:underline ml-2">{q.status === "error" ? "重置回队列" : "重置"}</button>
                                         )}
                                         {(q.status === "done" || q.task_status === "paid") && q.rebind_status === "pending" && (
                                             <button onClick={() => { api.rebindGmail([q.id], (q.rebind_target === "mailcom" ? "mailcom" : "gmail")).then((r) => { toast(r.queued ? "已排队换绑" : (r.skipped[0]?.reason || "已跳过")); loadQueue(); loadConfig(); }).catch((e: any) => toast(e.message)); }}
@@ -999,8 +1023,10 @@ export function RechargePanel({notify}: {notify?: (m: string) => void}) {
                             })}
                             {!filteredQueue.length && (
                                 <tr>
-                                    <td colSpan={isDeliveredTab ? 11 : 14} className="text-center py-8 text-gray-400">
-                                        {isDeliveredTab ? "暂无已交付账号；在「未交付」中点「标记已交付」后会出现在这里" : "队列为空，点击「选择账号入队」添加"}
+                                    <td colSpan={isDeliveredTab ? 11 : isFailedTab ? 12 : 14} className="text-center py-8 text-gray-400">
+                                        {isDeliveredTab ? "暂无已交付账号；在「未交付」中点「标记已交付」后会出现在这里"
+                                            : isFailedTab ? "没有失败项。点「标记失败」后会从作业队列挪到这里"
+                                            : "队列为空，点击「选择账号入队」添加"}
                                     </td>
                                 </tr>
                             )}

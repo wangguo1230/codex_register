@@ -251,6 +251,7 @@ export interface RechargeQueueStats {
     total: number;
     undelivered?: number;
     delivered?: number;
+    failed?: number;
 }
 
 /** Gmail 验证池 / 换绑池 一行（含账密） */
@@ -530,10 +531,10 @@ export const api = {
         j<{ok: boolean; count: number}>("/api/recharge/cards/validate", {method: "POST", body: JSON.stringify({ids})}),
     unpairRechargeCards: (ids: number[]) =>
         j<{ok: boolean}>("/api/recharge/cards/unpair", {method: "POST", body: JSON.stringify({ids})}),
-    // 充值队列（delivery: undelivered 默认作业中 | delivered 已交付 | all）
-    rechargeQueue: (delivery: "undelivered" | "delivered" | "all" = "undelivered") =>
+    // 充值队列（delivery: undelivered 作业中 | error 失败页 | delivered 已交付 | all）
+    rechargeQueue: (delivery: "undelivered" | "delivered" | "error" | "all" = "undelivered") =>
         j<{list: RechargeQueueItem[]; stats: RechargeQueueStats; delivery?: string}>(`/api/recharge/queue?delivery=${encodeURIComponent(delivery)}`),
-    rechargeQueueBatches: (delivery?: "undelivered" | "delivered" | "all") =>
+    rechargeQueueBatches: (delivery?: "undelivered" | "delivered" | "error" | "all") =>
         j<{name: string; n: number}[]>(`/api/recharge/queue/batches${delivery ? `?delivery=${encodeURIComponent(delivery)}` : ""}`),
     rechargeableAccounts: () => j<Account[]>("/api/recharge/accounts"),
     addToRechargeQueue: (accountIds: number[], batch?: string) =>

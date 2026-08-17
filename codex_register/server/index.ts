@@ -4268,7 +4268,7 @@ app.post("/api/recharge/queue/mark-error", async (req, res) => {
     const reason = String(req.body?.error || req.body?.reason || "").trim();
     const info = await db.markRechargeQueueError(ids, reason);
     await queueSync(); await rechargeSync();
-    if (info.count) rechargeLog(`人工标记失败 ${info.count} 个${info.reclaimed ? `，收回卡密 ${info.reclaimed}` : ""}${reason ? `：${reason}` : ""}`);
+    if (info.count) rechargeLog(`人工标记失败 ${info.count} 个（已移入失败页）${info.reclaimed ? `，收回卡密 ${info.reclaimed}` : ""}${reason ? `：${reason}` : ""}`);
     res.json({ok: true, ...info});
 });
 
@@ -5157,9 +5157,9 @@ app.post("/api/recharge/queue/probe-plan", async (req, res) => {
     if (ids.length) {
         targets = (await Promise.all(ids.map((id: number) => db.getRechargeQueueItem(id)))).filter(Boolean);
     } else if (batch) {
-        targets = (await db.listRechargeQueue()).filter((q: any) => q.batch === batch);
+        targets = ((await db.listRechargeQueue("all")).list || []).filter((q: any) => q.batch === batch);
     } else {
-        targets = await db.listRechargeQueue();
+        targets = (await db.listRechargeQueue("all")).list || [];
     }
     if (!targets.length) return res.json({ok: true, updated: 0});
     const dispatcher = buildProxyDispatcher(scheduler.regProxy);
