@@ -3411,22 +3411,47 @@ async function precheckRechargeMailbox(q) {
         const pw = String(acc.password || "").trim();
         if (!pw) return {ok: false, reason: "mail.com 没有邮箱密码"};
         rememberMailcomPassword(acc.email, pw);
-        // 充值预检跟重登/RT 同一条「充值代理」(rtProxy→regProxy)，本地无账密 socks；
-        // 不要用 mail 代理池(kookeey 带 user:pass，Playwright Chrome 不支持 socks5 鉴权)。
-        const proxy = rechargeProxy();
-        rechargeLog(`预检 ${acc.email}: 验 mail.com 密码（代理=${proxy ? maskProxyUrl(proxy) : "直连"}）`);
-        const v = await Promise.race([
-            verifyMailcomLogin(
-                acc.email,
-                pw,
-                (m) => rechargeLog(`预检 ${acc.email}: ${m}`),
-                {proxy, tries: 2, headless: true},
-            ),
-            new Promise((resolve) => setTimeout(() => resolve({ok: false, reason: "验密超时(50s)"}), 50_000)),
-        ]);
-        if (!v.ok) return {ok: false, reason: `mail.com 密码不可用 (${String(v.reason || "登录失败").slice(0, 100)})`};
-        rechargeLog(`预检 ${acc.email}: mail.com 密码可用`);
-        return {ok: true};
+        // Playwright 不能走 socks5 账密。池出口经跳板转成本机无账密 socks，一人一条；池空才回退 10808。
+        let proxy = rechargeProxy();
+        let lease = null;
+        let local = null;
+        const pool = mailProxyPool.urls.length ? mailProxyPool : gptProxyPool;
+        const jump = mailProxyPool.urls.length
+            ? (scheduler.mailProxyJump || "")
+            : (scheduler.gptProxyJump || scheduler.mailProxyJump || "");
+        const poolName = mailProxyPool.urls.length ? "邮箱代理池" : "GPT 代理池";
+        try {
+            if (pool.urls.length) {
+                lease = await pool.lease(`mail-precheck:${acc.email}`, {
+                    fallback: "", maxPerTemplate: 4, freshSession: true, timeoutMs: 8_000,
+                }).catch(() => null);
+            }
+            const exit = String(lease?.url || "").trim();
+            if (exit && proxyHasSocksAuth(exit)) {
+                const {openNoAuthSocksToAuthedProxy} = await import("../src/mail/proxy-chain.js");
+                local = await openNoAuthSocksToAuthedProxy(exit, jump);
+                proxy = local.url;
+                rechargeLog(`预检 ${acc.email}: 验 mail.com 密码（${poolName} ${maskProxyUrl(exit)}${jump ? " +跳板" : ""} → :${local.localPort}）`);
+            } else {
+                if (exit && !proxyHasSocksAuth(exit)) proxy = exit;
+                rechargeLog(`预检 ${acc.email}: 验 mail.com 密码（代理=${proxy ? maskProxyUrl(proxy) : "直连"}）`);
+            }
+            const v = await Promise.race([
+                verifyMailcomLogin(
+                    acc.email,
+                    pw,
+                    (m) => rechargeLog(`预检 ${acc.email}: ${m}`),
+                    {proxy, tries: 2, headless: true},
+                ),
+                new Promise((resolve) => setTimeout(() => resolve({ok: false, reason: "验密超时(50s)"}), 50_000)),
+            ]);
+            if (!v.ok) return {ok: false, reason: `mail.com 密码不可用 (${String(v.reason || "登录失败").slice(0, 100)})`};
+            rechargeLog(`预检 ${acc.email}: mail.com 密码可用`);
+            return {ok: true};
+        } finally {
+            try { local?.close(); } catch { /* */ }
+            try { lease?.release(); } catch { /* */ }
+        }
     }
     return {ok: true};
 }
