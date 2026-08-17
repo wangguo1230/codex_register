@@ -334,7 +334,7 @@ export function RechargePanel({notify}: {notify?: (m: string) => void}) {
     const doMarkError = async (ids?: number[]) => {
         const pick = ids && ids.length ? ids : selQIds();
         if (!pick.length) { toast("请先选择要标记的账号"); return; }
-        const typed = window.prompt(`把选中 ${pick.length} 个标为失败，立刻移入「失败」页\n已配对未提交的卡密会收回；已充上的不动\n原因：`, "人工标记失败");
+        const typed = window.prompt(`把选中 ${pick.length} 个标为失败，立刻移入「失败」页\n卡密放回未使用，可换号再提；已充上的不动\n原因：`, "人工标记失败");
         if (typed == null) return;
         const reason = typed.trim() || "人工标记失败";
         try {
@@ -848,7 +848,7 @@ export function RechargePanel({notify}: {notify?: (m: string) => void}) {
                             <Btn onClick={openPicker} className="bg-blue-600 text-white border-blue-600 hover:bg-blue-700">+ 选择账号入队</Btn>
                             <Btn onClick={() => { setShowSetBatch(true); setBatchInput(""); }}>设置批次</Btn>
                             <Btn onClick={doReset}>重置</Btn>
-                            <Btn onClick={() => doMarkError()} className="bg-white border-red-200 text-red-600 hover:bg-red-50" title="标失败并移入「失败」页；已配对未提交卡密收回；已充上的不动">标记失败</Btn>
+                            <Btn onClick={() => doMarkError()} className="bg-white border-red-200 text-red-600 hover:bg-red-50" title="号进失败页，卡密放回未使用，方便换号再提；已充上的不动">标记失败</Btn>
                             <Btn onClick={doReclaimCards}>回收卡密</Btn>
                             <Btn onClick={doRemoveFromQueue} className="bg-white border-emerald-200 text-emerald-700 hover:bg-emerald-50" title="标记已交付：保留账号与换绑记录，移入「已交付」">标记已交付</Btn>
                             <div className="border-l mx-1 h-5"/>

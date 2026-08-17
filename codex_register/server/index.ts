@@ -4513,11 +4513,12 @@ async function submitOneQueueItem(q, card, label = "") {
         return {ok: true, taskNo};
     } catch (e: any) {
         const msg = String(e?.message || e).slice(0, 200);
-        const consumed = stage === "challenge" || stage === "tasks";
-        const cardErr = consumed ? `[可能已消费·${stage}] ${msg}` : `[未提交·${stage}] ${msg}`;
-        await db.updateQueueItem(q.id, {status: "error", error: msg, finished_at: Date.now()});
-        await db.updateRechargeCard(card.id, {status: "error", error: cardErr});
-        rechargeLog(`${label}✗ ${q.email} 提交失败(${stage}阶段): ${msg}`);
+        await db.updateQueueItem(q.id, {
+            status: "error", error: msg, finished_at: Date.now(),
+            card_id: 0, card_code: card.code || q.card_code || "", instance_id: "",
+        });
+        await db.unpairRechargeCards([card.id]);
+        rechargeLog(`${label}✗ ${q.email} 提交失败(${stage}阶段): ${msg}；卡密已放回未使用`);
         return {ok: false, stage, msg};
     }
 }
@@ -4671,13 +4672,16 @@ async function pollRechargeTasksLoop() {
                     const updates: any = {task_status: task.status || "", task_message: task.message || ""};
                     if (task.task_no && !q.task_no) updates.task_no = task.task_no;
                     if (task.status === "paid") updates.status = "done";
-                    else if (["failed", "canceled", "returned"].includes(task.status)) updates.status = "error";
+                    else if (["failed", "canceled", "returned"].includes(task.status)) {
+                        updates.status = "error";
+                        updates.card_id = 0;
+                    }
                     if (updates.status === "done" || updates.status === "error") updates.finished_at = Date.now();
                     await db.updateQueueItem(q.id, updates);
                     if (q.card_id) {
-                        if (task.status === "returned") {
+                        if (["failed", "canceled", "returned"].includes(task.status)) {
                             await db.unpairRechargeCards([q.card_id]);
-                            rechargeLog(`  卡密 ${q.card_code.slice(0, 8)}... 已退回，自动回收到卡池`);
+                            rechargeLog(`  卡密 ${q.card_code} 任务${task.status}，已放回未使用`);
                         } else {
                             await db.updateRechargeCard(q.card_id, updates);
                         }
@@ -4741,13 +4745,16 @@ app.post("/api/recharge/poll", async (req, res) => {
                 const updates: any = {task_status: task.status || "", task_message: task.message || ""};
                 if (task.task_no && !q.task_no) updates.task_no = task.task_no;
                 if (task.status === "paid") updates.status = "done";
-                else if (["failed", "canceled", "returned"].includes(task.status)) updates.status = "error";
+                else if (["failed", "canceled", "returned"].includes(task.status)) {
+                    updates.status = "error";
+                    updates.card_id = 0;
+                }
                 if (updates.status === "done" || updates.status === "error") updates.finished_at = Date.now();
                 await db.updateQueueItem(q.id, updates);
                 if (q.card_id) {
-                    if (task.status === "returned") {
+                    if (["failed", "canceled", "returned"].includes(task.status)) {
                         await db.unpairRechargeCards([q.card_id]);
-                        rechargeLog(`  卡密 ${q.card_code.slice(0, 8)}... 已退回，自动回收到卡池`);
+                        rechargeLog(`  卡密 ${q.card_code} 任务${task.status}，已放回未使用`);
                     } else {
                         await db.updateRechargeCard(q.card_id, updates);
                     }

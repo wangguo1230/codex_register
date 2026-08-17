@@ -1242,13 +1242,25 @@ export async function pairRechargeCards(pairs) {
     });
 }
 
+/** 失败/退回后把卡密放回未使用池，换号可再领。已充上的 (done) 不动。 */
 export async function unpairRechargeCards(ids) {
+    const list = [...new Set((ids || []).map(Number).filter(Number.isInteger))];
+    if (!list.length) return 0;
     const now = Date.now();
-    await withTransaction(async (client) => {
-        for (const id of (ids || [])) {
-            await client.query(`UPDATE recharge_cards SET status='unused', account_id=0, account_email='', updated_at=$1 WHERE id=$2`, [now, id]);
-        }
-    });
+    const { rowCount } = await query(
+        `UPDATE recharge_cards SET
+            status='unused',
+            account_id=0,
+            account_email='',
+            error='',
+            task_no='',
+            task_status='',
+            task_message='',
+            updated_at=$1
+         WHERE id = ANY($2) AND status <> 'done'`,
+        [now, list],
+    );
+    return rowCount || 0;
 }
 
 export async function rechargeUnusedCount() {
@@ -1498,7 +1510,7 @@ export async function updateQueueItem(id, fields) {
     await query(`UPDATE recharge_queue SET ${sets.join(",")} WHERE id=$${vals.length}`, vals);
 }
 
-/** 人工把队列项标失败：进失败页。已充上(done/paid)不动；未提交配对卡密收回。 */
+/** 人工把队列项标失败：进失败页，卡密一律放回未使用池（已充上的号/卡不动）。 */
 export async function markRechargeQueueError(ids, reason = "") {
     const why = String(reason || "人工标记失败").trim().slice(0, 200);
     const now = Date.now();
@@ -1508,23 +1520,26 @@ export async function markRechargeQueueError(ids, reason = "") {
             const { rows: [item] } = await client.query(`SELECT * FROM recharge_queue WHERE id=$1`, [id]);
             if (!item) { skipped++; continue; }
             if (item.status === "done" || item.task_status === "paid") { skipped++; continue; }
-            let cardId = item.card_id || 0;
             const cardCode = String(item.card_code || "").trim();
-            if (item.card_id && !item.task_no) {
-                const { rows: [card] } = await client.query(`SELECT * FROM recharge_cards WHERE id=$1`, [item.card_id]);
-                if (card && (card.status === "paired" || card.status === "submitting")) {
-                    await client.query(
-                        `UPDATE recharge_cards SET status='unused', account_id=0, account_email='', error='', updated_at=$1 WHERE id=$2`,
-                        [now, item.card_id],
-                    );
-                    reclaimed++;
-                    cardId = 0;
-                }
+            let cardId = Number(item.card_id || 0);
+            if (!cardId && cardCode) {
+                const { rows: [byCode] } = await client.query(`SELECT id, status FROM recharge_cards WHERE code=$1`, [cardCode]);
+                if (byCode) cardId = byCode.id;
+            }
+            if (cardId) {
+                const { rowCount } = await client.query(
+                    `UPDATE recharge_cards SET
+                        status='unused', account_id=0, account_email='', error='',
+                        task_no='', task_status='', task_message='', updated_at=$1
+                     WHERE id=$2 AND status <> 'done'`,
+                    [now, cardId],
+                );
+                if (rowCount) reclaimed++;
             }
             await client.query(
-                `UPDATE recharge_queue SET status='error', error=$1, instance_id='', card_id=$2, card_code=$3,
-                 finished_at=CASE WHEN COALESCE(finished_at,0)>0 THEN finished_at ELSE $4 END WHERE id=$5`,
-                [why, cardId, cardCode, now, id],
+                `UPDATE recharge_queue SET status='error', error=$1, instance_id='', card_id=0, card_code=$2,
+                 finished_at=CASE WHEN COALESCE(finished_at,0)>0 THEN finished_at ELSE $3 END WHERE id=$4`,
+                [why, cardCode, now, id],
             );
             count++;
         }
