@@ -4545,16 +4545,14 @@ function emailMatchesMasked(masked, email) {
     return el.startsWith(prefix) && el.endsWith(suffix);
 }
 
-/** 平台卡虽显示 unused，但仍绑着别的号、换号核验没过，不能再配给下一家。 */
+/** 平台明确锁死换号才拦；管理员已授权 / 未锁定的 unused 卡可以换号再提。 */
 function cardBoundToOtherAccount(val, email) {
+    if (String(val?.status || "") !== "unused") return false;
+    if (val?.account_change_allowed === true) return false;
+    if (val?.account_change_locked !== true) return false;
     const bound = String(val?.bound_email || "").trim();
     if (!bound) return false;
-    if (emailMatchesMasked(bound, email)) return false;
-    const v = val.account_change_verdict || {};
-    if (val.account_change_locked) return true;
-    if (v.requires_card_replacement) return true;
-    if (/尚未完成换号核验|无法更换账号|请稍后重试/i.test(String(v.message || val.message || ""))) return true;
-    return true;
+    return !emailMatchesMasked(bound, email);
 }
 
 async function lockRechargeCard(cardId, err) {
