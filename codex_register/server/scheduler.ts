@@ -572,10 +572,18 @@ class Scheduler extends EventEmitter {
         const runId = `${domain}:${acc.id}`;
         let info = null;
         try {
-            if (domain === "gpt" && !acc.gpt_password) {
-                const touched = !!(acc.auth_file || acc.token || acc.error || acc.started_at);
-                const pw = touched ? String(appConfig.defaultPassword || "").trim() : randomPassword(16);
-                if (pw) {
+            if (domain === "gpt") {
+                const cur = String(acc.gpt_password || "").trim();
+                const started = !!(acc.auth_file || acc.token || acc.started_at);
+                const defaultPw = String(appConfig.defaultPassword || "").trim();
+                // 未真正开过号：空密码或库里仍是统一默认密码 → 每人随机一串
+                if (!started && (!cur || (defaultPw && cur === defaultPw))) {
+                    const pw = randomPassword(16);
+                    await db.updateAccount(acc.id, {gpt_password: pw});
+                    acc.gpt_password = pw;
+                    this.log(acc.id, "GPT 密码已按号随机生成");
+                } else if (!cur) {
+                    const pw = randomPassword(16);
                     await db.updateAccount(acc.id, {gpt_password: pw});
                     acc.gpt_password = pw;
                 }
