@@ -4522,63 +4522,64 @@ app.post("/api/recharge/submit", async (req, res) => {
 
     res.json({ok: true, paired: 0, claimed: items.length, skipped: skippedClaim.length, instanceId: db.instanceId});
 
-    // 后台：先预检再配卡提交。Gmail 不通 IMAP / mail.com 密码不可用的不配卡。
+    // 后台：预检并发；通过一个立刻配 1 张卡提交，不用等整批判完。
     (async () => {
         const intervalMs = (scheduler.rechargeInterval || 5) * 1000;
-        let submitted = 0, failed = 0;
+        const preConc = Math.max(2, Math.min(8, Number(scheduler.rechargeConcurrency) || 4));
+        let submitted = 0, failed = 0, preDone = 0;
+        let submitGate = Promise.resolve();
+        const enqueueSubmit = (q) => {
+            const run = submitGate.then(() => submitPassed(q));
+            submitGate = run.catch(() => {});
+            return run;
+        };
+        const submitPassed = async (q0) => {
+            if (rechargeStop) return;
+            const cards = await db.claimUnusedCards(1);
+            if (!cards.length) {
+                failed++;
+                await db.updateQueueItem(q0.id, {status: "error", error: "卡密分配不足", instance_id: "", finished_at: Date.now()});
+                rechargeLog(`预检 ✓ ${q0.email}，但没有未使用卡密，不提交`);
+                await queueSync();
+                return;
+            }
+            const card = cards[0];
+            await db.updateQueueItem(q0.id, {status: "paired", card_id: card.id, card_code: card.code});
+            await db.updateRechargeCard(card.id, {status: "paired", account_id: q0.account_id, account_email: q0.email});
+            await queueSync(); await rechargeSync();
+            const q = await db.getRechargeQueueItem(q0.id);
+            const liveCard = await db.getRechargeCard(card.id);
+            if (!q || !liveCard) { failed++; return; }
+            rechargeLog(`提交 ${q.email} ← ${String(liveCard.code || "").slice(0, 8)}…`);
+            const r = await submitOneQueueItem(q, liveCard);
+            if (r.ok) submitted++; else failed++;
+            await queueSync(); await rechargeSync();
+            if (!rechargeStop && intervalMs > 0) await new Promise((ok) => setTimeout(ok, intervalMs));
+        };
         try {
-        rechargeLog(`本实例 ${db.instanceId} 先预检再提交 ${items.length} 个 / API: ${scheduler.rechargeBaseUrl}`);
+        rechargeLog(`本实例 ${db.instanceId} 预检并发 ${preConc}，通过即提交 ${items.length} 个 / API: ${scheduler.rechargeBaseUrl}`);
         for (const s of skippedClaim) rechargeLog(`⏭ ${s.email}: ${s.reason}`);
 
-        const ready = [];
-        for (let i = 0; i < items.length; i++) {
-            if (rechargeStop) { rechargeLog("已停止充值提交"); break; }
-            const q = await db.getRechargeQueueItem(items[i].id);
-            if (!q) { failed++; continue; }
-            rechargeLog(`[预检 ${i + 1}/${items.length}] ${q.email}`);
+        await runPool(items, async (item) => {
+            if (rechargeStop) return;
+            const q = await db.getRechargeQueueItem(item.id);
+            if (!q) { failed++; return; }
+            rechargeLog(`[预检] ${q.email}`);
             const pre = await precheckRechargeMailbox(q);
+            const n = ++preDone;
             if (!pre.ok) {
                 failed++;
                 await db.updateQueueItem(q.id, {status: "error", error: pre.reason, instance_id: "", finished_at: Date.now()});
-                rechargeLog(`预检 ✗ ${q.email}: ${pre.reason}，不配卡、不提交`);
+                rechargeLog(`预检 ✗ ${n}/${items.length} ${q.email}: ${pre.reason}，不配卡、不提交`);
                 await queueSync();
-                continue;
+                return;
             }
-            ready.push(q);
-        }
-        if (!ready.length) {
-            rechargeLog(`预检后没有可提交的号（失败 ${failed}）`);
-        } else {
-        const cards = await db.claimUnusedCards(ready.length);
-        if (cards.length < ready.length) {
-            rechargeLog(`卡密不够：预检通过 ${ready.length}，只领到 ${cards.length} 张`);
-        }
-        const n = Math.min(ready.length, cards.length);
-        for (let i = 0; i < n; i++) {
-            await db.updateQueueItem(ready[i].id, {status: "paired", card_id: cards[i].id, card_code: cards[i].code});
-            await db.updateRechargeCard(cards[i].id, {status: "paired", account_id: ready[i].account_id, account_email: ready[i].email});
-        }
-        for (let i = n; i < ready.length; i++) {
-            failed++;
-            await db.updateQueueItem(ready[i].id, {status: "error", error: "卡密分配不足", instance_id: "", finished_at: Date.now()});
-        }
-        await queueSync(); await rechargeSync();
-        rechargeLog(`预检通过 ${ready.length} / 已配对 ${n} 组账号-卡密`);
+            rechargeLog(`预检 ✓ ${n}/${items.length} ${q.email}，立刻配卡提交`);
+            await enqueueSubmit(q);
+        }, preConc);
+        await submitGate;
 
-        for (let idx = 0; idx < n; idx++) {
-            if (rechargeStop) { rechargeLog("已停止充值提交"); break; }
-
-            const q = await db.getRechargeQueueItem(ready[idx].id);
-            const card = await db.getRechargeCard(cards[idx].id);
-            if (!q || !card) { failed++; continue; }
-
-            rechargeLog(`[${idx + 1}/${n}] 提交 ${q.email} ← ${card.code.slice(0, 8)}...`);
-            const r = await submitOneQueueItem(q, card);
-            if (r.ok) submitted++; else failed++;
-            await queueSync(); await rechargeSync();
-            if (idx + 1 < n && !rechargeStop) await new Promise((r) => setTimeout(r, intervalMs));
-        }
-        }
+        if (rechargeStop) rechargeLog("已停止充值提交");
         rechargeLog(`提交完成: 成功 ${submitted} / 失败 ${failed} / 总计 ${items.length}`);
         } finally {
         rechargeRunning = false;
