@@ -12,6 +12,11 @@ process.on("uncaughtException", (err) => {
         console.warn("[imap] TLS 记录损坏，已忽略（不退出进程）:", err?.message || err);
         return;
     }
+    const msg = `${err?.code || ""} ${err?.message || err || ""}`;
+    if (/EPIPE|ECONNRESET|socks|SOCKS/i.test(msg)) {
+        console.warn("[net] 忽略代理/管道异常（不退出）:", String(err?.message || err).slice(0, 160));
+        return;
+    }
     console.error(err);
     process.exit(1);
 });
@@ -3450,10 +3455,15 @@ async function precheckRechargeMailbox(q) {
             }
             const exit = String(lease?.url || "").trim();
             if (exit && proxyHasSocksAuth(exit)) {
-                const {openNoAuthSocksToAuthedProxy} = await import("../src/mail/proxy-chain.js");
-                local = await openNoAuthSocksToAuthedProxy(exit, jump);
-                proxy = local.url;
-                rechargeLog(`预检 ${acc.email}: 验 mail.com 密码（${poolName} ${maskProxyUrl(exit)}${jump ? " +跳板" : ""} → :${local.localPort}）`);
+                try {
+                    const {openNoAuthSocksToAuthedProxy} = await import("../src/mail/proxy-chain.js");
+                    local = await openNoAuthSocksToAuthedProxy(exit, jump);
+                    proxy = local.url;
+                    rechargeLog(`预检 ${acc.email}: 验 mail.com 密码（${poolName} ${maskProxyUrl(exit)}${jump ? " +跳板" : ""} → :${local.localPort}）`);
+                } catch (e) {
+                    proxy = rechargeProxy();
+                    rechargeLog(`预检 ${acc.email}: 代理池转发失败(${String(e?.message || e).slice(0, 60)})，回退 ${proxy || "直连"}`);
+                }
             } else {
                 if (exit && !proxyHasSocksAuth(exit)) proxy = exit;
                 rechargeLog(`预检 ${acc.email}: 验 mail.com 密码（代理=${proxy ? maskProxyUrl(proxy) : "直连"}）`);

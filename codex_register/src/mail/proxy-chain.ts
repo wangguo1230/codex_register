@@ -194,7 +194,9 @@ function readExact(socket: net.Socket, n: number, timeoutMs = 8000): Promise<Buf
             if (got < n) return;
             const all = Buffer.concat(chunks);
             const extra = all.subarray(n);
-            if (extra.length) socket.unshift(extra);
+            if (extra.length) {
+                try { socket.unshift(extra); } catch { /* 部分 socket 不支持 unshift */ }
+            }
             done(undefined, all.subarray(0, n));
         };
         socket.on("data", onData);
