@@ -74,7 +74,7 @@ async function main() {
     const shouldRotate = async (err) => {
         const {isProxySessionDead} = await import("./mail/proxy-pool.js");
         return isProxySessionDead(err)
-            || /多次打开 auth\/login 失败|原生表单|未进验证码|邮箱输入框未出现|验证码输入框未找到|换 IP|security verification/i.test(String(err || ""));
+            || /多次打开 auth\/login 失败|原生表单|未进验证码|邮箱输入框未出现|验证码输入框未找到|换 IP|security verification|未拿到 token|IMAP 未拿到|auth\/error|Oops|ConnectionRefused|跳板连不上|代理不通|Unable to load site/i.test(String(err || ""));
     };
 
     async function teardownBit(id, closeFn) {
@@ -132,14 +132,14 @@ async function main() {
 
     let r;
     let proxyUrl = process.env.PROXY_URL || "";
-    for (let attempt = 0; attempt < 3; attempt++) {
+    for (let attempt = 0; attempt < 4; attempt++) {
         let opened = {id: null, cdp: "", closeFn: () => {}, proxyUrl};
         try {
             if (attempt) {
                 const {mintStickySession} = await import("./mail/proxy-pool.js");
                 proxyUrl = mintStickySession(process.env.PROXY_URL || proxyUrl);
                 const why = /Cloudflare|Unable to load|出口被/.test(String(r?.error || "")) ? "出口被拦" : "代理断了";
-                emit({type: "progress", stage: "net", message: `${why}，换新 session 重开窗（${attempt + 1}/3）`});
+                emit({type: "progress", stage: "net", message: `${why}，换新 session 重开窗（${attempt + 1}/4）`});
             }
             opened = await openBitOnProxy(proxyUrl);
             bitId = opened.id;
@@ -162,7 +162,7 @@ async function main() {
             bitId = null;
         }
         if (r?.ok && r.token) break;
-        if (attempt < 2 && await shouldRotate(r?.error)) continue;
+        if (attempt < 3 && await shouldRotate(r?.error || "")) continue;
         emit({type: "result", status: "failed", email, error: r?.error || "浏览器注册未拿到 token"});
         process.exit(1); return;
     }

@@ -758,7 +758,8 @@ export async function registerViaBrowser(email, {password = "", totpSecret = "",
                         }
                         return waitGoogleImapOtp(cred, {
                             excludeCode: lastCode || "",
-                            attempts: 12,
+                            minTimestampMs: Date.now() - 3 * 60 * 1000,
+                            attempts: 16,
                             intervalMs: 5000,
                         });
                     }
@@ -1079,20 +1080,29 @@ export async function registerViaBrowser(email, {password = "", totpSecret = "",
         await page.waitForLoadState("domcontentloaded").catch(() => {});
         await page.waitForTimeout(3000);
         let session = null;
-        for (let i = 0; i < 10; i++) {
+        for (let i = 0; i < 12; i++) {
             await assertPageUsable(page, log);
             try {
                 session = await page.evaluate(async () => {
-                    try { const r = await fetch("/api/auth/session", {headers: {accept: "application/json"}}); return await r.json(); } catch { return null; }
+                    const urls = ["/api/auth/session", "https://chatgpt.com/api/auth/session"];
+                    for (const u of urls) {
+                        try {
+                            const r = await fetch(u, {headers: {accept: "application/json"}, credentials: "include"});
+                            const j = await r.json();
+                            if (j && (j.accessToken || j.user)) return j;
+                        } catch { /* next */ }
+                    }
+                    return null;
                 });
-                if (session && session.accessToken) break;
+                if (session && (session.accessToken || session.access_token)) break;
             } catch (e) { /* context destroyed(导航中) → 等一下重试 */ }
-            if (i === 4 && !/^https:\/\/chatgpt\.com/.test(page.url())) {
+            if ((i === 3 || i === 7) && !/^https:\/\/chatgpt\.com\/?$/.test(page.url().replace(/\?.*$/, ""))) {
+                await recoverLoginWhiteScreen(page, log).catch(() => {});
                 await page.goto("https://chatgpt.com/", {waitUntil: "domcontentloaded", timeout: 45000}).catch(() => {});
             }
             await page.waitForTimeout(2000);
         }
-        const token = session?.accessToken || "";
+        const token = session?.accessToken || session?.access_token || "";
         const cookies = await ctx.cookies();
         if (!token) log(`⚠️ 未从 /api/auth/session 拿到 accessToken(session=${JSON.stringify(session).slice(0, 80)})`);
         else log(`✅ 注册完成，拿到 accessToken ${token.slice(0, 18)}…`);
