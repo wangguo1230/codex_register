@@ -4531,6 +4531,37 @@ app.post("/api/recharge/queue/relogin-submit", async (req, res) => {
 let rechargeStop = false;
 let rechargeRunning = false;
 
+function emailMatchesMasked(masked, email) {
+    const m = String(masked || "").trim().toLowerCase();
+    const e = String(email || "").trim().toLowerCase();
+    if (!m || !e) return false;
+    if (m === e) return true;
+    const [ml, md] = m.split("@");
+    const [el, ed] = e.split("@");
+    if (!ml || !md || !el || md !== ed) return false;
+    if (!ml.includes("*")) return ml === el;
+    const prefix = ml.slice(0, ml.indexOf("*"));
+    const suffix = ml.slice(ml.lastIndexOf("*") + 1);
+    return el.startsWith(prefix) && el.endsWith(suffix);
+}
+
+/** 平台卡虽显示 unused，但仍绑着别的号、换号核验没过，不能再配给下一家。 */
+function cardBoundToOtherAccount(val, email) {
+    const bound = String(val?.bound_email || "").trim();
+    if (!bound) return false;
+    if (emailMatchesMasked(bound, email)) return false;
+    const v = val.account_change_verdict || {};
+    if (val.account_change_locked) return true;
+    if (v.requires_card_replacement) return true;
+    if (/尚未完成换号核验|无法更换账号|请稍后重试/i.test(String(v.message || val.message || ""))) return true;
+    return true;
+}
+
+async function lockRechargeCard(cardId, err) {
+    if (!cardId) return;
+    await db.updateRechargeCard(cardId, {status: "error", error: String(err || "提交失败，锁定不复用").slice(0, 200)});
+}
+
 // 单项提交核心(session → validate → challenge → tasks),队列/卡密状态在内部写入。
 // submit 与 relogin-submit 共用;label 为日志前缀。返回 {ok:true,taskNo} | {ok:false,stage,msg}
 async function submitOneQueueItem(q, card, label = "") {
@@ -4552,6 +4583,10 @@ async function submitOneQueueItem(q, card, label = "") {
             product: valResult.product || "", category: valResult.category || "", auth_mode: valResult.auth_mode || "",
         });
         if (valResult.status !== "unused") throw new Error(`卡密状态异常: ${valResult.status}`);
+        if (cardBoundToOtherAccount(valResult, q.email)) {
+            const bound = valResult.bound_email || "其他账号";
+            throw new Error(`卡密仍绑着 ${bound}，换号核验未过，不能配给 ${q.email}`);
+        }
 
         stage = "challenge";
         const chRes = await callRechargeApi("POST", "/submission-challenges", {
@@ -4577,8 +4612,9 @@ async function submitOneQueueItem(q, card, label = "") {
             status: "error", error: msg, finished_at: Date.now(),
             card_id: 0, card_code: card.code || q.card_code || "", instance_id: "",
         });
-        await db.unpairRechargeCards([card.id]);
-        rechargeLog(`${label}✗ ${q.email} 提交失败(${stage}阶段): ${msg}；卡密已放回未使用`);
+        // 提交失败锁卡，禁止下一号立刻再领同一张；人工「标记失败/回收卡密」才放回池
+        await lockRechargeCard(card.id, msg);
+        rechargeLog(`${label}✗ ${q.email} 提交失败(${stage}阶段): ${msg}；卡密已锁定，不给后面的号`);
         return {ok: false, stage, msg};
     }
 }
