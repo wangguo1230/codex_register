@@ -1895,13 +1895,33 @@ async function reviveIfAlive(id) {
     if (a && a.dead_at) { await db.setDeadAt(id, 0); broadcast("status", {id, ...(await db.getAccount(id))}); }
 }
 // at 与 rt 解耦:测 at 只测 at,失效直接走浏览器登录重登,★不用 rt 去续 at。
+/** 测 AT 走 GPT 代理池（经跳板转无账密 socks），避免 Node 直连/10808 被 CF 拦成 fetch failed。 */
+async function probeAtViaPool(acc, accessToken, accountId, log) {
+    return withLeasedGptProxy(`at-probe:${acc.email || acc.id}`, async (exit, jump) => {
+        let local = null;
+        let url = String(exit || "").trim();
+        try {
+            if (url && proxyHasSocksAuth(url)) {
+                const {openNoAuthSocksToAuthedProxy} = await import("../src/mail/proxy-chain.js");
+                local = await openNoAuthSocksToAuthedProxy(url, jump || "");
+                url = local.url;
+                try { log?.(`GPT 池 ${maskProxyUrl(exit)}${jump ? " +跳板" : ""} → :${local.localPort}`); } catch { /* */ }
+            } else if (!url) {
+                url = rechargeProxy() || scheduler.rtProxy || scheduler.regProxy || "";
+            }
+            return await probeAt(accessToken, accountId, buildProxyDispatcher(url));
+        } finally {
+            try { local?.close(); } catch { /* */ }
+        }
+    }, {timeoutMs: 20_000, log});
+}
+
 async function testOneAt(acc, {relogin = false} = {}) {
     await pushTestStatus(acc.id, "at", "测试中…");
-    // 探活 / 重登后校验：优先充值代理，其次注册代理（直连国内常整屏「网络重试」）
-    const probeDispatcher = () => buildProxyDispatcher(rechargeProxy() || scheduler.rtProxy || scheduler.regProxy || "");
+    const note = (m) => logAcct(acc.id, `[at] ${m}`);
     const tok = extractTokens(getAuthData(acc));
     if (tok && tok.accessToken) {
-        const r = await probeAt(tok.accessToken, tok.accountId, probeDispatcher());
+        const r = await probeAtViaPool(acc, tok.accessToken, tok.accountId, note);
         if (r.ok) { await pushTestStatus(acc.id, "at", "✅有效"); await reviveIfAlive(acc.id); return r; }
         if (!relogin) { await pushTestStatus(acc.id, "at", "❌" + r.reason); return r; } // 不重登→只标记失效
     } else if (!relogin) { await pushTestStatus(acc.id, "at", "无at"); return {ok: false, reason: "无at"}; }
@@ -1913,7 +1933,9 @@ async function testOneAt(acc, {relogin = false} = {}) {
     });
     if (!re.ok) { await pushTestStatus(acc.id, "at", "❌登录获取失败:" + String(re.reason || "").slice(0, 40)); return {ok: false, reason: re.reason}; }
     const fresh = re.authFile ? readAuthTokens(re.authFile) : extractTokens(getAuthData(await db.getAccount(acc.id)));
-    const r2 = fresh && fresh.accessToken ? await probeAt(fresh.accessToken, fresh.accountId, probeDispatcher()) : {ok: false, reason: "新 auth 无 at"};
+    const r2 = fresh && fresh.accessToken
+        ? await probeAtViaPool(acc, fresh.accessToken, fresh.accountId, note)
+        : {ok: false, reason: "新 auth 无 at"};
     await pushTestStatus(acc.id, "at", r2.ok ? "✅有效(已重登)" : ("❌" + r2.reason));
     if (r2.ok) await reviveIfAlive(acc.id);
     return r2;
