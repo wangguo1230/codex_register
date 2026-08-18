@@ -18,13 +18,41 @@ function withBitApiGate(fn) {
     return run;
 }
 
+function bitPostTimeoutMs(pathname) {
+    if (/\/(close|delete)$/.test(pathname)) return 8_000;
+    // 经跳板+出口开 Chrome 常 30–60s；20s 会把 fetch 掐成 This operation was aborted。
+    if (/\/browser\/open$/.test(pathname)) return 90_000;
+    if (/\/browser\/update/.test(pathname)) return 45_000;
+    return 20_000;
+}
+
+function isBitFetchAbort(err) {
+    const name = String(err?.name || "");
+    const msg = String(err?.message || err || "");
+    return name === "AbortError" || /operation was aborted|The operation was aborted/i.test(msg);
+}
+
 async function bitPost(pathname, body) {
     return withBitApiGate(async () => {
-    const r = await fetch(`${BIT_API}${pathname}`, {
-        method: "POST",
-        headers: {"Content-Type": "application/json"},
-        body: JSON.stringify(body || {}),
-    });
+    const timeoutMs = bitPostTimeoutMs(pathname);
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+    let r;
+    try {
+        r = await fetch(`${BIT_API}${pathname}`, {
+            method: "POST",
+            headers: {"Content-Type": "application/json"},
+            body: JSON.stringify(body || {}),
+            signal: ctrl.signal,
+        });
+    } catch (e) {
+        if (isBitFetchAbort(e)) {
+            throw new Error(`比特API ${pathname} 超时 ${Math.round(timeoutMs / 1000)}s`);
+        }
+        throw e;
+    } finally {
+        clearTimeout(timer);
+    }
     const j = await r.json().catch(() => ({}));
     if (!j || j.success !== true) {
         const msg = JSON.stringify(j).slice(0, 200);
@@ -227,9 +255,22 @@ export async function openBitWindow(id, {extractIp = true} = {}) {
         "--disable-save-password-bubble",
         "--disable-features=PasswordManagerOnboarding",
     ];
-    const d = await bitPost("/browser/open", {id, args, loadExtensions: false, extractIp: extractIp !== false});
-    scheduleArrangeBitWindows();
-    return {ws: d.ws, http: d.http, driver: d.driver};
+    const body = {id, args, loadExtensions: false, extractIp: extractIp !== false};
+    let lastErr;
+    // 第一次 HTTP 被超时掐掉时，比特这边窗往往还在开；再调一次常立刻拿到 ws。
+    for (let i = 0; i < 2; i++) {
+        try {
+            const d = await bitPost("/browser/open", body);
+            scheduleArrangeBitWindows();
+            return {ws: d.ws, http: d.http, driver: d.driver};
+        } catch (e) {
+            lastErr = e;
+            const msg = String(e?.message || e);
+            if (i === 0 && /超时|operation was aborted/i.test(msg)) continue;
+            throw e;
+        }
+    }
+    throw lastErr;
 }
 
 export async function closeBitWindow(id) {
@@ -240,13 +281,51 @@ export async function closeBitWindow(id) {
 export async function deleteBitWindow(id) { try { await bitPost("/browser/delete", {id}); } catch { /* ignore */ } }
 
 const liveBitIds = new Set();
-const STALE_NAME_RE = /^(harden-|totp-|probe-|gmail-|recharge|pw-|2fa-)/i;
-const STALE_REMARKS = new Set(["gmail-harden", "gmail-manage", "gmail-gpt", "gmail-pw", "gmail-2fa"]);
+const STALE_NAME_RE = /^(harden-|totp-|probe-|gmail-|rebind-|recharge|pw-|2fa-)/i;
+const STALE_REMARKS = new Set([
+    "gmail-harden", "gmail-manage", "gmail-gpt", "gmail-pw", "gmail-2fa",
+    "gmail-rebind-probe", "gmail-rebind-probe-10808", "gmail-rebind-probe-xray",
+    "gmail-rebind-probe-miya", "gmail-rebind-probe-jump",
+]);
+const REBIND_REMARKS = new Set([
+    "gmail-rebind-probe", "gmail-rebind-probe-10808", "gmail-rebind-probe-xray",
+    "gmail-rebind-probe-miya", "gmail-rebind-probe-jump",
+]);
 const GPT_WIN_NAME_RE = /^(gpt-|reg-)/i;
 const GPT_WIN_REMARKS = new Set(["gmail-gpt-imap", "codex-reg"]);
 
 export function trackBitWindow(id) { if (id) liveBitIds.add(id); }
 export function untrackBitWindow(id) { liveBitIds.delete(id); }
+
+/** 换绑探登录残留。onlyClosed=只删已关配置，绝不碰别人正在登的窗。 */
+export async function sweepRebindProbeWindows({log = () => {}, keepIds = [], onlyClosed = false, minAgeMs = 0} = {}) {
+    const keep = new Set((keepIds || []).filter(Boolean));
+    const ageMs = Math.max(0, Number(minAgeMs) || 0);
+    let windows = [];
+    try { windows = await listAllBitWindows({force: true}); }
+    catch (e) {
+        log(`[指纹] 列举换绑窗失败: ${e?.message || e}`);
+        return 0;
+    }
+    const now = Date.now();
+    let n = 0;
+    for (const w of windows) {
+        const remark = String(w?.remark || "");
+        const name = String(w?.name || "");
+        const ours = REBIND_REMARKS.has(remark) || /^rebind-/i.test(name);
+        if (!ours || !w?.id || keep.has(w.id) || liveBitIds.has(w.id)) continue;
+        if (onlyClosed && Number(w.status) === 1) continue;
+        if (ageMs > 0) {
+            const created = Date.parse(String(w.createdTime || "")) || 0;
+            if (created && now - created < ageMs) continue;
+        }
+        await closeBitWindow(w.id);
+        await deleteBitWindow(w.id);
+        n += 1;
+        log(`[指纹] 清换绑残留窗 ${name || w.id}`);
+    }
+    return n;
+}
 export function liveBitWindowIds() { return [...liveBitIds]; }
 
 export async function listBitWindows({page = 0, pageSize = 100} = {}) {
@@ -277,7 +356,7 @@ export function isBitTransientError(msg) {
 
 /** 跳板/出口挂了，不是这个号本身失败。 */
 export function isProxyInfraError(msg) {
-    return /跳板池全忙|跳板连不上|跳板不可用|代理不通|ECONNREFUSED|本地端口没起来|xray 启动失败|gate\.kookeey/i.test(String(msg || ""));
+    return /跳板池全忙|跳板连不上|跳板不可用|代理不通|ECONNREFUSED|本地端口没起来|xray 启动失败|gate\.kookeey|比特API .+ 超时|operation was aborted/i.test(String(msg || ""));
 }
 
 export async function listAllBitWindows({force = false} = {}) {

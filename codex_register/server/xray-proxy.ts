@@ -83,10 +83,26 @@ function inst(name) { if (!INSTANCES[name]) INSTANCES[name] = {proc: null, state
 
 export function xrayStatus(name = "reg") { return {...inst(name).state}; }
 
+/** 只有 :3100 主进程能启停跳板 xray。换绑/探活子进程 import scheduler 也会走到 ensureJumpFleet。 */
+export function isMainHttpServer() {
+    return process.argv.some((a) => /server\/index\.ts$/.test(String(a || "").replace(/\\/g, "/")));
+}
+
 /** 起独立 xray(命名实例):解析 vless → config → spawn。opts.name(reg/claude)、opts.localPort、opts.binPath(前端配置路径)。 */
 export function startXray(vlessUrl, opts: {name?: string; localPort?: number; binPath?: string} = {}) {
     const name = opts.name || "reg";
     const localPort = opts.localPort || DEFAULT_PORT[name] || 10809;
+    const it = inst(name);
+    if (it.proc && it.state.running && localPortListening(it.state.port || localPort)) {
+        return {ok: true, port: it.state.port || localPort, node: it.state.node, pid: it.state.pid, reused: true};
+    }
+    if (!isMainHttpServer()) {
+        if (localPortListening(localPort)) {
+            it.state = {running: true, port: localPort, node: parseVless(vlessUrl).name, vless: vlessUrl, pid: 0, error: ""};
+            return {ok: true, port: localPort, node: it.state.node, pid: 0, reused: true};
+        }
+        throw new Error("子进程不能启停跳板 xray（会把 3100 的跳板杀掉）");
+    }
     stopXray(name);
     const v = parseVless(vlessUrl);
     // 按端口清理跨重启残留的僵尸 xray
@@ -106,7 +122,6 @@ export function startXray(vlessUrl, opts: {name?: string; localPort?: number; bi
     mkdirSync(CFG_DIR, {recursive: true});
     const cfgFile = path.join(CFG_DIR, `${name}-vless.json`);
     writeFileSync(cfgFile, JSON.stringify(buildConfig(v, localPort), null, 2), "utf8");
-    const it = inst(name);
     const child = spawn(bin, ["run", "-c", cfgFile], {stdio: ["ignore", "pipe", "pipe"], detached: false});
     it.proc = child;
     it.state = {running: true, port: localPort, node: v.name, vless: vlessUrl, pid: child.pid, error: ""};
@@ -147,6 +162,176 @@ export const JUMP_PORT_BASE = 10811;
 
 export function listJumpXrays() {
     return Object.keys(INSTANCES).filter(isJumpName).map((name) => ({name, ...inst(name).state}));
+}
+
+export function isLocalNoAuthSocks(raw: string) {
+    try {
+        const cleaned = String(raw || "").trim().replace(/#.*$/, "");
+        if (!cleaned) return false;
+        const u = new URL(/^[a-z][a-z0-9+.-]*:\/\//i.test(cleaned) ? cleaned : `socks5://${cleaned}`);
+        const local = u.hostname === "127.0.0.1" || u.hostname === "localhost";
+        return local && u.protocol.startsWith("socks") && !u.username && !u.password;
+    } catch {
+        return false;
+    }
+}
+
+// 端口探测绝不能用 execSync。lsof 在本机实测 0.4s/次，而 execSync 会把整个事件循环冻住，
+// :3100 在这期间一个请求都不处理。换绑/重登/导出RT 每次都要问好几个端口，liveJumpSocks
+// 最坏还要扫 20 个，叠起来就是几秒到十几秒的假死。改成 TCP connect 探测 + 短缓存：
+// 单次 ~几毫秒、异步、并且同一个端口的并发提问只探一次。
+const PORT_PROBE_TTL_MS = 3000;
+const PORT_PROBE_TIMEOUT_MS = 400;
+const PORT_WARM_IDLE_MS = 60_000;
+const portCache = new Map<number, {at: number; up: boolean; usedAt: number}>();
+const portInflight = new Map<number, Promise<boolean>>();
+
+function probeLocalPortOnce(port: number): Promise<boolean> {
+    return new Promise((resolve) => {
+        let done = false;
+        const finish = (up: boolean) => {
+            if (done) return;
+            done = true;
+            try { sock.destroy(); } catch { /* */ }
+            resolve(up);
+        };
+        const sock = net.connect({host: "127.0.0.1", port});
+        sock.setTimeout(PORT_PROBE_TIMEOUT_MS);
+        sock.on("connect", () => finish(true));
+        sock.on("timeout", () => finish(false));
+        sock.on("error", () => finish(false));
+    });
+}
+
+function refreshPort(p: number, usedAt: number) {
+    const running = portInflight.get(p);
+    if (running) return running;
+    const task = probeLocalPortOnce(p).then((up) => {
+        const prev = portCache.get(p);
+        portCache.set(p, {at: Date.now(), up, usedAt: Math.max(usedAt, prev?.usedAt || 0)});
+        portInflight.delete(p);
+        return up;
+    }, () => {
+        portInflight.delete(p);
+        return false;
+    });
+    portInflight.set(p, task);
+    return task;
+}
+
+/** 端口在不在听。异步 + 3 秒缓存；同一端口并发只探一次。 */
+export async function localPortListeningAsync(port: number) {
+    const p = Number(port);
+    if (!p) return false;
+    const now = Date.now();
+    const hit = portCache.get(p);
+    if (hit && now - hit.at < PORT_PROBE_TTL_MS) {
+        hit.usedAt = now;
+        return hit.up;
+    }
+    return refreshPort(p, now);
+}
+
+// 后台把最近问过的端口焐热。这样热路径基本都是命中缓存（0 延迟），
+// 剩下那几个同步调用点（startXray / 读配置）也几乎撞不到冷缓存去跑阻塞 lsof。
+// 只跟着实际用过的端口走，不主动全段扫；unref 保证不吊住进程退出。
+const portWarmTimer = setInterval(() => {
+    const now = Date.now();
+    for (const [p, v] of portCache) {
+        if (now - v.usedAt > PORT_WARM_IDLE_MS) { portCache.delete(p); continue; }
+        if (now - v.at >= PORT_PROBE_TTL_MS - 800) refreshPort(p, v.usedAt).catch(() => {});
+    }
+}, 1500);
+try { portWarmTimer.unref(); } catch { /* */ }
+
+/**
+ * 同步版，只给启停 xray / 启动读配置这种低频同步调用留着。
+ * 命中缓存就直接返回（热路径会一直把缓存焐热）；缓存冷了才退回一次阻塞探测。
+ */
+export function localPortListening(port: number) {
+    const p = Number(port);
+    if (!p) return false;
+    const now = Date.now();
+    const hit = portCache.get(p);
+    if (hit && now - hit.at < PORT_PROBE_TTL_MS) {
+        hit.usedAt = now;
+        return hit.up;
+    }
+    let up = false;
+    try {
+        if (process.platform === "win32") {
+            const out = execSync("netstat -ano -p tcp", {stdio: ["ignore", "pipe", "ignore"]}).toString();
+            up = new RegExp(`[:.]${p}\\s+\\S+\\s+LISTENING`, "i").test(out);
+        } else {
+            execSync(`lsof -tiTCP:${p} -sTCP:LISTEN`, {stdio: "ignore"});
+            up = true;
+        }
+    } catch {
+        up = false;
+    }
+    portCache.set(p, {at: now, up, usedAt: now});
+    return up;
+}
+
+/** 当前真正在听的跳板 socks。settings 里的 10812 常是上次重启留下的死端口。 */
+export async function liveJumpSocks() {
+    // 已登记的跳板实例优先，按登记顺序保持原来的优先级
+    const known = listJumpXrays().filter((r) => r?.running && Number(r?.port || 0) > 0);
+    const knownUp = await Promise.all(known.map((r) => localPortListeningAsync(Number(r.port))));
+    for (let i = 0; i < known.length; i++) {
+        if (knownUp[i]) {
+            const r = known[i];
+            return String(r.socks || `socks5://127.0.0.1:${r.port}`);
+        }
+    }
+    // 扫描段并发探，20 个端口一起问，总耗时约等于一次探测
+    const ports: number[] = [];
+    for (let p = JUMP_PORT_BASE; p < JUMP_PORT_BASE + 20; p++) {
+        if (JUMP_RESERVED_PORTS.includes(p)) continue;
+        ports.push(p);
+    }
+    const ups = await Promise.all(ports.map((p) => localPortListeningAsync(p)));
+    const idx = ups.findIndex(Boolean);
+    return idx >= 0 ? `socks5://127.0.0.1:${ports[idx]}` : "";
+}
+
+/** 候选按优先级去重后排出来，只留本机无账密 socks。 */
+function xrayBrowserCandidatePorts(fallbacks: string[]) {
+    const urls: string[] = [];
+    for (const f of fallbacks) {
+        const u = String(f || "").trim();
+        if (u) urls.push(u);
+    }
+    urls.push("socks5://127.0.0.1:10808");
+    for (const r of listJumpXrays()) {
+        if (r?.running && r.socks) urls.push(String(r.socks));
+    }
+    urls.push("socks5://127.0.0.1:10811");
+    const seen = new Set<string>();
+    const ports: number[] = [];
+    for (const raw of urls) {
+        if (!isLocalNoAuthSocks(raw)) continue;
+        const key = raw.split("#")[0];
+        if (seen.has(key)) continue;
+        seen.add(key);
+        try {
+            const u = new URL(/^[a-z][a-z0-9+.-]*:\/\//i.test(key) ? key : `socks5://${key}`);
+            const port = Number(u.port || 1080);
+            if (port && !ports.includes(port)) ports.push(port);
+        } catch { /* */ }
+    }
+    return ports;
+}
+
+/**
+ * 浏览器/比特/Playwright 只走本机 xray 无账密 socks，禁止 JS 转发 kookeey。
+ * 候选并发探测，返回优先级最高的那个活口。重登/换绑每一轮都要走这里，不能阻塞事件循环。
+ */
+export async function pickXrayBrowserProxy(...fallbacks: string[]) {
+    const ports = xrayBrowserCandidatePorts(fallbacks);
+    const ups = await Promise.all(ports.map((p) => localPortListeningAsync(p)));
+    const idx = ups.findIndex(Boolean);
+    return idx >= 0 ? `socks5://127.0.0.1:${ports[idx]}` : "";
 }
 
 export function stopJumpFleet() {
@@ -191,6 +376,17 @@ function pickJumpPort(used) {
  * 同一条 vless 已在跑则复用，不再重启。不碰 10808。
  */
 export async function startJumpFleet(vlessUrls, opts: {binPath?: string; basePort?: number} = {}) {
+    if (!isMainHttpServer()) {
+        const live = await liveJumpSocks();
+        if (!live) return [];
+        let port = JUMP_PORT_BASE;
+        try { port = Number(new URL(live).port || JUMP_PORT_BASE); } catch { /* */ }
+        return (vlessUrls || []).filter((s) => isVlessUrl(s)).map((vless) => ({
+            vless, socks: live, port,
+            node: parseVless(vless).name, name: jumpInstanceName(vless),
+            running: true, error: "",
+        }));
+    }
     const wanted = [];
     const seen = new Set();
     for (const raw of vlessUrls || []) {

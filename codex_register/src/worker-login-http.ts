@@ -10,6 +10,7 @@ import {OpenAIClient} from "./openai.js";
 import {appConfig} from "./config.js";
 import {enrollTotp} from "./mfa.js";
 import {decodeJwt} from "./token-check.js";
+import {installWorkerProxyFromEnv} from "./mail/install-worker-proxy.js";
 
 const EVENT_PREFIX = "@@EVENT@@";
 const email = (process.env.REG_EMAIL || "").trim();
@@ -20,6 +21,8 @@ function emit(ev) { process.stdout.write(EVENT_PREFIX + JSON.stringify(ev) + "\n
 
 async function main() {
     if (!email) { emit({type: "result", status: "failed", email: "", error: "缺少 REG_EMAIL"}); process.exit(1); return; }
+    const closeProxy = await installWorkerProxyFromEnv();
+    try {
     emit({type: "progress", stage: "start", email, message: `开始协议登录 ${email}`});
 
     const client = new OpenAIClient({
@@ -72,6 +75,9 @@ async function main() {
         token: r.token,
         authFile: r.authFile,
     });
+    } finally {
+        try { closeProxy(); } catch { /* */ }
+    }
 }
 
 main()

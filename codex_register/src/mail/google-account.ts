@@ -75,13 +75,17 @@ export function rememberGoogleImapPassword(email, imapPassword) {
 }
 
 /** 只走 IMAP 轮询 ChatGPT 验证码（换绑/注册都可复用）。 */
-export async function waitGoogleImapOtp(cred, {minTimestampMs = 0, excludeCode = "", attempts = 16, intervalMs = 5000} = {}) {
+/** deadlineMs：绝对截止时间戳。换绑用它保证 verify 还落在 pwd_auth 窗口内。 */
+export async function waitGoogleImapOtp(cred, {minTimestampMs = 0, excludeCode = "", attempts = 16, intervalMs = 5000, deadlineMs = 0} = {}) {
     const c = rememberGoogleCred(cred) || cred;
     let lastErr = "";
     const n = Math.max(1, Number(attempts) || 16);
+    const overBudget = () => deadlineMs > 0 && Date.now() >= deadlineMs;
     for (let i = 0; i < n; i++) {
+        if (overBudget()) break;
+        console.log(`[google] IMAP 收码 ${i + 1}/${n} ${c.email}`);
         try {
-            const code = await tryImapOtp(c, {minTimestampMs, excludeCode});
+            const code = await tryImapOtp(c, {minTimestampMs, excludeCode, deadlineMs});
             if (code) {
                 console.log(`[google] IMAP 拿到验证码 ${code}`);
                 return code;
@@ -90,7 +94,10 @@ export async function waitGoogleImapOtp(cred, {minTimestampMs = 0, excludeCode =
             lastErr = String(e?.message || e);
             console.log(`[google] IMAP 不可用(${lastErr.slice(0, 80)})`);
         }
-        if (i < n - 1) await new Promise((r) => setTimeout(r, intervalMs));
+        if (i < n - 1 && !overBudget()) await new Promise((r) => setTimeout(r, intervalMs));
+    }
+    if (overBudget()) {
+        throw new Error(`IMAP 取码超预算，未拿到 ChatGPT 验证码${lastErr ? `(${lastErr.slice(0, 80)})` : ""}: ${c.email}`);
     }
     throw new Error(`IMAP 未拿到 ChatGPT 验证码${lastErr ? `(${lastErr.slice(0, 80)})` : ""}: ${c.email}`);
 }
@@ -182,9 +189,12 @@ async function tryImapOtpOnce(cred, {minTimestampMs = 0, excludeCode = "", proxy
     return "";
 }
 
-async function tryImapOtp(cred, {minTimestampMs = 0, excludeCode = ""} = {}) {
+async function tryImapOtp(cred, {minTimestampMs = 0, excludeCode = "", deadlineMs = 0} = {}) {
     let lastErr = "";
     for (const via of imapViaList()) {
+        // 一轮要试 4 个出口、每个 connectionTimeout 16s，不在出口之间看截止时间的话
+        // 单轮就能冲过整个取码预算（换绑那边靠这个预算保证 verify 落在 pwd_auth 窗口内）
+        if (deadlineMs && Date.now() >= deadlineMs) break;
         try {
             return await tryImapOtpOnce(cred, {minTimestampMs, excludeCode, proxy: via});
         } catch (e) {
@@ -264,6 +274,7 @@ export async function getGoogleEmailVerificationCode(email, options = {}) {
 
     let imapErr = "";
     for (let i = 0; i < 16; i++) {
+        console.log(`[google] IMAP 收码 ${i + 1}/16 ${email}`);
         try {
             const imapCode = await tryImapOtp(cred, {minTimestampMs, excludeCode});
             if (imapCode) {

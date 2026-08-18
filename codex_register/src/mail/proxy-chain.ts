@@ -206,19 +206,20 @@ function readExact(socket: net.Socket, n: number, timeoutMs = 8000): Promise<Buf
 }
 
 /** 已连上带账密的 socks5 出口后，在该 socket 上完成鉴权并 CONNECT dest。 */
-async function socks5ConnectOnSocket(socket: net.Socket, user: string, pass: string, destHost: string, destPort: number) {
+async function socks5ConnectOnSocket(socket: net.Socket, user: string, pass: string, destHost: string, destPort: number, timeoutMs = 8_000) {
+    socket.on("error", () => { /* 超时后晚到的 ECONNRESET 不要打成未处理异常 */ });
     if (user || pass) {
         socket.write(Buffer.from([0x05, 0x01, 0x02]));
-        const pick = await readExact(socket, 2);
+        const pick = await readExact(socket, 2, timeoutMs);
         if (pick[1] !== 0x02) throw new Error("出口不接受用户名密码鉴权");
         const u = Buffer.from(user || "");
         const p = Buffer.from(pass || "");
         socket.write(Buffer.concat([Buffer.from([0x01, u.length]), u, Buffer.from([p.length]), p]));
-        const auth = await readExact(socket, 2);
+        const auth = await readExact(socket, 2, timeoutMs);
         if (auth[1] !== 0x00) throw new Error("出口 socks5 账密被拒");
     } else {
         socket.write(Buffer.from([0x05, 0x01, 0x00]));
-        const pick = await readExact(socket, 2);
+        const pick = await readExact(socket, 2, timeoutMs);
         if (pick[1] !== 0x00) throw new Error("出口 socks5 无账密握手失败");
     }
     const host = Buffer.from(destHost);
@@ -227,13 +228,13 @@ async function socks5ConnectOnSocket(socket: net.Socket, user: string, pass: str
     host.copy(req, 5);
     req.writeUInt16BE(destPort, 5 + host.length);
     socket.write(req);
-    const head = await readExact(socket, 4);
+    const head = await readExact(socket, 4, timeoutMs);
     if (head[1] !== 0x00) throw new Error(`出口 CONNECT 失败 rep=${head[1]}`);
-    if (head[3] === 1) await readExact(socket, 6);
+    if (head[3] === 1) await readExact(socket, 6, timeoutMs);
     else if (head[3] === 3) {
-        const l = await readExact(socket, 1);
-        await readExact(socket, l[0] + 2);
-    } else if (head[3] === 4) await readExact(socket, 18);
+        const l = await readExact(socket, 1, timeoutMs);
+        await readExact(socket, l[0] + 2, timeoutMs);
+    } else if (head[3] === 4) await readExact(socket, 18, timeoutMs);
     return socket;
 }
 
@@ -241,10 +242,35 @@ async function socks5ConnectOnSocket(socket: net.Socket, user: string, pass: str
  * Playwright 不能走 socks5 账密。这里起一个本机无账密 socks5，
  * 把 CONNECT 转到池里的 kookeey（可经跳板），这样 mail.com 预检能一人一出口。
  */
+/** 协议出网：跳板 TCP 到 kookeey，再 socks5 CONNECT dest。不要在同进程再套一层本机 socks。 */
+export async function connectExitViaJump(exitUrl: string, jumpRaw: string, destHost: string, destPort: number) {
+    const exit = parseProxyEndpoint(exitUrl);
+    if (!exit || !exit.isSocks) throw new Error("出口须是 socks5");
+    if (jumpRaw) {
+        const raw = await connectViaJumpRetry(jumpRaw, exit.host, exit.port, 3);
+        // SocksClient + existing_socket 经 xray 跳板会卡死 25s（Proxy connection timed out）。
+        // 本机转发 / 比特窗走的是手工 socks5 握手，这里必须同一条。
+        return socks5ConnectOnSocket(raw, exit.user, exit.pass, destHost, destPort, 8_000);
+    }
+    const r = await SocksClient.createConnection({
+        proxy: {
+            host: exit.host, port: exit.port, type: 5,
+            userId: exit.user || undefined, password: exit.pass || undefined,
+        },
+        command: "connect",
+        destination: {host: destHost, port: destPort},
+        timeout: 25_000,
+    });
+    return r.socket;
+}
+
 export async function openNoAuthSocksToAuthedProxy(exitUrl: string, jumpRaw = "") {
     const exit = parseProxyEndpoint(exitUrl);
     if (!exit || !exit.isSocks) throw new Error("出口须是 socks5");
+    const clients = new Set<net.Socket>();
     const server = net.createServer((client) => {
+        clients.add(client);
+        client.on("close", () => clients.delete(client));
         (async () => {
             const hello = await readExact(client, 2);
             if (hello[0] !== 0x05) throw new Error("不是 socks5");
@@ -271,7 +297,7 @@ export async function openNoAuthSocksToAuthedProxy(exitUrl: string, jumpRaw = ""
             let up: net.Socket;
             if (jumpRaw) {
                 const raw = await connectViaJumpRetry(jumpRaw, exit.host, exit.port, 3);
-                up = await socks5ConnectOnSocket(raw, exit.user, exit.pass, destHost, destPort);
+                up = await socks5ConnectOnSocket(raw, exit.user, exit.pass, destHost, destPort, 25_000);
             } else {
                 const r = await SocksClient.createConnection({
                     proxy: {
@@ -309,7 +335,13 @@ export async function openNoAuthSocksToAuthedProxy(exitUrl: string, jumpRaw = ""
     return {
         url: `socks5://127.0.0.1:${port}`,
         localPort: port,
-        close() { try { server.close(); } catch { /* */ } },
+        close() {
+            for (const c of [...clients]) {
+                try { c.destroy(); } catch { /* */ }
+            }
+            clients.clear();
+            try { server.close(); } catch { /* */ }
+        },
     };
 }
 

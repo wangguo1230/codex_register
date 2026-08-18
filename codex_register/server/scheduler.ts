@@ -11,7 +11,8 @@ import {appConfig} from "../src/config.js";
 import {randomPassword} from "../src/utils.js";
 import {resolveEngine} from "./domain/register-engine.js";
 import {mailProxyPool, gptProxyPool, mailJumpPool, gptJumpPool, expandProxyImport, toProxyImportLine, setMailProxyJump, JUMP_MAX_EXITS, maskProxyUrl, normalizeProxyUrl} from "../src/mail/proxy-pool.js";
-import {startJumpFleet, stopJumpFleet, isVlessUrl, listJumpXrays} from "./xray-proxy.js";
+import {startJumpFleet, stopJumpFleet, isVlessUrl, listJumpXrays, pickXrayBrowserProxy, isMainHttpServer, localPortListening} from "./xray-proxy.js";
+import {cleanSpawnEnv} from "./strip-env-proxy.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const CODEX_ROOT = path.resolve(__dirname, "..");
@@ -189,6 +190,18 @@ class Scheduler extends EventEmitter {
     }
 
     async ensureJumpFleet() {
+        if (!isMainHttpServer()) {
+            const {liveJumpSocks} = await import("./xray-proxy.js");
+            const live = await liveJumpSocks();
+            if (live) {
+                mailJumpPool.setUrls([live]);
+                gptJumpPool.setUrls([live]);
+                this.mailProxyJump = live;
+                this.gptProxyJump = live;
+                setMailProxyJump(live);
+            }
+            return [];
+        }
         const lines = this.collectJumpLines();
         const vless = lines.filter((x) => isVlessUrl(x));
         if (!vless.length) {
@@ -203,9 +216,11 @@ class Scheduler extends EventEmitter {
                 socks.push(url);
             }
             mailJumpPool.setUrls(socks);
+            gptJumpPool.setUrls(socks);
             this.mailProxyJump = socks[0] || "";
             this.gptProxyJump = socks[0] || "";
             if (this.mailProxyJump) setMailProxyJump(this.mailProxyJump);
+            try { this.saveSettings(); } catch { /* */ }
             return [];
         }
         this.jumpFleet = await startJumpFleet(vless, {
@@ -229,9 +244,11 @@ class Scheduler extends EventEmitter {
             socks.push(url);
         }
         mailJumpPool.setUrls(socks);
+        gptJumpPool.setUrls(socks);
         this.mailProxyJump = socks[0] || "";
         this.gptProxyJump = socks[0] || "";
         if (this.mailProxyJump) setMailProxyJump(this.mailProxyJump);
+        try { this.saveSettings(); } catch { /* 跳板端口必须写回，避免子进程还读 10812 死口 */ }
         const dead = this.jumpFleet.filter((f) => !f.running);
         if (dead.length) {
             console.warn(`[jump] ${dead.length} 条 vless xray 没起来: ${dead.map((f) => f.error || f.node).join(" ; ")}`);
@@ -248,8 +265,10 @@ class Scheduler extends EventEmitter {
             : (this.gptProxyJump ? [this.gptProxyJump] : mail.slice());
         this.mailJumpPool = mail;
         this.gptJumpPool = gpt;
-        const socks = mail.concat(gpt).map((x) => this.resolveJumpLine(x, [])).filter(Boolean);
-        mailJumpPool.setUrls(socks.filter((u) => !isVlessUrl(u)));
+        const mailSocks = mail.map((x) => this.resolveJumpLine(x, [])).filter((u) => u && !isVlessUrl(u));
+        const gptSocks = gpt.map((x) => this.resolveJumpLine(x, [])).filter((u) => u && !isVlessUrl(u));
+        mailJumpPool.setUrls(mailSocks);
+        gptJumpPool.setUrls(gptSocks.length ? gptSocks : mailSocks);
         if (mail[0] && !isVlessUrl(mail[0])) setMailProxyJump(this.resolveJumpLine(mail[0], []) || "");
     }
     normalizeRebindAfterPaid() {
@@ -353,19 +372,12 @@ class Scheduler extends EventEmitter {
         return this.regProxy || "";
     }
 
+    /**
+     * 端口在不在听。复用 xray-proxy 的带缓存实现，别再自己 execSync 一份——
+     * lsof 一次 0.4s，execSync 会把事件循环整个冻住，:3100 期间不响应任何请求。
+     */
     portListening(port) {
-        const p = Number(port);
-        if (!p) return false;
-        try {
-            if (IS_WIN) {
-                const out = execSync("netstat -ano -p tcp", {stdio: ["ignore", "pipe", "ignore"]}).toString();
-                return new RegExp(`[:.]${p}\\s+\\S+\\s+LISTENING`, "i").test(out);
-            }
-            execSync(`lsof -tiTCP:${p} -sTCP:LISTEN`, {stdio: "ignore"});
-            return true;
-        } catch {
-            return false;
-        }
+        return localPortListening(port);
     }
 
     setMailProxyJump(url) {
@@ -374,9 +386,11 @@ class Scheduler extends EventEmitter {
         else this.mailJumpPool = [];
         this.gptJumpPool = this.mailJumpPool.slice();
         this.gptProxyJump = this.mailProxyJump;
-        const pending = this.ensureJumpFleet();
-        if (pending && typeof pending.then === "function") pending.catch((e) => console.warn("[jump] 起 xray 失败", e?.message || e));
-        this.saveSettings();
+        if (isMainHttpServer()) {
+            const pending = this.ensureJumpFleet();
+            if (pending && typeof pending.then === "function") pending.catch((e) => console.warn("[jump] 起 xray 失败", e?.message || e));
+            this.saveSettings();
+        }
         return this.mailProxyJump;
     }
 
@@ -592,27 +606,6 @@ class Scheduler extends EventEmitter {
             writeFileSync(tmpFile, [acc.email, acc.password, acc.mailbox_totp || "", acc.recovery_email || "", acc.mailbox_imap || ""].join("----") + "\n", "utf8");
             info = {child: null, tmpFile, gotResult: false, engine: null, domain, id: acc.id, mailboxId: acc.mailbox_id, releasing: false, wantGptPool: domain === "gpt", mailLease: null, jumpLease: null};
             this.running.set(runId, info);
-            if (info.wantGptPool) {
-                try {
-                    if (gptJumpPool.urls.length) {
-                        info.jumpLease = await gptJumpPool.lease(acc.email, {timeoutMs: 20_000, maxPerJump: JUMP_MAX_EXITS});
-                    }
-                    info.mailLease = await gptProxyPool.lease(acc.email, {
-                        fallback: "",
-                        timeoutMs: 20_000,
-                        maxPerTemplate: 1,
-                        freshSession: true,
-                    });
-                    const jump = info.jumpLease?.url || this.gptProxyJump || "";
-                    this.logJob(info, `GPT 代理池租到 ${String(info.mailLease.url || "直连").replace(/:[^:@/]+@/, ":***@")}（一号一代理 · 新 session${jump ? `，经跳板 ${jump} 1跳板≤${JUMP_MAX_EXITS}出口` : "，无跳板直连网关"}）`);
-                } catch (e) {
-                    try { info.jumpLease?.release(); } catch { /* */ }
-                    this.running.delete(runId);
-                    await db.releaseGptIfRunning(acc.id);
-                    this.log(acc.id, `GPT 代理池租不到: ${e?.message || e}，退回排队`);
-                    return;
-                }
-            }
 
             // 注册知识收敛在引擎:调度器只管进程/并发/事件(通用)。按账号所属域选引擎。
             const engine = resolveEngine(domain);
@@ -620,9 +613,6 @@ class Scheduler extends EventEmitter {
             try {
                 ({script, env} = engine.buildSpawn(acc, this, tmpFile));
             } catch (e) {
-                // 如 Gmail 无 IMAP：启动前直接失败，释放代理与 running 槽
-                try { info.mailLease?.release(); } catch { /* */ }
-                try { info.jumpLease?.release(); } catch { /* */ }
                 this.running.delete(runId);
                 const err = String(e?.message || e);
                 this.log(acc.id, `❌ 无法启动注册: ${err}`);
@@ -634,9 +624,49 @@ class Scheduler extends EventEmitter {
                 try { rmSync(tmpFile, {force: true}); } catch { /* */ }
                 return;
             }
-            if (info.mailLease) env.PROXY_URL = info.mailLease.url || "";
-            env.MAIL_PROXY_JUMP = info.jumpLease?.url || this.gptProxyJump || env.MAIL_PROXY_JUMP || "";
-            const child = spawn(TSX_BIN, [script], {cwd: CODEX_ROOT, env: {...process.env, ...env}, shell: IS_WIN});
+            const isBrowserWorker = /worker-register-browser|register-browser|worker-register-claude/i.test(String(script || ""));
+            if (isBrowserWorker) {
+                const xray = await pickXrayBrowserProxy(this.regProxy, this.rtProxy, "socks5://127.0.0.1:10811", "socks5://127.0.0.1:10808");
+                if (!xray) {
+                    this.running.delete(runId);
+                    const err = "浏览器必须走 xray，本机没有可用的 xray socks（10811/10808）";
+                    this.log(acc.id, `❌ 无法启动注册: ${err}`);
+                    if (domain === "gpt") {
+                        await db.markFailed(acc.id, err);
+                        this.emit("status", {id: acc.id, status: "failed"});
+                        try { this.emit("stats", await db.stats()); } catch { /* */ }
+                    }
+                    try { rmSync(tmpFile, {force: true}); } catch { /* */ }
+                    return;
+                }
+                env.PROXY_URL = xray;
+                env.MAIL_PROXY_JUMP = "";
+                this.logJob(info, `浏览器走 xray ${xray}（不用 JS 转发 kookeey）`);
+            } else if (info.wantGptPool) {
+                try {
+                    if (gptJumpPool.urls.length) {
+                        info.jumpLease = await gptJumpPool.lease(acc.email, {timeoutMs: 20_000, maxPerJump: JUMP_MAX_EXITS});
+                    }
+                    info.mailLease = await gptProxyPool.lease(acc.email, {
+                        fallback: "",
+                        timeoutMs: 20_000,
+                        maxPerTemplate: 1,
+                        freshSession: true,
+                    });
+                    const jump = info.jumpLease?.url || this.gptProxyJump || "";
+                    env.PROXY_URL = info.mailLease.url || "";
+                    env.MAIL_PROXY_JUMP = jump;
+                    this.logJob(info, `GPT 代理池租到 ${String(info.mailLease.url || "直连").replace(/:[^:@/]+@/, ":***@")}（协议自行转发${jump ? `，跳板 ${jump}` : "，无跳板"}）`);
+                } catch (e) {
+                    try { info.jumpLease?.release(); } catch { /* */ }
+                    this.running.delete(runId);
+                    await db.releaseGptIfRunning(acc.id);
+                    this.log(acc.id, `GPT 代理池租不到: ${e?.message || e}，退回排队`);
+                    try { rmSync(tmpFile, {force: true}); } catch { /* */ }
+                    return;
+                }
+            }
+            const child = spawn(TSX_BIN, [script], {cwd: CODEX_ROOT, env: cleanSpawnEnv(env), shell: IS_WIN});
             info.child = child;
             info.engine = engine;
             if (domain === "claude") this.emit("claude", {stats: await db.claudeStats()});

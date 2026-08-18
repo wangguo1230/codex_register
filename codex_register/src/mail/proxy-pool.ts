@@ -261,6 +261,20 @@ export async function probeMailProxy(rawUrl: string, {timeoutSec = 12, jump}: {t
 }> {
     const url = normalizeProxyUrl(rawUrl) || String(rawUrl || "").trim();
     const started = Date.now();
+    // tcp + 跳板包装 + 最多 3 次 curl，16s 会被硬掐死（换绑日志里的「探测超时 16000ms」）
+    const budgetMs = Math.max(25000, 10_000 + (Number(timeoutSec) || 12) * 3000);
+    const hardTimer = new Promise<{ok: false; ip: string; google: number; accounts: number; ms: number; reason: string}>((resolve) => {
+        setTimeout(() => resolve({
+            ok: false, ip: "", google: 0, accounts: 0, ms: Date.now() - started,
+            reason: `探测超时 ${budgetMs}ms`,
+        }), budgetMs);
+    });
+    return Promise.race([probeMailProxyOnce(url, timeoutSec, jump, started), hardTimer]);
+}
+
+async function probeMailProxyOnce(url: string, timeoutSec: number, jump: string | undefined, started: number): Promise<{
+    ok: boolean; ip: string; google: number; accounts: number; ms: number; reason?: string;
+}> {
     if (!url) return {ok: false, ip: "", google: 0, accounts: 0, ms: 0, reason: "无代理"};
     let host = "", port = 1080;
     try {
@@ -312,7 +326,12 @@ export async function pickLiveMailProxy(rawUrl: string, {
     let url = normalizeProxyUrl(rawUrl) || String(rawUrl || "").trim();
     if (!url) return {ok: false, url: "", probe: await probeMailProxy("", {jump})};
     let probe = await probeMailProxy(url, {jump});
+    const jumpDead = (p) => /ECONNREFUSED|跳板连不上|端口不通经跳板/i.test(String(p?.reason || ""));
     for (let i = 1; i < tries && !probe.ok; i++) {
+        if (jumpDead(probe)) {
+            log(`不通: ${probe.reason}（跳板口死了，换 kookeey session 没用）`);
+            break;
+        }
         if (!rotate) {
             log(`不通: ${probe.reason}，仍用原 session 再测 (${i + 1}/${tries})`);
         } else {
@@ -456,11 +475,11 @@ export class MailProxyPool {
 export const mailProxyPool = new MailProxyPool();
 export const gptProxyPool = new MailProxyPool();
 
-export const JUMP_MAX_EXITS = 2;
+export const JUMP_MAX_EXITS = 4;
 
 export type JumpHealth = {ok: boolean; at: number; ms: number; ip: string; google: number; reason?: string};
 
-/** 只测跳板本身能不能出网（不经 kookeey）。 */
+/** 只测跳板本身能不能出网。本地 xray 用 SOCKS 探测，curl -x 常误报超时。 */
 export async function probeJumpAlive(rawUrl: string, timeoutSec = 10): Promise<JumpHealth> {
     const url = normalizeProxyUrl(rawUrl) || String(rawUrl || "").trim();
     const started = Date.now();
@@ -468,7 +487,7 @@ export async function probeJumpAlive(rawUrl: string, timeoutSec = 10): Promise<J
     if (!url) return empty;
     let host = "", port = 1080;
     try {
-        const u = new URL(url);
+        const u = new URL(url.includes("://") ? url.split("#")[0] : `socks5://${url}`);
         host = u.hostname;
         port = Number(u.port || 1080);
     } catch {
@@ -478,19 +497,14 @@ export async function probeJumpAlive(rawUrl: string, timeoutSec = 10): Promise<J
     if (!tcp.ok) {
         return {ok: false, at: Date.now(), ms: Date.now() - started, ip: "", google: 0, reason: `端口不通 ${host}:${port} (${tcp.reason})`};
     }
-    const ipR = await curlVia(url, "https://api.ipify.org", [], timeoutSec);
-    const ip = ipR.ok && /^\d{1,3}(\.\d{1,3}){3}$/.test(ipR.stdout) ? ipR.stdout : "";
-    const gR = await curlVia(url, "https://www.google.com/generate_204", ["-o", "/dev/null", "-w", "%{http_code}"], timeoutSec);
-    const google = Number(gR.stdout || 0) || 0;
-    const googleOk = google === 204 || google === 200;
+    const {probeJumpTo} = await import("./proxy-chain.js");
+    const waitMs = Math.max(4000, Number(timeoutSec || 10) * 1000);
+    const g = await probeJumpTo(url, "www.google.com", 443, waitMs);
     const ms = Date.now() - started;
-    if (!ip && !googleOk) {
-        return {ok: false, at: Date.now(), ms, ip: "", google, reason: `跳板出网失败 ${ipR.reason || ipR.stdout || "无IP"} google=${google || gR.reason || "?"}`};
+    if (!g.ok) {
+        return {ok: false, at: Date.now(), ms, ip: "", google: 0, reason: `跳板连不上 Google (${g.reason || "?"})`};
     }
-    if (!googleOk) {
-        return {ok: false, at: Date.now(), ms, ip, google, reason: `跳板 Google 不通 generate_204=${google || gR.reason || "?"}`};
-    }
-    return {ok: true, at: Date.now(), ms, ip: ip || "?", google};
+    return {ok: true, at: Date.now(), ms, ip: host === "127.0.0.1" || host === "localhost" ? "local" : "?", google: 204};
 }
 
 export type JumpLease = {url: string; owner: string; release: () => void};
@@ -567,7 +581,8 @@ export class JumpPool {
             for (const url of ranked) {
                 if (this.load(url) >= cap) continue;
                 let h = this.health.get(url);
-                if (!h || Date.now() - h.at > 90_000) {
+                const staleMs = h?.ok ? 90_000 : 15_000;
+                if (!h || Date.now() - h.at > staleMs) {
                     h = await this.checkOne(url);
                 }
                 if (!h.ok) continue;
@@ -595,5 +610,5 @@ export class JumpPool {
 }
 
 export const mailJumpPool = new JumpPool();
-/** 邮箱/GPT 共用同一份跳板租约，保证 1 个跳板全局最多 2 条出口。 */
-export const gptJumpPool = mailJumpPool;
+/** GPT 自己的跳板租约。和邮箱探活共用同一批跳板 URL，但名额分开，探 Gmail 不会把重登挤去 10808。 */
+export const gptJumpPool = new JumpPool();

@@ -21,6 +21,7 @@ import {generateRandomDeviceProfile} from "./device-profile.js";
 import {OpenAIClient} from "./openai.js";
 import {appConfig} from "./config.js";
 import {createPoolBroker} from "./sms/pool-broker.js";
+import {installWorkerProxyFromEnv} from "./mail/install-worker-proxy.js";
 
 const EVENT_PREFIX = "@@EVENT@@";
 const email = (process.env.REG_EMAIL || "").trim();
@@ -38,6 +39,8 @@ async function main() {
         process.exit(1);
         return;
     }
+    const closeProxy = await installWorkerProxyFromEnv();
+    try {
     emit({type: "progress", stage: "rt", message: `开始为 ${email} 获取 refresh_token${preferPhone ? `(复用绑定号 +${preferPhone})` : ""}`});
 
     const deviceProfile = generateRandomDeviceProfile();
@@ -88,6 +91,9 @@ async function main() {
         phone,
         card,
     });
+    } finally {
+        try { closeProxy(); } catch { /* */ }
+    }
 }
 
 main()

@@ -20,10 +20,18 @@ const reportStage = (stage) => {
     process.stdout.write("@@EVENT@@" + JSON.stringify({type: "progress", stage}) + "\n");
 };
 
+// stdout 是管道，write 是异步的：紧跟 process.exit 会把结果行截断，父进程
+// JSON.parse 失败就等于"没结果"，needReauth / capped24h 这些分流信息全丢。
+const exitAfterWrite = (line, code) => {
+    process.exitCode = code;
+    process.stdout.write(line, () => process.exit(code));
+};
+
 try {
     const r = await changeChatgptEmail({
         accessToken: job.accessToken || "",
         accountId: job.accountId || "",
+        cookie: job.cookie || "",
         proxyUrl: process.env.PROXY_URL || job.proxyUrl || "",
         newEmail: job.newEmail || "",
         imapPassword: job.imapPassword || "",
@@ -33,7 +41,7 @@ try {
         useAddEmail: !!job.useAddEmail,
         onStage: reportStage,
     });
-    process.stdout.write("@@RESULT@@" + JSON.stringify({
+    exitAfterWrite("@@RESULT@@" + JSON.stringify({
         ok: !!r.ok,
         reason: r.reason || "",
         needReauth: !!r.needReauth,
@@ -44,13 +52,11 @@ try {
         indeterminate: !!r.indeterminate,
         code: r.code || "",
         stage: r.stage || lastStage,
-    }) + "\n");
-    process.exit(r.ok ? 0 : 2);
+    }) + "\n", r.ok ? 0 : 2);
 } catch (e) {
-    process.stdout.write("@@RESULT@@" + JSON.stringify({
+    exitAfterWrite("@@RESULT@@" + JSON.stringify({
         ok: false,
         reason: String(e?.message || e).slice(0, 240),
         stage: lastStage,
-    }) + "\n");
-    process.exit(1);
+    }) + "\n", 1);
 }

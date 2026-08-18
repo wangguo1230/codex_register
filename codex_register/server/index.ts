@@ -55,7 +55,7 @@ import {clearMailboxJobStop, isMailboxJobStopped, requestMailboxJobStop} from ".
 import {peekSms, buildSmsLink, classifySms} from "../src/sms-broker.js";
 import {probeAt, probePlan, refreshRt, buildProxyDispatcher, decodeJwt} from "../src/token-check.js";
 import {enrollTotp} from "../src/mfa.js";
-import {changeChatgptEmail, needsPwdReauth, isSessionJsonAlive, fetchCurrentLoginEmail} from "../src/change-email.js";
+import {changeChatgptEmail, needsPwdReauth, rebindNeedsFreshLogin, pwdAuthLeftMs, isSessionJsonAlive, fetchCurrentLoginEmail} from "../src/change-email.js";
 import {testGmailImap, isImapTransientError} from "../src/mail/google-imap.js";
 import {ensureGoogleLoggedIn} from "../src/mail/google-auth.js";
 import {rememberGoogleCred} from "../src/mail/google-account.js";
@@ -403,26 +403,31 @@ async function withLeasedMailProxy(owner, fn, mb = null, opts = {}) {
     const prefer = String(mb?.proxy_url || "").trim();
     const skipJump = opts?.skipJump === true;
     let jumpLease = null;
-    if (!skipJump && mailJumpPool.urls.length) {
-        jumpLease = await mailJumpPool.lease(who, {timeoutMs: 45_000, maxPerJump: JUMP_MAX_EXITS});
-    }
-    const lease = await mailProxyPool.lease(who, {
-        fallback: scheduler.mailProxyFallback(),
-        maxPerTemplate: cap,
-        freshSession: !prefer,
-        preferUrl: prefer,
-    });
-    const remember = (url, ip = "") => {
-        if (!mb?.id || !url) return;
-        db.setMailboxProxy(mb.id, url, ip).catch(() => {});
-        mb.proxy_url = url;
-        if (ip) mb.proxy_ip = ip;
-    };
-    if (lease.url) remember(lease.url, mb?.proxy_ip || "");
-    const jumpUrl = skipJump ? "" : (jumpLease?.url || scheduler.mailProxyJump || "");
-    try { return await fn(lease.url, jumpUrl, remember); }
-    finally {
-        lease.release();
+    let lease = null;
+    // 两个租约都要包在同一个 finally 里：出口池全忙时 mailProxyPool.lease 会抛，
+    // 此时已拿到的跳板租约若不归还就是永久泄漏（租约表纯内存、无 TTL、无回收），
+    // 泄满 JUMP_MAX_EXITS 之后跳板池对所有邮箱任务直接不可用，只能重启。
+    try {
+        if (!skipJump && mailJumpPool.urls.length) {
+            jumpLease = await mailJumpPool.lease(who, {timeoutMs: 45_000, maxPerJump: JUMP_MAX_EXITS});
+        }
+        lease = await mailProxyPool.lease(who, {
+            fallback: scheduler.mailProxyFallback(),
+            maxPerTemplate: cap,
+            freshSession: !prefer,
+            preferUrl: prefer,
+        });
+        const remember = (url, ip = "") => {
+            if (!mb?.id || !url) return;
+            db.setMailboxProxy(mb.id, url, ip).catch(() => {});
+            mb.proxy_url = url;
+            if (ip) mb.proxy_ip = ip;
+        };
+        if (lease.url) remember(lease.url, mb?.proxy_ip || "");
+        const jumpUrl = skipJump ? "" : (jumpLease?.url || scheduler.mailProxyJump || "");
+        return await fn(lease.url, jumpUrl, remember);
+    } finally {
+        try { lease?.release(); } catch { /* */ }
         try { jumpLease?.release(); } catch { /* */ }
     }
 }
@@ -2111,7 +2116,14 @@ function killExportChildren() {
 }
 // 邮箱域操作日志(登录/改密/收信):写独立 mailbox_logs 表 + 独立 SSE 事件 mbLog,与 GPT 注册日志隔离,分别管理。
 function logMailbox(id, line) { db.appendMailboxLog(id, line).catch(() => {}); broadcast("mbLog", {id, line, ts: Date.now()}); }
-function runRtWorker(acc, preferPhone, {onProgress, timeoutMs = 180000} = {}) {
+// 取码路径的子进程正常最坏耗时就有邮箱 OTP ~115s + 短信轮询 ~115s，旧的 180s 会
+// 在收码中途把它砍掉，所以这条超时是常态而不是兜底。放到 300s，再靠下面的宽限期
+// 保证「已经拿到的 rt 一定落库」。
+const RT_WORKER_TIMEOUT_MS = Math.max(120_000, Number(process.env.RT_WORKER_TIMEOUT_MS || 300_000));
+// SIGTERM 到 SIGKILL 之间的宽限：让 Playwright 关掉 Chrome 不留孤儿，
+// 同时给子进程时间把已拿到的 rt 刷完 stdout。
+const RT_WORKER_GRACE_MS = Math.max(3_000, Number(process.env.RT_WORKER_GRACE_MS || 12_000));
+function runRtWorker(acc, preferPhone, {onProgress, timeoutMs = RT_WORKER_TIMEOUT_MS} = {}) {
     const note = (m) => { logAcct(acc.id, `[rt] ${m}`); try { onProgress?.(m); } catch { /* */ } };
     return withLeasedGptProxy(`rt-acquire:${acc.email || acc.id}`, async (exit, jump) => {
         let proxyUrl = String(exit || "").trim();
@@ -2122,10 +2134,25 @@ function runRtWorker(acc, preferPhone, {onProgress, timeoutMs = 180000} = {}) {
             } else {
                 note(`GPT 池 ${maskProxyUrl(proxyUrl)}${jump ? " +跳板 " + maskProxyUrl(jump) : ""}（转发在子进程，不进 3100）`);
             }
+            const mailProxy = await pickXrayBrowserProxy(
+                scheduler.mailProxyEnabled !== false ? (scheduler.mailProxy || "") : "",
+                rechargeProxy(),
+                scheduler.rtProxy,
+            ) || pickMailcomBrowserProxy(
+                scheduler.mailProxyEnabled !== false ? (scheduler.mailProxy || "") : "",
+                rechargeProxy(),
+                scheduler.rtProxy,
+            );
             return await new Promise((resolve) => {
         let settled = false;
-        let timer = null;
-        const finish = (v) => { if (settled) return; settled = true; if (timer) clearTimeout(timer); resolve(v); };
+        let timedOut = false;
+        let timer = null, graceTimer = null, hardTimer = null;
+        const finish = (v) => {
+            if (settled) return;
+            settled = true;
+            for (const t of [timer, graceTimer, hardTimer]) if (t) clearTimeout(t);
+            resolve(v);
+        };
         const tmpDir = mkdtempSync(path.join(os.tmpdir(), "codex-rt-"));
         const tmpFile = path.join(tmpDir, `mc-${acc.id}.txt`);
         writeMailboxTokenFile(tmpFile, {
@@ -2140,6 +2167,7 @@ function runRtWorker(acc, preferPhone, {onProgress, timeoutMs = 180000} = {}) {
             || /pro|plus|team/i.test(String(acc.plan || ""));
         const mailcomHeadless = process.env.MAILCOM_HEADED === "1" ? "0" : "1";
         note(`启动 worker 获取 refresh_token${useSessionRt ? "(会话换rt,不接码)" : ""}${preferPhone ? `(复用绑定号 +${preferPhone})` : ""}${acc.mailbox_imap ? " +IMAP" : ""}…`);
+        note(`GPT 协议代理=${maskProxyUrl(proxyUrl) || "直连"} · mail.com 收码=${maskProxyUrl(mailProxy) || "直连"}`);
         const child = spawn(CHAT_TSX_BIN, [useSessionRt ? "scripts/worker-rt-nosms.ts" : "src/worker-rt.ts"], { shell: IS_WIN,
             cwd: CHAT_ROOT,
             env: cleanSpawnEnv({
@@ -2152,19 +2180,51 @@ function runRtWorker(acc, preferPhone, {onProgress, timeoutMs = 180000} = {}) {
                 RT_PREFER_PHONE: preferPhone || "",
                 PROXY_URL: proxyUrl,
                 MAIL_PROXY_JUMP: jump || "",
-                MAILCOM_PROXY: proxyUrl,
+                MAILCOM_PROXY: mailProxy,
                 GPT_PASSWORD: (acc.gpt_password || appConfig.defaultPassword || "").trim(),
                 TOTP_SECRET: acc.totp_secret || "",
                 // PG 迁移后 worker 通过 process.env.DATABASE_URL 继承连接
             }),
         });
         attachExportChild(child);
-        timer = setTimeout(() => {
-            try { child.kill("SIGKILL"); } catch { /* */ }
-            note(`超时(${Math.round(timeoutMs / 1000)}s)，已杀掉 worker`);
-            finish({ok: false, reason: `超时(${Math.round(timeoutMs / 1000)}s)，取码/OAuth卡住`});
-        }, timeoutMs);
         let result = null;
+        // rt 已经落盘并上报成功了就必须写库。之前超时分支直接 finish 掉，close 里的
+        // 写库被 settled 拦住，结果是磁盘上有 rt、库里没有，接码的钱和官方额度白花。
+        const persistSuccess = async () => {
+            try {
+                const rtData = readJsonFileSafe(result.rtFile);
+                await db.setAccountRtFile(acc.id, result.rtFile || "", rtData);
+                if (result.phone) await db.setAccountPhone(acc.id, result.phone);
+                if (result.card) await db.setAccountCard(acc.id, result.card);
+                await pushTestStatus(acc.id, "rt", "✅已获取rt");
+                scheduler.emit("sms", {stats: await db.smsStats()});
+                const tok = extractTokens(rtData);
+                const plan = await syncAccountPlan(acc, tok?.accessToken, tok?.accountId);
+                if (plan) note(`套餐 → ${plan}`);
+                finish({ok: true, refresh_token: result.rt, plan_type: plan || ""});
+            } catch (e: any) {
+                // 别在这里静默 return：不 finish 会让整个 Promise 永久挂住，连租约都不还
+                const why = String(e?.message || e).slice(0, 120);
+                note(`rt 已拿到但写库失败: ${why}（文件 ${result?.rtFile || "无"}）`);
+                finish({ok: false, reason: `rt 已拿到但写库失败: ${why}`});
+            }
+        };
+        timer = setTimeout(() => {
+            timedOut = true;
+            note(`超时(${Math.round(timeoutMs / 1000)}s)，SIGTERM 收尾，留 ${Math.round(RT_WORKER_GRACE_MS / 1000)}s 让已拿到的 rt 落库…`);
+            try { child.kill("SIGTERM"); } catch { /* */ }
+            graceTimer = setTimeout(() => { try { child.kill("SIGKILL"); } catch { /* */ } }, RT_WORKER_GRACE_MS);
+            // close 迟迟不来（子进程卡在不可中断的调用里）时的硬兜底：
+            // 结果可能早就上报过了，先落库再判失败。
+            hardTimer = setTimeout(async () => {
+                if (settled) return;
+                // close 可能永远不来，凭证临时目录得在这里也删掉
+                try { rmSync(tmpDir, {recursive: true, force: true}); } catch { /* */ }
+                if (result && result.status === "success") return persistSuccess();
+                await pushTestStatus(acc.id, "rt", "❌获取失败:超时");
+                finish({ok: false, reason: `超时(${Math.round(timeoutMs / 1000)}s)，取码/OAuth卡住`});
+            }, RT_WORKER_GRACE_MS + 3_000);
+        }, timeoutMs);
         child.on("error", async (e) => {
             try { rmSync(tmpDir, {recursive: true, force: true}); } catch { /* ignore */ }
             await pushTestStatus(acc.id, "rt", "❌启动失败:" + (e?.message ?? e));
@@ -2180,22 +2240,11 @@ function runRtWorker(acc, preferPhone, {onProgress, timeoutMs = 180000} = {}) {
         child.on("close", async () => {
             try { rmSync(tmpDir, {recursive: true, force: true}); } catch { /* ignore */ }
             if (settled) return;
-            if (result && result.status === "success") {
-                const rtData = readJsonFileSafe(result.rtFile);
-                await db.setAccountRtFile(acc.id, result.rtFile || "", rtData);
-                if (result.phone) await db.setAccountPhone(acc.id, result.phone);
-                if (result.card) await db.setAccountCard(acc.id, result.card);
-                await pushTestStatus(acc.id, "rt", "✅已获取rt");
-                scheduler.emit("sms", {stats: await db.smsStats()});
-                const tok = extractTokens(rtData);
-                const plan = await syncAccountPlan(acc, tok?.accessToken, tok?.accountId);
-                if (plan) note(`套餐 → ${plan}`);
-                finish({ok: true, refresh_token: result.rt, plan_type: plan || ""});
-            } else {
-                const reason = result?.error || "获取失败";
-                await pushTestStatus(acc.id, "rt", "❌获取失败:" + String(reason).slice(0, 60));
-                finish({ok: false, reason});
-            }
+            if (result && result.status === "success") return persistSuccess();
+            const reason = result?.error
+                || (timedOut ? `超时(${Math.round(timeoutMs / 1000)}s)，取码/OAuth卡住` : "获取失败");
+            await pushTestStatus(acc.id, "rt", "❌获取失败:" + String(reason).slice(0, 60));
+            finish({ok: false, reason});
         });
             });
         }
@@ -2362,7 +2411,7 @@ function spawnReloginWorker(acc, {proxy, jump, script = "src/worker-login-http.t
         })();
         const isBrowserWorker = /worker-register-browser|register-browser|worker-register-claude/i.test(String(script || ""));
         if (isBrowserWorker) {
-            const xray = pickXrayBrowserProxy(rechargeProxy(), scheduler.rtProxy, scheduler.regProxy);
+            const xray = await pickXrayBrowserProxy(rechargeProxy(), scheduler.rtProxy, scheduler.regProxy);
             if (!xray) {
                 finish({ok: false, reason: "浏览器必须走 xray，本机没有可用的 xray socks（10811/10808）"});
                 return;
@@ -2379,7 +2428,7 @@ function spawnReloginWorker(acc, {proxy, jump, script = "src/worker-login-http.t
         const mailProxyConfigured = (scheduler.mailProxyEnabled !== false && scheduler.mailProxy)
             ? scheduler.mailProxy
             : "";
-        const mailProxy = pickXrayBrowserProxy(mailProxyConfigured, rechargeProxy()) || pickMailcomBrowserProxy(mailProxyConfigured, rechargeProxy());
+        const mailProxy = await pickXrayBrowserProxy(mailProxyConfigured, rechargeProxy()) || pickMailcomBrowserProxy(mailProxyConfigured, rechargeProxy());
         const viaJump = !isBrowserWorker && !!(jumpUrl && !exitHostLocal);
         const gptPw = String(gptPassword || acc.gpt_password || appConfig.defaultPassword || "").trim();
         note(
@@ -2517,7 +2566,7 @@ async function runReloginAtWorker(acc, {proxy, jump = "", timeoutMs = 0, allowBr
     note(`协议登录失败(${String(http.reason || "").slice(0, 80)}),回退浏览器…`);
     // Playwright/Chrome 不支持 socks5 user:pass。kookeey 链式 URL 仍带账密 → 会直接炸
     // 「Browser does not support socks5 proxy authentication」。浏览器只走无账密本地代理(充值 10808 等)。
-    const browserProxy = pickXrayBrowserProxy(rechargeProxy(), scheduler.rtProxy, scheduler.regProxy) || "";
+    const browserProxy = await pickXrayBrowserProxy(rechargeProxy(), scheduler.rtProxy, scheduler.regProxy) || "";
     if (!browserProxy) {
         note("浏览器必须走 xray，本机没有 10811/10808，浏览器回退跳过");
         return {...http, reason: `${http.reason || "协议失败"}；浏览器回退无可用 xray`};
@@ -2631,7 +2680,7 @@ async function runReloginAtWorkerPooled(acc, {
 
     // ③ 浏览器：只走本机 xray。429 不要回退再打一轮 authorize。
     if (allowBrowser && last && !last.ok && !isAuthorizeRateLimited(last?.reason)) {
-        const browserProxy = pickXrayBrowserProxy(rechargeProxy(), scheduler.rtProxy, scheduler.regProxy) || "";
+        const browserProxy = await pickXrayBrowserProxy(rechargeProxy(), scheduler.rtProxy, scheduler.regProxy) || "";
         if (browserProxy) {
             note(`③ 浏览器回退 xray ${maskProxyUrl(browserProxy)}`);
             last = await runReloginAtWorker(acc, {
@@ -2920,7 +2969,7 @@ function runChatWorker(acc, message) {
             if (authData) { tmpAuthFile = path.join(os.tmpdir(), `chat-auth-${acc.id}-${Date.now()}.json`); writeFileSync(tmpAuthFile, JSON.stringify(authData)); return tmpAuthFile; }
             return acc.auth_file || "";
         })();
-        const xray = pickXrayBrowserProxy(scheduler.regProxy, scheduler.rtProxy, rechargeProxy());
+        const xray = await pickXrayBrowserProxy(scheduler.regProxy, scheduler.rtProxy, rechargeProxy());
         if (!xray) {
             await pushTestStatus(acc.id, "chat", "❌无xray");
             resolve({ok: false, reason: "浏览器必须走 xray，本机没有 10811/10808"});
@@ -3386,18 +3435,28 @@ app.post("/api/tools/batch-acquire-rt", (req, res) => {
     })();
 });
 // 独立 OAuth 获取 rt(不走接码,用邮箱密码走 codex OAuth,Pro 号不触发 add-phone)
+const RT_SA_TIMEOUT_MS = Math.max(120_000, Number(process.env.RT_SA_TIMEOUT_MS || 240_000));
 function runRtWorkerStandalone(email, mailPassword, gptPassword, onProgress): Promise<{ok: boolean; rt?: string; accessToken?: string; rtFile?: string; reason?: string}> {
     return withLeasedGptProxy(`rt-sa:${email}`, (exit, jump) => new Promise(async (resolve) => {
         let settled = false;
+        let timedOut = false;
+        let child = null, timer = null, graceTimer = null, hardTimer = null;
         const finish = (v) => {
             if (settled) return;
             settled = true;
-            clearTimeout(timer);
-            if (batchRtChild === child) batchRtChild = null;
+            for (const t of [timer, graceTimer, hardTimer]) if (t) clearTimeout(t);
+            if (child && batchRtChild === child) batchRtChild = null;
             resolve(v);
         };
         const tmpDir = mkdtempSync(path.join(os.tmpdir(), "codex-rt-sa-"));
         const tmpFile = path.join(tmpDir, `mc.txt`);
+        // 单行凭证文件带邮箱密码/IMAP，每条退出路径都要删（原来 error 分支漏了）
+        const cleanTmp = () => {
+            try { rmSync(tmpFile, {force: true}); rmSync(tmpDir, {force: true, recursive: true}); } catch { /* */ }
+        };
+        // 这是个 async executor：spawn 之前任何一步抛异常都不会变成 reject，
+        // Promise 会永远挂住，外面的 GPT 出口租约也就永远还不回去。必须自己兜。
+        try {
         const mb = await db.getMailboxByEmail?.(email);
         const gptAcc = await db.getAccountByEmail(email);
         writeMailboxTokenFile(tmpFile, {
@@ -3408,8 +3467,11 @@ function runRtWorkerStandalone(email, mailPassword, gptPassword, onProgress): Pr
             imapPassword: mb?.imap_password || "",
         });
         const gptPwd = (gptPassword || gptAcc?.gpt_password || mailPassword || appConfig.defaultPassword || "").trim();
+        const mailProxyCfg = scheduler.mailProxyEnabled !== false ? (scheduler.mailProxy || "") : "";
+        const mailProxy = await pickXrayBrowserProxy(mailProxyCfg, rechargeProxy(), scheduler.rtProxy)
+            || pickMailcomBrowserProxy(mailProxyCfg, rechargeProxy(), scheduler.rtProxy);
         // 用独立脚本(不带 smsBroker),跳过 add-phone
-        const child = spawn(CHAT_TSX_BIN, ["scripts/worker-rt-nosms.ts"], {
+        child = spawn(CHAT_TSX_BIN, ["scripts/worker-rt-nosms.ts"], {
             shell: IS_WIN, cwd: CHAT_ROOT,
             env: cleanSpawnEnv({
                 REG_EMAIL: email,
@@ -3418,19 +3480,36 @@ function runRtWorkerStandalone(email, mailPassword, gptPassword, onProgress): Pr
                 MAILCOM_HEADLESS: "1",
                 PROXY_URL: exit || rechargeProxy() || "",
                 MAIL_PROXY_JUMP: jump || "",
-                MAILCOM_PROXY: scheduler.mailProxyEnabled !== false ? (scheduler.mailProxy || "") : "",
+                MAILCOM_PROXY: mailProxy,
                 GPT_PASSWORD: gptPwd,
                 TOTP_SECRET: gptAcc?.totp_secret || "",
                 SMS_LINK_TEMPLATE: scheduler.smsLinkTemplate || "",
             }),
         });
         batchRtChild = child;
-        const timer = setTimeout(() => {
-            try { child.kill("SIGKILL"); } catch { /* */ }
-            finish({ok: false, reason: "超时(120s)，OAuth/取码卡住"});
-        }, 120000);
         let result = null;
-        child.on("error", (e) => finish({ok: false, reason: String(e?.message || e)}));
+        const takeResult = () => {
+            const tok = result.rtFile ? readAuthTokens(result.rtFile) : null;
+            finish({ok: true, rt: result.rt, accessToken: tok?.accessToken || "", rtFile: result.rtFile || ""});
+        };
+        // 走 nosms 脚本仍要等邮箱 OTP（约 115s）加 mail.com 开窗，120s 会在收码中途砍掉；
+        // 而且旧的超时分支直接判失败，已经拿到的 rt 会被丢掉。
+        timer = setTimeout(() => {
+            timedOut = true;
+            onProgress?.(`超时(${Math.round(RT_SA_TIMEOUT_MS / 1000)}s)，SIGTERM 收尾，留 ${Math.round(RT_WORKER_GRACE_MS / 1000)}s 让已拿到的 rt 上报…`);
+            try { child.kill("SIGTERM"); } catch { /* */ }
+            graceTimer = setTimeout(() => { try { child.kill("SIGKILL"); } catch { /* */ } }, RT_WORKER_GRACE_MS);
+            hardTimer = setTimeout(() => {
+                if (settled) return;
+                cleanTmp();
+                if (result?.status === "success" && result.rt) return takeResult();
+                finish({ok: false, reason: `超时(${Math.round(RT_SA_TIMEOUT_MS / 1000)}s)，OAuth/取码卡住`});
+            }, RT_WORKER_GRACE_MS + 3_000);
+        }, RT_SA_TIMEOUT_MS);
+        child.on("error", (e) => {
+            cleanTmp();
+            finish({ok: false, reason: String(e?.message || e)});
+        });
         pipeWorkerStdout(child, {
             onLine: (line) => {
                 onProgress?.(line);
@@ -3445,14 +3524,19 @@ function runRtWorkerStandalone(email, mailPassword, gptPassword, onProgress): Pr
             },
         });
         child.on("exit", () => {
-            try { rmSync(tmpFile, {force: true}); rmSync(tmpDir, {force: true, recursive: true}); } catch {}
-            if (result?.status === "success" && result.rt) {
-                const tok = result.rtFile ? readAuthTokens(result.rtFile) : null;
-                finish({ok: true, rt: result.rt, accessToken: tok?.accessToken || "", rtFile: result.rtFile || ""});
-            } else {
-                finish({ok: false, reason: result?.error || "OAuth 获取 rt 失败"});
-            }
+            cleanTmp();
+            if (settled) return;
+            if (result?.status === "success" && result.rt) return takeResult();
+            finish({
+                ok: false,
+                reason: result?.error
+                    || (timedOut ? `超时(${Math.round(RT_SA_TIMEOUT_MS / 1000)}s)，OAuth/取码卡住` : "OAuth 获取 rt 失败"),
+            });
         });
+        } catch (e: any) {
+            cleanTmp();
+            finish({ok: false, reason: `启动 rt worker 失败: ${String(e?.message || e).slice(0, 140)}`});
+        }
     }), {timeoutMs: 45_000, log: (m) => onProgress?.(m)}).catch((e) => ({ok: false, reason: String(e?.message || e)}));
 }
 
@@ -3845,9 +3929,11 @@ const gmailRebindPool = new Map();
 const gmailRebindActive = new Set();
 const liveRebindMailboxIds = new Set();
 
-// 换绑子进程超时必须大于内层取码最坏预算，否则会在 verify 前后被砍，
-// 制造出「官方已改、库里没写」的不确定态。Gmail: IMAP 4 条出口 × 16s × 10 轮；
-// mail.com: Playwright 登录 + 24×5s 取码。取 480s 兜住，真正的失败靠内层自己报。
+// 换绑子进程超时必须大于内层最坏预算，否则会在 verify 前后被砍，
+// 制造出「官方已改、库里没写」的不确定态。内层现在是有界的（取码从 pwd_auth
+// 剩余额度里切，见 change-email.ts 的 REBIND_OTP_MIN_BUDGET_MS / OTP_MAX_WAIT_MS）：
+// 目标邮箱预检 ~60s + eligibility/begin ~20s + 取码 ≤150s + verify ~20s ≈ 250s。
+// 480s 留了近一倍余量，真正的失败靠内层自己报。
 const CHANGE_EMAIL_TIMEOUT_MS = Math.max(240_000, Number(process.env.CHANGE_EMAIL_TIMEOUT_MS || 480_000));
 const CHANGE_EMAIL_NET_FAIL = /fetch failed|timeout|timed out|ECONN|ENOTFOUND|EPIPE|socket|TLS|disconnected|Proxy connection/i;
 
@@ -3860,10 +3946,10 @@ function fmtUntil(ts) {
     return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
 }
 
-function spawnChangeEmailChild({accessToken, accountId, newEmail, imapPassword, mailPassword, totpSecret, proxyUrl, jumpUrl, note}) {
+function spawnChangeEmailChild({accessToken, accountId, cookie, newEmail, imapPassword, mailPassword, totpSecret, proxyUrl, jumpUrl, note}) {
     const jobFile = path.join(os.tmpdir(), `change-email-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.json`);
     writeFileSync(jobFile, JSON.stringify({
-        accessToken, accountId, newEmail,
+        accessToken, accountId, cookie: cookie || "", newEmail,
         imapPassword: imapPassword || "",
         mailPassword: mailPassword || "",
         totpSecret: totpSecret || "",
@@ -3938,16 +4024,16 @@ function spawnChangeEmailChild({accessToken, accountId, newEmail, imapPassword, 
     });
 }
 
-function runChangeEmailWorker({accessToken, accountId = "", newEmail, imapPassword, mailPassword = "", totpSecret = "", log = () => {}} = {}) {
+async function runChangeEmailWorker({accessToken, accountId = "", cookie = "", newEmail, imapPassword, mailPassword = "", totpSecret = "", log = () => {}} = {}) {
     const note = (m) => { try { log(m); } catch { /* */ } };
     // chatgpt.com 官方换绑走本机 10808。重登可以链式；kookeey→chatgpt.com TLS 会断，断了还会误伤 Gmail。
-    const local = pickXrayBrowserProxy(rechargeProxy(), scheduler.rtProxy, scheduler.regProxy) || "";
+    const local = await pickXrayBrowserProxy(rechargeProxy(), scheduler.rtProxy, scheduler.regProxy) || "";
     if (!local) {
-        return Promise.resolve({ok: false, reason: "官方换绑需要本机 10808（chatgpt.com HTTP）"});
+        return {ok: false, reason: "官方换绑需要本机 10808（chatgpt.com HTTP）"};
     }
     note(`官方换绑走 ${maskProxyUrl(local)}（chatgpt.com HTTP，不走 kookeey）`);
     return spawnChangeEmailChild({
-        accessToken, accountId, newEmail, imapPassword, mailPassword, totpSecret,
+        accessToken, accountId, cookie, newEmail, imapPassword, mailPassword, totpSecret,
         proxyUrl: local, jumpUrl: "", note,
     });
 }
@@ -4110,12 +4196,14 @@ async function runGmailRebind(queueId) {
             rememberMailcomPassword(mb.email, mb.password);
         }
     };
+    let fresh = acc;
     const doChange = async (at, tok, mb) => {
         // 意图先落盘：官方 verify 之后若失联，只有这条记录能告诉对账任务该去比对哪个邮箱
         await db.markRebindAttempt(queueId, {email: mb.email, mailboxId: mb.id, stage: "begin"}).catch(() => {});
         const r = await runChangeEmailWorker({
             accessToken: at,
             accountId: tok?.accountId || "",
+            cookie: String(getAuthData(fresh)?.cookie || getAuthData(acc)?.cookie || "").trim(),
             newEmail: mb.email,
             imapPassword: mb.imap_password,
             mailPassword: mb.password,
@@ -4145,13 +4233,18 @@ async function runGmailRebind(queueId) {
         pumpRebindReconcile().catch(() => {});
     };
     try {
-        let fresh = acc;
         let authObj = getAuthData(fresh) || q.auth_data;
         let tok = extractTokens(authObj);
         let at = tok?.accessToken || "";
         const sessLive = isSessionJsonAlive(authObj);
-        if (!at || !sessLive.ok) {
-            rechargeLog(`换绑 ${acc.email}: ${!at ? "无 session JSON" : "session JSON 已过期"}，先重登再换绑`);
+        // 不能只判"过期没"：pwd_auth 还剩几十秒的 AT 一样跑不完 begin→取码→verify，
+        // 拿它去 begin 只会白烧一个官方 24h 换绑名额，然后 verify 401 再重登重试，
+        // 又是一次 begin —— 所以这里按余量判，宁可多重登一次。
+        const pwdTight = !!(at && rebindNeedsFreshLogin(at));
+        if (!at || !sessLive.ok || pwdTight) {
+            const why = !at ? "无 session JSON" : !sessLive.ok ? "session JSON 已过期"
+                : `pwd_auth 仅剩 ${Math.round(pwdAuthLeftMs(at) / 1000)}s，不够跑完换绑`;
+            rechargeLog(`换绑 ${acc.email}: ${why}，先重登再换绑`);
             if (isGoogleMailbox(fresh)) {
                 rememberGoogleCred({
                     email: fresh.email, password: fresh.password,
@@ -4174,7 +4267,7 @@ async function runGmailRebind(queueId) {
             if (!at) return fail("重登后仍无 access_token", false);
         } else {
             const left = sessLive.leftMs > 0 ? formatSessionLeft(sessLive.leftMs) : "";
-            rechargeLog(`换绑 ${acc.email}: 复用已有 session JSON${left ? `（约 ${left} 后过期）` : ""}，官方接口若要重验密码再登录`);
+            rechargeLog(`换绑 ${acc.email}: 复用新鲜 session JSON${left ? `（约 ${left} 后过期）` : ""}`);
         }
 
         const pool = dest === "gmail" ? (gmailRebindPool.get(queueId) || {}) : {};
@@ -4356,6 +4449,18 @@ async function runGmailRebind(queueId) {
             && CHANGE_EMAIL_NET_FAIL.test(String(r.reason || ""))) {
             return holdForReconcile(claimed, r.reason || "verify 后失联");
         }
+        // begin 报 already linked：可能是咱们上次已经换成功但没记账。先对账，别把好号标废。
+        if (!r.ok && r.alreadyLinked) {
+            rechargeLog(`换绑 ${acc.email}: begin 报已占用，先对账确认官方当前邮箱`);
+            const cur = await currentLoginEmailOf(fresh);
+            const want = String(claimed.email || "").trim().toLowerCase();
+            if (cur.ok && cur.email && cur.email === want) {
+                rechargeLog(`换绑 ${acc.email}: 对账确认官方已是 ${want}，按成功记账`);
+                r = {...r, ok: true, reason: "对账确认官方已是目标邮箱"};
+            } else if (!cur.ok || !cur.email) {
+                return holdForReconcile(claimed, `begin 报占用但对账读不到官方邮箱: ${cur.reason || "未知"}`);
+            }
+        }
         if (r.ok) {
             claimedKept = true;
             try {
@@ -4438,9 +4543,10 @@ let rebindReconcileBusy = false;
  * 读不到就返回 ok:false，让调用方保持 unknown，绝不允许靠猜下结论。
  */
 async function currentLoginEmailOf(acc) {
-    const proxyUrl = pickXrayBrowserProxy(rechargeProxy(), scheduler.rtProxy, scheduler.regProxy) || "";
+    const proxyUrl = await pickXrayBrowserProxy(rechargeProxy(), scheduler.rtProxy, scheduler.regProxy) || "";
     if (!proxyUrl) return {ok: false, email: "", reason: "对账需要本机 10808（chatgpt.com HTTP）"};
-    const read = (at, accountId) => fetchCurrentLoginEmail(at, {accountId: accountId || "", proxyUrl});
+    const cookie = String(getAuthData(acc)?.cookie || "").trim();
+    const read = (at, accountId) => fetchCurrentLoginEmail(at, {accountId: accountId || "", proxyUrl, cookie});
 
     const tok = extractTokens(getAuthData(acc));
     if (tok?.accessToken) {

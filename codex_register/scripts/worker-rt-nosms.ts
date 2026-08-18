@@ -4,6 +4,7 @@
 import {generateRandomDeviceProfile} from "../src/device-profile.js";
 import {OpenAIClient} from "../src/openai.js";
 import {appConfig} from "../src/config.js";
+import {installWorkerProxyFromEnv} from "../src/mail/install-worker-proxy.js";
 
 const EVENT_PREFIX = "@@EVENT@@";
 const email = (process.env.REG_EMAIL || "").trim();
@@ -20,6 +21,8 @@ async function main() {
         process.exit(1);
         return;
     }
+    const closeProxy = await installWorkerProxyFromEnv();
+    try {
     emit({type: "progress", stage: "rt", message: `开始为 ${email} 获取 refresh_token(无接码${totpSecret ? "+2FA会话" : ""})…`});
 
     const deviceProfile = generateRandomDeviceProfile();
@@ -53,6 +56,9 @@ async function main() {
         phone: "",
         card: "",
     });
+    } finally {
+        try { closeProxy(); } catch { /* */ }
+    }
 }
 
 main()

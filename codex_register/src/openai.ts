@@ -19,6 +19,7 @@ import {
     AUTH_BASE_URL,
     AUTH_EMAIL_OTP_SEND_URL,
     AUTH_EMAIL_OTP_VALIDATE_URL,
+    AUTH_PASSWORDLESS_SEND_OTP_URL,
     AUTH_OAUTH_TOKEN_URLS,
     AUTH_MFA_VALIDATE_URLS,
     AUTH_PASSWORD_VERIFY_URL,
@@ -35,6 +36,7 @@ import {ensureNextAuthCsrf, buildAuthRecord} from "./email-reg/index.js";
 import {fetchSentinelToken} from "./sentinel.js";
 import { pkceCodeChallenge, randomUrlSafeString } from "./utils.js";
 import {ISMSActivationBroker} from "./sms/activation-broker.js";
+import {connectExitViaJump} from "./mail/proxy-chain.js";
 
 type FetchLike = typeof fetch;
 
@@ -115,25 +117,30 @@ async function createSocksSocket(
             : Number(rawPort);
     const proxyPort = Number(proxyUrl.port || (proxyUrl.protocol.startsWith("socks5") ? 1080 : 1080));
     const proxyType = proxyUrl.protocol.startsWith("socks4") ? 4 : 5;
+    const jump = String(process.env.MAIL_PROXY_JUMP || "").trim();
+    const proxyLocal = proxyUrl.hostname === "127.0.0.1" || proxyUrl.hostname === "localhost";
 
-    // 经跳板→kookeey 时握手偏慢，给足 timeout；默认过短易 ECONNRESET 后整段 fetch failed
-    const connection = await SocksClient.createConnection({
-        proxy: {
-            host: proxyUrl.hostname,
-            port: proxyPort,
-            type: proxyType,
-            userId: proxyUrl.username ? decodeURIComponent(proxyUrl.username) : undefined,
-            password: proxyUrl.password ? decodeURIComponent(proxyUrl.password) : undefined,
-        },
-        command: "connect",
-        destination: {
-            host: destinationHost,
-            port: destinationPort,
-        },
-        timeout: 25_000,
-    });
-
-    const socket = connection.socket;
+    let socket: net.Socket;
+    if (jump && !proxyLocal) {
+        socket = await connectExitViaJump(proxyUrl.toString(), jump, destinationHost, destinationPort);
+    } else {
+        const connection = await SocksClient.createConnection({
+            proxy: {
+                host: proxyUrl.hostname,
+                port: proxyPort,
+                type: proxyType,
+                userId: proxyUrl.username ? decodeURIComponent(proxyUrl.username) : undefined,
+                password: proxyUrl.password ? decodeURIComponent(proxyUrl.password) : undefined,
+            },
+            command: "connect",
+            destination: {
+                host: destinationHost,
+                port: destinationPort,
+            },
+            timeout: 25_000,
+        });
+        socket = connection.socket;
+    }
     try {
         socket.setKeepAlive(true, 15_000);
         socket.setNoDelay(true);
@@ -1075,10 +1082,37 @@ export class OpenAIClient {
             if (url.startsWith(`${CHATGPT_BASE_URL}/api/auth/callback`)) return url;
             if (/\/(sign-in-with-chatgpt\/codex\/consent|add-phone|add-email|about-you|choose-an-account)(\/|$|\?)/i.test(url)) return url;
 
-            if (/\/(log-in|create-account)\/password/i.test(url) && !didPassword) {
+            if (/\/log-in\/password/i.test(url) && !didPassword) {
                 didPassword = true;
-                this.logProgress("pwd", 0, "提交登录密码");
-                continueURL = /create-account/i.test(url) ? await this.registerPassword() : await this.passwordVerify();
+                let pwdErr = "";
+                if (String(this.password || "").trim()) {
+                    // 官网密码页默认 POST /password/verify，不是空打 passwordless。
+                    this.logProgress("pwd", 0, "密码页提交 password/verify（对齐官网）");
+                    try {
+                        continueURL = await this.passwordVerify();
+                        continue;
+                    } catch (e: any) {
+                        pwdErr = String(e?.message || e);
+                        this.logProgress("pwd", 0, `password/verify 未过: ${pwdErr.slice(0, 100)}`);
+                    }
+                } else {
+                    this.logProgress("pwd", 0, "密码页无 GPT 密码，走官网「发送邮箱验证码」");
+                }
+                this.logProgress("pwd", 0, "改走 passwordless/send-otp");
+                try {
+                    continueURL = await this.sendPasswordlessOtp();
+                } catch (e: any) {
+                    const otpErr = String(e?.message || e);
+                    throw new Error(
+                        `密码页登录失败: ${pwdErr || "未提交密码"}；邮箱码也失败: ${otpErr}`.slice(0, 240),
+                    );
+                }
+                continue;
+            }
+            if (/\/create-account\/password/i.test(url) && !didPassword) {
+                didPassword = true;
+                this.logProgress("pwd", 0, "提交注册密码");
+                continueURL = await this.registerPassword();
                 continue;
             }
             if (isMfaContinueUrl(url) && !didTotp) {
@@ -1196,6 +1230,29 @@ export class OpenAIClient {
         }
         const payload = (await response.json()) as ContinueResponse;
         return payload.continue_url;
+    }
+
+    /** 官网密码页「发送邮箱验证码」：空 body，referer=密码页。password/verify 失败后的回退。 */
+    async sendPasswordlessOtp(): Promise<string> {
+        const response = await this.fetch(AUTH_PASSWORDLESS_SEND_OTP_URL, {
+            method: "POST",
+            headers: this.createBrowserHeaders({
+                accept: "application/json",
+                "content-type": "application/json",
+                origin: AUTH_BASE_URL,
+                referer: `${AUTH_BASE_URL}/log-in/password`,
+                "sec-fetch-dest": "empty",
+                "sec-fetch-mode": "cors",
+                "sec-fetch-site": "same-origin",
+            }),
+        });
+        if (!response.ok) {
+            throw new Error(`PasswordlessSendOtp请求失败: ${await this.formatErrorResponse(response)}`);
+        }
+        const payload = (await response.json()) as ContinueResponse;
+        const next = payload.continue_url || `${AUTH_BASE_URL}/email-verification`;
+        this.logProgress("pwd", 0, `passwordless/send-otp → ${String(next).slice(0, 80)}`);
+        return next;
     }
 
     async sendEmailOtp(): Promise<string> {

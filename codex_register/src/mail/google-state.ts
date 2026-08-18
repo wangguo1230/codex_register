@@ -40,7 +40,7 @@ export const GOOGLE_LOGIN_ERROR_LABEL = {
     disabled: "账号已停用",
 };
 
-const HARDEN_IP_RE = /代理中断|换 session|signin\/rejected|拒绝页|SSL\/代理|ERR_PROXY|ERR_SSL|ERR_CONNECTION|ERR_TUNNEL|邮箱页卡住/i;
+const HARDEN_IP_RE = /代理中断|换 session|signin\/rejected|拒绝页|SSL\/代理|ERR_PROXY|ERR_SSL|ERR_CONNECTION|ERR_TUNNEL|邮箱页卡住|operation was aborted|比特API .+ 超时|开窗超时/i;
 const HARDEN_LOGIN_DEAD_RE = /登录失败|Wrong password|密码错误|Senha incorreta|找不到您的 Google|Couldn't find your Google|帐号已被停用|账号已停用|account has been disabled|尝试次数过多|Too many failed|This account cannot be accessed|账号已停用/i;
 const HARDEN_CRED_DEAD_RE = /Wrong password|密码错误|Senha incorreta|Kata sandi salah|找不到您的 Google|Couldn't find your Google|帐号已被停用|账号已停用|account has been disabled|尝试次数过多|Too many failed|This account cannot be accessed/i;
 
@@ -83,6 +83,7 @@ export function emptyGoogleState() {
     return {
         stage: "imported",
         login: "unknown",
+        login_at: 0,
         login_error: "",
         phone: "unknown",
         recovery: "unknown",
@@ -140,6 +141,7 @@ export function deriveGoogleState(facts = {}, overlay = {}) {
         s.login = "ok";
         s.login_error = "";
     }
+    if (s.login === "fail") s.login_at = 0;
     if (s.login === "fail" && !s.last_error) {
         s.last_error = GOOGLE_LOGIN_ERROR_LABEL[s.login_error] || s.login_error || "登录失败";
     }
@@ -261,6 +263,18 @@ export function needsHardenRetry(mb = {}) {
 export function liveGoogleStage(mb = {}) {
     if (String(mb.google_stage || "") === "gpt_ok") return "gpt_ok";
     return deriveGoogleState(mb, {}).stage;
+}
+
+/** 网页登录探活有效期：1 小时内不再开比特窗重登。只认显式 login_at，不用 IMAP 推断的 login=ok。 */
+export const GMAIL_WEB_LOGIN_TTL_MS = 60 * 60 * 1000;
+
+export function gmailWebLoginFresh(mb = {}, now = Date.now()) {
+    const st = mb?.google_state && typeof mb.google_state === "object" ? mb.google_state : {};
+    if (st.login !== "ok") return {fresh: false, ageMs: null};
+    const at = Number(st.login_at || 0);
+    if (!Number.isFinite(at) || at <= 0) return {fresh: false, ageMs: null};
+    const ageMs = now - at;
+    return {fresh: ageMs >= 0 && ageMs < GMAIL_WEB_LOGIN_TTL_MS, ageMs};
 }
 
 export function googleStageLabel(stage) {

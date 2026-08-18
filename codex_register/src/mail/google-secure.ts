@@ -452,7 +452,7 @@ export async function hardenGoogleAccountOnPage(page, cred, log = () => {}, onCh
     return out;
 }
 
-async function openGoogleBitOnce({proxyUrl = "", jumpUrl = "", name = "gmail", remark = "gmail-manage", log = () => {}, signal, fn, onProxy} = {}) {
+async function openGoogleBitOnce({proxyUrl = "", jumpUrl, name = "gmail", remark = "gmail-manage", log = () => {}, signal, fn, onProxy} = {}) {
     const {bitSessionReady, createBitWindow, openBitWindow, closeBitWindow, deleteBitWindow, trackBitWindow, untrackBitWindow, isBitLoggedOut} = await import("../bitbrowser.js");
     const {chromium} = await import("playwright-core");
     const {pickLiveMailProxy, maskProxyUrl} = await import("./proxy-pool.js");
@@ -469,8 +469,21 @@ async function openGoogleBitOnce({proxyUrl = "", jumpUrl = "", name = "gmail", r
     if (liveProxy) {
         if (stopped()) throw new Error("已停止");
         const {getMailProxyJump} = await import("./proxy-pool.js");
-        const jumpNow = String(jumpUrl || getMailProxyJump() || "").trim();
-        log(jumpNow ? `[网络] 先测代理出口 / Google（经跳板 ${jumpNow}）` : "[网络] 先测代理出口 / Google（无跳板，直连网关，国内会超时）");
+        // jumpUrl === "" 表示强制不跳板；只有没传才回落全局跳板。
+        // 以前空字符串被当成 falsy，10808/直出方案也会被套上 miyaip，探本机被 ConnectionRefused。
+        let jumpNow = jumpUrl === undefined || jumpUrl === null
+            ? String(getMailProxyJump() || "").trim()
+            : String(jumpUrl || "").trim();
+        try {
+            const {liveJumpSocks} = await import("../../server/xray-proxy.js");
+            const live = await liveJumpSocks();
+            if (live) jumpNow = live;
+        } catch { /* 非服务端环境没有 fleet */ }
+        try {
+            const host = new URL(liveProxy.includes("://") ? liveProxy.split("#")[0] : `socks5://${liveProxy}`).hostname;
+            if (host === "127.0.0.1" || host === "localhost") jumpNow = "";
+        } catch { /* */ }
+        log(jumpNow ? `[网络] 先测代理出口 / Google（经跳板 ${jumpNow}）` : "[网络] 先测代理出口 / Google（无跳板）");
         const picked = await pickLiveMailProxy(liveProxy, {tries: 3, rotate: true, log: (m) => log(`[网络] ${m}`), jump: jumpNow});
         if (!picked.ok) throw new Error(`代理不通，先别登 Google: ${picked.probe.reason || "未知"}`);
         liveProxy = picked.url;
@@ -513,11 +526,13 @@ async function openGoogleBitOnce({proxyUrl = "", jumpUrl = "", name = "gmail", r
             }
             throw e;
         }
-        log(`[指纹] 比特窗口 ${bitId}${liveProxy ? " ← " + String(liveProxy).replace(/:[^:@/]+@/, ":***@") : "（无代理）"}${bitProxy && bitProxy !== liveProxy ? " 经跳板" : ""}`);
+        log(`[指纹] 比特窗口 ${bitId}${liveProxy ? " ← " + String(liveProxy).replace(/:[^:@/]+@/, ":***@") : "（无代理）"}${bitProxy && bitProxy !== liveProxy ? " 经跳板" : ""}，打开中（链式开窗常要半分钟）`);
         trackBitWindow(bitId);
         const {ws} = await openBitWindow(bitId, {extractIp});
+        log(`[指纹] 窗口已打开，接 CDP`);
         if (stopped()) throw new Error("已停止");
-        const browser = await chromium.connectOverCDP(ws);
+        let browser = null;
+        browser = await chromium.connectOverCDP(ws);
         const ctx = browser.contexts()[0] || await browser.newContext();
         const page = ctx.pages()[0] || await ctx.newPage();
         page.setDefaultTimeout(30000);
@@ -535,12 +550,13 @@ async function openGoogleBitOnce({proxyUrl = "", jumpUrl = "", name = "gmail", r
             return await fn(page);
         } finally {
             untrackBitWindow(bitId);
+            try { await Promise.race([browser?.close?.() || Promise.resolve(), new Promise((r) => setTimeout(r, 3_000))]); } catch { /* */ }
         }
     } finally {
         clearInterval(stopWatch);
         if (bitId) {
-            await closeBitWindow(bitId);
-            await deleteBitWindow(bitId);
+            const done = closeBitWindow(bitId).catch(() => {}).then(() => deleteBitWindow(bitId).catch(() => {}));
+            await Promise.race([done, new Promise((r) => setTimeout(r, 8_000))]);
         }
         try { chainClose(); } catch { /* */ }
     }
@@ -551,7 +567,7 @@ async function openGoogleBitOnce({proxyUrl = "", jumpUrl = "", name = "gmail", r
  * 只有「还没登录进 Google」时，出口死了才关窗换 IP。
  * 一旦 markLoggedIn，窗里已有账号会话，再关会拆掉刚换的 2FA/密码，只许记步骤失败。
  */
-export async function withGoogleBitSession({proxyUrl = "", jumpUrl = "", name = "gmail", remark = "gmail-manage", log = () => {}, signal, onProxy} = {}, fn) {
+export async function withGoogleBitSession({proxyUrl = "", jumpUrl, name = "gmail", remark = "gmail-manage", log = () => {}, signal, onProxy} = {}, fn) {
     const {isMailboxJobStopped} = await import("./mailbox-job-stop.js");
     const {isProxySessionDead, mintStickySession, kookeeySessionOf} = await import("./proxy-pool.js");
     const stopped = () => !!(signal?.aborted || isMailboxJobStopped());

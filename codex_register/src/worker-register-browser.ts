@@ -101,22 +101,13 @@ async function main() {
         let bitProxy = rawProxy || "";
         let timeZone = "";
         if (bitProxy) {
-            const {pickLiveMailProxy, maskProxyUrl, getMailProxyJump, setMailProxyJump} = await import("./mail/proxy-pool.js");
-            setMailProxyJump(process.env.MAIL_PROXY_JUMP || getMailProxyJump() || "");
-            const jump = getMailProxyJump();
-            emit({type: "progress", stage: "net", message: jump ? `[网络] 经跳板 ${jump} 测出口` : "[网络] 无跳板，直连测出口"});
-            const picked = await pickLiveMailProxy(bitProxy, {tries: 3, log: (m) => emit({type: "progress", stage: "net", message: `[网络] ${m}`})});
-            if (!picked.ok) throw new Error(`代理不通: ${picked.probe.reason || "未知"}`);
-            bitProxy = picked.url;
-            emit({type: "progress", stage: "net", message: `[网络] 通 ${maskProxyUrl(bitProxy)}`});
-            if (jump) {
-                const {wrapExitThroughJump, timezoneFromExitUrl} = await import("./mail/proxy-chain.js");
-                const wrapped = await wrapExitThroughJump(bitProxy, jump);
-                closeFn = wrapped.close;
-                bitProxy = wrapped.url;
-                timeZone = timezoneFromExitUrl(picked.url);
-                emit({type: "progress", stage: "net", message: `[网络] 链式跳板 :${wrapped.localPort}`});
-            }
+            let hasAuth = false;
+            try {
+                const u = new URL(bitProxy.includes("://") ? bitProxy.split("#")[0] : `socks5://${bitProxy}`);
+                hasAuth = !!(u.username || u.password);
+            } catch { /* */ }
+            if (hasAuth) throw new Error("浏览器必须走 xray（本机无账密 socks），不能把 kookeey 账密交给比特/Chrome");
+            emit({type: "progress", stage: "net", message: `[网络] 浏览器走 xray ${bitProxy}`});
         }
         id = await createBitWindow({
             proxy: bitProxy,
@@ -136,10 +127,8 @@ async function main() {
         let opened = {id: null, cdp: "", closeFn: () => {}, proxyUrl};
         try {
             if (attempt) {
-                const {mintStickySession} = await import("./mail/proxy-pool.js");
-                proxyUrl = mintStickySession(process.env.PROXY_URL || proxyUrl);
                 const why = /Cloudflare|Unable to load|出口被/.test(String(r?.error || "")) ? "出口被拦" : "代理断了";
-                emit({type: "progress", stage: "net", message: `${why}，换新 session 重开窗（${attempt + 1}/4）`});
+                emit({type: "progress", stage: "net", message: `${why}，同一 xray 重开窗（${attempt + 1}/4）`});
             }
             opened = await openBitOnProxy(proxyUrl);
             bitId = opened.id;
@@ -183,15 +172,7 @@ async function main() {
         emit({type: "progress", stage: "mfa", message: "注册后绑定 TOTP…"});
         const accountId = decodeJwt(r.token)?.["https://api.openai.com/auth"]?.chatgpt_account_id || "";
         let mfaProxy = process.env.PROXY_URL || "";
-        let mfaClose = () => {};
         try {
-            const jump = process.env.MAIL_PROXY_JUMP || "";
-            if (jump && mfaProxy) {
-                const {wrapExitThroughJump} = await import("./mail/proxy-chain.js");
-                const wrapped = await wrapExitThroughJump(mfaProxy, jump);
-                mfaProxy = wrapped.url;
-                mfaClose = wrapped.close;
-            }
             const mfaCookie = cookieString(r.cookies) || record.cookie || "";
             const mfa = await enrollTotp(r.token, {
                 accountId,
@@ -216,8 +197,6 @@ async function main() {
         } catch (e: any) {
             mfaStatus = "❌" + String(e?.message || e).slice(0, 80);
             emit({type: "progress", stage: "mfa", message: "TOTP 未绑(不影响注册): " + mfaStatus});
-        } finally {
-            try { mfaClose(); } catch { /* */ }
         }
     }
 

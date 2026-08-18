@@ -1344,6 +1344,9 @@ export function createMailcomProvider() {
         async getEmailVerificationCode(email, options) {
             const minTimestampMs = options?.minTimestampMs || 0;
             const excludeCode = options?.excludeCode || ""; // 排除的旧码(重复注册/上次验证失败的残留码),跳过等新邮件
+            // deadlineMs：绝对截止时间戳。换绑用它保证 verify 还落在 pwd_auth 窗口内
+            const deadlineMs = Number(options?.deadlineMs || 0);
+            const overBudget = () => deadlineMs > 0 && Date.now() >= deadlineMs;
             const session = await ensureSession(email);
             if (session.page && !/3c\.|webmailer/i.test(session.page.url())) {
                 await session.page.goto("https://3c.mail.com/", {waitUntil: "domcontentloaded", timeout: 30000}).catch(() => {});
@@ -1351,6 +1354,7 @@ export function createMailcomProvider() {
             }
 
             for (let attempt = 1; attempt <= POLL_ATTEMPTS; attempt += 1) {
+                if (overBudget()) break;
                 console.log(`[mailcom] pollOtp attempt=${attempt}/${POLL_ATTEMPTS} email=${email}`);
                 try {
                     let list = await fetchList(session);
@@ -1400,10 +1404,11 @@ export function createMailcomProvider() {
                 } catch (err) {
                     console.warn(`[mailcom] pollOtp attempt=${attempt} 失败: ${err?.message ?? err}`);
                 }
-                if (attempt < POLL_ATTEMPTS) {
+                if (attempt < POLL_ATTEMPTS && !overBudget()) {
                     await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
                 }
             }
+            if (overBudget()) throw new Error(`mail.com 取码超预算，未找到验证码: ${email}`);
             throw new Error(`mail.com 未找到验证码: ${email}`);
         },
     };

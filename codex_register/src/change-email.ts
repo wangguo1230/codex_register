@@ -1,7 +1,8 @@
 // ChatGPT 登录邮箱换绑：走官方 backend-api change_email / add_email。
 // 账单页 /payments/checkout/update_email 不是登录邮箱，不要用。
-import {CHATGPT_BASE_URL, DEFAULT_USER_AGENT} from "./constants.js";
+import {CHATGPT_BASE_URL, CHATGPT_OAI_CLIENT_VERSION, DEFAULT_USER_AGENT} from "./constants.js";
 import {decodeJwt} from "./token-check.js";
+import {defaultDeviceProfile, getDeviceClientHints} from "./device-profile.js";
 import {createProtocolDispatcher} from "./mail/protocol-dispatcher.js";
 import {rememberGoogleCred, waitGoogleImapOtp} from "./mail/google-account.js";
 
@@ -12,6 +13,17 @@ const ADD_BEGIN_URL = `${CHATGPT_BASE_URL}/backend-api/accounts/add_email/begin`
 const ADD_VERIFY_URL = `${CHATGPT_BASE_URL}/backend-api/accounts/add_email/verify`;
 const ME_URL = `${CHATGPT_BASE_URL}/backend-api/me`;
 const PWD_AUTH_WINDOW_MS = 270_000;
+/**
+ * begin 一发就计入官方 24h 换绑上限，而 verify 必须落在 pwd_auth 窗口内。
+ * 所以 begin 之前不能只问"过期了没"，要问"剩下的额度够不够跑完取码 + verify"。
+ * 额度不够就先重登：否则这次 begin 必然换来 verify 401，配额白烧一次，
+ * 上层再重登重试又是一次 begin —— 这正是把号推到 24h 上限的那个循环。
+ */
+export const REBIND_OTP_MIN_BUDGET_MS = Math.max(30_000, Number(process.env.REBIND_OTP_MIN_BUDGET_MS || 90_000));
+/** 取码拿到码之后还要发 verify，给它留出的余量。 */
+const VERIFY_RESERVE_MS = 20_000;
+/** 取码最多占多久（还会被 pwd_auth 剩余额度进一步压低）。 */
+const OTP_MAX_WAIT_MS = Math.max(60_000, Number(process.env.REBIND_OTP_MAX_WAIT_MS || 150_000));
 
 /**
  * 换绑阶段。父进程据此判断官方侧状态是否确定：
@@ -19,15 +31,41 @@ const PWD_AUTH_WINDOW_MS = 270_000;
  */
 export type ChangeEmailStage = "precheck" | "eligibility" | "begin" | "otp" | "verify" | "done";
 
-function authHeaders(accessToken: string, accountId?: string): Record<string, string> {
+function cookieDeviceId(cookie: string): string {
+    const m = String(cookie || "").match(/(?:^|;\s*)oai-did=([^;]+)/i);
+    return m ? decodeURIComponent(m[1].trim()) : "";
+}
+
+function cookieAccountId(cookie: string): string {
+    const m = String(cookie || "").match(/(?:^|;\s*)_account=([^;]+)/i);
+    return m ? decodeURIComponent(m[1].trim()) : "";
+}
+
+/** 对齐官网 HAR：Bearer + oai-* + CF/session cookie + Client Hints。 */
+function authHeaders(accessToken: string, accountId?: string, cookie = ""): Record<string, string> {
+    const hints = getDeviceClientHints(defaultDeviceProfile());
+    const did = cookieDeviceId(cookie);
+    const accId = String(accountId || cookieAccountId(cookie) || "").trim();
     return {
         authorization: `Bearer ${accessToken}`,
-        accept: "application/json",
+        accept: "*/*",
         "content-type": "application/json",
+        "accept-encoding": "identity",
         origin: CHATGPT_BASE_URL,
         referer: `${CHATGPT_BASE_URL}/`,
         "user-agent": DEFAULT_USER_AGENT,
-        ...(accountId ? {"chatgpt-account-id": accountId} : {}),
+        "accept-language": "zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6",
+        "oai-language": "zh-CN",
+        "oai-client-version": CHATGPT_OAI_CLIENT_VERSION,
+        "sec-ch-ua": hints.secChUa,
+        "sec-ch-ua-mobile": hints.secChUaMobile,
+        "sec-ch-ua-platform": hints.secChUaPlatform,
+        "sec-fetch-dest": "empty",
+        "sec-fetch-mode": "cors",
+        "sec-fetch-site": "same-origin",
+        ...(accId ? {"chatgpt-account-id": accId} : {}),
+        ...(did ? {"oai-device-id": did} : {}),
+        ...(cookie ? {cookie} : {}),
     };
 }
 
@@ -54,14 +92,35 @@ function errText(body: any, fallback = ""): string {
     try { return JSON.stringify(body).slice(0, 200); } catch { return fallback; }
 }
 
-export function needsPwdReauth(accessToken: string, windowMs = PWD_AUTH_WINDOW_MS): boolean {
+/** pwd_auth 窗口还剩多少毫秒。拿不到 pwd_auth_time 一律当 0（要重登）。 */
+export function pwdAuthLeftMs(accessToken: string, windowMs = PWD_AUTH_WINDOW_MS): number {
     const jwt = decodeJwt(accessToken);
-    if (!jwt) return true;
+    if (!jwt) return 0;
     const t = jwt.pwd_auth_time;
-    if (t == null) return true;
+    if (t == null) return 0;
     const ms = t < 1e12 ? t * 1000 : t;
     const age = Date.now() - ms;
-    return age < 0 || age > windowMs;
+    if (age < 0) return 0;
+    return Math.max(0, windowMs - age);
+}
+
+export function needsPwdReauth(accessToken: string, windowMs = PWD_AUTH_WINDOW_MS): boolean {
+    return pwdAuthLeftMs(accessToken, windowMs) <= 0;
+}
+
+/** 子进程里目标邮箱预检（mail.com 要开 Playwright）可能吃掉的时间。 */
+const REBIND_PRECHECK_ALLOWANCE_MS = 60_000;
+
+/**
+ * 上层 spawn 换绑子进程之前用的新鲜度判断：额度必须够跑完
+ * 目标邮箱预检 → begin → 取码 → verify。
+ * 一个还剩 1 秒的 AT 能过 needsPwdReauth，但拿它去 begin 是纯浪费 24h 配额，
+ * 所以宁可多重登一次，也不要烧掉一个换绑名额。
+ */
+export function rebindNeedsFreshLogin(accessToken: string): boolean {
+    if (!accessToken) return true;
+    return pwdAuthLeftMs(accessToken)
+        < REBIND_OTP_MIN_BUDGET_MS + VERIFY_RESERVE_MS + REBIND_PRECHECK_ALLOWANCE_MS;
 }
 
 /** 从库里的 auth_data / session JSON 取出 accessToken。 */
@@ -89,10 +148,10 @@ export function isSessionJsonAlive(authData: any, {now = Date.now(), skewMs = 60
     return {ok: leftMs > skewMs, accessToken, expMs, leftMs};
 }
 
-export async function getChangeEmailEligibility(accessToken: string, {accountId = "", proxyUrl = ""} = {}) {
+export async function getChangeEmailEligibility(accessToken: string, {accountId = "", proxyUrl = "", cookie = ""} = {}) {
     const dispatcher = createProtocolDispatcher(proxyUrl);
     const res = await fetch(ELIGIBILITY_URL, {
-        method: "GET", headers: authHeaders(accessToken, accountId), dispatcher,
+        method: "GET", headers: authHeaders(accessToken, accountId, cookie), dispatcher,
     } as any);
     const body = await readJson(res);
     if (res.status === 401) return {ok: false, status: 401, needReauth: true, reason: "AT 失效(401)", body};
@@ -112,17 +171,23 @@ export async function getChangeEmailEligibility(accessToken: string, {accountId 
  * 读官方当前登录邮箱，用于换绑对账（我们不确定 verify 到底成没成时的唯一真相来源）。
  * 返回 email 为空且 ok=true 时表示接口通了但没给邮箱，调用方不要据此下结论。
  */
-export async function fetchCurrentLoginEmail(accessToken: string, {accountId = "", proxyUrl = ""} = {}): Promise<{
+export async function fetchCurrentLoginEmail(accessToken: string, {accountId = "", proxyUrl = "", cookie = ""} = {}): Promise<{
     ok: boolean; email: string; status: number; needReauth?: boolean; reason?: string;
 }> {
     if (!accessToken) return {ok: false, email: "", status: 0, reason: "无 access_token"};
     const dispatcher = createProtocolDispatcher(proxyUrl);
     try {
         const res = await fetch(ME_URL, {
-            method: "GET", headers: authHeaders(accessToken, accountId), dispatcher,
+            method: "GET", headers: authHeaders(accessToken, accountId, cookie), dispatcher,
         } as any);
         const body = await readJson(res);
-        if (res.status === 401) return {ok: false, email: "", status: 401, needReauth: true, reason: "AT 失效(401)"};
+        if (res.status === 401) {
+            const revoked = /token_revoked/i.test(errText(body));
+            return {
+                ok: false, email: "", status: 401, needReauth: true,
+                reason: revoked ? "AT 已吊销(token_revoked，换绑成功后官网会这样)" : "AT 失效(401)",
+            };
+        }
         if (!res.ok) return {ok: false, email: "", status: res.status, reason: errText(body, `me ${res.status}`)};
         const email = String(body?.email || body?.user?.email || "").trim().toLowerCase();
         return {ok: true, email, status: res.status};
@@ -134,6 +199,7 @@ export async function fetchCurrentLoginEmail(accessToken: string, {accountId = "
 export async function changeChatgptEmail({
     accessToken,
     accountId = "",
+    cookie = "",
     proxyUrl = "",
     newEmail,
     imapPassword,
@@ -145,6 +211,7 @@ export async function changeChatgptEmail({
 }: {
     accessToken: string;
     accountId?: string;
+    cookie?: string;
     proxyUrl?: string;
     newEmail: string;
     imapPassword: string;
@@ -168,7 +235,7 @@ export async function changeChatgptEmail({
     if (!isGmail && !mailPassword && !imapPassword) return {ok: false, reason: "目标邮箱无密码", stage};
 
     const dispatcher = createProtocolDispatcher(proxyUrl);
-    const headers = authHeaders(accessToken, accountId);
+    const headers = authHeaders(accessToken, accountId, cookie);
     const cred = rememberGoogleCred({
         email, password: mailPassword, totpSecret, imapPassword,
     });
@@ -191,7 +258,7 @@ export async function changeChatgptEmail({
     let social = socialUser;
     enter("eligibility");
     try {
-        const elig = await getChangeEmailEligibility(accessToken, {accountId, proxyUrl});
+        const elig = await getChangeEmailEligibility(accessToken, {accountId, proxyUrl, cookie});
         if (elig.needReauth) return {ok: false, needReauth: true, reason: elig.reason, stage};
         if (elig.ok) {
             if (elig.socialUser) social = true;
@@ -206,6 +273,24 @@ export async function changeChatgptEmail({
     } catch (e: any) {
         return {ok: false, reason: `eligibility: ${fetchErr(e)}`, stage};
     }
+
+    // begin 之前最后一道闸：额度不够跑完取码 + verify 就别发 begin。
+    // 这里返回 needReauth，让上层先重登再进来，而不是白烧一次 24h 配额换一个必然的 verify 401。
+    const leftMs = pwdAuthLeftMs(accessToken);
+    if (leftMs < REBIND_OTP_MIN_BUDGET_MS + VERIFY_RESERVE_MS) {
+        return {
+            ok: false,
+            needReauth: true,
+            reason: `pwd_auth 仅剩 ${Math.round(leftMs / 1000)}s，不够取码+verify（需 ≥${Math.round((REBIND_OTP_MIN_BUDGET_MS + VERIFY_RESERVE_MS) / 1000)}s），先重登再 begin`,
+            stage,
+        };
+    }
+    // 取码窗口从 pwd_auth 剩余额度里切出来，保证 verify 一定落在窗口内。
+    const otpBudgetMs = Math.max(
+        REBIND_OTP_MIN_BUDGET_MS,
+        Math.min(OTP_MAX_WAIT_MS, leftMs - VERIFY_RESERVE_MS),
+    );
+    const otpDeadlineMs = Date.now() + otpBudgetMs;
 
     const beginUrl = useAddEmail ? ADD_BEGIN_URL : BEGIN_URL;
     const verifyUrl = useAddEmail ? ADD_VERIFY_URL : VERIFY_URL;
@@ -239,11 +324,15 @@ export async function changeChatgptEmail({
     enter("otp");
     try {
         if (isGmail) {
-            code = await waitGoogleImapOtp(cred, {minTimestampMs: sentAt, attempts: 10, intervalMs: 4000});
+            code = await waitGoogleImapOtp(cred, {
+                minTimestampMs: sentAt, attempts: 10, intervalMs: 4000, deadlineMs: otpDeadlineMs,
+            });
         } else {
             const {createMailcomProvider, rememberMailcomPassword} = await import("./mail/mailcom.js");
             rememberMailcomPassword(email, mailPassword || imapPassword);
-            code = await createMailcomProvider().getEmailVerificationCode(email, {minTimestampMs: sentAt});
+            code = await createMailcomProvider().getEmailVerificationCode(email, {
+                minTimestampMs: sentAt, deadlineMs: otpDeadlineMs,
+            });
         }
     } catch (e: any) {
         const why = String(e?.message || e).slice(0, 200);
@@ -271,7 +360,15 @@ export async function changeChatgptEmail({
         };
     }
     const verifyJson = await readJson(verifyRes);
-    if (verifyRes.status === 401) return {ok: false, needReauth: true, reason: "verify 401，需重新登录", stage};
+    if (verifyRes.status === 401) {
+        const why = errText(verifyJson);
+        // 官网 HAR：verify 成功后旧 AT 立刻 token_revoked。verify 本身若回吊销，
+        // 可能已经改完，不能当普通需重登失败，交给对账。
+        if (/token_revoked/i.test(why)) {
+            return {ok: false, indeterminate: true, reason: "verify 401 token_revoked（官网换绑后会吊销旧 AT）", stage};
+        }
+        return {ok: false, needReauth: true, reason: "verify 401，需重新登录", stage};
+    }
     if (!verifyRes.ok) {
         const why = errText(verifyJson);
         const netty = /fetch failed|timeout|timed out|ECONN|ENOTFOUND|EPIPE|socket|TLS|disconnected|Proxy connection/i.test(why);

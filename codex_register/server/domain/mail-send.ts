@@ -1,9 +1,15 @@
 // @ts-nocheck
 // mail.com 发信：用邮箱管理已记住的粘性出口。
 // 同一条代理连试多次；连续不可用才换 session 并写回 mailboxes.proxy_url。
+// Playwright 必须丢到子进程：跟 :3100 同进程会把事件循环卡死，前端表现为 500。
+import {spawn} from "node:child_process";
+import {existsSync, unlinkSync, writeFileSync} from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import {fileURLToPath} from "node:url";
 import * as db from "../db.js";
 import {scheduler} from "../scheduler.js";
-import {sendMailcomMail} from "../../src/mail/mailcom.js";
+import {cleanSpawnEnv} from "../strip-env-proxy.js";
 import {ensureMailcomProfile} from "../../src/mail/mailcom-fingerprint.js";
 import {
     mailProxyPool,
@@ -18,6 +24,81 @@ import {
 
 const SAME_PROXY_TRIES = Math.max(2, Number(process.env.MAILCOM_SEND_PROXY_TRIES || 3));
 const FAIL_BEFORE_ROTATE = Math.max(2, Number(process.env.MAILCOM_SEND_PROXY_FAILS || 3));
+const PROBE_BUDGET_MS = Math.max(3000, Number(process.env.MAILCOM_SEND_PROBE_MS || 8000));
+const SEND_WORKER_MS = Math.max(60_000, Number(process.env.MAILCOM_SEND_TIMEOUT_MS || 180_000));
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
+const TSX_BIN = existsSync(path.join(ROOT, "node_modules", ".bin", "tsx"))
+    ? path.join(ROOT, "node_modules", ".bin", "tsx")
+    : "tsx";
+
+let sendChild = null;
+
+function runSendWorker(job, log) {
+    const jobFile = path.join(os.tmpdir(), `mail-send-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.json`);
+    writeFileSync(jobFile, JSON.stringify(job));
+    return new Promise((resolve, reject) => {
+        const child = spawn(TSX_BIN, ["scripts/worker-mail-send.ts", jobFile], {
+            cwd: ROOT,
+            env: cleanSpawnEnv({MAILCOM_HEADLESS: job.headless === false ? "0" : "1"}),
+            stdio: ["ignore", "pipe", "pipe"],
+            detached: process.platform !== "win32",
+        });
+        sendChild = child;
+        const killChild = () => {
+            try {
+                if (process.platform !== "win32" && child.pid) process.kill(-child.pid, "SIGKILL");
+                else child.kill("SIGKILL");
+            } catch {
+                try { child.kill("SIGKILL"); } catch { /* */ }
+            }
+        };
+        let out = "";
+        const pump = (buf) => {
+            const s = String(buf || "");
+            out += s;
+            for (const line of s.split(/\r?\n/)) {
+                const t = line.trim();
+                if (!t || t.startsWith("@@RESULT@@")) continue;
+                log(t.slice(0, 220));
+            }
+        };
+        child.stdout?.on("data", pump);
+        child.stderr?.on("data", pump);
+        const timer = setTimeout(() => {
+            killChild();
+            reject(new Error(`发信超时 ${Math.round(SEND_WORKER_MS / 1000)}s`));
+        }, SEND_WORKER_MS);
+        const done = (fn, val) => {
+            clearTimeout(timer);
+            if (sendChild === child) sendChild = null;
+            try { unlinkSync(jobFile); } catch { /* */ }
+            fn(val);
+        };
+        child.on("error", (e) => done(reject, e));
+        child.on("close", (code) => {
+            const hit = out.split(/\r?\n/).reverse().find((l) => l.startsWith("@@RESULT@@"));
+            if (hit) {
+                try {
+                    const r = JSON.parse(hit.slice("@@RESULT@@".length));
+                    if (r?.ok) { done(resolve, r); return; }
+                    done(reject, new Error(r?.error || "发信失败"));
+                    return;
+                } catch { /* */ }
+            }
+            done(reject, new Error((out || `worker exit ${code}`).replace(/\s+/g, " ").slice(-240)));
+        });
+    });
+}
+
+function withTimeout(promise, ms, label = "超时") {
+    let timer;
+    return Promise.race([
+        Promise.resolve(promise).finally(() => { try { clearTimeout(timer); } catch { /* */ } }),
+        new Promise((_, reject) => {
+            timer = setTimeout(() => reject(new Error(label)), Math.max(500, Number(ms) || 0));
+        }),
+    ]);
+}
 
 function publicProxy(row) {
     const url = String(row?.proxy_url || "");
@@ -30,7 +111,7 @@ function publicProxy(row) {
 
 function isRetryableSend(err) {
     if (isProxySessionDead(err)) return true;
-    return /timeout|ETIMEDOUT|ECONNRESET|ECONNREFUSED|HTTP 5\d\d|HTTP 429|net::|ERR_TUNNEL|ERR_PROXY|socket hang up/i.test(String((err as Error)?.message || err || ""));
+    return /timeout|超时|ETIMEDOUT|ECONNRESET|ECONNREFUSED|HTTP 5\d\d|HTTP 429|net::|ERR_TUNNEL|ERR_PROXY|socket hang up/i.test(String((err as Error)?.message || err || ""));
 }
 
 async function writeSendLog(fields) {
@@ -142,16 +223,22 @@ export async function sendMailcomViaPool(opts: any = {}) {
                 log(`发信${attemptTag} ${maskProxyUrl(exit)}${sess ? ` session=${sess}` : ""}${ip ? ` ip=${ip}` : ""} tz=${profile.timezoneId} ${profile.viewportWidth}x${profile.viewportHeight}（${reused ? "邮箱已记出口" : "新出口"} · 第 ${i}/${SAME_PROXY_TRIES} 次）${jumpUrl ? ` · 跳板 ${maskProxyUrl(jumpUrl)}` : " · 无跳板"}`);
                 if (i === 1 || !ip) {
                     try {
-                        const live = await pickLiveMailProxy(exit, {tries: 2, rotate: false, jump: jumpUrl, log: (m) => log(`发信探测 ${m}`)});
+                        const live = await withTimeout(
+                            pickLiveMailProxy(exit, {tries: 1, rotate: false, jump: jumpUrl, log: (m) => log(`发信探测 ${m}`)}),
+                            PROBE_BUDGET_MS,
+                            `探测超时 ${PROBE_BUDGET_MS}ms`,
+                        );
                         if (live?.probe?.ip && live.probe.ip !== "?") ip = live.probe.ip;
                         if (live && !live.ok) log(`发信探测未过: ${live.probe?.reason || "未知"}，仍用原 session 发`);
-                    } catch { /* 探测失败仍发 */ }
+                    } catch (e) {
+                        log(`发信探测跳过（${String((e as Error)?.message || e).slice(0, 80)}），直接登录发`);
+                    }
                 }
                 try {
-                    const r = await sendMailcomMail(email, password, {
-                        to, subject, html, text, fromName, headless: headless ?? true,
-                        proxy: exit, jump: jumpUrl, profile,
-                    });
+                    const r = await runSendWorker({
+                        email, password, to, subject, html, text, fromName,
+                        headless: headless ?? true, proxy: exit, jump: jumpUrl, profile,
+                    }, log);
                     if (mb.id) {
                         await db.resetMailboxProxyFail(mb.id).catch(() => {});
                         if (ip && ip !== mb.proxy_ip) await db.setMailboxProxy(mb.id, exit, ip);
@@ -185,7 +272,8 @@ export async function sendMailcomViaPool(opts: any = {}) {
                     if (mb.id) {
                         db.appendMailboxLog(mb.id, `[发信] 第 ${i}/${SAME_PROXY_TRIES} 次失败 ${err.slice(0, 140)} session=${sess || "-"}`).catch(() => {});
                     }
-                    if (!isRetryableSend(e) || i >= SAME_PROXY_TRIES) break;
+                    // 子进程整段超时已经等够了，不要同一条出口再空等 3×180s
+                    if (/发信超时/.test(err) || !isRetryableSend(e) || i >= SAME_PROXY_TRIES) break;
                     log(`同一粘性出口再试（${i}/${SAME_PROXY_TRIES} 已失败）`);
                 }
             }
@@ -202,7 +290,8 @@ export async function sendMailcomViaPool(opts: any = {}) {
             }
             mb.proxy_fail = fails;
             const sess = kookeeySessionOf(exitUrl) || "-";
-            if (fails < FAIL_BEFORE_ROTATE) {
+            const forceRotate = /发信超时/.test(String((e as Error)?.message || e || ""));
+            if (!forceRotate && fails < FAIL_BEFORE_ROTATE) {
                 const msg = `粘性代理暂不可用（${fails}/${FAIL_BEFORE_ROTATE}），仍保留邮箱 session=${sess}`;
                 log(msg);
                 throw new Error(`${msg}: ${String((e as Error)?.message || e).slice(0, 160)}`);
@@ -221,7 +310,7 @@ export async function sendMailcomViaPool(opts: any = {}) {
     });
 }
 
-export async function sendMailcomBatch(items, {concurrency, log} = {} as any) {
+export async function sendMailcomBatch(items, {concurrency, log, shouldStop} = {} as any) {
     const list = Array.isArray(items) ? items : [];
     const cap = Math.max(1, Math.min(8, Number(concurrency || scheduler.pwConcurrency || 1)));
     const out = [];
@@ -230,6 +319,10 @@ export async function sendMailcomBatch(items, {concurrency, log} = {} as any) {
         while (i < list.length) {
             const idx = i++;
             const item = list[idx];
+            if (typeof shouldStop === "function" && shouldStop()) {
+                out[idx] = {ok: false, email: item?.email, error: "已停止"};
+                continue;
+            }
             try {
                 out[idx] = await sendMailcomViaPool({...item, log});
             } catch (e) {
@@ -341,8 +434,13 @@ export async function testSendDelivered(ids, opts: any = {}) {
     const skipped = preview.items.filter((x) => !x.canSend);
     const results = skipped.map((x) => ({id: x.id, email: x.queueEmail, from: x.from, ok: false, skipped: true, error: x.reason}));
     const log = typeof opts.log === "function" ? opts.log : (m) => console.log(m);
+    const shouldStop = typeof opts.shouldStop === "function" ? opts.shouldStop : () => false;
     const mailcomItems = [];
     for (const row of sendable) {
+        if (shouldStop()) {
+            results.push({id: row.id, email: row.queueEmail, from: row.from, ok: false, skipped: true, error: "已停止"});
+            continue;
+        }
         const mb = await db.getMailboxByEmailAny(row.from);
         const mail = buildTestMailContent({from: row.from, to, subject: opts.subject});
         if (isGmailAddr(row.from)) {
@@ -378,7 +476,7 @@ export async function testSendDelivered(ids, opts: any = {}) {
         });
     }
     if (mailcomItems.length) {
-        const r = await sendMailcomBatch(mailcomItems, {concurrency: opts.concurrency || 1, log});
+        const r = await sendMailcomBatch(mailcomItems, {concurrency: opts.concurrency || 1, log, shouldStop});
         for (let i = 0; i < (r.items || []).length; i++) {
             const one = r.items[i] || {};
             const src = mailcomItems[i];
@@ -402,6 +500,107 @@ export async function testSendDelivered(ids, opts: any = {}) {
         failed: results.filter((x) => !x.ok && !x.skipped).length,
         skipped: results.filter((x) => x.skipped).length,
         items: results,
+        preview: preview.items,
+    };
+}
+
+const sendJob = {
+    running: false,
+    stop: false,
+    to: "",
+    queued: 0,
+    sent: 0,
+    failed: 0,
+    skipped: 0,
+    error: "",
+    startedAt: 0,
+    finishedAt: 0,
+};
+
+function publicSendJob() {
+    return {
+        running: !!sendJob.running,
+        stop: !!sendJob.stop,
+        to: sendJob.to,
+        queued: sendJob.queued,
+        sent: sendJob.sent,
+        failed: sendJob.failed,
+        skipped: sendJob.skipped,
+        error: sendJob.error,
+        startedAt: sendJob.startedAt,
+        finishedAt: sendJob.finishedAt,
+    };
+}
+
+export function getDeliveredSendJob() {
+    return publicSendJob();
+}
+
+export function stopDeliveredSend() {
+    const running = !!sendJob.running;
+    sendJob.stop = true;
+    if (sendChild) {
+        try {
+            if (process.platform !== "win32" && sendChild.pid) process.kill(-sendChild.pid, "SIGKILL");
+            else sendChild.kill("SIGKILL");
+        } catch {
+            try { sendChild.kill("SIGKILL"); } catch { /* */ }
+        }
+    }
+    return {ok: true, running, ...publicSendJob()};
+}
+
+/** 立刻返回，真正发信在后台跑。前端不能把 Playwright 登录堵在一次 HTTP 里，否则代理一卡就 500。 */
+export async function startTestSendDelivered(ids, opts: any = {}) {
+    if (sendJob.running) throw new Error("已有测试发信在跑，先停止或等它跑完");
+    const to = String(opts.to || "").trim();
+    if (!to) throw new Error("请填写测试收件人");
+    const list = (ids || []).map(Number).filter(Number.isInteger);
+    if (!list.length) throw new Error("未选择账号");
+    const preview = await previewDeliveredSend(list, to);
+    const sendable = preview.items.filter((x) => x.canSend);
+    if (!sendable.length) throw new Error(preview.items[0]?.reason || "没有可发的号");
+
+    sendJob.running = true;
+    sendJob.stop = false;
+    sendJob.to = to;
+    sendJob.queued = sendable.length;
+    sendJob.sent = 0;
+    sendJob.failed = 0;
+    sendJob.skipped = preview.items.length - sendable.length;
+    sendJob.error = "";
+    sendJob.startedAt = Date.now();
+    sendJob.finishedAt = 0;
+
+    const log = typeof opts.log === "function" ? opts.log : (m) => console.log(m);
+    const onDone = typeof opts.onDone === "function" ? opts.onDone : null;
+    setImmediate(() => {
+        testSendDelivered(sendable.map((x) => x.id), {
+            ...opts,
+            to,
+            log,
+            shouldStop: () => sendJob.stop,
+        }).then((r) => {
+            sendJob.sent = r.sent || 0;
+            sendJob.failed = r.failed || 0;
+            sendJob.skipped = r.skipped || 0;
+            sendJob.error = r.ok ? "" : (r.items || []).find((x) => !x.ok && !x.skipped)?.error || "";
+            onDone?.(r);
+        }).catch((e) => {
+            sendJob.error = String((e as Error)?.message || e).slice(0, 240);
+            onDone?.({ok: false, error: sendJob.error, sent: 0, failed: sendJob.queued, skipped: sendJob.skipped, to, items: []});
+        }).finally(() => {
+            sendJob.running = false;
+            sendJob.finishedAt = Date.now();
+        });
+    });
+
+    return {
+        ok: true,
+        async: true,
+        queued: sendable.length,
+        skipped: preview.items.length - sendable.length,
+        to,
         preview: preview.items,
     };
 }

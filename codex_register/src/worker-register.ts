@@ -22,6 +22,7 @@ import {createPoolBroker} from "./sms/pool-broker.js";
 import {enrollTotp} from "./mfa.js";
 import {decodeJwt} from "./token-check.js";
 import {readFile} from "node:fs/promises";
+import {installWorkerProxyFromEnv} from "./mail/install-worker-proxy.js";
 
 const EVENT_PREFIX = "@@EVENT@@";
 const email = (process.env.REG_EMAIL || "").trim();
@@ -72,6 +73,8 @@ async function main() {
         process.exit(1);
         return;
     }
+    const closeProxy = await installWorkerProxyFromEnv();
+    try {
     emit({type: "progress", stage: "start", email, message: `开始注册 ${email}`});
 
     const deviceProfile = generateRandomDeviceProfile();
@@ -165,6 +168,9 @@ async function main() {
     } catch { /* ignore */ }
 
     emit({type: "result", status: "success", email: client.email, password, gptPassword: password, totpSecret, mfaStatus, token, authFile, rtFile, chatOk, plan, phone: smsBroker?.boundPhone || "", card: smsBroker?.boundCard || ""});
+    } finally {
+        try { closeProxy(); } catch { /* */ }
+    }
 }
 
 main()
