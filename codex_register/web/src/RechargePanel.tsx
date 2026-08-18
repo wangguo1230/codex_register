@@ -146,6 +146,7 @@ export function RechargePanel({notify}: {notify?: (m: string, ms?: number) => vo
     const [busy, setBusy] = useState(false);
     const [logs, setLogs] = useState<{ts: number; line: string}[]>([]);
     const logBoxRef = useRef<HTMLDivElement>(null);
+    const logStickBottomRef = useRef(true);
     const [showRebindGmail, setShowRebindGmail] = useState(false);
     const [rebindIds, setRebindIds] = useState<number[]>([]);
     /** 验证区分组；换绑只从「换绑池」ready 列表选 */
@@ -238,9 +239,15 @@ export function RechargePanel({notify}: {notify?: (m: string, ms?: number) => vo
         loadQueue();
     }, [deliveryTab]);
 
+    const onLogBoxScroll = () => {
+        const el = logBoxRef.current;
+        if (!el) return;
+        logStickBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 48;
+    };
     useEffect(() => {
         const el = logBoxRef.current;
-        if (el) el.scrollTop = el.scrollHeight;
+        if (!el || !logStickBottomRef.current) return;
+        el.scrollTop = el.scrollHeight;
     }, [logs]);
 
     // 队列筛选
@@ -1312,7 +1319,7 @@ export function RechargePanel({notify}: {notify?: (m: string, ms?: number) => vo
                     <span className="text-sm font-semibold">操作日志 <span className="text-xs font-normal text-gray-400">{logs.length ? `${logs.length} 条` : ""}</span></span>
                     <button onClick={() => { api.clearRechargeLogs().then(() => setLogs([])).catch(() => setLogs([])); }} className="text-xs text-gray-400 hover:text-gray-600">清空</button>
                 </div>
-                <div ref={logBoxRef} className="max-h-[280px] overflow-auto bg-gray-50 p-3 font-mono text-xs text-gray-600 space-y-0.5">
+                <div ref={logBoxRef} onScroll={onLogBoxScroll} className="max-h-[280px] overflow-auto bg-gray-50 p-3 font-mono text-xs text-gray-600 space-y-0.5">
                     {logs.length ? logs.map((l, i) => {
                         const line = String(l.line || "");
                         const cls = /换绑 ✗|^✗/.test(line) ? "text-red-500"

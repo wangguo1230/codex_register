@@ -22,8 +22,14 @@ const PWD_AUTH_WINDOW_MS = 270_000;
 export const REBIND_OTP_MIN_BUDGET_MS = Math.max(30_000, Number(process.env.REBIND_OTP_MIN_BUDGET_MS || 90_000));
 /** 取码拿到码之后还要发 verify，给它留出的余量。 */
 const VERIFY_RESERVE_MS = 20_000;
-/** 取码最多占多久（还会被 pwd_auth 剩余额度进一步压低）。 */
-const OTP_MAX_WAIT_MS = Math.max(60_000, Number(process.env.REBIND_OTP_MAX_WAIT_MS || 150_000));
+/**
+ * 取码的绝对上限。刻意【不】按 pwd_auth 剩余额度来切：动态代理很慢，收码经常
+ * 要等好几分钟，而 begin 早就烧掉了，此时提前放弃没有任何好处——拿到码去试
+ * verify 哪怕窗口已过也只是多一个请求，成功了就是白赚。所以这里放宽到能等，
+ * 窗口过期改成在 verify 之后据实分流（见 pwdWindowExpired）。
+ * 上限要留在父进程 CHANGE_EMAIL_TIMEOUT_MS(480s) 之内：预检 ~60s + 本值 + verify ~20s。
+ */
+const OTP_MAX_WAIT_MS = Math.max(60_000, Number(process.env.REBIND_OTP_MAX_WAIT_MS || 300_000));
 
 /**
  * 换绑阶段。父进程据此判断官方侧状态是否确定：
@@ -220,7 +226,7 @@ export async function changeChatgptEmail({
     socialUser?: boolean;
     useAddEmail?: boolean;
     onStage?: (stage: ChangeEmailStage) => void;
-}): Promise<{ok: boolean; reason?: string; needReauth?: boolean; alreadyLinked?: boolean; badTarget?: boolean; rateLimited?: boolean; capped24h?: boolean; indeterminate?: boolean; code?: string; stage: ChangeEmailStage}> {
+}): Promise<{ok: boolean; reason?: string; needReauth?: boolean; alreadyLinked?: boolean; badTarget?: boolean; rateLimited?: boolean; capped24h?: boolean; pwdWindowExpired?: boolean; indeterminate?: boolean; code?: string; stage: ChangeEmailStage}> {
     let stage: ChangeEmailStage = "precheck";
     const enter = (s: ChangeEmailStage) => {
         stage = s;
@@ -285,12 +291,8 @@ export async function changeChatgptEmail({
             stage,
         };
     }
-    // 取码窗口从 pwd_auth 剩余额度里切出来，保证 verify 一定落在窗口内。
-    const otpBudgetMs = Math.max(
-        REBIND_OTP_MIN_BUDGET_MS,
-        Math.min(OTP_MAX_WAIT_MS, leftMs - VERIFY_RESERVE_MS),
-    );
-    const otpDeadlineMs = Date.now() + otpBudgetMs;
+    // 取码只受绝对上限约束，不受 pwd_auth 剩余额度约束（慢代理要能等，理由见 OTP_MAX_WAIT_MS）
+    const otpDeadlineMs = Date.now() + OTP_MAX_WAIT_MS;
 
     const beginUrl = useAddEmail ? ADD_BEGIN_URL : BEGIN_URL;
     const verifyUrl = useAddEmail ? ADD_VERIFY_URL : VERIFY_URL;
@@ -343,6 +345,10 @@ export async function changeChatgptEmail({
 
     const verifyBody: any = {email, code};
     if (social && !useAddEmail) verifyBody.remove_social_subs = true;
+    // 取码可能已经把 270s 密码验证窗口耗光了。窗口过期也照样发 verify：
+    // begin 反正已经烧了，试一次成本只是一个请求，成了就是白赚。
+    const otpTookMs = Date.now() - sentAt;
+    const pwdLeftAtVerify = pwdAuthLeftMs(accessToken);
     // 一旦进入 verify，官方侧可能已经改掉了邮箱。这之后的任何失联（超时/被杀/网络断）
     // 都必须当"状态不确定"处理，不能直接判失败把目标邮箱放回池。
     enter("verify");
@@ -366,6 +372,16 @@ export async function changeChatgptEmail({
         // 可能已经改完，不能当普通需重登失败，交给对账。
         if (/token_revoked/i.test(why)) {
             return {ok: false, indeterminate: true, reason: "verify 401 token_revoked（官网换绑后会吊销旧 AT）", stage};
+        }
+        // 取码把密码验证窗口拖过了：重登再来一轮会在同一个地方同样失败，
+        // 只是再烧一次 24h 配额。标成 pwdWindowExpired 让上层直接停手并报清楚原因。
+        if (pwdLeftAtVerify <= 0) {
+            return {
+                ok: false,
+                pwdWindowExpired: true,
+                reason: `verify 401：取码花了 ${Math.round(otpTookMs / 1000)}s，已超出官方约 270s 密码验证窗口（重试会同样失败，需要更快的收码通道）`,
+                stage,
+            };
         }
         return {ok: false, needReauth: true, reason: "verify 401，需重新登录", stage};
     }

@@ -2116,14 +2116,17 @@ function killExportChildren() {
 }
 // 邮箱域操作日志(登录/改密/收信):写独立 mailbox_logs 表 + 独立 SSE 事件 mbLog,与 GPT 注册日志隔离,分别管理。
 function logMailbox(id, line) { db.appendMailboxLog(id, line).catch(() => {}); broadcast("mbLog", {id, line, ts: Date.now()}); }
-// 取码路径的子进程正常最坏耗时就有邮箱 OTP ~115s + 短信轮询 ~115s，旧的 180s 会
-// 在收码中途把它砍掉，所以这条超时是常态而不是兜底。放到 300s，再靠下面的宽限期
-// 保证「已经拿到的 rt 一定落库」。
-const RT_WORKER_TIMEOUT_MS = Math.max(120_000, Number(process.env.RT_WORKER_TIMEOUT_MS || 300_000));
+// 动态代理很慢，取码经常要等很久，墙钟超时会把正在正常推进的 worker 砍掉。
+// 所以跟重登 worker 一样改成【空闲判定】：连续这么久没有新日志才算卡住，
+// 还在出日志就一直等。
+const RT_WORKER_IDLE_MS = Math.max(60_000, Number(process.env.RT_WORKER_IDLE_MS || 180_000));
+// 绝对上限只是兜底：worker 真的死循环刷日志时不能让它永久占着 GPT 出口租约。
+const RT_WORKER_MAX_MS = Math.max(RT_WORKER_IDLE_MS * 2, Number(process.env.RT_WORKER_MAX_MS || 1_200_000));
 // SIGTERM 到 SIGKILL 之间的宽限：让 Playwright 关掉 Chrome 不留孤儿，
 // 同时给子进程时间把已拿到的 rt 刷完 stdout。
 const RT_WORKER_GRACE_MS = Math.max(3_000, Number(process.env.RT_WORKER_GRACE_MS || 12_000));
-function runRtWorker(acc, preferPhone, {onProgress, timeoutMs = RT_WORKER_TIMEOUT_MS} = {}) {
+function runRtWorker(acc, preferPhone, {onProgress, timeoutMs = 0} = {}) {
+    const idleMs = Math.max(RT_WORKER_IDLE_MS, Number(timeoutMs) || 0);
     const note = (m) => { logAcct(acc.id, `[rt] ${m}`); try { onProgress?.(m); } catch { /* */ } };
     return withLeasedGptProxy(`rt-acquire:${acc.email || acc.id}`, async (exit, jump) => {
         let proxyUrl = String(exit || "").trim();
@@ -2146,11 +2149,11 @@ function runRtWorker(acc, preferPhone, {onProgress, timeoutMs = RT_WORKER_TIMEOU
             return await new Promise((resolve) => {
         let settled = false;
         let timedOut = false;
-        let timer = null, graceTimer = null, hardTimer = null;
+        let idleTimer = null, capTimer = null, graceTimer = null, hardTimer = null;
         const finish = (v) => {
             if (settled) return;
             settled = true;
-            for (const t of [timer, graceTimer, hardTimer]) if (t) clearTimeout(t);
+            for (const t of [idleTimer, capTimer, graceTimer, hardTimer]) if (t) clearTimeout(t);
             resolve(v);
         };
         const tmpDir = mkdtempSync(path.join(os.tmpdir(), "codex-rt-"));
@@ -2209,9 +2212,11 @@ function runRtWorker(acc, preferPhone, {onProgress, timeoutMs = RT_WORKER_TIMEOU
                 finish({ok: false, reason: `rt 已拿到但写库失败: ${why}`});
             }
         };
-        timer = setTimeout(() => {
+        // 收尾：SIGTERM 留宽限让已拿到的 rt 走正常落库分支，之后才 SIGKILL
+        const wrapUp = (why) => {
+            if (settled || timedOut) return;
             timedOut = true;
-            note(`超时(${Math.round(timeoutMs / 1000)}s)，SIGTERM 收尾，留 ${Math.round(RT_WORKER_GRACE_MS / 1000)}s 让已拿到的 rt 落库…`);
+            note(`${why}，SIGTERM 收尾，留 ${Math.round(RT_WORKER_GRACE_MS / 1000)}s 让已拿到的 rt 落库…`);
             try { child.kill("SIGTERM"); } catch { /* */ }
             graceTimer = setTimeout(() => { try { child.kill("SIGKILL"); } catch { /* */ } }, RT_WORKER_GRACE_MS);
             // close 迟迟不来（子进程卡在不可中断的调用里）时的硬兜底：
@@ -2221,18 +2226,32 @@ function runRtWorker(acc, preferPhone, {onProgress, timeoutMs = RT_WORKER_TIMEOU
                 // close 可能永远不来，凭证临时目录得在这里也删掉
                 try { rmSync(tmpDir, {recursive: true, force: true}); } catch { /* */ }
                 if (result && result.status === "success") return persistSuccess();
-                await pushTestStatus(acc.id, "rt", "❌获取失败:超时");
-                finish({ok: false, reason: `超时(${Math.round(timeoutMs / 1000)}s)，取码/OAuth卡住`});
+                await pushTestStatus(acc.id, "rt", "❌获取失败:" + why);
+                finish({ok: false, reason: why});
             }, RT_WORKER_GRACE_MS + 3_000);
-        }, timeoutMs);
+        };
+        // 空闲判定：慢代理下只要 worker 还在出日志就一直等，不按墙钟砍
+        const armIdle = () => {
+            if (idleTimer) clearTimeout(idleTimer);
+            // 已经在收尾了就别再续命，等它自己 close
+            if (settled || timedOut) return;
+            idleTimer = setTimeout(() => {
+                wrapUp(`连续 ${Math.round(idleMs / 1000)}s 无新日志，判定取码/OAuth卡住`);
+            }, idleMs);
+        };
+        armIdle();
+        capTimer = setTimeout(() => {
+            wrapUp(`已跑满 ${Math.round(RT_WORKER_MAX_MS / 60_000)} 分钟上限`);
+        }, RT_WORKER_MAX_MS);
         child.on("error", async (e) => {
             try { rmSync(tmpDir, {recursive: true, force: true}); } catch { /* ignore */ }
             await pushTestStatus(acc.id, "rt", "❌启动失败:" + (e?.message ?? e));
             finish({ok: false, reason: String(e?.message || e)});
         });
         pipeWorkerStdout(child, {
-            onLine: note,
+            onLine: (line) => { armIdle(); note(line); },
             onEvent: (ev) => {
+                armIdle();
                 if (ev?.type === "progress") note(ev.message);
                 else if (ev?.type === "result") result = ev;
             },
@@ -2242,7 +2261,7 @@ function runRtWorker(acc, preferPhone, {onProgress, timeoutMs = RT_WORKER_TIMEOU
             if (settled) return;
             if (result && result.status === "success") return persistSuccess();
             const reason = result?.error
-                || (timedOut ? `超时(${Math.round(timeoutMs / 1000)}s)，取码/OAuth卡住` : "获取失败");
+                || (timedOut ? `取码/OAuth卡住，已收尾` : "获取失败");
             await pushTestStatus(acc.id, "rt", "❌获取失败:" + String(reason).slice(0, 60));
             finish({ok: false, reason});
         });
@@ -3435,16 +3454,16 @@ app.post("/api/tools/batch-acquire-rt", (req, res) => {
     })();
 });
 // 独立 OAuth 获取 rt(不走接码,用邮箱密码走 codex OAuth,Pro 号不触发 add-phone)
-const RT_SA_TIMEOUT_MS = Math.max(120_000, Number(process.env.RT_SA_TIMEOUT_MS || 240_000));
 function runRtWorkerStandalone(email, mailPassword, gptPassword, onProgress): Promise<{ok: boolean; rt?: string; accessToken?: string; rtFile?: string; reason?: string}> {
     return withLeasedGptProxy(`rt-sa:${email}`, (exit, jump) => new Promise(async (resolve) => {
         let settled = false;
         let timedOut = false;
-        let child = null, timer = null, graceTimer = null, hardTimer = null;
+        let child = null, timer = null, capTimer = null, graceTimer = null, hardTimer = null;
+        let armIdle = () => {};
         const finish = (v) => {
             if (settled) return;
             settled = true;
-            for (const t of [timer, graceTimer, hardTimer]) if (t) clearTimeout(t);
+            for (const t of [timer, capTimer, graceTimer, hardTimer]) if (t) clearTimeout(t);
             if (child && batchRtChild === child) batchRtChild = null;
             resolve(v);
         };
@@ -3492,30 +3511,44 @@ function runRtWorkerStandalone(email, mailPassword, gptPassword, onProgress): Pr
             const tok = result.rtFile ? readAuthTokens(result.rtFile) : null;
             finish({ok: true, rt: result.rt, accessToken: tok?.accessToken || "", rtFile: result.rtFile || ""});
         };
-        // 走 nosms 脚本仍要等邮箱 OTP（约 115s）加 mail.com 开窗，120s 会在收码中途砍掉；
+        // 同样走空闲判定：动态代理慢，收码要等很久，墙钟会砍掉正在推进的 worker；
         // 而且旧的超时分支直接判失败，已经拿到的 rt 会被丢掉。
-        timer = setTimeout(() => {
+        const wrapUp = (why) => {
+            if (settled || timedOut) return;
             timedOut = true;
-            onProgress?.(`超时(${Math.round(RT_SA_TIMEOUT_MS / 1000)}s)，SIGTERM 收尾，留 ${Math.round(RT_WORKER_GRACE_MS / 1000)}s 让已拿到的 rt 上报…`);
+            onProgress?.(`${why}，SIGTERM 收尾，留 ${Math.round(RT_WORKER_GRACE_MS / 1000)}s 让已拿到的 rt 上报…`);
             try { child.kill("SIGTERM"); } catch { /* */ }
             graceTimer = setTimeout(() => { try { child.kill("SIGKILL"); } catch { /* */ } }, RT_WORKER_GRACE_MS);
             hardTimer = setTimeout(() => {
                 if (settled) return;
                 cleanTmp();
                 if (result?.status === "success" && result.rt) return takeResult();
-                finish({ok: false, reason: `超时(${Math.round(RT_SA_TIMEOUT_MS / 1000)}s)，OAuth/取码卡住`});
+                finish({ok: false, reason: why});
             }, RT_WORKER_GRACE_MS + 3_000);
-        }, RT_SA_TIMEOUT_MS);
+        };
+        armIdle = () => {
+            if (timer) clearTimeout(timer);
+            if (settled || timedOut) return;
+            timer = setTimeout(() => {
+                wrapUp(`连续 ${Math.round(RT_WORKER_IDLE_MS / 1000)}s 无新日志，判定 OAuth/取码卡住`);
+            }, RT_WORKER_IDLE_MS);
+        };
+        armIdle();
+        capTimer = setTimeout(() => {
+            wrapUp(`已跑满 ${Math.round(RT_WORKER_MAX_MS / 60_000)} 分钟上限`);
+        }, RT_WORKER_MAX_MS);
         child.on("error", (e) => {
             cleanTmp();
             finish({ok: false, reason: String(e?.message || e)});
         });
         pipeWorkerStdout(child, {
             onLine: (line) => {
+                armIdle();
                 onProgress?.(line);
                 broadcast("log", {id: 0, line: `[批量RT] ${email}: ${line}`, ts: Date.now()});
             },
             onEvent: (ev) => {
+                armIdle();
                 if (ev?.type === "result") result = ev;
                 else if (ev?.message) {
                     onProgress?.(ev.message);
@@ -3529,8 +3562,7 @@ function runRtWorkerStandalone(email, mailPassword, gptPassword, onProgress): Pr
             if (result?.status === "success" && result.rt) return takeResult();
             finish({
                 ok: false,
-                reason: result?.error
-                    || (timedOut ? `超时(${Math.round(RT_SA_TIMEOUT_MS / 1000)}s)，OAuth/取码卡住` : "OAuth 获取 rt 失败"),
+                reason: result?.error || (timedOut ? "OAuth/取码卡住，已收尾" : "OAuth 获取 rt 失败"),
             });
         });
         } catch (e: any) {
@@ -3930,11 +3962,11 @@ const gmailRebindActive = new Set();
 const liveRebindMailboxIds = new Set();
 
 // 换绑子进程超时必须大于内层最坏预算，否则会在 verify 前后被砍，
-// 制造出「官方已改、库里没写」的不确定态。内层现在是有界的（取码从 pwd_auth
-// 剩余额度里切，见 change-email.ts 的 REBIND_OTP_MIN_BUDGET_MS / OTP_MAX_WAIT_MS）：
-// 目标邮箱预检 ~60s + eligibility/begin ~20s + 取码 ≤150s + verify ~20s ≈ 250s。
-// 480s 留了近一倍余量，真正的失败靠内层自己报。
-const CHANGE_EMAIL_TIMEOUT_MS = Math.max(240_000, Number(process.env.CHANGE_EMAIL_TIMEOUT_MS || 480_000));
+// 制造出「官方已改、库里没写」的不确定态。内层是有界的（见 change-email.ts 的
+// OTP_MAX_WAIT_MS）：动态代理慢，目标邮箱预检 ≤120s + eligibility/begin ~30s
+// + 取码 ≤300s + verify ~20s ≈ 470s。取 600s 留余量，真正的失败靠内层自己报。
+// 这个子进程走本机 10808、不占代理池租约，等久一点不影响别的任务。
+const CHANGE_EMAIL_TIMEOUT_MS = Math.max(240_000, Number(process.env.CHANGE_EMAIL_TIMEOUT_MS || 600_000));
 const CHANGE_EMAIL_NET_FAIL = /fetch failed|timeout|timed out|ECONN|ENOTFOUND|EPIPE|socket|TLS|disconnected|Proxy connection/i;
 
 // 官方 24h 换绑上限的冷却。官方不给解禁时间，按上限窗口 +5 分钟余量。
@@ -4009,6 +4041,7 @@ function spawnChangeEmailChild({accessToken, accountId, cookie, newEmail, imapPa
                     badTarget: !!ev.badTarget,
                     rateLimited: !!ev.rateLimited,
                     capped24h: !!ev.capped24h,
+                    pwdWindowExpired: !!ev.pwdWindowExpired,
                     code: ev.code || "",
                     // verify 发出后拿到网络类错误：官方可能已改，同样要对账
                     indeterminate: !!(ev.indeterminate
@@ -4369,6 +4402,12 @@ async function runGmailRebind(queueId) {
             rechargeLog(`换绑 ${acc.email}: 官方限流 429，停止（不再换出口/重登）`);
             return fail("官方换绑限流 429，过几分钟再点", true);
         }
+        // 取码太慢拖过了官方 270s 密码验证窗口：重登再来一轮会在同一处同样失败，
+        // 只是再烧一次 24h 配额。这里直接停手，把慢在哪儿说清楚。
+        if (!r.ok && r.pwdWindowExpired) {
+            rechargeLog(`换绑 ${acc.email}: ${r.reason}`);
+            return fail(String(r.reason || "取码超出官方密码验证窗口"), true);
+        }
         if (!r.ok && !r.needReauth && !r.alreadyLinked && !r.badTarget && changeNetFail(r)) {
             rechargeLog(`换绑 ${acc.email}: 官方换绑出口断了 (${String(r.reason || "").slice(0, 80)})，换一条再试`);
             r = await doChange(at, tok, claimed);
@@ -4376,6 +4415,10 @@ async function runGmailRebind(queueId) {
             if (!r.ok && changeRateLimited(r)) {
                 rechargeLog(`换绑 ${acc.email}: 官方限流 429，停止`);
                 return fail("官方换绑限流 429，过几分钟再点", true);
+            }
+            if (!r.ok && r.pwdWindowExpired) {
+                rechargeLog(`换绑 ${acc.email}: ${r.reason}`);
+                return fail(String(r.reason || "取码超出官方密码验证窗口"), true);
             }
         }
         if (!r.ok && r.needReauth) {
@@ -4434,6 +4477,11 @@ async function runGmailRebind(queueId) {
                 rechargeLog(`换绑 ${acc.email}: 重登后官方限流 429，停止`);
                 return fail("官方换绑限流 429，过几分钟再点", true);
             }
+            // 刚重登过、窗口还是被取码拖过去了：这条链路的收码速度就是不够，别再重试
+            if (!r.ok && r.pwdWindowExpired) {
+                rechargeLog(`换绑 ${acc.email}: 重登后仍 ${r.reason}`);
+                return fail(String(r.reason || "取码超出官方密码验证窗口"), true);
+            }
             if (!r.ok && !r.alreadyLinked && !r.badTarget && !r.needReauth && changeNetFail(r)) {
                 rechargeLog(`换绑 ${acc.email}: 重登后官方换绑出口断了 (${String(r.reason || "").slice(0, 80)})，换一条再试`);
                 r = await doChange(at, tok, claimed);
@@ -4441,6 +4489,10 @@ async function runGmailRebind(queueId) {
                 if (!r.ok && changeRateLimited(r)) {
                     rechargeLog(`换绑 ${acc.email}: 官方限流 429，停止`);
                     return fail("官方换绑限流 429，过几分钟再点", true);
+                }
+                if (!r.ok && r.pwdWindowExpired) {
+                    rechargeLog(`换绑 ${acc.email}: ${r.reason}`);
+                    return fail(String(r.reason || "取码超出官方密码验证窗口"), true);
                 }
             }
         }
@@ -4690,6 +4742,18 @@ app.post("/api/recharge/logs/clear", (req, res) => {
     res.json({ok: true});
 });
 
+function rechargeJobState() {
+    return {
+        submit: !!rechargeRunning && !queueReloginRunning,
+        reloginSubmit: !!queueReloginRunning && !!rechargeRunning,
+        relogin: !!queueReloginRunning && !rechargeRunning,
+        exportRt: !!exportRtBusy,
+    };
+}
+function broadcastRechargeJobs() {
+    try { broadcast("rechargeJobs", rechargeJobState()); } catch { /* */ }
+}
+
 app.get("/api/recharge/config", async (req, res) => {
     const key = scheduler.rechargeApiKey || "";
     res.json({
@@ -4701,6 +4765,7 @@ app.get("/api/recharge/config", async (req, res) => {
         rebindAfterPaid: scheduler.rebindAfterPaid || "gmail",
         rebindGmailAfterPaid: scheduler.rebindAfterPaid === "gmail",
         instanceId: db.instanceId,
+        jobs: rechargeJobState(),
         gmailFreeImap: await db.countFreeGoogleImapMailboxes(),
         mailcomFree: await db.countFreeMailcomMailboxes(),
     });
@@ -4964,6 +5029,7 @@ app.post("/api/recharge/queue/relogin", async (req, res) => {
     if (!ids.length) return res.status(400).json({error: "未选择队列项"});
     queueReloginRunning = true;
     queueReloginStop = false;
+    broadcastRechargeJobs();
     const {claimed: items, skipped} = await db.claimRechargeQueueItems(ids, db.instanceId);
     if (!items.length) {
         queueReloginRunning = false;
@@ -5009,12 +5075,17 @@ app.post("/api/recharge/queue/relogin", async (req, res) => {
         } finally {
         queueReloginRunning = false;
         queueReloginStop = false;
+        broadcastRechargeJobs();
         await db.releaseRechargeQueueByInstance(db.instanceId, myIds);
         broadcast("rechargeQueue", await db.listRechargeQueue());
         }
     })();
 });
-app.post("/api/recharge/queue/relogin/stop", (req, res) => { queueReloginStop = true; rechargeStop = true; res.json({ok: true}); });
+app.post("/api/recharge/queue/relogin/stop", (req, res) => {
+    queueReloginStop = true;
+    broadcastRechargeJobs();
+    res.json({ok: true, running: !!queueReloginRunning});
+});
 
 // ---- 充值队列：重登刷新 session → 重置任务 → 立即提交(一条龙) ----
 // 针对"提交后 session 失效"的场景:先浏览器重登拿新 session,再验卡+重置,最后用同一张卡密重提。
@@ -5027,6 +5098,7 @@ app.post("/api/recharge/queue/relogin-submit", async (req, res) => {
     queueReloginRunning = true;
     queueReloginStop = false;
     const myGen = beginRechargeBatch();
+    broadcastRechargeJobs();
     const {claimed: items, skipped: skippedClaim} = await db.claimRechargeQueueItems(ids, db.instanceId);
     if (!items.length) {
         queueReloginRunning = false;
@@ -5130,6 +5202,7 @@ app.post("/api/recharge/queue/relogin-submit", async (req, res) => {
         queueReloginRunning = false;
         queueReloginStop = false;
         endRechargeBatch(myGen);
+        broadcastRechargeJobs();
         await db.releaseRechargeQueueByInstance(db.instanceId, myIds);
         await queueSync(); await rechargeSync();
         }
@@ -5150,6 +5223,7 @@ function beginRechargeBatch() {
     rechargeRunning = true;
     rechargeStop = false;
     rechargeGenAt = Date.now();
+    broadcastRechargeJobs();
     return ++rechargeGen;
 }
 /** 只有最新那批能解锁。旧批次收尾时静默跳过，不动全局标志。 */
@@ -5157,6 +5231,7 @@ function endRechargeBatch(gen) {
     if (gen !== rechargeGen) return false;
     rechargeRunning = false;
     rechargeStop = false;
+    broadcastRechargeJobs();
     return true;
 }
 
@@ -5443,7 +5518,7 @@ app.post("/api/recharge/submit", async (req, res) => {
 app.post("/api/recharge/stop", (req, res) => {
     rechargeStop = true;
     validateStop = true;
-    queueReloginStop = true;
+    broadcastRechargeJobs();
     // 不在这里清 rechargeRunning：那一批还在跑，清了就能再开一批，
     // 而旧批收尾时会把新批的认领一起归还、把 rechargeStop 清掉。让owner自己收。
     // 只有卡死（超过兜底时长还占着锁）才允许强解。
@@ -5986,6 +6061,7 @@ app.post("/api/recharge/queue/export", async (req, res) => {
         : `导出含RT: ${needRt.length}/${rows.length} 个账号缺少 RT，并发${rtConc}获取中...`);
     exportRtBusy = true;
     exportRtStop = false;
+    broadcastRechargeJobs();
     (async () => {
         let ok = 0, fail = 0, done = 0;
         try {
@@ -6035,6 +6111,7 @@ app.post("/api/recharge/queue/export", async (req, res) => {
         }, rtConc);
         } finally {
             exportRtBusy = false;
+            broadcastRechargeJobs();
         }
         if (exportRtStop) {
             rechargeLog(`${forceRelogin ? "重登导出" : "导出含RT"}已停止: 已完成 ${ok} / 失败 ${fail}`);
@@ -6054,6 +6131,7 @@ app.post("/api/recharge/queue/export", async (req, res) => {
 app.post("/api/recharge/queue/export/stop", (req, res) => {
     const running = !!exportRtBusy;
     exportRtStop = true;
+    broadcastRechargeJobs();
     const n = exportLiveChildren.size;
     killExportChildren();
     if (running) rechargeLog(n ? `已停止导出RT，杀掉 ${n} 个子进程` : "已请求停止导出RT，当前这个号跑完就停，后面的不再开始");

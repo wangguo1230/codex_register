@@ -181,6 +181,8 @@ export default function App() {
     const [viewH, setViewH] = useState(600);
     const [toast, setToast] = useState("");
     const logEndRef = useRef<HTMLDivElement>(null);
+    const logBoxRef = useRef<HTMLDivElement>(null);
+    const logStickBottomRef = useRef(true);
     const selectedIdRef = useRef<number | null>(null);
     selectedIdRef.current = selectedId;
     const accountsRef = useRef<Account[]>([]);
@@ -295,7 +297,16 @@ export default function App() {
         }).catch(() => {});
     }, [selectedId]);
 
-    useEffect(() => { logEndRef.current?.scrollIntoView({behavior: "smooth"}); }, [logs, allLogs, logMode]);
+    useEffect(() => { logStickBottomRef.current = true; }, [selectedId, logMode]);
+    const onLogBoxScroll = () => {
+        const el = logBoxRef.current;
+        if (!el) return;
+        logStickBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 48;
+    };
+    useEffect(() => {
+        if (!logStickBottomRef.current) return;
+        logEndRef.current?.scrollIntoView({block: "end"});
+    }, [logs, allLogs, logMode]);
     // 测量表格滚动容器高度(用于虚拟滚动可视区计算)
     useEffect(() => {
         const el = scrollRef.current; if (!el) return;
@@ -1041,7 +1052,7 @@ export default function App() {
                                 <span onClick={() => setPanelOpen(false)} title="点击收起日志面板" className="text-sm font-medium cursor-pointer hover:text-white select-none">🌐 全部实时日志 <span className="text-gray-500 text-xs">⟩收起</span></span>
                                 <span className="ml-auto text-gray-500 text-xs">所有任务合并 · 实时</span>
                             </div>
-                            <div className="flex-1 overflow-auto px-3 py-2 font-mono text-xs leading-relaxed bg-gray-900 text-gray-100">
+                            <div ref={logBoxRef} onScroll={onLogBoxScroll} className="flex-1 overflow-auto px-3 py-2 font-mono text-xs leading-relaxed bg-gray-900 text-gray-100">
                                 {allLogs.length === 0
                                     ? <div className="text-gray-500">（开始注册后，这里实时显示所有号的进度；点左侧某行看该号详情）</div>
                                     : allLogs.map((l, i) => (
@@ -1166,7 +1177,7 @@ export default function App() {
                             <div className="px-3 pt-2 flex items-center gap-1 text-sm shrink-0">
                                 <span className="px-3 py-1.5 rounded-t text-xs font-medium bg-gray-900 text-white">📋 日志</span>
                             </div>
-                            <div className="flex-1 overflow-auto min-h-0">
+                            <div ref={logBoxRef} onScroll={onLogBoxScroll} className="flex-1 overflow-auto min-h-0">
                                 <div className="px-3 py-2 font-mono text-xs leading-relaxed bg-gray-900 text-gray-100 min-h-full">
                                     {logs.length === 0
                                         ? <div className="text-gray-500">（暂无该号日志）</div>

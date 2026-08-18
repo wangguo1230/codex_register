@@ -49,6 +49,7 @@ try {
         badTarget: !!r.badTarget,
         rateLimited: !!r.rateLimited,
         capped24h: !!r.capped24h,
+        pwdWindowExpired: !!r.pwdWindowExpired,
         indeterminate: !!r.indeterminate,
         code: r.code || "",
         stage: r.stage || lastStage,
