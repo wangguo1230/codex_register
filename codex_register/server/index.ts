@@ -1994,6 +1994,27 @@ async function probeAtViaPool(acc, accessToken, accountId, log) {
     }, {timeoutMs: 20_000, log});
 }
 
+/** 刷新 RT 走 GPT 代理池 + 跳板，不再死钉 10808。池空才回退 rtProxy/regProxy。 */
+async function refreshRtViaPool(acc, refreshToken, log) {
+    return withLeasedGptProxy(`rt-refresh:${acc.email || acc.id}`, async (exit, jump) => {
+        let local = null;
+        let url = String(exit || "").trim();
+        try {
+            if (url && proxyHasSocksAuth(url)) {
+                const {openNoAuthSocksToAuthedProxy} = await import("../src/mail/proxy-chain.js");
+                local = await openNoAuthSocksToAuthedProxy(url, jump || "");
+                url = local.url;
+                try { log?.(`GPT 池 ${maskProxyUrl(exit)}${jump ? " +跳板" : ""} → :${local.localPort}`); } catch { /* */ }
+            } else if (!url) {
+                url = rechargeProxy() || scheduler.rtProxy || scheduler.regProxy || "";
+            }
+            return await refreshRt(refreshToken, buildProxyDispatcher(url));
+        } finally {
+            try { local?.close(); } catch { /* */ }
+        }
+    }, {timeoutMs: 20_000, log});
+}
+
 async function testOneAt(acc, {relogin = false} = {}) {
     await pushTestStatus(acc.id, "at", "测试中…");
     const note = (m) => logAcct(acc.id, `[at] ${m}`);
@@ -2025,11 +2046,24 @@ function logAcct(id, line) { db.appendLog(id, line).catch(() => {}); broadcast("
 // 邮箱域操作日志(登录/改密/收信):写独立 mailbox_logs 表 + 独立 SSE 事件 mbLog,与 GPT 注册日志隔离,分别管理。
 function logMailbox(id, line) { db.appendMailboxLog(id, line).catch(() => {}); broadcast("mbLog", {id, line, ts: Date.now()}); }
 function runRtWorker(acc, preferPhone, {onProgress, timeoutMs = 180000} = {}) {
-    return new Promise((resolve) => {
+    const note = (m) => { logAcct(acc.id, `[rt] ${m}`); try { onProgress?.(m); } catch { /* */ } };
+    return withLeasedGptProxy(`rt-acquire:${acc.email || acc.id}`, async (exit, jump) => {
+        let local = null;
+        let proxyUrl = String(exit || "").trim();
+        try {
+            if (proxyUrl && proxyHasSocksAuth(proxyUrl)) {
+                const {openNoAuthSocksToAuthedProxy} = await import("../src/mail/proxy-chain.js");
+                local = await openNoAuthSocksToAuthedProxy(proxyUrl, jump || "");
+                proxyUrl = local.url;
+                note(`GPT 池 ${maskProxyUrl(exit)}${jump ? " +跳板" : ""} → :${local.localPort}`);
+            } else if (!proxyUrl) {
+                proxyUrl = scheduler.rtProxy || scheduler.regProxy || "";
+                note(`GPT 池空，回退 ${maskProxyUrl(proxyUrl) || "无代理"}`);
+            }
+            return await new Promise((resolve) => {
         let settled = false;
         let timer = null;
         const finish = (v) => { if (settled) return; settled = true; if (timer) clearTimeout(timer); resolve(v); };
-        const note = (m) => { logAcct(acc.id, `[rt] ${m}`); try { onProgress?.(m); } catch { /* */ } };
         const tmpDir = mkdtempSync(path.join(os.tmpdir(), "codex-rt-"));
         const tmpFile = path.join(tmpDir, `mc-${acc.id}.txt`);
         writeMailboxTokenFile(tmpFile, {
@@ -2043,8 +2077,6 @@ function runRtWorker(acc, preferPhone, {onProgress, timeoutMs = 180000} = {}) {
             || acc.provider === "mailcom"
             || /pro|plus|team/i.test(String(acc.plan || ""));
         const mailcomHeadless = process.env.MAILCOM_HEADED === "1" ? "0" : "1";
-        const mailProxy = (scheduler.mailProxyEnabled !== false ? (scheduler.mailProxy || "") : "")
-            || scheduler.rtProxy || scheduler.regProxy || "";
         note(`启动 worker 获取 refresh_token${useSessionRt ? "(会话换rt,不接码)" : ""}${preferPhone ? `(复用绑定号 +${preferPhone})` : ""}${acc.mailbox_imap ? " +IMAP" : ""}…`);
         const child = spawn(CHAT_TSX_BIN, [useSessionRt ? "scripts/worker-rt-nosms.ts" : "src/worker-rt.ts"], { shell: IS_WIN,
             cwd: CHAT_ROOT,
@@ -2057,8 +2089,8 @@ function runRtWorker(acc, preferPhone, {onProgress, timeoutMs = 180000} = {}) {
                 SMS_LINK_TEMPLATE: scheduler.smsLinkTemplate || "",
                 SMS_MAX_BIND: String(scheduler.smsMaxBind ?? 0),
                 RT_PREFER_PHONE: preferPhone || "",
-                PROXY_URL: scheduler.rtProxy || scheduler.regProxy || "",
-                MAILCOM_PROXY: mailProxy,
+                PROXY_URL: proxyUrl,
+                MAILCOM_PROXY: proxyUrl,
                 GPT_PASSWORD: (acc.gpt_password || appConfig.defaultPassword || "").trim(),
                 TOTP_SECRET: acc.totp_secret || "",
                 // PG 迁移后 worker 通过 process.env.DATABASE_URL 继承连接
@@ -2114,7 +2146,11 @@ function runRtWorker(acc, preferPhone, {onProgress, timeoutMs = 180000} = {}) {
                 finish({ok: false, reason});
             }
         });
-    });
+            });
+        } finally {
+            try { local?.close(); } catch { /* */ }
+        }
+    }, {timeoutMs: 45_000, log: note});
 }
 
 // 充值页代理:rtProxy 优先,空则回退注册代理。重登/验卡浏览器与 RT 刷新共用。
@@ -2594,13 +2630,13 @@ async function testOneRt(acc, {updateRt = true, acquire = false, onProgress} = {
     await pushTestStatus(acc.id, "rt", "测试中…");
     const rtData = getRtData(acc);
     const tok = extractTokens(rtData || getAuthData(acc));
-    const rtDispatcher = buildProxyDispatcher(scheduler.rtProxy || scheduler.regProxy);
+    const noteRt = (m) => { logAcct(acc.id, `[rt] ${m}`); try { onProgress?.(m); } catch { /* */ } };
     if (tok && tok.refreshToken) {
-        let r = await refreshRt(tok.refreshToken, rtDispatcher);
+        let r = await refreshRtViaPool(acc, tok.refreshToken, noteRt);
         if (!r.ok) { // 失败重试一次:过滤网络/代理抖动,两次都失败才算过期(避免抖动误判 dead)
             await pushTestStatus(acc.id, "rt", "失败,重试中…");
             await new Promise((s) => setTimeout(s, 2500));
-            r = await refreshRt(tok.refreshToken, rtDispatcher);
+            r = await refreshRtViaPool(acc, tok.refreshToken, noteRt);
         }
         if (r.ok) {
             // 续期只写回【rt 文件本身】(更新 refresh_token/id_token),★绝不碰 at(auth_file 的网页 access_token)。
