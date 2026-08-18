@@ -16,6 +16,7 @@ import path from "node:path";
 import {chromium} from "playwright-core";
 import {findLatestVerificationMail} from "./verification-matcher.js";
 import {formatBeijingDateTime} from "../utils.js";
+import {applyMailcomFingerprint, ensureMailcomProfile, playwrightContextOptions} from "./mailcom-fingerprint.js";
 
 const POOL_FILE = process.env.MAILCOM_TOKENS_FILE
     ? path.resolve(process.env.MAILCOM_TOKENS_FILE)
@@ -61,6 +62,15 @@ const MAILBOX_OAUTH = {
         {clientId: "mailcom_mailsidebar_passport_live", secret: "*******", xUiApp: "mailcom.webmailer.mail-sidebar/3.24.0"},
         {clientId: "mailcom_webmailermailroot_live", secret: "*******", xUiApp: "mailcom.webmailer.mail-root/2.38.0"},
         {clientId: "mailcom_webmailermaillist_passport_live", secret: "", xUiApp: "mailcom.webmailer.mail-list/6.6.3"},
+    ],
+};
+const COMPOSE_OAUTH = {
+    url: MAILBOX_OAUTH.url,
+    grant: MAILBOX_OAUTH.grant,
+    scope: "mail_mailbox_w",
+    clients: [
+        {clientId: "mailcom_mailcompose_passport_live", secret: "*******", xUiApp: "mailcom.webmailer.mail-compose/1.43.6"},
+        {clientId: "mailcom_mailcompose_passport_live", secret: "", xUiApp: "mailcom.webmailer.mail-compose/1.43.6"},
     ],
 };
 const COMMON_HDR = {
@@ -218,6 +228,182 @@ async function mintMailboxToken(session, navsid) {
         }
     }
     return "";
+}
+
+async function mintComposeToken(session, navsid) {
+    if (!navsid) return "";
+    const url = `${COMPOSE_OAUTH.url}?sid=${encodeURIComponent(navsid)}`;
+    const body = `grant_type=${encodeURIComponent(COMPOSE_OAUTH.grant)}&scope=${encodeURIComponent(COMPOSE_OAUTH.scope)}`;
+    const tryParse = (status, text, tag) => {
+        if (status >= 400) {
+            console.warn(`[mailcom] compose mint ${tag} HTTP ${status} ${String(text).slice(0, 120)}`);
+            return "";
+        }
+        try {
+            const data = JSON.parse(text);
+            if (data?.access_token) {
+                const sc = String(data.scope || COMPOSE_OAUTH.scope);
+                if (/mail_mailbox_w/i.test(sc) || /mail_mailbox/i.test(sc) || !data.scope) {
+                    return `Bearer ${data.access_token}`;
+                }
+                console.warn(`[mailcom] compose mint ${tag} scope=${sc.slice(0, 60)}`);
+            }
+        } catch (e) {
+            console.warn(`[mailcom] compose mint ${tag} 解析失败: ${String(e?.message || e).slice(0, 60)}`);
+        }
+        return "";
+    };
+    for (const c of COMPOSE_OAUTH.clients) {
+        const basic = Buffer.from(`${c.clientId}:${c.secret || ""}`).toString("base64");
+        const headers = {
+            "content-type": "application/x-www-form-urlencoded",
+            authorization: `Basic ${basic}`,
+            "x-ui-app": c.xUiApp,
+            origin: "https://webmailer.mail.com",
+            referer: "https://webmailer.mail.com/",
+        };
+        const tag = c.clientId.replace(/^mailcom_/, "").slice(0, 32);
+        try {
+            const res = await session.context.request.post(url, {headers, data: body, timeout: 15000});
+            const minted = tryParse(res.status(), await res.text(), tag);
+            if (minted) {
+                console.log(`[mailcom] compose mint 成功 client=${tag}`);
+                return minted;
+            }
+        } catch (e) {
+            console.warn(`[mailcom] compose mint ${tag} request: ${String(e?.message || e).slice(0, 80)}`);
+        }
+        if (session.page) {
+            try {
+                const inPage = await session.page.evaluate(async ({url, headers, body}) => {
+                    const res = await fetch(url, {method: "POST", credentials: "include", headers, body});
+                    return {status: res.status, text: await res.text()};
+                }, {url, headers, body});
+                const minted = tryParse(inPage.status, inPage.text, `${tag}/page`);
+                if (minted) {
+                    console.log(`[mailcom] compose mint 成功 client=${tag} (in-page)`);
+                    return minted;
+                }
+            } catch (e) {
+                console.warn(`[mailcom] compose mint ${tag} in-page: ${String(e?.message || e).slice(0, 80)}`);
+            }
+        }
+    }
+    return "";
+}
+
+function socksHasAuth(url) {
+    try {
+        const u = new URL(String(url || "").trim());
+        return u.protocol.startsWith("socks") && !!(u.username || u.password);
+    } catch {
+        return false;
+    }
+}
+
+/** Playwright 不能带 socks 账密：经跳板起本机无账密口。 */
+async function openBrowserProxy(exitUrl, jumpUrl = "") {
+    const exit = String(exitUrl || "").trim();
+    if (!exit || !socksHasAuth(exit)) {
+        return {url: exit, close() {}};
+    }
+    const {openNoAuthSocksToAuthedProxy, timezoneFromExitUrl} = await import("./proxy-chain.js");
+    const wrapped = await openNoAuthSocksToAuthedProxy(exit, String(jumpUrl || "").trim());
+    return {
+        url: wrapped.url,
+        timezone: timezoneFromExitUrl(exit) || "",
+        localPort: wrapped.localPort,
+        close: wrapped.close,
+    };
+}
+
+/**
+ * 登录 mail.com 后按 CATS mailsubmission 协议发一封信。
+ * 成功一般为 HTTP 202/204。
+ * 出口若带 socks 账密（kookeey），会经跳板起本机无账密 socks 再给 Playwright。
+ */
+export async function sendMailcomMail(email, password, opts = {}) {
+    const key = normalizeEmail(email);
+    const toList = (Array.isArray(opts.to) ? opts.to : [opts.to]).map((x) => String(x || "").trim()).filter(Boolean);
+    if (!toList.length) throw new Error("sendMailcomMail: 缺少收件人");
+    const subject = String(opts.subject || "test");
+    const text = opts.text == null ? "" : String(opts.text);
+    const html = String(opts.html || `<html><body><p>${text.replace(/[&<>]/g, (ch) => ({"&": "&amp;", "<": "&lt;", ">": "&gt;"}[ch]))}</p></body></html>`);
+    const fromName = String(opts.fromName || "").trim();
+    const exitUrl = String(opts.proxy || "").trim();
+    const jumpUrl = String(opts.jump || "").trim();
+    let relayClose = () => {};
+    let session = null;
+    try {
+        const via = await openBrowserProxy(exitUrl, jumpUrl);
+        relayClose = via.close;
+        if (via.localPort) {
+            console.log(`[mailcom] 发信链式 本机:${via.localPort}${jumpUrl ? " ←跳板" : ""} ← 粘性出口`);
+        }
+        const {kookeeySessionOf} = await import("./proxy-pool.js");
+        const profile = ensureMailcomProfile(opts.profile, exitUrl);
+        session = await loginMailcom(key, password, {
+            headless: opts.headless ?? true,
+            proxy: via.url || undefined,
+            skipInbox: true,
+            timezone: profile.timezoneId,
+            profile,
+        });
+        const navsid = (await readNavsid(session.page)) || extractNavsid(session.page) || "";
+        if (!navsid) throw new Error("sendMailcomMail: 登录后没有 sid");
+        const token = await mintComposeToken(session, navsid);
+        if (!token) throw new Error("sendMailcomMail: 未拿到 mail_mailbox_w token");
+        const authId = String(decodeJwtPayload(token)?.auth_id || "").trim();
+        const url = `https://webmail-cats-live.mail.com/mailbox/primary/mailsubmission?absoluteURI=false${authId ? `&no_cache=${encodeURIComponent(authId)}` : ""}`;
+        const from = fromName ? `"${fromName.replace(/"/g, "")}" <${key}>` : key;
+        const payload = {
+            mailHeader: {
+                messageType: "MAIL",
+                from,
+                to: toList,
+                subject,
+                date: Date.now(),
+            },
+            htmlBody: html,
+            plaintextBody: text || null,
+            mailClientMeta: {"mail-drop": "[]"},
+            transientMailProperties: {},
+        };
+        const headers = {
+            accept: "text/plain",
+            authorization: token,
+            "content-type": "application/vnd.ui.trinity.minimalmailmessage+json; charset=utf-8",
+            origin: "https://webmailer.mail.com",
+            referer: "https://webmailer.mail.com/",
+            "x-ui-app": "mailcom.webmailer.mail-compose/1.43.6",
+            "x-request-id": crypto.randomUUID(),
+        };
+        const res = await session.context.request.post(url, {
+            headers,
+            data: JSON.stringify(payload),
+            timeout: 20000,
+        });
+        const status = res.status();
+        const location = res.headers().location || res.headers().Location || "";
+        const respText = await res.text();
+        if (status !== 202 && status !== 204) {
+            throw new Error(`sendMailcomMail: HTTP ${status} ${respText.slice(0, 200)}`);
+        }
+        return {
+            ok: true,
+            status,
+            location,
+            from: key,
+            to: toList,
+            subject,
+            proxySession: kookeeySessionOf(exitUrl) || "",
+            proxyUrl: exitUrl,
+            jumpUrl,
+        };
+    } finally {
+        try { if (session?.browser) await session.browser.close(); } catch { /* ignore */ }
+        try { relayClose(); } catch { /* ignore */ }
+    }
 }
 
 /** 等页面网络里出现 mail_mailbox token（webmailer 列表真正加载时会发）。 */
@@ -565,6 +751,8 @@ async function loginMailcom(email, password, opts = {}) {
         args: [
             "--disable-blink-features=AutomationControlled",
             "--disable-dev-shm-usage",
+            "--no-first-run",
+            "--no-default-browser-check",
         ],
     };
     const proxyRaw = (opts.proxy != null ? opts.proxy : mailProxy) || "";
@@ -574,15 +762,13 @@ async function loginMailcom(email, password, opts = {}) {
     const browser = await chromium.launch(launchOpts);
     let page = null;
     try {
-        const context = await browser.newContext({
-            viewport: {width: 1280, height: 900},
-            locale: "en-US",
-            timezoneId: "America/New_York",
-            userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-        });
-        const session = {browser, context, page: null, bearer: null, lastList: null};
+        const profile = ensureMailcomProfile(opts.profile, proxyRaw);
+        const context = await browser.newContext(playwrightContextOptions(profile));
+        const session = {browser, context, page: null, bearer: null, lastList: null, profile};
         page = await context.newPage();
         session.page = page;
+        await applyMailcomFingerprint(context, page, profile);
+        console.log(`[mailcom] 指纹 ${profile.platform} ${profile.viewportWidth}x${profile.viewportHeight} tz=${profile.timezoneId} ua=${String(profile.userAgent).match(/Chrome\/[\d.]+/)?.[0] || "?"}`);
         const grabBearer = (auth, url = "") => {
             if (!auth || !String(auth).toLowerCase().startsWith("bearer ")) return;
             const mailbox = isMailboxAuth(auth) || /maillist\.mail\.com/i.test(url);
@@ -669,13 +855,21 @@ async function loginMailcom(email, password, opts = {}) {
                     // 优先可见填写；失败则 DOM 强制提交
                     const visible = await emailBox.isVisible({timeout: 2000}).catch(() => false);
                     if (visible) {
-                        await emailBox.fill(email, {timeout: 8000});
+                        await emailBox.click({timeout: 4000}).catch(() => {});
+                        await emailBox.fill("");
+                        await emailBox.pressSequentially(email, {delay: 35 + Math.floor(Math.random() * 45), timeout: 12000});
                         const pwdBox = page.locator("#login-password").first();
                         await forceShowLoginLayer(page);
                         await pwdBox.waitFor({state: "attached", timeout: 8000});
-                        await pwdBox.fill(password, {force: true, timeout: 8000}).catch(async () => {
-                            await pwdBox.evaluate((el, v) => { el.value = v; el.dispatchEvent(new Event("input", {bubbles: true})); }, password);
+                        await page.waitForTimeout(180 + Math.floor(Math.random() * 320));
+                        await pwdBox.click({force: true, timeout: 4000}).catch(() => {});
+                        await pwdBox.fill("").catch(() => {});
+                        await pwdBox.pressSequentially(password, {delay: 30 + Math.floor(Math.random() * 40), timeout: 12000}).catch(async () => {
+                            await pwdBox.fill(password, {force: true, timeout: 8000}).catch(async () => {
+                                await pwdBox.evaluate((el, v) => { el.value = v; el.dispatchEvent(new Event("input", {bubbles: true})); }, password);
+                            });
                         });
+                        await page.waitForTimeout(220 + Math.floor(Math.random() * 400));
                         for (const sel of [
                             "button.login-submit",
                             "#header-login-box button[type='submit']",
@@ -846,19 +1040,23 @@ async function ensureSession(email) {
  * 改 mail.com 邮箱密码(Playwright 操作 Wicket 改密表单)。用旧密码登录 → 打开改密页 → 填 当前/新/确认 → 提交。
  * 选择器初值来自 HAR(Wicket 组件 name),入口/提交/成功判定待真号实测微调。成功后返回 {ok,newPassword}。
  */
-export async function changeMailcomPassword(email, oldPassword, newPassword, log = (m) => console.log(m)) {
+export async function changeMailcomPassword(email, oldPassword, newPassword, log = (m) => console.log(m), opts = {}) {
     const key = normalizeEmail(email);
     // 改密流程含多层 SSO 跳转 + Wicket,headless 下浏览器易崩("Target page/browser closed");强制 headed(可 env 覆盖)。
     const headless = process.env.CHANGE_PW_HEADLESS === "1";
+    const via = await openBrowserProxy(opts.proxy, opts.jump);
+    const profile = ensureMailcomProfile(opts.profile, opts.proxy);
+    const loginOpts = {headless, proxy: via.url || undefined, timezone: profile.timezoneId, profile};
     // 候选当前密码:依次试登录(自愈——之前"疑似失败但实为成功"的号,库密码已失效,可用记录过的新密码登录)
     const candidates = (Array.isArray(oldPassword) ? oldPassword : [oldPassword]).filter(Boolean);
     let session, usedPw = candidates[0];
+    try {
     for (const pw of candidates) {
-        try { session = await loginMailcom(key, pw, {headless}); usedPw = pw; if (candidates.length > 1) log(`用密码 ${pw} 登录成功`); break; }
+        try { session = await loginMailcom(key, pw, loginOpts); usedPw = pw; if (candidates.length > 1) log(`用密码 ${pw} 登录成功`); break; }
         catch (e) { if (pw !== candidates[candidates.length - 1]) log(`密码 ${pw} 登录失败,试下一个候选…`); else throw e; }
     }
     const page = session.page;
-    try {
+    {
         const ctx = session.context;
         // 1) 提取 navigator sid(96位十六进制)。SSO 跳转端点需要它。
         let navsid = (page.url().match(/[?&]sid=([0-9a-f]{96})/i) || [])[1] || "";
@@ -950,11 +1148,11 @@ export async function changeMailcomPassword(email, oldPassword, newPassword, log
         // 先关改密浏览器,避免与验证登录的浏览器抢资源(同号两个浏览器→page.fill timeout 误判)。
         try { await session.browser.close(); } catch { /* ignore */ }
         log(`改密已提交，用新密码登录验证结果…`);
-        let v = await verifyMailcomLogin(key, newPassword);
+        let v = await verifyMailcomLogin(key, newPassword, log, {proxy: via.url, tries: 2});
         if (!v.ok && !v.wrongPassword) { // 验证登录本身异常(page.fill timeout/网络,非密码错)=瞬时问题 → 重试一次
             log(`验证登录受阻(${(v.reason || "").slice(0, 30)})，重试一次…`);
             await new Promise((r) => setTimeout(r, 2500));
-            v = await verifyMailcomLogin(key, newPassword);
+            v = await verifyMailcomLogin(key, newPassword, log, {proxy: via.url, tries: 1});
         }
         let ok = false, verified = false;
         if (v.ok) {
@@ -971,8 +1169,10 @@ export async function changeMailcomPassword(email, oldPassword, newPassword, log
         log(`结果: ${ok ? (verified ? "✅成功(登录已验证)" : "✅疑似成功(未验证)") : "❌失败"} | ${body.slice(0, 50)}`);
         console.log(`[mailcom改密] ${key} 结果: ${ok ? "成功" : "失败"}${verified ? "(验证)" : ""} | ${body.slice(0, 130)}`);
         return {ok, newPassword, verified, detail: body.slice(0, 200)};
+    }
     } finally {
-        try { await session.browser.close(); } catch { /* ignore */ }
+        try { if (session?.browser) await session.browser.close(); } catch { /* ignore */ }
+        try { via.close(); } catch { /* ignore */ }
         sessions.delete(key); inboxSessions.delete(key); // 密码已变,清缓存会话
     }
 }
@@ -994,6 +1194,7 @@ export async function verifyMailcomLogin(email, password, log = (m) => {}, opts 
                 headless: opts.headless ?? true,
                 proxy: opts.proxy,
                 skipInbox: true,
+                profile: opts.profile,
             });
             log(`${key} 登录成功(密码正确)`);
             return {ok: true};

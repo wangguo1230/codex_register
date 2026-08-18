@@ -390,6 +390,7 @@ async function insertOrReviveGpt(client, mailboxId, batch, now) {
 const MAILBOX_LIST_COLS = `
     id, email, password, provider, usage, grp, pw_status, google_stage,
     totp_secret, totp_secret_orig, imap_password, recovery_email, sold_at, deleted_at, created_at, note,
+    proxy_ip, proxy_fail, proxy_url,
     CASE
       WHEN google_state IS NULL OR google_state = '{}'::jsonb THEN NULL
       ELSE jsonb_build_object(
@@ -420,7 +421,17 @@ export async function listMailboxes(usage?) {
     } else {
         ({rows} = await query(`SELECT ${MAILBOX_LIST_COLS} FROM mailboxes WHERE deleted_at=0 ORDER BY id`));
     }
-    return rows.map((r) => r.provider === "google" ? {...r, google_stage: liveGoogleStage(r)} : r);
+    const {kookeeySessionOf} = await import("../src/mail/proxy-pool.js");
+    return rows.map((r) => {
+        const proxy_session = kookeeySessionOf(r.proxy_url || "") || "";
+        const {proxy_url: _drop, ...rest} = r;
+        const row = {
+            ...rest,
+            proxy_session,
+            has_proxy: !!String(r.proxy_url || "").trim(),
+        };
+        return r.provider === "google" ? {...row, google_stage: liveGoogleStage(r)} : row;
+    });
 }
 
 export async function mailboxStats() {
@@ -486,6 +497,64 @@ export async function lookupMailboxesByEmails(emails) {
 export async function getMailboxByEmail(email) {
     const { rows } = await query(`SELECT * FROM mailboxes WHERE email=$1 AND deleted_at=0`, [String(email).toLowerCase()]);
     return rows[0] || undefined;
+}
+
+/** 发信用：含已软删，优先活号。 */
+export async function getMailboxByEmailAny(email) {
+    const key = String(email || "").trim().toLowerCase();
+    if (!key) return undefined;
+    const { rows } = await query(
+        `SELECT * FROM mailboxes
+         WHERE lower(email)=$1
+         ORDER BY CASE WHEN COALESCE(deleted_at,0)=0 THEN 0 ELSE 1 END, id DESC
+         LIMIT 1`,
+        [key],
+    );
+    return rows[0] || undefined;
+}
+
+export async function insertMailSendLog(row) {
+    const { rows } = await query(
+        `INSERT INTO mail_send_logs(
+            mailbox_id, email, to_email, subject, status, http_status, location, error,
+            proxy_url, proxy_session, proxy_ip, jump_url, reused, created_at
+         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+         RETURNING id`,
+        [
+            Number(row.mailbox_id || 0),
+            String(row.email || "").toLowerCase(),
+            String(row.to_email || ""),
+            String(row.subject || ""),
+            String(row.status || "pending"),
+            Number(row.http_status || 0),
+            String(row.location || ""),
+            String(row.error || ""),
+            String(row.proxy_url || ""),
+            String(row.proxy_session || ""),
+            String(row.proxy_ip || ""),
+            String(row.jump_url || ""),
+            row.reused ? 1 : 0,
+            Number(row.created_at || Date.now()),
+        ],
+    );
+    return rows[0]?.id || 0;
+}
+
+export async function listMailSendLogs({email = "", limit = 50} = {}) {
+    const n = Math.max(1, Math.min(200, Number(limit) || 50));
+    const key = String(email || "").trim().toLowerCase();
+    if (key) {
+        const { rows } = await query(
+            `SELECT * FROM mail_send_logs WHERE email=$1 ORDER BY id DESC LIMIT $2`,
+            [key, n],
+        );
+        return rows;
+    }
+    const { rows } = await query(
+        `SELECT * FROM mail_send_logs ORDER BY id DESC LIMIT $1`,
+        [n],
+    );
+    return rows;
 }
 
 export async function importFreeMailboxes(rows, grp = "", usage = "free", provider = "mailcom") {
@@ -1001,11 +1070,15 @@ export async function setMailboxPwStatus(id, pwStatus) {
     await refreshMailboxGoogleState(id).catch(() => {});
 }
 
-export async function setMailboxProxy(id, url, ip = "") {
+export async function setMailboxProxy(id, url, ip = "", fail) {
     const u = String(url || "").trim();
     const p = String(ip || "").trim();
     if (!u) {
-        await query(`UPDATE mailboxes SET proxy_url='', proxy_ip='' WHERE id=$1`, [id]);
+        await query(`UPDATE mailboxes SET proxy_url='', proxy_ip='', proxy_fail=0 WHERE id=$1`, [id]);
+        return;
+    }
+    if (fail !== undefined) {
+        await query(`UPDATE mailboxes SET proxy_url=$1, proxy_ip=$2, proxy_fail=$3 WHERE id=$4`, [u, p, Number(fail) || 0, id]);
         return;
     }
     if (p) {
@@ -1013,6 +1086,23 @@ export async function setMailboxProxy(id, url, ip = "") {
     } else {
         await query(`UPDATE mailboxes SET proxy_url=$1 WHERE id=$2`, [u, id]);
     }
+}
+
+export async function bumpMailboxProxyFail(id) {
+    const {rows} = await query(
+        `UPDATE mailboxes SET proxy_fail=COALESCE(proxy_fail,0)+1 WHERE id=$1 RETURNING proxy_fail`,
+        [id],
+    );
+    return Number(rows[0]?.proxy_fail || 0);
+}
+
+export async function resetMailboxProxyFail(id) {
+    await query(`UPDATE mailboxes SET proxy_fail=0 WHERE id=$1`, [id]);
+}
+
+export async function setMailboxBrowserFp(id, profile) {
+    if (!id || !profile) return;
+    await query(`UPDATE mailboxes SET browser_fp=$1::jsonb WHERE id=$2`, [JSON.stringify(profile), id]);
 }
 
 export async function setMailboxTotp(id, totpSecret) {
@@ -1321,6 +1411,7 @@ function rechargeQueueDeliveryKind(delivery = "undelivered") {
     if (d === "all") return "all";
     if (d === "delivered") return "delivered";
     if (d === "error" || d === "failed") return "error";
+    if (d === "ready" || d === "deliverable") return "ready";
     return "undelivered";
 }
 
@@ -1328,7 +1419,8 @@ function rechargeQueueWhere(kind) {
     if (kind === "all") return "";
     if (kind === "delivered") return `WHERE COALESCE(delivery_status,'undelivered')='delivered'`;
     if (kind === "error") return `WHERE COALESCE(delivery_status,'undelivered')='failed'`;
-    return `WHERE COALESCE(delivery_status,'undelivered')='undelivered'`;
+    if (kind === "ready") return `WHERE COALESCE(delivery_status,'undelivered')='undelivered' AND status='done'`;
+    return `WHERE COALESCE(delivery_status,'undelivered')='undelivered' AND status<>'done'`;
 }
 
 /**
@@ -1341,13 +1433,15 @@ export async function listRechargeQueue(delivery = "undelivered") {
     const { rows: list } = await query(
         `SELECT * FROM recharge_queue ${where} ORDER BY ${kind === "delivered" ? "delivered_at DESC NULLS LAST, id DESC" : kind === "error" ? "finished_at DESC NULLS LAST, id DESC" : "id"}`,
     );
-    const out = { pending: 0, paired: 0, submitting: 0, submitted: 0, done: 0, error: 0, total: 0, undelivered: 0, delivered: 0, failed: 0 };
+    const out = { pending: 0, paired: 0, submitting: 0, submitted: 0, done: 0, error: 0, total: 0, undelivered: 0, delivered: 0, failed: 0, working: 0, ready: 0 };
     const { rows: statsRows } = await query(
         `SELECT status, COUNT(*)::int AS n FROM recharge_queue
          WHERE COALESCE(delivery_status,'undelivered')='undelivered' GROUP BY status`,
     );
     for (const r of statsRows) { out[r.status] = r.n; out.total += r.n; }
     out.undelivered = out.total;
+    out.ready = out.done || 0;
+    out.working = Math.max(0, out.undelivered - out.ready);
     const { rows: [failRow] } = await query(
         `SELECT COUNT(*)::int AS n FROM recharge_queue
          WHERE COALESCE(delivery_status,'undelivered')='failed'`,

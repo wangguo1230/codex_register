@@ -223,6 +223,8 @@ export async function ensureSchema() {
         await client.query(`CREATE INDEX IF NOT EXISTS idx_mailboxes_google_stage ON mailboxes(google_stage)`);
         await client.query(`ALTER TABLE mailboxes ADD COLUMN IF NOT EXISTS proxy_url TEXT DEFAULT ''`);
         await client.query(`ALTER TABLE mailboxes ADD COLUMN IF NOT EXISTS proxy_ip TEXT DEFAULT ''`);
+        await client.query(`ALTER TABLE mailboxes ADD COLUMN IF NOT EXISTS proxy_fail INTEGER DEFAULT 0`);
+        await client.query(`ALTER TABLE mailboxes ADD COLUMN IF NOT EXISTS browser_fp JSONB DEFAULT '{}'::jsonb`);
 
         // 充值提交时间 + 多实例认领(谁点的谁跑)
         await client.query(`ALTER TABLE recharge_queue ADD COLUMN IF NOT EXISTS submitted_at BIGINT DEFAULT 0`);
@@ -239,6 +241,29 @@ export async function ensureSchema() {
         // 换绑前邮箱（首次换绑写入后保留，便于看 原→新）
         await client.query(`ALTER TABLE recharge_queue ADD COLUMN IF NOT EXISTS rebind_from TEXT DEFAULT ''`);
         await client.query(`CREATE INDEX IF NOT EXISTS idx_recharge_queue_delivery ON recharge_queue(delivery_status)`);
+
+        // 发信：每次使用的粘性代理 session（一号一出口，日志可回放）
+        await client.query(`
+            CREATE TABLE IF NOT EXISTS mail_send_logs (
+                id SERIAL PRIMARY KEY,
+                mailbox_id INTEGER DEFAULT 0,
+                email TEXT NOT NULL,
+                to_email TEXT NOT NULL DEFAULT '',
+                subject TEXT DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'pending',
+                http_status INTEGER DEFAULT 0,
+                location TEXT DEFAULT '',
+                error TEXT DEFAULT '',
+                proxy_url TEXT DEFAULT '',
+                proxy_session TEXT DEFAULT '',
+                proxy_ip TEXT DEFAULT '',
+                jump_url TEXT DEFAULT '',
+                reused INTEGER DEFAULT 0,
+                created_at BIGINT NOT NULL
+            )
+        `);
+        await client.query(`CREATE INDEX IF NOT EXISTS idx_mail_send_logs_email ON mail_send_logs(email, id DESC)`);
+        await client.query(`CREATE INDEX IF NOT EXISTS idx_mail_send_logs_created ON mail_send_logs(created_at DESC)`);
 
         // ChatGPT 登录凭证(与邮箱密码分离):每号独立密码 + TOTP
         await client.query(`ALTER TABLE gpt_accounts ADD COLUMN IF NOT EXISTS gpt_password TEXT DEFAULT ''`);

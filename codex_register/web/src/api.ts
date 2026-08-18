@@ -48,6 +48,10 @@ export interface Mailbox {
     imap_password?: string;
     deleted_at?: number;
     sold_at?: number;
+    proxy_ip?: string;
+    proxy_fail?: number;
+    proxy_session?: string;
+    has_proxy?: boolean;
     google_stage?: string;
     google_state?: {
         stage?: string;
@@ -252,6 +256,8 @@ export interface RechargeQueueStats {
     undelivered?: number;
     delivered?: number;
     failed?: number;
+    working?: number;
+    ready?: number;
 }
 
 /** Gmail 验证池 / 换绑池 一行（含账密） */
@@ -473,6 +479,19 @@ export const api = {
     testMailProxyJump: (jump?: string) =>
         j<{ok: boolean; jump?: string; sample?: string; ip?: string; google?: number; ms?: number; reason?: string; error?: string}>(
             "/api/mailboxes/proxy-jump/test", {method: "POST", body: JSON.stringify({jump: jump || ""})}),
+    sendMailcom: (body: {email?: string; mailboxId?: number; to: string | string[]; subject?: string; html?: string; text?: string; fromName?: string}) =>
+        j<{ok: boolean; status?: number; location?: string; from?: string; proxySession?: string; proxyIp?: string; proxyMasked?: string; jumpMasked?: string; reused?: boolean; error?: string}>(
+            "/api/mailcom/send", {method: "POST", body: JSON.stringify(body)}),
+    sendMailcomBatch: (items: any[], concurrency?: number) =>
+        j<{ok: boolean; total: number; sent: number; failed: number; items: any[]}>("/api/mailcom/send-batch", {method: "POST", body: JSON.stringify({items, concurrency})}),
+    mailSendLogs: (email?: string, limit = 50) =>
+        j<{ok: boolean; items: any[]}>(`/api/mailcom/send-logs?email=${encodeURIComponent(email || "")}&limit=${limit}`),
+    rechargeSendPreview: (ids: number[], to?: string) =>
+        j<{ok: boolean; to: string; items: {id: number; queueEmail: string; from: string; rebound: boolean; to: string; subject: string; text: string; html: string; canSend: boolean; reason: string; group: string}[]}>(
+            "/api/recharge/queue/send-preview", {method: "POST", body: JSON.stringify({ids, to: to || ""})}),
+    rechargeTestSend: (ids: number[], to: string, opts?: {subject?: string; html?: string; text?: string}) =>
+        j<{ok: boolean; to: string; sent: number; failed: number; skipped: number; items: any[]; error?: string}>(
+            "/api/recharge/queue/test-send", {method: "POST", body: JSON.stringify({ids, to, ...opts})}),
     gptProxyPool: () => j<{ok: boolean; urls: string[]; lines?: string[]; jump?: string; total: number; slots: number; leased: number; free: number; items: {url: string; masked: string; leased: boolean; owner: string}[]}>("/api/gpt/proxy-pool"),
     setGptProxyPool: (text: string, opts?: {append?: boolean; copies?: number}) =>
         j<{ok: boolean; urls: string[]; lines?: string[]; jump?: string; total: number; slots: number; leased: number; free: number; inserted?: number; skipped?: number}>(
@@ -532,9 +551,9 @@ export const api = {
     unpairRechargeCards: (ids: number[]) =>
         j<{ok: boolean}>("/api/recharge/cards/unpair", {method: "POST", body: JSON.stringify({ids})}),
     // 充值队列（delivery: undelivered 作业中 | error 失败页 | delivered 已交付 | all）
-    rechargeQueue: (delivery: "undelivered" | "delivered" | "error" | "all" = "undelivered") =>
+    rechargeQueue: (delivery: "undelivered" | "ready" | "delivered" | "error" | "all" = "undelivered") =>
         j<{list: RechargeQueueItem[]; stats: RechargeQueueStats; delivery?: string}>(`/api/recharge/queue?delivery=${encodeURIComponent(delivery)}`),
-    rechargeQueueBatches: (delivery?: "undelivered" | "delivered" | "error" | "all") =>
+    rechargeQueueBatches: (delivery?: "undelivered" | "ready" | "delivered" | "error" | "all") =>
         j<{name: string; n: number}[]>(`/api/recharge/queue/batches${delivery ? `?delivery=${encodeURIComponent(delivery)}` : ""}`),
     rechargeableAccounts: () => j<Account[]>("/api/recharge/accounts"),
     addToRechargeQueue: (accountIds: number[], batch?: string) =>
@@ -589,7 +608,7 @@ export const api = {
     rechargeLogs: () => j<{ts: number; line: string}[]>("/api/recharge/logs"),
     clearRechargeLogs: () => j<{ok: boolean}>("/api/recharge/logs/clear", {method: "POST"}),
     // 导出 / RT 获取
-    exportRechargeQueue: async (opts: {ids?: number[]; batch?: string; format: "account" | "full" | "card" | "session" | "sub2json"}): Promise<{text?: string; async?: boolean; needRt?: number; total?: number; withRt?: number; missingRt?: number; ok?: boolean}> => {
+    exportRechargeQueue: async (opts: {ids?: number[]; batch?: string; format: "account" | "full" | "card" | "session" | "sub2json"; relogin?: boolean}): Promise<{text?: string; async?: boolean; needRt?: number; total?: number; withRt?: number; missingRt?: number; ok?: boolean; relogin?: boolean}> => {
         const res = await fetch("/api/recharge/queue/export", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(opts)});
         if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || `HTTP ${res.status}`);
         const ct = res.headers.get("content-type") || "";

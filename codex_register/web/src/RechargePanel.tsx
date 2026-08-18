@@ -30,7 +30,8 @@ const fmtDur = (start?: number, end?: number) => {
 const Q_LABEL: Record<string, string> = {pending: "待提交", paired: "已配对", submitting: "提交中", submitted: "已提交", done: "完成", error: "失败"};
 const Q_COLOR: Record<string, string> = {pending: "#6b7280", paired: "#2563eb", submitting: "#f59e0b", submitted: "#8b5cf6", done: "#16a34a", error: "#dc2626"};
 const TASK_COLOR: Record<string, string> = {pending: "#6b7280", leased: "#2563eb", running: "#2563eb", paid: "#16a34a", failed: "#dc2626", canceled: "#dc2626", returned: "#f59e0b", manual_review: "#f59e0b"};
-const EMPTY_Q: RechargeQueueStats = {pending: 0, paired: 0, submitting: 0, submitted: 0, done: 0, error: 0, total: 0, undelivered: 0, delivered: 0, failed: 0};
+const EMPTY_Q: RechargeQueueStats = {pending: 0, paired: 0, submitting: 0, submitted: 0, done: 0, error: 0, total: 0, undelivered: 0, delivered: 0, failed: 0, working: 0, ready: 0};
+const TEST_SEND_TO = "wangguodong194@163.com";
 const EMPTY_C: RechargeCardStats = {unused: 0, paired: 0, submitting: 0, submitted: 0, done: 0, error: 0, total: 0};
 
 /** 换绑展示：原邮箱 → 现邮箱 */
@@ -50,10 +51,10 @@ function rebindLine(q: RechargeQueueItem): {text: string; title: string; ok: boo
     return {text: "—", title: "", ok: false};
 }
 
-export function RechargePanel({notify}: {notify?: (m: string) => void}) {
+export function RechargePanel({notify}: {notify?: (m: string, ms?: number) => void}) {
     // 队列：未交付=作业中；失败=标失败/预检失败；已交付=移除后的历史
-    const [deliveryTab, setDeliveryTab] = useState<"undelivered" | "error" | "delivered">("undelivered");
-    const deliveryTabRef = useRef<"undelivered" | "error" | "delivered">("undelivered");
+    const [deliveryTab, setDeliveryTab] = useState<"undelivered" | "ready" | "error" | "delivered">("undelivered");
+    const deliveryTabRef = useRef<"undelivered" | "ready" | "error" | "delivered">("undelivered");
     deliveryTabRef.current = deliveryTab;
     const [queue, setQueue] = useState<RechargeQueueItem[]>([]);
     const [qStats, setQStats] = useState<RechargeQueueStats>(EMPTY_Q);
@@ -90,8 +91,15 @@ export function RechargePanel({notify}: {notify?: (m: string) => void}) {
     const [pickerBatch, setPickerBatch] = useState("");
     const [pickerSel, setPickerSel] = useState<Set<number>>(new Set());
     const [rechargeBatch, setRechargeBatch] = useState("");
+    const [rechargeGrpNew, setRechargeGrpNew] = useState("");
+    const [queueGroups, setQueueGroups] = useState<{name: string; n: number}[]>([]);
     const [showSetBatch, setShowSetBatch] = useState(false);
     const [batchInput, setBatchInput] = useState("");
+    const [showTestSend, setShowTestSend] = useState(false);
+    const [testSendTo, setTestSendTo] = useState(TEST_SEND_TO);
+    const [testSendPreview, setTestSendPreview] = useState<{id: number; from: string; queueEmail: string; rebound: boolean; subject: string; text: string; canSend: boolean; reason: string; group: string; via?: string}[]>([]);
+    const [testSendResult, setTestSendResult] = useState("");
+    const [testSendBusy, setTestSendBusy] = useState(false);
     // 导出 sub2json
     const [showSub2json, setShowSub2json] = useState(false);
     const [sub2jsonInput, setSub2jsonInput] = useState("");
@@ -123,9 +131,10 @@ export function RechargePanel({notify}: {notify?: (m: string) => void}) {
         readyCount: number;
     }>({poolGrp: "换绑池", staging: [], ready: [], groups: [], stagingCount: 0, readyCount: 0});
 
-    const toast = (m: string) => notify?.(m);
+    const toast = (m: string, ms?: number) => notify?.(m, ms);
     const isDeliveredTab = deliveryTab === "delivered";
     const isFailedTab = deliveryTab === "error";
+    const isReadyTab = deliveryTab === "ready";
     const isWorkingTab = deliveryTab === "undelivered";
     /** SSE 异步导出 RT 完成后回调（ref 避免 effect 闭包拿不到最新 deliver） */
     const deliverExportTextRef = useRef<(text: string, format: "account" | "full" | "card" | "session") => Promise<void>>(async () => {});
@@ -149,7 +158,6 @@ export function RechargePanel({notify}: {notify?: (m: string) => void}) {
         loadQueue(); loadCards(); loadConfig(); loadLogs();
         const off = connectStream((ev, data: any) => {
             if (ev === "rechargeQueue") {
-                // 服务端广播始终是未交付列表；统计含 undelivered/delivered 计数
                 setQStats(data.stats || EMPTY_Q);
                 if (deliveryTabRef.current === "undelivered") setQueue(data.list || []);
             }
@@ -160,7 +168,8 @@ export function RechargePanel({notify}: {notify?: (m: string) => void}) {
             }
             if (ev === "batchRtAcquire") { setBatchRtResults(data.results.map((r: any) => ({...r, status: r.status || "done"}))); if (data.done) setBatchRtRunning(false); }
             if (ev === "rechargeExportReady" && data?.text) {
-                void deliverExportTextRef.current(String(data.text), "full");
+                if (data.relogin) toast("重登取 RT 完成，再点「导出含RT」即可复制", 6000);
+                else void deliverExportTextRef.current(String(data.text), "full");
             }
         });
         // SSE 重连会丢中间事件；换绑卡在 mail.com 时也要靠轮询把磁盘日志刷出来
@@ -239,9 +248,14 @@ export function RechargePanel({notify}: {notify?: (m: string) => void}) {
     const openPicker = async () => {
         try {
             const accs = await api.rechargeableAccounts();
-            setAccounts(accs); setPickerSel(new Set()); setPickerSearch(""); setPickerBatch(""); setRechargeBatch(""); setPickerFacets(new Set()); setPickerTakeN("20"); setShowPicker(true);
+            const grps = await api.rechargeQueueBatches("all").catch(() => []);
+            setQueueGroups(Array.isArray(grps) ? grps : []);
+            setAccounts(accs); setPickerSel(new Set()); setPickerSearch(""); setPickerBatch("");
+            setRechargeBatch(""); setRechargeGrpNew(""); setPickerFacets(new Set()); setPickerTakeN("20"); setShowPicker(true);
         } catch (e: any) { toast("获取账号列表失败: " + e.message); }
     };
+
+    const resolvedEnqueueGrp = () => (rechargeGrpNew.trim() || rechargeBatch.trim());
 
     const pickerBatches = useMemo(() => {
         const map = new Map<string, number>();
@@ -291,11 +305,13 @@ export function RechargePanel({notify}: {notify?: (m: string) => void}) {
     const doAddToQueue = async (ids?: number[]) => {
         const pick = ids && ids.length ? ids : [...pickerSel];
         if (!pick.length) return;
-        if (!confirm(`确认将 ${pick.length} 个账号加入充值队列?\n这些账号将在 GPT 面板中标记为已售出。`)) return;
+        const grp = resolvedEnqueueGrp();
+        if (!confirm(`确认将 ${pick.length} 个账号加入充值队列?\n分组：${grp || "（无分组）"}\n这些账号将在 GPT 面板中标记为已售出。`)) return;
         setBusy(true); setShowPicker(false);
         try {
-            const r = await api.addToRechargeQueue(pick, rechargeBatch);
-            toast(`已入队 ${r.added} 个账号`);
+            const r = await api.addToRechargeQueue(pick, grp);
+            toast(`已入队 ${r.added} 个账号${grp ? ` · 分组 ${grp}` : ""}`);
+            setDeliveryTab("undelivered");
             loadQueue();
         } catch (e: any) { toast("入队失败: " + e.message); } finally { setBusy(false); }
     };
@@ -307,9 +323,11 @@ export function RechargePanel({notify}: {notify?: (m: string) => void}) {
         if (!confirm(`确认将选中项里「已充上」的号标记为已交付？\n失败 / 退回 / 待提交的不会搬走。`)) return;
         try {
             const r = await api.deliverRechargeQueue(ids);
-            setQSel(new Set()); loadQueue();
+            setQSel(new Set());
             const skip = r.skipped ? `，跳过 ${r.skipped} 个未成功` : "";
             toast(r.count ? `已交付 ${r.count} 个${skip}` : (r.skipped ? "所选都还没充上，没有搬走" : "没有可交付的"));
+            if (r.count) setDeliveryTab("delivered");
+            loadQueue();
         } catch (e: any) { toast("标记已交付失败: " + e.message); }
     };
 
@@ -690,16 +708,66 @@ export function RechargePanel({notify}: {notify?: (m: string) => void}) {
         }
     };
     deliverExportTextRef.current = deliverExportText;
-    const doExport = async (format: "account" | "full" | "card" | "session") => {
+    const doExport = async (format: "account" | "full" | "card" | "session", opts?: {relogin?: boolean}) => {
         const ids = selQIds();
         try {
-            const r = await api.exportRechargeQueue({ids: ids.length ? ids : undefined, batch: qBatchFilter || undefined, format});
+            const r = await api.exportRechargeQueue({
+                ids: ids.length ? ids : undefined,
+                batch: qBatchFilter || undefined,
+                format,
+                relogin: !!opts?.relogin,
+            });
             if (r.text) {
                 await deliverExportText(r.text, format);
             } else if (r.async) {
-                toast(`${r.needRt} 个账号缺少 RT，正在自动获取，完成后自动下载...`);
+                toast(opts?.relogin
+                    ? `正在重登取 RT（${r.needRt} 个），完成后点「导出含RT」复制`
+                    : `${r.needRt} 个账号缺少 RT，正在自动获取，完成后自动下载...`, 6000);
             }
         } catch (e: any) { toast("导出失败: " + e.message); }
+    };
+    const openTestSend = async () => {
+        let ids = selQIds();
+        if (!ids.length) ids = filteredQueue.slice(0, 5).map((q) => q.id);
+        setShowTestSend(true);
+        setTestSendPreview([]);
+        if (!ids.length) {
+            setTestSendResult("已交付列表是空的");
+            toast("已交付列表是空的");
+            return;
+        }
+        setTestSendResult("正在核对发件账号（换绑号用原邮箱）…");
+        setTestSendBusy(true);
+        try {
+            const r = await api.rechargeSendPreview(ids, testSendTo);
+            setTestSendPreview(r.items || []);
+            const okN = (r.items || []).filter((x) => x.canSend).length;
+            setTestSendResult(okN ? `可发 ${okN} / ${r.items.length}（换绑走原邮箱）` : "这些号现在都发不了，看下表原因");
+            toast(okN ? `可发 ${okN} 封，确认后点「发出测试信」` : "看弹窗里的原因（换绑必须用原邮箱）", 6000);
+        } catch (e: any) {
+            setTestSendResult("预览失败: " + e.message);
+            toast("预览失败: " + e.message, 6000);
+        } finally { setTestSendBusy(false); }
+    };
+    const doTestSend = async () => {
+        const sendable = testSendPreview.filter((x) => x.canSend);
+        if (!sendable.length) {
+            toast(testSendPreview[0]?.reason || "没有可发的号", 5000);
+            return;
+        }
+        if (!testSendTo.trim()) { toast("请填写测试收件人"); return; }
+        setTestSendBusy(true);
+        setTestSendResult(`正在发送 ${sendable.length} 封（mail.com 要登录，大约 1 分钟）…`);
+        toast("正在发测试信，请等登录完成", 8000);
+        try {
+            const r = await api.rechargeTestSend(sendable.map((x) => x.id), testSendTo.trim());
+            const line = `发出 ${r.sent} · 失败 ${r.failed} · 跳过 ${r.skipped} → ${r.to}`;
+            setTestSendResult(line);
+            toast(r.ok ? `测试邮件已发 ${r.sent} 封` : (r.error || line), 6000);
+        } catch (e: any) {
+            setTestSendResult("发送失败: " + e.message);
+            toast("测试发送失败: " + e.message, 6000);
+        } finally { setTestSendBusy(false); }
     };
     const doProbePlan = async () => {
         const ids = selQIds();
@@ -823,7 +891,21 @@ export function RechargePanel({notify}: {notify?: (m: string) => void}) {
                     >
                         未交付
                         <span className={`ml-1.5 text-xs tabular-nums ${isWorkingTab ? "text-blue-600" : "text-gray-400"}`}>
-                            {qStats.undelivered ?? qStats.total}
+                            {qStats.working ?? Math.max(0, (qStats.undelivered ?? qStats.total) - (qStats.ready ?? qStats.done ?? 0))}
+                        </span>
+                    </button>
+                    <button
+                        type="button"
+                        onClick={() => setDeliveryTab("ready")}
+                        className={`px-3 py-2 text-sm font-medium border-b-2 -mb-px transition-colors ${
+                            isReadyTab
+                                ? "border-amber-500 text-amber-700"
+                                : "border-transparent text-gray-500 hover:text-gray-800"
+                        }`}
+                    >
+                        可交付
+                        <span className={`ml-1.5 text-xs tabular-nums ${isReadyTab ? "text-amber-600" : "text-gray-400"}`}>
+                            {qStats.ready ?? qStats.done ?? 0}
                         </span>
                     </button>
                     <button
@@ -856,14 +938,15 @@ export function RechargePanel({notify}: {notify?: (m: string) => void}) {
                     </button>
                     <div className="flex-1"/>
                     <span className="text-[11px] text-gray-400 pb-2 pr-1">
-                        {isDeliveredTab ? "已交付可查看换绑记录；可退回未交付"
+                        {isDeliveredTab ? "已交付可按分组筛选，也可测试发信"
+                            : isReadyTab ? "充值完成、尚未交付；点「标记已交付」后进已交付"
                             : isFailedTab ? "只有点过「标记失败」的号；提交失败不会自动进来"
-                            : "提交失败仍留在未交付；只有点「标记失败」才进中间页"}
+                            : "作业中；完成后会进「可交付」"}
                     </span>
                 </div>
 
                 <div className="px-4 py-3 border-b flex items-center gap-2 flex-wrap">
-                    <span className="text-sm font-semibold">{isDeliveredTab ? "已交付列表" : isFailedTab ? "失败列表" : "充值队列"}</span>
+                    <span className="text-sm font-semibold">{isDeliveredTab ? "已交付列表" : isReadyTab ? "可交付列表" : isFailedTab ? "失败列表" : "充值队列"}</span>
                     {isWorkingTab && (
                         <>
                             <Btn onClick={openPicker} className="bg-blue-600 text-white border-blue-600 hover:bg-blue-700">+ 选择账号入队</Btn>
@@ -871,7 +954,6 @@ export function RechargePanel({notify}: {notify?: (m: string) => void}) {
                             <Btn onClick={doReset}>重置</Btn>
                             <Btn onClick={() => doMarkError()} className="bg-white border-red-200 text-red-600 hover:bg-red-50" title="号进失败页，卡密放回未使用，方便换号再提；已充上的不动">标记失败</Btn>
                             <Btn onClick={doReclaimCards}>回收卡密</Btn>
-                            <Btn onClick={doRemoveFromQueue} className="bg-white border-emerald-200 text-emerald-700 hover:bg-emerald-50" title="标记已交付：保留账号与换绑记录，移入「已交付」">标记已交付</Btn>
                             <div className="border-l mx-1 h-5"/>
                             <span className="text-xs text-gray-500 tabular-nums">已选 <b className="text-blue-600">{selQIds().length}</b> / {filteredQueue.length}</span>
                             <Btn onClick={() => doSubmit(selQIds())} disabled={!hasKey || cStats.unused === 0} className="bg-green-600 text-white border-green-600 hover:bg-green-700">提交选中 ({selQIds().length})</Btn>
@@ -892,14 +974,29 @@ export function RechargePanel({notify}: {notify?: (m: string) => void}) {
                             <div className="border-l mx-1 h-5"/>
                         </>
                     )}
+                    {isReadyTab && (
+                        <>
+                            <Btn onClick={doRemoveFromQueue} className="bg-emerald-600 text-white border-emerald-600 hover:bg-emerald-700" title="标记已交付：保留账号与换绑记录，移入「已交付」">标记已交付</Btn>
+                            <Btn onClick={() => doRebind("gmail")} title="对已付费项换绑 Gmail">换绑 Gmail</Btn>
+                            <Btn onClick={() => doRebind("mailcom")}>换绑 mail.com</Btn>
+                            <span className="text-xs text-gray-500 tabular-nums">已选 <b className="text-amber-600">{selQIds().length}</b> / {filteredQueue.length}</span>
+                            <div className="border-l mx-1 h-5"/>
+                        </>
+                    )}
                     {isDeliveredTab && (
                         <>
                             <Btn onClick={doUndeliver} className="bg-white border-blue-200 text-blue-700 hover:bg-blue-50">退回未交付</Btn>
+                            <button type="button" onClick={() => { void openTestSend(); }}
+                                    className="px-3 py-1.5 rounded text-xs font-medium border bg-violet-600 text-white border-violet-600 hover:bg-violet-700">
+                                测试发送（原邮箱）
+                            </button>
+                            <span className="text-xs text-gray-500 tabular-nums">已选 <b className="text-emerald-600">{selQIds().length}</b> / {filteredQueue.length}</span>
                             <div className="border-l mx-1 h-5"/>
                         </>
                     )}
                     <Btn onClick={() => doExport("account")}>导出账密</Btn>
                     <Btn onClick={() => doExport("full")}>导出含RT</Btn>
+                    <Btn onClick={() => doExport("full", {relogin: true})} title="先强制重登再取 RT；取完后点「导出含RT」复制">重登导出含RT</Btn>
                     <Btn onClick={() => doExport("card")}>复制卡密</Btn>
                     <Btn onClick={() => doExport("session")}>复制session</Btn>
                     {isWorkingTab && (
@@ -929,7 +1026,7 @@ export function RechargePanel({notify}: {notify?: (m: string) => void}) {
                         {qBatches.length > 0 && (
                             <select value={qBatchFilter} onChange={(e) => setQBatchFilter(e.target.value)}
                                     className="px-1.5 py-0.5 border rounded text-xs outline-none ml-1">
-                                <option value="">全部批次</option>
+                                <option value="">{isDeliveredTab || isReadyTab ? "全部分组" : "全部批次"}</option>
                                 {qBatches.map((b) => <option key={b.name} value={b.name}>{b.name} ({b.n})</option>)}
                             </select>
                         )}
@@ -944,7 +1041,7 @@ export function RechargePanel({notify}: {notify?: (m: string) => void}) {
                                 <th className="text-left px-2 py-2 font-medium text-gray-500">当前邮箱</th>
                                 {isDeliveredTab && <th className="text-left px-2 py-2 font-medium text-gray-500">换绑记录</th>}
                                 <th className="text-left px-2 py-2 font-medium text-gray-500">套餐</th>
-                                <th className="text-left px-2 py-2 font-medium text-gray-500">批次</th>
+                                <th className="text-left px-2 py-2 font-medium text-gray-500">{isDeliveredTab || isReadyTab ? "分组" : "批次"}</th>
                                 {isWorkingTab && <th className="text-left px-2 py-2 font-medium text-gray-500">实例</th>}
                                 <th className="text-left px-2 py-2 font-medium text-gray-500">状态</th>
                                 <th className="text-left px-2 py-2 font-medium text-gray-500">卡密</th>
@@ -953,9 +1050,9 @@ export function RechargePanel({notify}: {notify?: (m: string) => void}) {
                                 {isDeliveredTab && <th className="text-left px-2 py-2 font-medium text-gray-500">交付时间</th>}
                                 {(isWorkingTab || isFailedTab) && <th className="text-left px-2 py-2 font-medium text-gray-500">耗时</th>}
                                 <th className="text-left px-2 py-2 font-medium text-gray-500">任务状态</th>
-                                {isWorkingTab && <th className="text-left px-2 py-2 font-medium text-gray-500">换绑</th>}
+                                {(isWorkingTab || isReadyTab) && <th className="text-left px-2 py-2 font-medium text-gray-500">换绑</th>}
                                 <th className="text-left px-2 py-2 font-medium text-gray-500">消息</th>
-                                {(isWorkingTab || isFailedTab) && <th className="text-left px-2 py-2 font-medium text-gray-500">操作</th>}
+                                {(isWorkingTab || isFailedTab || isReadyTab) && <th className="text-left px-2 py-2 font-medium text-gray-500">操作</th>}
                             </tr>
                         </thead>
                         <tbody>
@@ -1005,7 +1102,7 @@ export function RechargePanel({notify}: {notify?: (m: string) => void}) {
                                     <td className="px-2 py-1.5 text-gray-500 text-xs whitespace-nowrap" title={q.submitted_at && q.finished_at ? `${fmtTime(q.submitted_at)} → ${fmtTime(q.finished_at)}` : ""}>{fmtDur(q.submitted_at, q.finished_at)}</td>
                                     )}
                                     <td className="px-2 py-1.5">{q.task_status ? <span style={{color: TASK_COLOR[q.task_status] || "#6b7280"}}>{q.task_status}</span> : "—"}</td>
-                                    {isWorkingTab && (
+                                    {(isWorkingTab || isReadyTab) && (
                                     <td className="px-2 py-1.5 max-w-[200px] truncate" title={rb.title || q.rebind_error || q.rebind_email || ""}>
                                         {rb.ok ? <span className="text-green-600" title={rb.title}>{rb.text}</span>
                                             : q.rebind_status === "pending" ? <span className="text-amber-600">{rb.text}</span>
@@ -1017,7 +1114,7 @@ export function RechargePanel({notify}: {notify?: (m: string) => void}) {
                                     <td className="px-2 py-1.5 text-gray-500 max-w-[180px] truncate" title={q.task_message || q.error || ""}>
                                         {q.error ? <span className="text-red-500">{q.error}</span> : (q.task_message || "—")}
                                     </td>
-                                    {(isWorkingTab || isFailedTab) && (
+                                    {(isWorkingTab || isFailedTab || isReadyTab) && (
                                     <td className="px-2 py-1.5" onClick={(e) => e.stopPropagation()}>
                                         {q.status !== "done" && q.status !== "pending" && q.card_code && (
                                             <button onClick={() => { api.pollRecharge([q.id]).then(() => { toast(`已刷新 ${q.email}`); loadQueue(); }).catch((e: any) => toast(e.message)); }}
@@ -1054,8 +1151,9 @@ export function RechargePanel({notify}: {notify?: (m: string) => void}) {
                             })}
                             {!filteredQueue.length && (
                                 <tr>
-                                    <td colSpan={isDeliveredTab ? 11 : isFailedTab ? 12 : 14} className="text-center py-8 text-gray-400">
-                                        {isDeliveredTab ? "暂无已交付账号；在「未交付」中点「标记已交付」后会出现在这里"
+                                    <td colSpan={isDeliveredTab ? 11 : isFailedTab ? 12 : isReadyTab ? 13 : 14} className="text-center py-8 text-gray-400">
+                                        {isDeliveredTab ? "暂无已交付账号；在「可交付」中点「标记已交付」后会出现在这里"
+                                            : isReadyTab ? "没有可交付的号。充值完成（状态=完成）后会出现在这里"
                                             : isFailedTab ? "没有人工标记失败的号。提交失败仍在「未交付」"
                                             : "队列为空，点击「选择账号入队」添加"}
                                     </td>
@@ -1066,7 +1164,8 @@ export function RechargePanel({notify}: {notify?: (m: string) => void}) {
                 </div>
             </div>
 
-            {/* ====== 卡密池 ====== */}
+            {/* ====== 卡密池：仅未交付作业页显示 ====== */}
+            {isWorkingTab && (
             <div className="bg-white rounded-lg border shadow-sm">
                 <div className="px-4 py-3 border-b flex items-center gap-2 flex-wrap">
                     <span className="text-sm font-semibold">卡密池</span>
@@ -1109,6 +1208,7 @@ export function RechargePanel({notify}: {notify?: (m: string) => void}) {
                     </table>
                 </div>
             </div>
+            )}
 
             {/* ====== 操作日志 ====== */}
             <div className="bg-white rounded-lg border shadow-sm">
@@ -1175,11 +1275,21 @@ export function RechargePanel({notify}: {notify?: (m: string) => void}) {
                                 <input value={pickerSearch} onChange={(e) => setPickerSearch(e.target.value)} placeholder="搜索邮箱..."
                                        className="flex-1 px-2 py-1 text-xs border rounded outline-none"/>
                                 <select value={pickerBatch} onChange={(e) => setPickerBatch(e.target.value)} className="px-2 py-1 text-xs border rounded outline-none">
-                                    <option value="">全部批次 ({accounts.length})</option>
+                                    <option value="">全部来源批次 ({accounts.length})</option>
                                     {pickerBatches.map((b) => <option key={b.name} value={b.name}>{b.name || "(无批次)"} ({b.n})</option>)}
                                 </select>
-                                <input value={rechargeBatch} onChange={(e) => setRechargeBatch(e.target.value)} placeholder="充值批次名(可选)"
-                                       className="w-36 px-2 py-1 text-xs border rounded outline-none"/>
+                            </div>
+                            <div className="flex items-center gap-2 flex-wrap">
+                                <span className="text-[11px] text-gray-500 shrink-0">入队分组</span>
+                                <select value={rechargeGrpNew.trim() ? "" : rechargeBatch} onChange={(e) => { setRechargeBatch(e.target.value); if (e.target.value) setRechargeGrpNew(""); }}
+                                        className="px-2 py-1 text-xs border rounded outline-none min-w-[160px]">
+                                    <option value="">选择已有分组</option>
+                                    {queueGroups.map((g) => <option key={g.name} value={g.name}>{g.name} ({g.n})</option>)}
+                                </select>
+                                <span className="text-[11px] text-gray-400">或</span>
+                                <input value={rechargeGrpNew} onChange={(e) => setRechargeGrpNew(e.target.value)} placeholder="新建分组名"
+                                       className="w-40 px-2 py-1 text-xs border rounded outline-none"/>
+                                <span className="text-[11px] text-gray-400">将记为：<b className="text-gray-700">{resolvedEnqueueGrp() || "（无分组）"}</b></span>
                             </div>
                             {/* facet 筛选条(同 GPT 面板逻辑:组内 OR、跨组 AND) */}
                             <div className="flex items-center gap-1.5 flex-wrap">
@@ -1253,6 +1363,60 @@ export function RechargePanel({notify}: {notify?: (m: string) => void}) {
                                     确认入队 ({pickerSel.size})
                                 </Btn>
                             </div>
+                        </div>
+                    </div>
+                </div>
+            )}
+
+            {showTestSend && (
+                <div className="fixed inset-0 bg-black/30 flex items-center justify-center z-50" onClick={() => !testSendBusy && setShowTestSend(false)}>
+                    <div className="bg-white rounded-xl shadow-xl w-[720px] max-w-[96vw] max-h-[90vh] flex flex-col" onClick={(e) => e.stopPropagation()}>
+                        <div className="px-5 py-3 border-b font-semibold text-sm">测试发送
+                            <div className="text-xs text-gray-400 font-normal mt-0.5">没勾选就发当前列表前 10 个。mail.com 走协议，Gmail 走应用密码 SMTP。</div>
+                        </div>
+                        <div className="px-5 py-3 space-y-3 overflow-auto">
+                            <label className="block text-xs text-gray-500">测试收件人
+                                <input value={testSendTo} onChange={(e) => setTestSendTo(e.target.value)}
+                                       className="mt-1 w-full px-2 py-1.5 text-sm border rounded outline-none font-mono"/>
+                            </label>
+                            {testSendPreview[0] && (
+                                <div className="rounded-lg border bg-gray-50 p-3 text-xs text-gray-700 space-y-1">
+                                    <div className="font-medium text-gray-800">收件内容预览</div>
+                                    <div>主题：{testSendPreview[0].subject}</div>
+                                    <pre className="whitespace-pre-wrap text-[11px] text-gray-600 bg-white border rounded p-2 max-h-36 overflow-auto">{testSendPreview[0].text}</pre>
+                                </div>
+                            )}
+                            <div className="max-h-52 overflow-auto border rounded">
+                                <table className="w-full text-xs">
+                                    <thead className="bg-gray-50 sticky top-0">
+                                        <tr>
+                                            <th className="text-left px-2 py-1.5 text-gray-500">队列邮箱</th>
+                                            <th className="text-left px-2 py-1.5 text-gray-500">发件（协议）</th>
+                                            <th className="text-left px-2 py-1.5 text-gray-500">分组</th>
+                                            <th className="text-left px-2 py-1.5 text-gray-500">状态</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody>
+                                        {testSendPreview.map((row) => (
+                                            <tr key={row.id} className="border-t">
+                                                <td className="px-2 py-1.5 font-mono">{row.queueEmail}</td>
+                                                <td className="px-2 py-1.5 font-mono">{row.from}{row.rebound ? <span className="text-amber-600">（原号）</span> : ""}</td>
+                                                <td className="px-2 py-1.5 text-gray-500">{row.group || "—"}</td>
+                                                <td className="px-2 py-1.5">{row.canSend ? <span className="text-green-600">可发{row.via ? ` · ${row.via}` : ""}</span> : <span className="text-red-500">{row.reason || "不可发"}</span>}</td>
+                                            </tr>
+                                        ))}
+                                    </tbody>
+                                </table>
+                            </div>
+                            {testSendResult && <div className="text-xs text-violet-700">{testSendResult}</div>}
+                        </div>
+                        <div className="px-5 py-3 border-t flex justify-end gap-2">
+                            <button type="button" disabled={testSendBusy} onClick={() => setShowTestSend(false)}
+                                    className="px-3 py-1.5 rounded text-xs font-medium border bg-white border-gray-200 text-gray-700 hover:bg-gray-50 disabled:opacity-40">关闭</button>
+                            <button type="button" disabled={testSendBusy} onClick={doTestSend}
+                                    className="px-3 py-1.5 rounded text-xs font-medium border bg-violet-600 text-white border-violet-600 hover:bg-violet-700 disabled:opacity-40">
+                                {testSendBusy ? "发送中…" : "发出测试信"}
+                            </button>
                         </div>
                     </div>
                 </div>

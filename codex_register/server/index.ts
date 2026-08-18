@@ -59,6 +59,8 @@ import {ensureGoogleLoggedIn} from "../src/mail/google-auth.js";
 import {rememberGoogleCred} from "../src/mail/google-account.js";
 import {isCredentialDead, isHardenIpError, isHardenLoginDead} from "../src/mail/google-state.js";
 import {rememberMailcomPassword} from "../src/mail/mailcom.js";
+import {ensureMailcomProfile} from "../src/mail/mailcom-fingerprint.js";
+import {sendMailcomViaPool, sendMailcomBatch, listMailSendLogsPublic, previewDeliveredSend, testSendDelivered} from "./domain/mail-send.js";
 import {startXray, stopXray, xrayStatus, listJumpXrays, isVlessUrl, stopJumpFleet} from "./xray-proxy.js";
 import {queryClaudeInfo, claudeChat} from "../src/claude-api.js";
 import {execSync} from "node:child_process";
@@ -672,6 +674,69 @@ app.post("/api/mailboxes/proxy-jump/test", async (req, res) => {
         ok: !!probe.ok, jump: scheduler.mailProxyJump || "", sample: maskProxyUrl(sample),
         ip: probe.ip, google: probe.google, ms: probe.ms, reason: probe.reason || "",
     });
+});
+
+// mail.com 协议发信：走邮箱代理池 + 跳板，记下粘性 session
+app.post("/api/mailcom/send", async (req, res) => {
+    try {
+        const r = await sendMailcomViaPool({
+            email: req.body?.email,
+            mailboxId: req.body?.mailboxId,
+            password: req.body?.password,
+            to: req.body?.to,
+            subject: req.body?.subject,
+            html: req.body?.html,
+            text: req.body?.text,
+            fromName: req.body?.fromName,
+        });
+        res.json(r);
+    } catch (e: any) {
+        res.status(400).json({ok: false, error: String(e?.message || e).slice(0, 240)});
+    }
+});
+app.post("/api/mailcom/send-batch", async (req, res) => {
+    const items = Array.isArray(req.body?.items) ? req.body.items : [];
+    if (!items.length) return res.status(400).json({error: "items 为空"});
+    try {
+        const r = await sendMailcomBatch(items, {concurrency: req.body?.concurrency});
+        res.json(r);
+    } catch (e: any) {
+        res.status(400).json({ok: false, error: String(e?.message || e).slice(0, 240)});
+    }
+});
+app.get("/api/mailcom/send-logs", async (req, res) => {
+    const rows = await listMailSendLogsPublic({
+        email: String(req.query.email || ""),
+        limit: Number(req.query.limit || 50),
+    });
+    res.json({ok: true, items: rows});
+});
+app.post("/api/recharge/queue/send-preview", async (req, res) => {
+    const ids = (req.body?.ids || []).map(Number).filter(Number.isInteger);
+    if (!ids.length) return res.status(400).json({error: "未选择账号"});
+    try {
+        res.json(await previewDeliveredSend(ids, String(req.body?.to || "")));
+    } catch (e: any) {
+        res.status(400).json({ok: false, error: String(e?.message || e).slice(0, 240)});
+    }
+});
+app.post("/api/recharge/queue/test-send", async (req, res) => {
+    const ids = (req.body?.ids || []).map(Number).filter(Number.isInteger);
+    if (!ids.length) return res.status(400).json({error: "未选择账号"});
+    try {
+        const r = await testSendDelivered(ids, {
+            to: req.body?.to,
+            subject: req.body?.subject,
+            html: req.body?.html,
+            text: req.body?.text,
+            concurrency: req.body?.concurrency,
+            log: (m) => rechargeLog(m),
+        });
+        rechargeLog(`测试发信 ${r.sent} 成功 / ${r.failed} 失败 / ${r.skipped} 跳过 → ${r.to}`);
+        res.json(r);
+    } catch (e: any) {
+        res.status(400).json({ok: false, error: String(e?.message || e).slice(0, 240)});
+    }
 });
 
 app.get("/api/gpt/proxy-pool", (req, res) => {
@@ -1579,7 +1644,15 @@ async function doPwChange(mailboxId, email, oldPw, forcedNp = "") {
     try {
         const r = mb?.provider === "google"
             ? await changeGooglePasswordWithPool(mb, np, (m) => logMailbox(mailboxId, `[改密] ${m}`))
-            : await changeMailcomPassword(email, oldPw, np, (m) => logMailbox(mailboxId, `[改密] ${m}`));
+            : await withLeasedMailProxy(email, async (proxyUrl, jumpUrl) => {
+                const sess = kookeeySessionOf(proxyUrl);
+                const profile = ensureMailcomProfile(mb?.browser_fp, proxyUrl);
+                if (mb?.id) db.setMailboxBrowserFp(mb.id, profile).catch(() => {});
+                logMailbox(mailboxId, `[改密] 记住出口 ${maskProxyUrl(proxyUrl)}${sess ? ` session=${sess}` : ""} tz=${profile.timezoneId}${jumpUrl ? " · 跳板" : ""}`);
+                return changeMailcomPassword(email, oldPw, np, (m) => logMailbox(mailboxId, `[改密] ${m}`), {
+                    proxy: proxyUrl, jump: jumpUrl, profile,
+                });
+            }, mb);
         const ok = !!r?.ok;
         await mailboxPwApply({id: mailboxId}, {ok, np, verified: r?.verified, detail: r?.detail || "失败"});
         logMailbox(mailboxId, ok ? `[改密] 成功` : `[改密] 失败(新密码 ${np} 已记录)`);
@@ -5218,13 +5291,14 @@ app.post("/api/recharge/queue/export", async (req, res) => {
         });
     }
 
-    // full 格式: 先检查是否需要获取 RT，需要则异步执行后通过 SSE 推送结果
+    // full 格式: 缺 RT 则异步获取；relogin=true 则先强制重登再取 RT
+    const forceRelogin = req.body?.relogin === true;
     const needRt = rows.filter((r: any) => {
         const tok = extractTokens(r.gpt_rt_data || r.gpt_auth_data || readJsonFileSafe(r.rt_file) || readJsonFileSafe(r.gpt_auth_file));
         return !tok?.refreshToken;
     });
 
-    if (!needRt.length) {
+    if (!forceRelogin && !needRt.length) {
         const text = rows.map((r: any) => {
             const tok = extractTokens(r.gpt_rt_data || r.gpt_auth_data || readJsonFileSafe(r.rt_file) || readJsonFileSafe(r.gpt_auth_file));
             return formatAccountExportLine(r, {rt: tok?.refreshToken || "", sep});
@@ -5232,50 +5306,75 @@ app.post("/api/recharge/queue/export", async (req, res) => {
         return res.set("Content-Type", "text/plain; charset=utf-8").send(text);
     }
 
-    // 有账号缺少 RT → 异步并发获取，完成后 SSE 推送
+    const work = forceRelogin ? rows : needRt;
     if (exportRtBusy) {
         rechargeLog("已有导出含RT在跑，请等当前这批打出「RT 获取完成」");
         return res.status(409).json({error: "已有导出含RT在跑"});
     }
-    const rtConc = Math.min(2, scheduler.rtConcurrency || 4);
-    res.json({ok: true, async: true, total: rows.length, needRt: needRt.length});
-    rechargeLog(`导出含RT: ${needRt.length}/${rows.length} 个账号缺少 RT，并发${rtConc}获取中...`);
+    const rtConc = forceRelogin ? 1 : Math.min(2, scheduler.rtConcurrency || 4);
+    res.json({ok: true, async: true, total: rows.length, needRt: work.length, relogin: forceRelogin});
+    rechargeLog(forceRelogin
+        ? `重登导出含RT: ${work.length} 个账号将先重登再取 RT，串行进行…`
+        : `导出含RT: ${needRt.length}/${rows.length} 个账号缺少 RT，并发${rtConc}获取中...`);
     exportRtBusy = true;
     (async () => {
         let ok = 0, fail = 0, done = 0;
         try {
-        await runPool(needRt, async (r) => {
+        await runPool(work, async (r) => {
             const idx = ++done;
-            const acc = await db.getAccount(r.account_id);
-            if (!acc) { fail++; rechargeLog(`[${idx}/${needRt.length}] ✗ ${r.email} 账号不存在`); return; }
-            const already = extractTokens(getRtData(acc) || getAuthData(acc));
-            if (already?.refreshToken) {
-                ok++;
-                rechargeLog(`[${idx}/${needRt.length}] ✓ ${r.email} 已有 RT，跳过获取`);
-                return;
+            let acc = await db.getAccount(r.account_id);
+            if (!acc) { fail++; rechargeLog(`[${idx}/${work.length}] ✗ ${r.email} 账号不存在`); return; }
+            if (forceRelogin) {
+                rechargeLog(`[${idx}/${work.length}] 重登 ${r.email}…`);
+                try {
+                    const re = await runReloginAtWorkerPooled(acc, {
+                        allowBrowser: true,
+                        preferPool: true,
+                        onProgress: (m) => rechargeLog(`  ${r.email}: ${String(m || "").slice(0, 120)}`),
+                    });
+                    if (!re?.ok) {
+                        fail++;
+                        rechargeLog(`[${idx}/${work.length}] ✗ ${r.email} 重登失败 ${String(re?.reason || "").slice(0, 120)}`);
+                        return;
+                    }
+                    acc = await db.getAccount(r.account_id) || acc;
+                    rechargeLog(`[${idx}/${work.length}] 重登成功，取 RT: ${r.email}`);
+                } catch (e: any) {
+                    fail++;
+                    rechargeLog(`[${idx}/${work.length}] ✗ ${r.email} 重登异常 ${e?.message || e}`);
+                    return;
+                }
+            } else {
+                const already = extractTokens(getRtData(acc) || getAuthData(acc));
+                if (already?.refreshToken) {
+                    ok++;
+                    rechargeLog(`[${idx}/${work.length}] ✓ ${r.email} 已有 RT，跳过获取`);
+                    return;
+                }
+                rechargeLog(`[${idx}/${work.length}] 获取 RT: ${r.email}...`);
             }
-            rechargeLog(`[${idx}/${needRt.length}] 获取 RT: ${r.email}...`);
             try {
                 const result = await testOneRt(acc, {
                     acquire: true,
                     onProgress: (m) => rechargeLog(`  ${r.email}: ${String(m || "").slice(0, 120)}`),
                 });
-                if (result.ok) { ok++; rechargeLog(`[${idx}/${needRt.length}] ✓ ${r.email}${result.plan_type ? " · " + result.plan_type : ""}`); }
-                else { fail++; rechargeLog(`[${idx}/${needRt.length}] ✗ ${r.email} ${result.reason || "失败"}`); }
-            } catch (e: any) { fail++; rechargeLog(`[${idx}/${needRt.length}] ✗ ${r.email} ${e?.message || e}`); }
+                if (result.ok) { ok++; rechargeLog(`[${idx}/${work.length}] ✓ ${r.email}${result.plan_type ? " · " + result.plan_type : ""}`); }
+                else { fail++; rechargeLog(`[${idx}/${work.length}] ✗ ${r.email} ${result.reason || "失败"}`); }
+            } catch (e: any) { fail++; rechargeLog(`[${idx}/${work.length}] ✗ ${r.email} ${e?.message || e}`); }
         }, rtConc);
         } finally {
             exportRtBusy = false;
         }
-        rechargeLog(`RT 获取完成: 成功 ${ok} / 失败 ${fail}`);
-        // 重新查询最新数据并通过 SSE 推送
+        rechargeLog(`${forceRelogin ? "重登导出" : "RT 获取"}完成: 成功 ${ok} / 失败 ${fail}`);
         const freshRows = await db.listRechargeQueueFull(ids.length ? ids : undefined, batch || undefined);
         const text = freshRows.map((r: any) => {
             const tok = extractTokens(r.gpt_rt_data || r.gpt_auth_data || readJsonFileSafe(r.rt_file) || readJsonFileSafe(r.gpt_auth_file));
             return formatAccountExportLine(r, {rt: tok?.refreshToken || "", sep});
         }).join("\n");
-        broadcast("rechargeExportReady", {text});
-        rechargeLog(`导出含RT 已就绪，共 ${freshRows.length} 条`);
+        broadcast("rechargeExportReady", {text, relogin: forceRelogin});
+        rechargeLog(forceRelogin
+            ? `重登取 RT 完成，共 ${freshRows.length} 条，点「导出含RT」即可复制`
+            : `导出含RT 已就绪，共 ${freshRows.length} 条`);
     })();
 });
 

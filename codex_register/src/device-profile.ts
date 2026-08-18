@@ -90,6 +90,15 @@ export function generateRandomDeviceProfile(): DeviceProfile {
     return Math.random() < 0.68 ? buildDesktopProfile() : buildMobileProfile();
 }
 
+/** mail.com 网页登录只要桌面指纹（移动端会把首页登录层弄没）。 */
+export function generateDesktopDeviceProfile(): DeviceProfile {
+    return buildDesktopProfile();
+}
+
+export function isDeviceProfile(raw: any): raw is DeviceProfile {
+    return !!(raw && typeof raw === "object" && raw.userAgent && raw.viewportWidth && raw.platform);
+}
+
 export function getDeviceClientHints(profile: DeviceProfile): DeviceClientHints {
     const majorVersion = extractBrowserMajorVersion(profile.userAgent);
     const fullVersion = extractBrowserFullVersion(profile.userAgent);
@@ -132,7 +141,7 @@ function buildDesktopProfile(): DeviceProfile {
     const viewport = pick(DESKTOP_VIEWPORTS);
     const locale = pick(DESKTOP_LOCALES);
     const browser = Math.random() < 0.72 ? "chrome" : "edge";
-    const chromeMajor = randomInt(134, 146);
+    const chromeMajor = randomInt(146, 151);
     const chromeBuild = randomInt(6000, 9999);
     const chromePatch = randomInt(50, 220);
     const edgeMajor = clamp(chromeMajor + randomInt(-1, 0), 134, 146);

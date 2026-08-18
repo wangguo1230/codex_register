@@ -11,6 +11,7 @@ import {
     fetchMailBodyFor as fetchMailcomBodyFor,
     setMailProxy,
     getMailProxy,
+    sendMailcomMail,
 } from "../../src/mail/mailcom.js";
 import {fetchGmailImapInbox, fetchGmailImapBody} from "../../src/mail/google-imap.js";
 import {getEmailVerificationCode} from "../../src/mailbox.js";
@@ -29,7 +30,7 @@ export const deleteMailbox = (id) => db.deleteMailbox(id);
 export const setMailboxPassword = (id, pw, pwStatus) => db.setMailboxPassword(id, pw, pwStatus);
 
 // ---- 邮箱能力 ----
-export {changeMailcomPassword, verifyMailcomLogin, setMailProxy, getMailProxy};
+export {changeMailcomPassword, verifyMailcomLogin, setMailProxy, getMailProxy, sendMailcomMail};
 /** 取邮箱验证码(注册/绑定用);支持 minTimestampMs 只取新码、excludeCode 排除旧码 */
 export const getOtp = (email, opts) => getEmailVerificationCode(email, opts);
 
