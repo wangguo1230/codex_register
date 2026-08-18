@@ -225,6 +225,10 @@ export async function ensureSchema() {
         await client.query(`ALTER TABLE mailboxes ADD COLUMN IF NOT EXISTS proxy_ip TEXT DEFAULT ''`);
         await client.query(`ALTER TABLE mailboxes ADD COLUMN IF NOT EXISTS proxy_fail INTEGER DEFAULT 0`);
         await client.query(`ALTER TABLE mailboxes ADD COLUMN IF NOT EXISTS browser_fp JSONB DEFAULT '{}'::jsonb`);
+        await client.query(`ALTER TABLE mailboxes ADD COLUMN IF NOT EXISTS claimed_at BIGINT DEFAULT 0`);
+        // 上次被当作换绑目标试过的时间。候选按它升序排，失败放回池的号排到最后，
+        // 否则 ORDER BY id DESC 会让同一个号被每个账号反复探活（探活要开比特窗口，很贵）。
+        await client.query(`ALTER TABLE mailboxes ADD COLUMN IF NOT EXISTS rebind_tried_at BIGINT DEFAULT 0`);
 
         // 充值提交时间 + 多实例认领(谁点的谁跑)
         await client.query(`ALTER TABLE recharge_queue ADD COLUMN IF NOT EXISTS submitted_at BIGINT DEFAULT 0`);
@@ -241,6 +245,19 @@ export async function ensureSchema() {
         // 换绑前邮箱（首次换绑写入后保留，便于看 原→新）
         await client.query(`ALTER TABLE recharge_queue ADD COLUMN IF NOT EXISTS rebind_from TEXT DEFAULT ''`);
         await client.query(`CREATE INDEX IF NOT EXISTS idx_recharge_queue_delivery ON recharge_queue(delivery_status)`);
+
+        // 换绑意图：打官方 verify 之前先落盘。verify 之后失联时，靠这几列去官方对账，
+        // 判断"平台到底改没改"，避免库里还是旧邮箱、目标邮箱又被放回池给下一个号。
+        await client.query(`ALTER TABLE recharge_queue ADD COLUMN IF NOT EXISTS rebind_attempt_email TEXT DEFAULT ''`);
+        await client.query(`ALTER TABLE recharge_queue ADD COLUMN IF NOT EXISTS rebind_attempt_mailbox_id INTEGER DEFAULT 0`);
+        await client.query(`ALTER TABLE recharge_queue ADD COLUMN IF NOT EXISTS rebind_attempt_at BIGINT DEFAULT 0`);
+        await client.query(`ALTER TABLE recharge_queue ADD COLUMN IF NOT EXISTS rebind_attempt_stage TEXT DEFAULT ''`);
+        // 多实例：对账任务按行认领，避免两个实例同时给一个号收敛
+        await client.query(`ALTER TABLE recharge_queue ADD COLUMN IF NOT EXISTS rebind_instance TEXT DEFAULT ''`);
+        await client.query(`CREATE INDEX IF NOT EXISTS idx_recharge_queue_rebind_status ON recharge_queue(rebind_status)`);
+        // 官方 24h 换绑次数上限：限的是这个 ChatGPT 号，换目标/换出口都没用，只能等。
+        // 记下解禁时间，拦住"反复点换绑"——每点一次都要探活+begin，白烧目标号和限流额度。
+        await client.query(`ALTER TABLE recharge_queue ADD COLUMN IF NOT EXISTS rebind_blocked_until BIGINT DEFAULT 0`);
 
         // 发信：每次使用的粘性代理 session（一号一出口，日志可回放）
         await client.query(`

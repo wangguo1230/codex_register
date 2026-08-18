@@ -1,5 +1,7 @@
 // @ts-nocheck
 // 后端服务：REST(导入/控制/下载) + SSE(实时日志/状态/统计) + 静态托管前端
+import "./strip-env-proxy.js";
+import {cleanSpawnEnv} from "./strip-env-proxy.js";
 import express from "express";
 
 function isImapTlsCrash(err) {
@@ -53,15 +55,16 @@ import {clearMailboxJobStop, isMailboxJobStopped, requestMailboxJobStop} from ".
 import {peekSms, buildSmsLink, classifySms} from "../src/sms-broker.js";
 import {probeAt, probePlan, refreshRt, buildProxyDispatcher, decodeJwt} from "../src/token-check.js";
 import {enrollTotp} from "../src/mfa.js";
-import {changeChatgptEmail, needsPwdReauth} from "../src/change-email.js";
+import {changeChatgptEmail, needsPwdReauth, isSessionJsonAlive, fetchCurrentLoginEmail} from "../src/change-email.js";
 import {testGmailImap, isImapTransientError} from "../src/mail/google-imap.js";
 import {ensureGoogleLoggedIn} from "../src/mail/google-auth.js";
 import {rememberGoogleCred} from "../src/mail/google-account.js";
-import {isCredentialDead, isHardenIpError, isHardenLoginDead} from "../src/mail/google-state.js";
+import {isCredentialDead, isHardenIpError, isHardenLoginDead, gmailWebLoginFresh} from "../src/mail/google-state.js";
 import {rememberMailcomPassword} from "../src/mail/mailcom.js";
 import {ensureMailcomProfile} from "../src/mail/mailcom-fingerprint.js";
-import {sendMailcomViaPool, sendMailcomBatch, listMailSendLogsPublic, previewDeliveredSend, testSendDelivered} from "./domain/mail-send.js";
-import {startXray, stopXray, xrayStatus, listJumpXrays, isVlessUrl, stopJumpFleet} from "./xray-proxy.js";
+import {sendMailcomViaPool, sendMailcomBatch, listMailSendLogsPublic, previewDeliveredSend, startTestSendDelivered, getDeliveredSendJob, stopDeliveredSend} from "./domain/mail-send.js";
+import {runGmailLoginWorker} from "./domain/gmail-rebind-probe.js";
+import {startXray, stopXray, xrayStatus, listJumpXrays, isVlessUrl, stopJumpFleet, pickXrayBrowserProxy} from "./xray-proxy.js";
 import {queryClaudeInfo, claudeChat} from "../src/claude-api.js";
 import {execSync} from "node:child_process";
 
@@ -477,8 +480,10 @@ async function applyGoogleHardenResult(id, mb, r) {
     const loginDead = credDead || (!proven && (r.login === false || isHardenLoginDead(brief) || isHardenLoginDead(r.error || "")));
     const refuseImap = /拒绝生成应用密码|error generating your app password/i.test(brief);
     const genFail = refuseImap ? Number(st.imap_gen_fail || 0) + 1 : st.imap_gen_fail;
+    const loginOk = !!(r.ok || r.password || r.totpSecret || r.imapPassword);
     await db.refreshMailboxGoogleState(id, {
-        login: r.ok || r.password || r.totpSecret || r.imapPassword ? "ok" : (loginDead ? "fail" : undefined),
+        login: loginOk ? "ok" : (loginDead ? "fail" : undefined),
+        login_at: loginOk ? Date.now() : undefined,
         login_error: loginDead ? classifyHardenLoginError(brief || r.error || "登录失败") : undefined,
         password: r.passwordChanged ? "ok" : undefined,
         totp: r.totpSecret ? "ok" : undefined,
@@ -724,19 +729,41 @@ app.post("/api/recharge/queue/test-send", async (req, res) => {
     const ids = (req.body?.ids || []).map(Number).filter(Number.isInteger);
     if (!ids.length) return res.status(400).json({error: "未选择账号"});
     try {
-        const r = await testSendDelivered(ids, {
+        const r = await startTestSendDelivered(ids, {
             to: req.body?.to,
             subject: req.body?.subject,
             html: req.body?.html,
             text: req.body?.text,
             concurrency: req.body?.concurrency,
             log: (m) => rechargeLog(m),
+            onDone: (done) => {
+                if (done?.error && !done.sent) rechargeLog(`测试发信失败: ${done.error}`);
+                else rechargeLog(`测试发信 ${done?.sent || 0} 成功 / ${done?.failed || 0} 失败 / ${done?.skipped || 0} 跳过 → ${done?.to || ""}`);
+                broadcast("rechargeSendDone", {
+                    ok: !!done?.ok,
+                    sent: done?.sent || 0,
+                    failed: done?.failed || 0,
+                    skipped: done?.skipped || 0,
+                    to: done?.to || "",
+                    error: done?.error || "",
+                    stopped: !!getDeliveredSendJob().stop,
+                });
+            },
         });
-        rechargeLog(`测试发信 ${r.sent} 成功 / ${r.failed} 失败 / ${r.skipped} 跳过 → ${r.to}`);
+        rechargeLog(`测试发信已开始 ${r.queued} 封 → ${r.to}（后台跑，进度看日志）`);
         res.json(r);
     } catch (e: any) {
-        res.status(400).json({ok: false, error: String(e?.message || e).slice(0, 240)});
+        const msg = String(e?.message || e).slice(0, 240);
+        res.status(/已有/.test(msg) ? 409 : 400).json({ok: false, error: msg});
     }
+});
+app.get("/api/recharge/queue/test-send", (_req, res) => {
+    res.json({ok: true, ...getDeliveredSendJob()});
+});
+app.post("/api/recharge/queue/test-send/stop", (_req, res) => {
+    const r = stopDeliveredSend();
+    if (r.running) rechargeLog("已请求停止测试发信，当前这封跑完就停");
+    res.json(r);
 });
 
 app.get("/api/gpt/proxy-pool", (req, res) => {
@@ -2043,22 +2070,57 @@ async function testOneAt(acc, {relogin = false} = {}) {
 // mailcom provider 收邮箱 OTP 需临时单行池文件(email----邮箱密码)，与注册 worker 同套。
 // test worker(rt/chat)日志:同时落库(db.appendLog)+SSE,以便事后在库里查失败过程(如 rt 的 add-phone/接码/400)
 function logAcct(id, line) { db.appendLog(id, line).catch(() => {}); broadcast("log", {id, line, ts: Date.now()}); }
+/** worker 若吐出没有换行的超大 JSON/HTML，主进程 buf += 会把 3100 吃到几十 GB。 */
+function pipeWorkerStdout(child, {onLine, onEvent, maxBuf = 512 * 1024} = {}) {
+    let buf = "";
+    const feed = (chunk) => {
+        buf += String(chunk || "");
+        if (buf.length > maxBuf) buf = buf.slice(-Math.floor(maxBuf / 2));
+        let idx;
+        while ((idx = buf.indexOf("\n")) >= 0) {
+            const line = buf.slice(0, idx);
+            buf = buf.slice(idx + 1);
+            if (line.startsWith("@@EVENT@@") || line.startsWith("@@RESULT@@")) {
+                try { onEvent?.(JSON.parse(line.replace(/^@@(EVENT|RESULT)@@/, ""))); } catch { /* */ }
+            } else if (line.trim()) {
+                try { onLine?.(line.trim().slice(0, 220)); } catch { /* */ }
+            }
+        }
+    };
+    child.stdout?.on("data", feed);
+    child.stderr?.on("data", (d) => {
+        const s = String(d || "").trim();
+        if (s) try { onLine?.(`[err] ${s.slice(0, 160)}`); } catch { /* */ }
+    });
+}
+let exportRtBusy = false;
+let exportRtStop = false;
+const exportLiveChildren = new Set();
+function attachExportChild(child) {
+    if (!exportRtBusy || !child) return;
+    exportLiveChildren.add(child);
+    const drop = () => exportLiveChildren.delete(child);
+    child.once("close", drop);
+    child.once("exit", drop);
+}
+function killExportChildren() {
+    for (const c of [...exportLiveChildren]) {
+        try { c.kill("SIGKILL"); } catch { /* */ }
+        exportLiveChildren.delete(c);
+    }
+}
 // 邮箱域操作日志(登录/改密/收信):写独立 mailbox_logs 表 + 独立 SSE 事件 mbLog,与 GPT 注册日志隔离,分别管理。
 function logMailbox(id, line) { db.appendMailboxLog(id, line).catch(() => {}); broadcast("mbLog", {id, line, ts: Date.now()}); }
 function runRtWorker(acc, preferPhone, {onProgress, timeoutMs = 180000} = {}) {
     const note = (m) => { logAcct(acc.id, `[rt] ${m}`); try { onProgress?.(m); } catch { /* */ } };
     return withLeasedGptProxy(`rt-acquire:${acc.email || acc.id}`, async (exit, jump) => {
-        let local = null;
         let proxyUrl = String(exit || "").trim();
-        try {
-            if (proxyUrl && proxyHasSocksAuth(proxyUrl)) {
-                const {openNoAuthSocksToAuthedProxy} = await import("../src/mail/proxy-chain.js");
-                local = await openNoAuthSocksToAuthedProxy(proxyUrl, jump || "");
-                proxyUrl = local.url;
-                note(`GPT 池 ${maskProxyUrl(exit)}${jump ? " +跳板" : ""} → :${local.localPort}`);
-            } else if (!proxyUrl) {
+        {
+            if (!proxyUrl) {
                 proxyUrl = scheduler.rtProxy || scheduler.regProxy || "";
                 note(`GPT 池空，回退 ${maskProxyUrl(proxyUrl) || "无代理"}`);
+            } else {
+                note(`GPT 池 ${maskProxyUrl(proxyUrl)}${jump ? " +跳板 " + maskProxyUrl(jump) : ""}（转发在子进程，不进 3100）`);
             }
             return await new Promise((resolve) => {
         let settled = false;
@@ -2080,8 +2142,7 @@ function runRtWorker(acc, preferPhone, {onProgress, timeoutMs = 180000} = {}) {
         note(`启动 worker 获取 refresh_token${useSessionRt ? "(会话换rt,不接码)" : ""}${preferPhone ? `(复用绑定号 +${preferPhone})` : ""}${acc.mailbox_imap ? " +IMAP" : ""}…`);
         const child = spawn(CHAT_TSX_BIN, [useSessionRt ? "scripts/worker-rt-nosms.ts" : "src/worker-rt.ts"], { shell: IS_WIN,
             cwd: CHAT_ROOT,
-            env: {
-                ...process.env,
+            env: cleanSpawnEnv({
                 REG_EMAIL: acc.email,
                 MAIL_PROVIDER: acc.provider || "mailcom",
                 MAILCOM_TOKENS_FILE: tmpFile, ICLOUD_TOKENS_FILE: tmpFile,
@@ -2090,41 +2151,31 @@ function runRtWorker(acc, preferPhone, {onProgress, timeoutMs = 180000} = {}) {
                 SMS_MAX_BIND: String(scheduler.smsMaxBind ?? 0),
                 RT_PREFER_PHONE: preferPhone || "",
                 PROXY_URL: proxyUrl,
+                MAIL_PROXY_JUMP: jump || "",
                 MAILCOM_PROXY: proxyUrl,
                 GPT_PASSWORD: (acc.gpt_password || appConfig.defaultPassword || "").trim(),
                 TOTP_SECRET: acc.totp_secret || "",
                 // PG 迁移后 worker 通过 process.env.DATABASE_URL 继承连接
-            },
+            }),
         });
+        attachExportChild(child);
         timer = setTimeout(() => {
             try { child.kill("SIGKILL"); } catch { /* */ }
             note(`超时(${Math.round(timeoutMs / 1000)}s)，已杀掉 worker`);
             finish({ok: false, reason: `超时(${Math.round(timeoutMs / 1000)}s)，取码/OAuth卡住`});
         }, timeoutMs);
-        let buf = "";
         let result = null;
         child.on("error", async (e) => {
             try { rmSync(tmpDir, {recursive: true, force: true}); } catch { /* ignore */ }
             await pushTestStatus(acc.id, "rt", "❌启动失败:" + (e?.message ?? e));
             finish({ok: false, reason: String(e?.message || e)});
         });
-        child.stdout.on("data", (d) => {
-            buf += d.toString();
-            let idx;
-            while ((idx = buf.indexOf("\n")) >= 0) {
-                const line = buf.slice(0, idx); buf = buf.slice(idx + 1);
-                if (line.startsWith("@@EVENT@@")) {
-                    try {
-                        const ev = JSON.parse(line.slice(9));
-                        if (ev.type === "progress") note(ev.message);
-                        else if (ev.type === "result") result = ev;
-                    } catch { /* ignore */ }
-                } else if (line.trim()) note(line.trim());
-            }
-        });
-        child.stderr.on("data", (d) => {
-            const msg = String(d).trim();
-            if (msg) note(`[stderr] ${msg.slice(0, 160)}`);
+        pipeWorkerStdout(child, {
+            onLine: note,
+            onEvent: (ev) => {
+                if (ev?.type === "progress") note(ev.message);
+                else if (ev?.type === "result") result = ev;
+            },
         });
         child.on("close", async () => {
             try { rmSync(tmpDir, {recursive: true, force: true}); } catch { /* ignore */ }
@@ -2147,8 +2198,6 @@ function runRtWorker(acc, preferPhone, {onProgress, timeoutMs = 180000} = {}) {
             }
         });
             });
-        } finally {
-            try { local?.close(); } catch { /* */ }
         }
     }, {timeoutMs: 45_000, log: note});
 }
@@ -2188,10 +2237,18 @@ function pickMailcomBrowserProxy(...candidates) {
     return "";
 }
 
+function exitNeedsJump(proxyUrl) {
+    try {
+        const u = new URL(String(proxyUrl || "").includes("://") ? String(proxyUrl).split("#")[0] : `socks5://${proxyUrl}`);
+        return u.hostname !== "127.0.0.1" && u.hostname !== "localhost";
+    } catch {
+        return true;
+    }
+}
+
 /**
  * 与邮箱整备同款：从 GPT 代理池租一条（1 代理 = 1 任务 · 新 sticky session）。
- * 池空则 fallback 充值代理；池满超时则回退充值代理，不堵死换绑。
- * 协议重登/authorize 429 靠换出口，不能全挤在 10808 一条线上。
+ * 远程出口（kookeey）必须带跳板，租不到也用配置跳板，禁止国内直连。
  */
 async function withLeasedGptProxy(owner, fn, {timeoutMs = 45_000, log, noEmptyFallback = false} = {}) {
     const who = String(owner || "gpt-relogin");
@@ -2209,9 +2266,15 @@ async function withLeasedGptProxy(owner, fn, {timeoutMs = 45_000, log, noEmptyFa
     };
     try {
         if (gptJumpPool.urls.length) {
-            jumpLease = await gptJumpPool.lease(who, {timeoutMs: Math.min(timeoutMs, 20_000), maxPerJump: JUMP_MAX_EXITS});
-        } else if (scheduler.gptProxyJump) {
-            // 单跳板配置也算有跳板（池为空时仍可链式）
+            try {
+                jumpLease = await gptJumpPool.lease(who, {
+                    timeoutMs: noEmptyFallback ? 45_000 : Math.min(timeoutMs, 20_000),
+                    maxPerJump: JUMP_MAX_EXITS,
+                });
+            } catch (e: any) {
+                try { log?.(`跳板租约未成: ${String(e?.message || e).slice(0, 80)}，仍用配置跳板，不直连出口`); } catch { /* */ }
+                jumpLease = null;
+            }
         }
         lease = await gptProxyPool.lease(who, {
             fallback: noEmptyFallback ? "" : rechargeProxy(),
@@ -2221,16 +2284,23 @@ async function withLeasedGptProxy(owner, fn, {timeoutMs = 45_000, log, noEmptyFa
         });
         const proxyUrl = String(lease?.url || "").trim() || (noEmptyFallback ? "" : rechargeProxy()) || "";
         if (!proxyUrl) throw new Error("GPT 代理池租约空且无充值代理");
-        const jumpUrl = jumpLease?.url || scheduler.gptProxyJump || "";
+        const configuredJump = scheduler.gptProxyJump || gptJumpPool.urls[0] || "";
+        const jumpUrl = exitNeedsJump(proxyUrl)
+            ? (jumpLease?.url || configuredJump || "")
+            : "";
+        if (exitNeedsJump(proxyUrl) && !jumpUrl) {
+            throw new Error("远程出口需要跳板，当前没有可用跳板（禁止直连 kookeey）");
+        }
         try {
-            log?.(`GPT 代理池 ${maskProxyUrl(proxyUrl)}${jumpUrl ? " · 跳板 " + maskProxyUrl(jumpUrl) : ""}（一号一代理 · 新 session）`);
+            log?.(`GPT 代理池 ${maskProxyUrl(proxyUrl)}${jumpUrl ? " · 跳板 " + maskProxyUrl(jumpUrl) : " · 无跳板"}（一号一代理 · 新 session）`);
         } catch { /* */ }
         return await fn(proxyUrl, jumpUrl);
     } catch (e) {
         const msg = String(e?.message || e);
-        if (noEmptyFallback && !rechargeProxy()) throw e;
-        if (/代理池全忙|等待超时|租约空/i.test(msg)) return runFallback(/忙|超时/.test(msg) ? "忙" : "空");
-        if (!rechargeProxy() && !scheduler.gptProxyPool?.length) throw e;
+        if (noEmptyFallback) throw e;
+        if (!rechargeProxy()) throw e;
+        if (/代理池全忙|等待超时|租约空|跳板池全忙|需要跳板/i.test(msg)) return runFallback(/忙|超时/.test(msg) ? "忙" : "空");
+        if (!scheduler.gptProxyPool?.length) throw e;
         return runFallback(`租约失败(${msg.slice(0, 60)})`);
     } finally {
         try { lease?.release(); } catch { /* */ }
@@ -2244,8 +2314,8 @@ function reloginIdleMs(_acc) {
 }
 // at 失效优先协议登录(密码/邮箱码/TOTP);协议失败再回退浏览器。
 // opts.proxy=出口；opts.jump：undefined=用配置默认跳板；""/null=强制不跳板（10808 本地出口必须如此）。
-// 有跳板且出口非本机时 wrap 成本机链式 SOCKS。
-function spawnReloginWorker(acc, {proxy, jump, script = "src/worker-login-http.ts", timeoutMs = 0, skipMfa = false, onProgress} = {}) {
+// 协议：子进程 installWorkerProxyFromEnv 自转发（不进 :3100）。浏览器：只走本机 xray。
+function spawnReloginWorker(acc, {proxy, jump, script = "src/worker-login-http.ts", timeoutMs = 0, skipMfa = false, onProgress, gptPassword} = {}) {
     return new Promise(async (resolve) => {
         let settled = false;
         let beatTimer = null;
@@ -2284,50 +2354,37 @@ function spawnReloginWorker(acc, {proxy, jump, script = "src/worker-login-http.t
         const jumpUrl = jump === undefined
             ? String(scheduler.gptProxyJump || scheduler.mailProxyJump || "").trim()
             : String(jump || "").trim();
-        // 出口是外网网关时：本机 → 跳板 → kookeey
         const exitHostLocal = (() => {
             try {
                 const u = new URL(exitProxy.includes("://") ? exitProxy.split("#")[0] : `socks5://${exitProxy}`);
                 return u.hostname === "127.0.0.1" || u.hostname === "localhost";
             } catch { return false; }
         })();
-        if (exitProxy && jumpUrl && !exitHostLocal) {
-            try {
-                const {wrapExitThroughJump} = await import("../src/mail/proxy-chain.js");
-                const wrapped = await wrapExitThroughJump(exitProxy, jumpUrl);
-                note(`链式已接通 跳板 ${maskProxyUrl(jumpUrl)} → 出口 ${maskProxyUrl(exitProxy)} · 本机 :${wrapped.localPort}`);
-                chainClose = wrapped.close;
-                exitProxy = wrapped.url;
-            } catch (e) {
-                note(`跳板链式失败(${String(e?.message || e).slice(0, 80)})，仍用出口（无跳板时国内访问 kookeey 易超时）`);
+        const isBrowserWorker = /worker-register-browser|register-browser|worker-register-claude/i.test(String(script || ""));
+        if (isBrowserWorker) {
+            const xray = pickXrayBrowserProxy(rechargeProxy(), scheduler.rtProxy, scheduler.regProxy);
+            if (!xray) {
+                finish({ok: false, reason: "浏览器必须走 xray，本机没有可用的 xray socks（10811/10808）"});
+                return;
             }
+            if (exitProxy !== xray) note(`浏览器改走 xray ${maskProxyUrl(xray)}（不用 JS 转发 kookeey）`);
+            exitProxy = xray;
+        } else if (exitProxy && jumpUrl && !exitHostLocal) {
+            note(`出口 ${maskProxyUrl(exitProxy)} + 跳板 ${maskProxyUrl(jumpUrl)}（协议转发在子进程）`);
         } else if (exitProxy && !jumpUrl && !exitHostLocal) {
             note(`无跳板，经出口 ${maskProxyUrl(exitProxy)}（国内访问 kookeey 常需跳板）`);
         } else if (exitHostLocal) {
             note(`本地出口 ${maskProxyUrl(exitProxy)}（不套跳板）`);
         }
-        // OpenAI 协议登录：PROXY_URL 可用 kookeey 账密（undici socks 支持）
-        // 浏览器 worker / mail.com Playwright：绝不能带 socks 账密
-        const isBrowserWorker = /worker-register-browser|register-browser/i.test(String(script || ""));
-        if (isBrowserWorker && proxyHasSocksAuth(exitProxy)) {
-            const safe = pickMailcomBrowserProxy(rechargeProxy(), scheduler.rtProxy, scheduler.regProxy) || "";
-            if (safe) {
-                note(`浏览器 worker 去掉 socks 账密出口，改用 ${maskProxyUrl(safe)}`);
-                try { chainClose(); } catch { /* */ }
-                chainClose = () => {};
-                exitProxy = safe;
-            } else {
-                finish({ok: false, reason: "Browser does not support socks5 proxy authentication（无可用无账密代理如 10808）"});
-                return;
-            }
-        }
         const mailProxyConfigured = (scheduler.mailProxyEnabled !== false && scheduler.mailProxy)
             ? scheduler.mailProxy
             : "";
-        const mailProxy = pickMailcomBrowserProxy(mailProxyConfigured, rechargeProxy());
-        const viaJump = !!(jumpUrl && String(exitProxy).includes("127.0.0.1") && proxyHasSocksAuth(exitProxy));
+        const mailProxy = pickXrayBrowserProxy(mailProxyConfigured, rechargeProxy()) || pickMailcomBrowserProxy(mailProxyConfigured, rechargeProxy());
+        const viaJump = !isBrowserWorker && !!(jumpUrl && !exitHostLocal);
+        const gptPw = String(gptPassword || acc.gpt_password || appConfig.defaultPassword || "").trim();
         note(
-            `邮箱密码用库内当前值 ${String(acc.password || "").slice(0, 4)}…(${String(acc.password || "").length}位)`
+            `邮箱密码 ${String(acc.password || "").slice(0, 4)}…(${String(acc.password || "").length}位)`
+            + ` · GPT密码 ${gptPw.slice(0, 4)}…(${gptPw.length}位)`
             + `${mailcomHeadless === "0" ? "；mail.com 有头" : "；mail.com 无头收码"}`
             + ` · GPT代理=${exitProxy ? maskProxyUrl(exitProxy) : "直连"}${viaJump ? "（经跳板）" : ""}`
             + ` · 收码代理=${mailProxy ? maskProxyUrl(mailProxy) : "直连"}`
@@ -2338,32 +2395,31 @@ function spawnReloginWorker(acc, {proxy, jump, script = "src/worker-login-http.t
         try {
             child = spawn(CHAT_TSX_BIN, [script], {
                 shell: IS_WIN, cwd: CHAT_ROOT,
-                env: {
-                    ...process.env,
+                env: cleanSpawnEnv({
                     REG_EMAIL: acc.email,
                     MAIL_PROVIDER: acc.provider || "mailcom",
                     MAILCOM_TOKENS_FILE: tmpFile, ICLOUD_TOKENS_FILE: tmpFile,
                     MAILCOM_HEADLESS: mailcomHeadless,
-                    // 浏览器：不再传跳板（避免 worker 内再 wrap 出带账密的链）
                     PROXY_URL: exitProxy || "",
                     MAIL_PROXY_JUMP: isBrowserWorker ? "" : jumpUrl,
                     MAILCOM_PROXY: mailProxy,
                     REG_SIMULATE_CHAT: "",
                     REG_TRY_RT: "0",
-                    GPT_PASSWORD: (acc.gpt_password || appConfig.defaultPassword || "").trim(),
+                    GPT_PASSWORD: gptPw,
                     TOTP_SECRET: acc.totp_secret || "",
                     REG_TRY_MFA: skipMfa ? "0" : (acc.totp_secret ? "0" : "1"),
                     // 重登要快失败换出口：少重试、短等待（默认 4×(2/4/6/8)s 会拖到 1 分钟+）
                     OPENAI_FETCH_RETRY: process.env.OPENAI_FETCH_RETRY || "2",
                     OPENAI_FETCH_RETRY_DELAY_MS: process.env.OPENAI_FETCH_RETRY_DELAY_MS || "800",
-                },
+                }),
             });
         } catch (e) {
             try { rmSync(tmpDir, {recursive: true, force: true}); } catch { /* */ }
             finish({ok: false, reason: `启动 worker 失败: ${e?.message || e}`});
             return;
         }
-        let buf = "", result = null;
+        attachExportChild(child);
+        let result = null;
         let idleTimer = null, killTimer = null, stopping = false;
         const idleMs = timeoutMs > 0 ? timeoutMs : 90_000;
         const startedAt = Date.now();
@@ -2383,8 +2439,8 @@ function spawnReloginWorker(acc, {proxy, jump, script = "src/worker-login-http.t
                 : (n ? "已写回最新 session（GPT + 充值队列）" : "已写回最新 session（GPT）"));
             return {ok: true, authFile: result.authFile, authData};
         };
-        // 协议重登：空转 45s 就杀；显式 timeoutMs 优先。心跳仅作进度提示。
-        const effectiveIdle = timeoutMs > 0 ? timeoutMs : Math.min(idleMs, 45_000);
+        // 等邮箱 OTP（Gmail IMAP 常 1–2 分钟才到）不能 45s 就杀。心跳不算进度，只认 worker 日志。
+        const effectiveIdle = Math.max(timeoutMs > 0 ? timeoutMs : idleMs, 180_000);
         const armIdle = () => {
             if (idleTimer) clearTimeout(idleTimer);
             idleTimer = setTimeout(() => {
@@ -2419,17 +2475,14 @@ function spawnReloginWorker(acc, {proxy, jump, script = "src/worker-login-http.t
             note(`仍在跑，已 ${elapsed}s（子进程 ${silent}s 无新步骤）`);
         }, 15_000);
         child.on("error", (e) => note(`worker 启动失败: ${e?.message || e}`));
-        child.stdout.on("data", (d) => {
-            touch();
-            buf += d.toString(); let idx;
-            while ((idx = buf.indexOf("\n")) >= 0) {
-                const line = buf.slice(0, idx); buf = buf.slice(idx + 1);
-                if (line.startsWith("@@EVENT@@")) {
-                    try { const ev = JSON.parse(line.slice(9)); if (ev.type === "progress") note(ev.message); else if (ev.type === "result") result = ev; } catch { /* ignore */ }
-                } else if (line.trim()) note(line.trim().slice(0, 160));
-            }
+        pipeWorkerStdout(child, {
+            onLine: (line) => { touch(); note(line); },
+            onEvent: (ev) => {
+                touch();
+                if (ev?.type === "progress") note(ev.message);
+                else if (ev?.type === "result") result = ev;
+            },
         });
-        child.stderr.on("data", (d) => { touch(); note(`[err] ${String(d).slice(0, 160)}`); });
         child.on("close", async () => {
             if (idleTimer) clearTimeout(idleTimer);
             if (killTimer) clearTimeout(killTimer);
@@ -2456,39 +2509,45 @@ function spawnReloginWorker(acc, {proxy, jump, script = "src/worker-login-http.t
         });
     });
 }
-async function runReloginAtWorker(acc, {proxy, jump = "", timeoutMs = 0, allowBrowser = true, skipMfa = false, onProgress} = {}) {
+async function runReloginAtWorker(acc, {proxy, jump = "", timeoutMs = 0, allowBrowser = true, skipMfa = false, onProgress, gptPassword} = {}) {
     const note = (m) => { logAcct(acc.id, `[at] ${m}`); try { onProgress?.(m); } catch { /* */ } };
     note("走协议登录重新获取 at(密码/邮箱码/TOTP)…");
-    const http = await spawnReloginWorker(acc, {proxy, jump, script: "src/worker-login-http.ts", timeoutMs, skipMfa, onProgress});
+    const http = await spawnReloginWorker(acc, {proxy, jump, script: "src/worker-login-http.ts", timeoutMs, skipMfa, onProgress, gptPassword});
     if (http.ok || /account_deactivated/i.test(http.reason || "") || !allowBrowser) return http;
     note(`协议登录失败(${String(http.reason || "").slice(0, 80)}),回退浏览器…`);
     // Playwright/Chrome 不支持 socks5 user:pass。kookeey 链式 URL 仍带账密 → 会直接炸
     // 「Browser does not support socks5 proxy authentication」。浏览器只走无账密本地代理(充值 10808 等)。
-    const browserProxy = pickMailcomBrowserProxy(rechargeProxy(), scheduler.rtProxy, scheduler.regProxy, proxy) || "";
+    const browserProxy = pickXrayBrowserProxy(rechargeProxy(), scheduler.rtProxy, scheduler.regProxy) || "";
     if (!browserProxy) {
-        note("无可用无账密浏览器代理(请配充值代理 10808)，浏览器回退跳过");
-        return {...http, reason: `${http.reason || "协议失败"}；浏览器回退无可用无账密代理`};
+        note("浏览器必须走 xray，本机没有 10811/10808，浏览器回退跳过");
+        return {...http, reason: `${http.reason || "协议失败"}；浏览器回退无可用 xray`};
     }
-    if (proxyHasSocksAuth(proxy) || (jump && proxy)) {
-        note(`浏览器改用无账密代理 ${maskProxyUrl(browserProxy)}（不套 kookeey 账密/跳板链）`);
-    }
+    note(`浏览器回退走 xray ${maskProxyUrl(browserProxy)}`);
     return spawnReloginWorker(acc, {
         proxy: browserProxy,
         jump: "",
         script: "src/worker-register-browser.ts",
-        timeoutMs, skipMfa, onProgress,
+        timeoutMs, skipMfa, onProgress, gptPassword,
     });
 }
 
-/** 可换出口再试：网络抖动 / CF 403 / 429 / TLS 掐断 / fetch failed 等 */
-function isReloginRetryable(reason) {
-    return /429|403|authorize|chatgpt\.com|打开 OpenAI|Proxy connection|timed out|timeout|ECONN|ENOTFOUND|EPIPE|EHOST|network|socket|TLS|fetch failed|disconnected|secure TLS|超时|限流|Cloudflare|Just a moment|rate_limit|请求过多|身份验证错误|too many requests/i
+/** 号已经没了，换出口也登不上 */
+function isAccountDeadReason(reason) {
+    return /account_deactivated|账户已被删除或停用|已被删除或停用|deleted or deactivated|account.{0,12}deactivated/i
         .test(String(reason || ""));
 }
 
-/** authorize 出口被限流时才值得换 kookeey 池（换 IP）；纯网络/TLS/403 优先本地 10808 */
+/** 官方 429 / too many：换出口只会越打越限，立刻停。 */
 function isAuthorizeRateLimited(reason) {
-    return /429|authorize 页|打开 OpenAI authorize|Retry-After|限流|rate_limit|请求过多|身份验证错误|too many requests/i.test(String(reason || ""));
+    return /429|rate_limit_exceeded|too many requests|请求过多|Retry-After/i.test(String(reason || ""));
+}
+
+/** 可换出口再试：网络抖动 / TLS / 跳板。429 和号废不要重试。 */
+function isReloginRetryable(reason) {
+    const s = String(reason || "");
+    if (isAccountDeadReason(s) || isAuthorizeRateLimited(s)) return false;
+    return /403|409|invalid_state|no longer valid|authorize|chatgpt\.com|打开 OpenAI|Proxy connection|timed out|timeout|ECONN|ENOTFOUND|EPIPE|EHOST|network|socket|TLS|fetch failed|disconnected|secure TLS|超时|Cloudflare|Just a moment|身份验证错误|跳板池全忙|代理池全忙/i
+        .test(s);
 }
 
 /**
@@ -2507,6 +2566,7 @@ async function runReloginAtWorkerPooled(acc, {
     onProgress,
     usePool = true,
     preferPool = false,
+    gptPassword,
 } = {}) {
     const note = (m) => {
         // onProgress 通常已带 [at] 前缀落库；无回调时自己写
@@ -2526,85 +2586,63 @@ async function runReloginAtWorkerPooled(acc, {
         return runReloginAtWorker(acc, {
             proxy: p,
             jump: forced ? defaultJump : "",
-            timeoutMs, allowBrowser, skipMfa, onProgress,
+            timeoutMs, allowBrowser, skipMfa, onProgress, gptPassword,
         });
     }
 
     let last = {ok: false, reason: "未尝试"};
-    const localProxy = rechargeProxy();
-    // ① 充值代理 10808（充值批量重登跳过：同一出口会身份验证限流）
-    if (preferPool) {
-        note("① 跳过 10808，充值重登直接 GPT 池换出口");
-    } else if (localProxy) {
-        note(`① 协议重登走充值代理 ${maskProxyUrl(localProxy)}`);
-        last = await runReloginAtWorker(acc, {
-            proxy: localProxy,
-            jump: "",
-            timeoutMs,
-            allowBrowser: false,
-            skipMfa, onProgress,
-        });
-        if (last?.ok) return last;
-        note(`① 充值代理失败: ${String(last?.reason || "").slice(0, 100)}`);
-    } else {
-        note("① 未配置 rtProxy/充值代理，跳过 10808，直接 GPT 池");
+    // 链式：GPT 池 kookeey + 跳板。10811 只是 vless 跳板本机入口，不是出口。
+    const poolSize = Math.max(0, Number(scheduler.gptProxyPoolSnap?.total || gptProxyPool.urls?.length || 0));
+    const maxPoolTries = Math.min(3, Math.max(1, poolSize || 1));
+    if (poolSize) {
+        for (let i = 0; i < maxPoolTries; i++) {
+            note(`① 协议重登链式 GPT 池（${i + 1}/${maxPoolTries}）`);
+            try {
+                last = await withLeasedGptProxy(acc.email, async (proxyUrl, jumpUrl) => {
+                    const p = String(proxyUrl || "").trim();
+                    if (!p) throw new Error("池租约为空");
+                    note(`   出口 ${maskProxyUrl(p)}${jumpUrl ? " ←跳板 " + maskProxyUrl(jumpUrl) : ""}`);
+                    return runReloginAtWorker(acc, {
+                        proxy: p,
+                        jump: jumpUrl || "",
+                        timeoutMs,
+                        allowBrowser: false,
+                        skipMfa, onProgress, gptPassword,
+                    });
+                }, {log: note, timeoutMs: 45_000, noEmptyFallback: true});
+            } catch (e: any) {
+                last = {ok: false, reason: String(e?.message || e).slice(0, 160)};
+                note(`   链式失败: ${last.reason}`);
+            }
+            if (last?.ok) return last;
+            if (isAccountDeadReason(last?.reason)) return last;
+            if (isAuthorizeRateLimited(last?.reason)) {
+                note(`官方限流 429，停止换出口（再打会更限）`);
+                return last;
+            }
+            if (i + 1 < maxPoolTries && isReloginRetryable(last?.reason)) {
+                note(`本条链不通，换出口再试: ${String(last?.reason || "").slice(0, 80)}`);
+                await new Promise((r) => setTimeout(r, 800));
+                continue;
+            }
+            break;
+        }
     }
 
-    // ② GPT 池：本地空/超时/429 都多试几次换出口（Connect Timeout 也算可重试）
-    if (!isReloginRetryable(last?.reason) && last?.reason !== "未尝试") return last;
-    const poolSize = Math.max(1, Number(scheduler.gptProxyPoolSnap?.total || gptProxyPool.urls?.length || 0));
-    const maxPoolTries = Math.min(5, Math.max(3, poolSize)); // 至少 3 次，池大可到 5
-    if (!poolSize && !localProxy) {
-        return {ok: false, reason: "无可用代理：rtProxy 空且 GPT 代理池为空，禁止直连 chatgpt.com"};
-    }
-    for (let i = 0; i < maxPoolTries; i++) {
-        if (!poolSize) break;
-        const lastTry = i + 1 >= maxPoolTries;
-        note(`② GPT 代理池换出口（${i + 1}/${maxPoolTries}）${lastTry && allowBrowser ? "，失败可回退浏览器" : ""}`);
-        try {
-            last = await withLeasedGptProxy(acc.email, async (proxyUrl, jumpUrl) => {
-                const p = String(proxyUrl || "").trim();
-                if (!p) throw new Error("池租约为空");
-                note(`   池出口 ${maskProxyUrl(p)}${jumpUrl ? " + 跳板 " + maskProxyUrl(jumpUrl) : ""}`);
-                return runReloginAtWorker(acc, {
-                    proxy: p,
-                    jump: jumpUrl || defaultJump,
-                    timeoutMs,
-                    allowBrowser: allowBrowser && lastTry,
-                    skipMfa, onProgress,
-                });
-            }, {
-                log: note,
-                timeoutMs: 45_000,
-                // 池失败时不要静默回退「空代理直连」
-                noEmptyFallback: true,
-            });
-        } catch (e: any) {
-            last = {ok: false, reason: String(e?.message || e).slice(0, 160)};
-            note(`   租约/池失败: ${last.reason}`);
-        }
-        if (last?.ok) return last;
-        if (i + 1 < maxPoolTries && isReloginRetryable(last?.reason)) {
-            await new Promise((r) => setTimeout(r, 2_000 + Math.random() * 2_000));
-            continue;
-        }
-        break;
-    }
-
-    // ③ 浏览器：仅无账密本地代理
-    if (allowBrowser && last && !last.ok) {
-        const browserProxy = pickMailcomBrowserProxy(rechargeProxy(), scheduler.rtProxy, scheduler.regProxy) || "";
+    // ③ 浏览器：只走本机 xray。429 不要回退再打一轮 authorize。
+    if (allowBrowser && last && !last.ok && !isAuthorizeRateLimited(last?.reason)) {
+        const browserProxy = pickXrayBrowserProxy(rechargeProxy(), scheduler.rtProxy, scheduler.regProxy) || "";
         if (browserProxy) {
-            note(`③ 浏览器回退 ${maskProxyUrl(browserProxy)}（无账密）`);
+            note(`③ 浏览器回退 xray ${maskProxyUrl(browserProxy)}`);
             last = await runReloginAtWorker(acc, {
                 proxy: browserProxy,
                 jump: "",
                 timeoutMs,
                 allowBrowser: true,
-                skipMfa, onProgress,
+                skipMfa, onProgress, gptPassword,
             });
         } else {
-            note("③ 无无账密浏览器代理，跳过浏览器回退");
+            note("③ 本机没有可用 xray，跳过浏览器回退");
         }
     }
     return last;
@@ -2882,28 +2920,30 @@ function runChatWorker(acc, message) {
             if (authData) { tmpAuthFile = path.join(os.tmpdir(), `chat-auth-${acc.id}-${Date.now()}.json`); writeFileSync(tmpAuthFile, JSON.stringify(authData)); return tmpAuthFile; }
             return acc.auth_file || "";
         })();
+        const xray = pickXrayBrowserProxy(scheduler.regProxy, scheduler.rtProxy, rechargeProxy());
+        if (!xray) {
+            await pushTestStatus(acc.id, "chat", "❌无xray");
+            resolve({ok: false, reason: "浏览器必须走 xray，本机没有 10811/10808"});
+            return;
+        }
         const child = spawn(CHAT_TSX_BIN, ["src/worker-chat.ts"], {
             shell: IS_WIN, cwd: CHAT_ROOT,
-            env: {...process.env, CHAT_AUTH_FILE: chatAuthFile, CHAT_MESSAGE: message || "", PROXY_URL: scheduler.regProxy || ""},
+            env: cleanSpawnEnv({
+                CHAT_AUTH_FILE: chatAuthFile,
+                CHAT_MESSAGE: message || "",
+                PROXY_URL: xray,
+                MAIL_PROXY_JUMP: "",
+            }),
         });
-        let buf = "";
         let result = null;
         child.on("error", (e) => logAcct(acc.id, `[chat] worker 启动失败: ${e?.message || e}`));
-        child.stdout.on("data", (d) => {
-            buf += d.toString();
-            let idx;
-            while ((idx = buf.indexOf("\n")) >= 0) {
-                const line = buf.slice(0, idx); buf = buf.slice(idx + 1);
-                if (line.startsWith("@@EVENT@@")) {
-                    try {
-                        const ev = JSON.parse(line.slice(9));
-                        if (ev.type === "progress") broadcast("log", {id: acc.id, line: `[chat] ${ev.message}`, ts: Date.now()});
-                        else if (ev.type === "result") result = ev;
-                    } catch { /* ignore */ }
-                } else if (line.trim()) broadcast("log", {id: acc.id, line: `[chat] ${line}`, ts: Date.now()});
-            }
+        pipeWorkerStdout(child, {
+            onLine: (line) => broadcast("log", {id: acc.id, line: `[chat] ${line}`, ts: Date.now()}),
+            onEvent: (ev) => {
+                if (ev?.type === "progress") broadcast("log", {id: acc.id, line: `[chat] ${ev.message}`, ts: Date.now()});
+                else if (ev?.type === "result") result = ev;
+            },
         });
-        child.stderr.on("data", (d) => broadcast("log", {id: acc.id, line: `[chat:err] ${String(d).slice(0, 120)}`, ts: Date.now()}));
         child.on("close", async () => {
             if (tmpAuthFile) try { rmSync(tmpAuthFile, {force: true}); } catch {}
             const status = result ? (result.ok ? "✅回复成功" : ("❌" + (result.error || "无回复"))) : "❌进程异常退出";
@@ -3219,7 +3259,7 @@ app.post("/api/tools/batch-refresh-at", async (req, res) => {
 });
 // 独立协议登录拿 at(不依赖数据库账号记录)
 function runReloginAtWorkerStandalone(email, password): Promise<{ok: boolean; accessToken?: string; authFile?: string; reason?: string}> {
-    return new Promise(async (resolve) => {
+    return withLeasedGptProxy(`at-sa:${email}`, (exit, jump) => new Promise(async (resolve) => {
         const tmpDir = mkdtempSync(path.join(os.tmpdir(), "codex-relogin-sa-"));
         const tmpFile = path.join(tmpDir, `mc.txt`);
         broadcast("log", {id: 0, line: `[批量AT] ${email}: 走协议登录获取 at…`, ts: Date.now()});
@@ -3234,41 +3274,29 @@ function runReloginAtWorkerStandalone(email, password): Promise<{ok: boolean; ac
         });
         const child = spawn(CHAT_TSX_BIN, ["src/worker-login-http.ts"], {
             shell: IS_WIN, cwd: CHAT_ROOT,
-            env: {
-                ...process.env,
+            env: cleanSpawnEnv({
                 REG_EMAIL: email,
                 MAIL_PROVIDER: (mb?.provider) || (/@(gmail|googlemail)\.com$/i.test(email) ? "google" : email.endsWith("@icloud.com") ? "icloud" : "mailcom"),
                 MAILCOM_TOKENS_FILE: tmpFile, ICLOUD_TOKENS_FILE: tmpFile,
                 MAILCOM_HEADLESS: "1",
-                PROXY_URL: scheduler.regProxy || "",
+                PROXY_URL: exit || scheduler.regProxy || "",
+                MAIL_PROXY_JUMP: jump || "",
                 MAILCOM_PROXY: scheduler.mailProxyEnabled !== false ? (scheduler.mailProxy || "") : "",
                 REG_SIMULATE_CHAT: "",
                 REG_TRY_RT: "0",
                 GPT_PASSWORD: (gptAcc?.gpt_password || appConfig.defaultPassword || "").trim(),
                 TOTP_SECRET: gptAcc?.totp_secret || "",
                 REG_TRY_MFA: gptAcc?.totp_secret ? "0" : "1",
-            },
+            }),
         });
-        let buf = "", result = null;
+        let result = null;
         child.on("error", (e) => { broadcast("log", {id: 0, line: `[批量AT] ${email}: worker 启动失败: ${e?.message || e}`, ts: Date.now()}); resolve({ok: false, reason: String(e?.message || e)}); });
-        child.stdout.on("data", (d) => {
-            buf += d.toString(); let idx;
-            while ((idx = buf.indexOf("\n")) >= 0) {
-                const line = buf.slice(0, idx); buf = buf.slice(idx + 1);
-                if (line.startsWith("@@EVENT@@")) {
-                    try {
-                        const ev = JSON.parse(line.slice(9));
-                        if (ev.type === "result") result = ev;
-                        else if (ev.message) broadcast("log", {id: 0, line: `[批量AT] ${email}: ${ev.message}`, ts: Date.now()});
-                    } catch {}
-                } else if (line.trim()) {
-                    broadcast("log", {id: 0, line: `[批量AT] ${email}: ${line}`, ts: Date.now()});
-                }
-            }
-        });
-        child.stderr.on("data", (d) => {
-            const msg = d.toString().trim();
-            if (msg) broadcast("log", {id: 0, line: `[批量AT] ${email}: [stderr] ${msg}`, ts: Date.now()});
+        pipeWorkerStdout(child, {
+            onLine: (line) => broadcast("log", {id: 0, line: `[批量AT] ${email}: ${line}`, ts: Date.now()}),
+            onEvent: (ev) => {
+                if (ev?.type === "result") result = ev;
+                else if (ev?.message) broadcast("log", {id: 0, line: `[批量AT] ${email}: ${ev.message}`, ts: Date.now()});
+            },
         });
         child.on("exit", () => {
             try { rmSync(tmpFile, {force: true}); rmSync(tmpDir, {force: true, recursive: true}); } catch {}
@@ -3279,7 +3307,7 @@ function runReloginAtWorkerStandalone(email, password): Promise<{ok: boolean; ac
                 resolve({ok: false, reason: result?.error || "浏览器登录失败"});
             }
         });
-    });
+    }), {timeoutMs: 45_000}).catch((e) => ({ok: false, reason: String(e?.message || e)}));
 }
 
 // 批量获取 RT：走 codex OAuth 登录获取全新 refresh_token(Pro 号不触发 add-phone,无需接码)
@@ -3359,7 +3387,7 @@ app.post("/api/tools/batch-acquire-rt", (req, res) => {
 });
 // 独立 OAuth 获取 rt(不走接码,用邮箱密码走 codex OAuth,Pro 号不触发 add-phone)
 function runRtWorkerStandalone(email, mailPassword, gptPassword, onProgress): Promise<{ok: boolean; rt?: string; accessToken?: string; rtFile?: string; reason?: string}> {
-    return new Promise(async (resolve) => {
+    return withLeasedGptProxy(`rt-sa:${email}`, (exit, jump) => new Promise(async (resolve) => {
         let settled = false;
         const finish = (v) => {
             if (settled) return;
@@ -3383,48 +3411,38 @@ function runRtWorkerStandalone(email, mailPassword, gptPassword, onProgress): Pr
         // 用独立脚本(不带 smsBroker),跳过 add-phone
         const child = spawn(CHAT_TSX_BIN, ["scripts/worker-rt-nosms.ts"], {
             shell: IS_WIN, cwd: CHAT_ROOT,
-            env: {
-                ...process.env,
+            env: cleanSpawnEnv({
                 REG_EMAIL: email,
                 MAIL_PROVIDER: (mb?.provider) || (/@(gmail|googlemail)\.com$/i.test(email) ? "google" : email.endsWith("@icloud.com") ? "icloud" : "mailcom"),
                 MAILCOM_TOKENS_FILE: tmpFile, ICLOUD_TOKENS_FILE: tmpFile,
                 MAILCOM_HEADLESS: "1",
-                PROXY_URL: rechargeProxy() || "",
+                PROXY_URL: exit || rechargeProxy() || "",
+                MAIL_PROXY_JUMP: jump || "",
                 MAILCOM_PROXY: scheduler.mailProxyEnabled !== false ? (scheduler.mailProxy || "") : "",
                 GPT_PASSWORD: gptPwd,
                 TOTP_SECRET: gptAcc?.totp_secret || "",
                 SMS_LINK_TEMPLATE: scheduler.smsLinkTemplate || "",
-            },
+            }),
         });
         batchRtChild = child;
         const timer = setTimeout(() => {
             try { child.kill("SIGKILL"); } catch { /* */ }
             finish({ok: false, reason: "超时(120s)，OAuth/取码卡住"});
         }, 120000);
-        let buf = "", result = null;
+        let result = null;
         child.on("error", (e) => finish({ok: false, reason: String(e?.message || e)}));
-        child.stdout.on("data", (d) => {
-            buf += d.toString(); let idx;
-            while ((idx = buf.indexOf("\n")) >= 0) {
-                const line = buf.slice(0, idx); buf = buf.slice(idx + 1);
-                if (line.startsWith("@@EVENT@@")) {
-                    try {
-                        const ev = JSON.parse(line.slice(9));
-                        if (ev.type === "result") result = ev;
-                        else if (ev.message) {
-                            onProgress?.(ev.message);
-                            broadcast("log", {id: 0, line: `[批量RT] ${email}: ${ev.message}`, ts: Date.now()});
-                        }
-                    } catch {}
-                } else if (line.trim()) {
-                    onProgress?.(line.trim());
-                    broadcast("log", {id: 0, line: `[批量RT] ${email}: ${line}`, ts: Date.now()});
+        pipeWorkerStdout(child, {
+            onLine: (line) => {
+                onProgress?.(line);
+                broadcast("log", {id: 0, line: `[批量RT] ${email}: ${line}`, ts: Date.now()});
+            },
+            onEvent: (ev) => {
+                if (ev?.type === "result") result = ev;
+                else if (ev?.message) {
+                    onProgress?.(ev.message);
+                    broadcast("log", {id: 0, line: `[批量RT] ${email}: ${ev.message}`, ts: Date.now()});
                 }
-            }
-        });
-        child.stderr.on("data", (d) => {
-            const msg = d.toString().trim();
-            if (msg) broadcast("log", {id: 0, line: `[批量RT] ${email}: [stderr] ${msg}`, ts: Date.now()});
+            },
         });
         child.on("exit", () => {
             try { rmSync(tmpFile, {force: true}); rmSync(tmpDir, {force: true, recursive: true}); } catch {}
@@ -3435,7 +3453,7 @@ function runRtWorkerStandalone(email, mailPassword, gptPassword, onProgress): Pr
                 finish({ok: false, reason: result?.error || "OAuth 获取 rt 失败"});
             }
         });
-    });
+    }), {timeoutMs: 45_000, log: (m) => onProgress?.(m)}).catch((e) => ({ok: false, reason: String(e?.message || e)}));
 }
 
 // ★统一导出端点(合并原下载菜单 /api/export + 批量 /api/export/selected)。POST 一站式:范围×scope×格式×标记已售出。
@@ -3589,127 +3607,41 @@ function gmailLoginDead(err) {
 function isGmailLoginProxyError(err) {
     const s = String(err || "");
     if (isHardenIpError(s)) return true;
-    return /signin\/rejected|出口已被风控|换 session 重开窗|代理中断|ERR_PROXY|ERR_TUNNEL|ERR_CONNECTION|ERR_SSL|代理不通|比特已退出|未登录|端口不通|ConnectionRefused|跳板连不上|ECONNREFUSED/i.test(s);
+    return /signin\/rejected|出口已被风控|换 session 重开窗|代理中断|ERR_PROXY|ERR_TUNNEL|ERR_CONNECTION|ERR_SSL|代理不通|比特已退出|未登录|端口不通|ConnectionRefused|跳板连不上|ECONNREFUSED|has been closed|Target page|browser has been closed|窗口被关|operation was aborted|比特API .+ 超时|开窗超时/i.test(s);
 }
 
-/**
- * 换绑前探 Gmail 网页登录（密码+TOTP）——比特浏览器。
- * 出口顺序（跳板连 kookeey 常 ConnectionRefused，故默认不经跳板）：
- *   ① 邮箱代理池直出  ② 10808/充值代理  ③ 邮箱代理池+跳板
- * 返回 {ok, error?, dead?, proxyDead?}
- */
+/** 换绑/迁入探 Gmail：丢到子进程，避免比特 CDP 把 :3100 内存打爆。 */
 async function probeGmailWebLogin(mb, log = () => {}) {
-    const email = String(mb?.email || "").trim();
-    const password = String(mb?.password || "").trim();
-    const totpSecret = String(mb?.totp_secret || mb?.mailbox_totp || "").trim();
-    const recoveryEmail = String(mb?.recovery_email || "").trim();
-    if (!email) return {ok: false, error: "无邮箱", dead: true};
-    if (!password) return {ok: false, error: "无登录密码", dead: true};
-    if (!totpSecret) return {ok: false, error: "无 Gmail 2FA", dead: true};
+    return runGmailLoginWorker(mb, log);
+}
 
-    let lastErr = "";
-    let sawProxyDead = false;
-    const notes = [];
-    const write = (m) => {
-        const s = String(m || "");
-        notes.push(s);
-        try { log(s); } catch { /* */ }
-    };
-
-    const runOnPage = async (page, sess) => {
-        page.setDefaultTimeout(45000);
-        const r = await ensureGoogleLoggedIn(
-            page,
-            "https://myaccount.google.com/security?hl=en",
-            {email, password, totpSecret, recoveryEmail, requireInbox: false},
-            write,
-        );
-        if (r) {
-            try { sess?.markLoggedIn?.(); } catch { /* */ }
-        }
-        return r;
-    };
-
-    /** @type {{label: string, run: () => Promise<any>}[]} */
-    const plans = [
-        {
-            label: "邮箱代理直出（无跳板）",
-            run: () => withLeasedMailProxy(email, async (proxyUrl, jumpUrl, remember) => {
-                write(`  网页登录探活：比特 · ${maskProxyUrl(proxyUrl) || "无代理"} · 无跳板`);
-                return withGoogleBitSession({
-                    proxyUrl, jumpUrl: "", name: googleBitName("rebind", email),
-                    remark: "gmail-rebind-probe", log: write, onProxy: remember,
-                }, runOnPage);
-            }, {...mb, proxy_url: ""}, {skipJump: true}),
-        },
-        {
-            label: "充值代理 10808",
-            run: async () => {
-                const proxyUrl = pickMailcomBrowserProxy(rechargeProxy(), scheduler.rtProxy, "socks5://127.0.0.1:10808") || "";
-                if (!proxyUrl) throw new Error("未配置 rtProxy/10808");
-                write(`  网页登录探活：比特 · ${maskProxyUrl(proxyUrl)} · 无跳板`);
-                return withGoogleBitSession({
-                    proxyUrl, jumpUrl: "", name: googleBitName("rebind", email),
-                    remark: "gmail-rebind-probe-10808", log: write,
-                }, runOnPage);
-            },
-        },
-        {
-            label: "邮箱代理+跳板",
-            run: () => withLeasedMailProxy(email, async (proxyUrl, jumpUrl, remember) => {
-                write(`  网页登录探活：比特 · ${maskProxyUrl(proxyUrl) || "无"}${jumpUrl ? " · 跳板 " + maskProxyUrl(jumpUrl) : " · 无跳板"}`);
-                return withGoogleBitSession({
-                    proxyUrl, jumpUrl, name: googleBitName("rebind", email),
-                    remark: "gmail-rebind-probe-jump", log: write, onProxy: remember,
-                }, runOnPage);
-            }, {...mb, proxy_url: ""}, {skipJump: false}),
-        },
-    ];
-
-    for (let i = 0; i < plans.length; i++) {
-        notes.length = 0;
-        const plan = plans[i];
-        try {
-            write(`  换绑探登录方案 ${i + 1}/${plans.length}：${plan.label}`);
-            const ok = await plan.run();
-            if (ok) return {ok: true};
-            const joined = notes.join("\n");
-            if (isGmailLoginProxyError(joined)) {
-                lastErr = notes.find((l) => /拒绝|rejected|代理|风控|不通|跳板/i.test(l)) || "出口被风控";
-                sawProxyDead = true;
-                write(`  方案失败（网络/出口），试下一个`);
-                continue;
-            }
-            const hint = notes.find((l) => /Wrong|错误|失败|disabled|停用|找不到|code|密码/i.test(l))
-                || "登录失败";
-            return {ok: false, error: String(hint).slice(0, 160), dead: gmailLoginDead(joined), proxyDead: false};
-        } catch (e) {
-            const err = String(e?.message || e).slice(0, 160);
-            lastErr = err;
-            if (isGmailLoginProxyError(err) || /代理池全忙|超时|lease/i.test(err)) {
-                sawProxyDead = true;
-                write(`  方案异常: ${err}，试下一个`);
-                continue;
-            }
-            return {ok: false, error: err, dead: gmailLoginDead(err), proxyDead: false};
-        }
-    }
-
-    return {
-        ok: false,
-        error: String(lastErr || "登录失败").slice(0, 160),
-        dead: false,
-        proxyDead: sawProxyDead,
-    };
+function formatLoginAge(ageMs) {
+    const m = Math.max(0, Math.round(Number(ageMs || 0) / 60000));
+    if (m < 1) return "不到 1 分钟";
+    return `${m} 分钟`;
+}
+function formatSessionLeft(leftMs) {
+    const m = Math.max(0, Math.round(Number(leftMs || 0) / 60000));
+    if (m < 2) return "不到 2 分钟";
+    if (m < 60) return `${m} 分钟`;
+    const h = Math.round(m / 60);
+    if (h < 48) return `${h} 小时`;
+    return `${Math.round(h / 24)} 天`;
 }
 
 /**
  * 换绑领号预检：只探网页登录（比特浏览器）。
  * IMAP 在迁入换绑池时已探过一次，这里不再重复。
+ * 网页登录成功会写 login_at，1 小时内再领这号就跳过开窗。
  */
 async function probeGmailLoginForRebind(mb, log = () => {}) {
     const imapPw = String(mb?.imap_password || mb?.mailbox_imap || "").trim();
     if (!imapPw) return {ok: false, step: "imap", error: "无 IMAP 应用密码", dead: true};
+    const recent = gmailWebLoginFresh(mb);
+    if (recent.fresh) {
+        log(`网页登录 ${formatLoginAge(recent.ageMs)}前已验证过，1 小时内跳过开窗`);
+        return {ok: true, skipped: true};
+    }
     log(`探网页登录（比特浏览器；IMAP 迁入时已探过）`);
     const login = await probeGmailWebLogin(mb, log);
     if (!login.ok) {
@@ -3722,6 +3654,9 @@ async function probeGmailLoginForRebind(mb, log = () => {}) {
         };
     }
     log(`网页登录 OK`);
+    try {
+        await db.refreshMailboxGoogleState(mb.id, {login: "ok", login_at: Date.now()});
+    } catch { /* 时间戳写失败不挡换绑 */ }
     return {ok: true};
 }
 function exportableAccount(r) {
@@ -3881,10 +3816,15 @@ function loadRechargeLogsFromDisk() {
         rechargeLogBuf = keep.map((s) => { try { return JSON.parse(s); } catch { return {ts: 0, line: s}; } }).filter((x) => x && x.line);
     } catch { /* 损坏则空 */ }
 }
+let persistLogTimer = null;
 function persistRechargeLogs() {
-    try {
-        writeFileSync(RECHARGE_LOG_FILE, rechargeLogBuf.map((x) => JSON.stringify(x)).join("\n") + (rechargeLogBuf.length ? "\n" : ""), "utf8");
-    } catch { /* 忽略写失败 */ }
+    if (persistLogTimer) return;
+    persistLogTimer = setTimeout(() => {
+        persistLogTimer = null;
+        try {
+            writeFileSync(RECHARGE_LOG_FILE, rechargeLogBuf.map((x) => JSON.stringify(x)).join("\n") + (rechargeLogBuf.length ? "\n" : ""), "utf8");
+        } catch { /* 忽略写失败 */ }
+    }, 400);
 }
 loadRechargeLogsFromDisk();
 function rechargeLog(line: string) {
@@ -3894,8 +3834,6 @@ function rechargeLog(line: string) {
     persistRechargeLogs();
     broadcast("rechargeLog", rec);
 }
-let exportRtBusy = false;
-let exportRtStop = false;
 async function rechargeSync() { broadcast("recharge", await db.listRechargeCards()); }
 async function queueSync() { broadcast("rechargeQueue", await db.listRechargeQueue()); }
 
@@ -3904,8 +3842,120 @@ const gmailRebindQueued = new Set();
 const gmailRebindCancelled = new Set();
 const gmailRebindTargets = new Map();
 const gmailRebindPool = new Map();
-let gmailRebindRunning = false;
-let gmailRebindCurrentId = 0;
+const gmailRebindActive = new Set();
+const liveRebindMailboxIds = new Set();
+
+// 换绑子进程超时必须大于内层取码最坏预算，否则会在 verify 前后被砍，
+// 制造出「官方已改、库里没写」的不确定态。Gmail: IMAP 4 条出口 × 16s × 10 轮；
+// mail.com: Playwright 登录 + 24×5s 取码。取 480s 兜住，真正的失败靠内层自己报。
+const CHANGE_EMAIL_TIMEOUT_MS = Math.max(240_000, Number(process.env.CHANGE_EMAIL_TIMEOUT_MS || 480_000));
+const CHANGE_EMAIL_NET_FAIL = /fetch failed|timeout|timed out|ECONN|ENOTFOUND|EPIPE|socket|TLS|disconnected|Proxy connection/i;
+
+// 官方 24h 换绑上限的冷却。官方不给解禁时间，按上限窗口 +5 分钟余量。
+const REBIND_CAP_COOLDOWN_MS = Math.max(60_000, Number(process.env.REBIND_CAP_COOLDOWN_MS || 24 * 3600_000 + 300_000));
+function fmtUntil(ts) {
+    const d = new Date(Number(ts) || 0);
+    if (!Number.isFinite(d.getTime())) return "稍后";
+    const p = (n) => String(n).padStart(2, "0");
+    return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
+function spawnChangeEmailChild({accessToken, accountId, newEmail, imapPassword, mailPassword, totpSecret, proxyUrl, jumpUrl, note}) {
+    const jobFile = path.join(os.tmpdir(), `change-email-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.json`);
+    writeFileSync(jobFile, JSON.stringify({
+        accessToken, accountId, newEmail,
+        imapPassword: imapPassword || "",
+        mailPassword: mailPassword || "",
+        totpSecret: totpSecret || "",
+    }));
+    return new Promise((resolve) => {
+        let settled = false;
+        // 子进程实时上报的阶段。verify 一旦开打，官方侧就可能已经改掉邮箱，
+        // 之后失联只能算「状态不确定」，交给对账定论，绝不能直接判失败把目标邮箱放回池。
+        let lastStage = "precheck";
+        const child = spawn(CHAT_TSX_BIN, ["scripts/worker-change-email.ts", jobFile], {
+            cwd: CHAT_ROOT,
+            env: cleanSpawnEnv({
+                PROXY_URL: proxyUrl || "",
+                MAIL_PROXY_JUMP: jumpUrl || "",
+            }),
+            stdio: ["ignore", "pipe", "pipe"],
+        });
+        const killChild = () => {
+            try { child.kill("SIGKILL"); } catch { /* */ }
+        };
+        const finish = (r) => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            try { unlinkSync(jobFile); } catch { /* */ }
+            try { killChild(); } catch { /* */ }
+            resolve({stage: lastStage, ...r});
+        };
+        // 失联兜底：打到过 verify 就标 indeterminate，让上层挂起等对账
+        const lost = (reason) => finish({
+            ok: false,
+            reason,
+            indeterminate: lastStage === "verify",
+        });
+        const timer = setTimeout(() => {
+            lost(`官方换绑超时 ${Math.round(CHANGE_EMAIL_TIMEOUT_MS / 1000)}s（停在 ${lastStage} 阶段）`);
+        }, CHANGE_EMAIL_TIMEOUT_MS);
+        pipeWorkerStdout(child, {
+            onLine: (line) => note(String(line || "").slice(0, 200)),
+            onEvent: (ev) => {
+                if (!ev || ev.type === "progress") {
+                    if (ev?.stage) {
+                        lastStage = String(ev.stage);
+                        note(`阶段 → ${lastStage}`);
+                    }
+                    if (ev?.message) note(ev.message);
+                    return;
+                }
+                if (ev.stage) lastStage = String(ev.stage);
+                const reason = ev.reason || ev.error || "";
+                const stageNow = String(ev.stage || lastStage || "");
+                finish({
+                    ok: !!ev.ok,
+                    reason,
+                    needReauth: !!ev.needReauth,
+                    alreadyLinked: !!ev.alreadyLinked,
+                    badTarget: !!ev.badTarget,
+                    rateLimited: !!ev.rateLimited,
+                    capped24h: !!ev.capped24h,
+                    code: ev.code || "",
+                    // verify 发出后拿到网络类错误：官方可能已改，同样要对账
+                    indeterminate: !!(ev.indeterminate
+                        || (!ev.ok && (stageNow === "verify" || /^verify\b/i.test(reason))
+                            && CHANGE_EMAIL_NET_FAIL.test(String(reason)))),
+                });
+            },
+        });
+        child.on("error", (e) => lost(String(e?.message || e).slice(0, 160)));
+        child.on("close", () => {
+            if (!settled) lost("官方换绑子进程无结果");
+        });
+    });
+}
+
+function runChangeEmailWorker({accessToken, accountId = "", newEmail, imapPassword, mailPassword = "", totpSecret = "", log = () => {}} = {}) {
+    const note = (m) => { try { log(m); } catch { /* */ } };
+    // chatgpt.com 官方换绑走本机 10808。重登可以链式；kookeey→chatgpt.com TLS 会断，断了还会误伤 Gmail。
+    const local = pickXrayBrowserProxy(rechargeProxy(), scheduler.rtProxy, scheduler.regProxy) || "";
+    if (!local) {
+        return Promise.resolve({ok: false, reason: "官方换绑需要本机 10808（chatgpt.com HTTP）"});
+    }
+    note(`官方换绑走 ${maskProxyUrl(local)}（chatgpt.com HTTP，不走 kookeey）`);
+    return spawnChangeEmailChild({
+        accessToken, accountId, newEmail, imapPassword, mailPassword, totpSecret,
+        proxyUrl: local, jumpUrl: "", note,
+    });
+}
+
+function rebindConcurrency() {
+    const n = Number(process.env.REBIND_CONCURRENCY || scheduler.rechargeConcurrency || 3);
+    return Math.max(2, Math.min(4, n));
+}
 
 function isGmailRebindCancelled(id) {
     return gmailRebindCancelled.has(Number(id));
@@ -3950,11 +4000,23 @@ function enqueueGmailRebind(q, {force = false, target, pool} = {}) {
     if (!dest) return false;
     const id = Number(q?.id);
     if (!Number.isInteger(id)) return false;
-    if (gmailRebindQueued.has(id)) {
+    if (gmailRebindQueued.has(id) || gmailRebindActive.has(id)) {
         rechargeLog(`换绑跳过 ${q.email || id}: 已在进行，不要重复点`);
         return false;
     }
     const st = String(q.rebind_status || "");
+    // 待核对的号不能再换一轮：官方可能已经改过了，再来一遍就是重复申请 + 连环领号
+    if (st === "unknown") {
+        rechargeLog(`换绑跳过 ${q.email || id}: 状态待核对，先对账确认官方到底改没改`);
+        pumpRebindReconcile().catch(() => {});
+        return false;
+    }
+    // 官方 24h 上限期内再点也只会 begin 400，白探活一个目标号 + 白打一次官方接口
+    const blockedUntil = Number(q?.rebind_blocked_until) || 0;
+    if (blockedUntil > Date.now()) {
+        rechargeLog(`换绑跳过 ${q.email || id}: 官方 24h 换绑上限未解，${fmtUntil(blockedUntil)} 后再点`);
+        return false;
+    }
     if (!force && (st === "ok" || st === "pending" || st === "skipped")) return false;
     gmailRebindCancelled.delete(id);
     gmailRebindQueued.add(id);
@@ -3967,40 +4029,42 @@ function enqueueGmailRebind(q, {force = false, target, pool} = {}) {
     if (p.emails || p.grp !== undefined) gmailRebindPool.set(id, p);
     else gmailRebindPool.delete(id);
     gmailRebindIds.push(id);
-    const ahead = gmailRebindRunning && gmailRebindCurrentId && gmailRebindCurrentId !== id;
+    const cap = rebindConcurrency();
+    const ahead = gmailRebindActive.size >= cap;
     db.updateQueueItem(id, {
         rebind_status: "pending", rebind_error: "", rebind_target: dest,
         rebind_pool: (p.emails || p.grp !== undefined) ? p : null,
     }).then(() => queueSync()).catch(() => {});
-    if (ahead) rechargeLog(`换绑 ${q.email} → ${rebindTargetLabel(dest)} 已排队，等当前号跑完`);
+    if (ahead) rechargeLog(`换绑 ${q.email} → ${rebindTargetLabel(dest)} 已排队，等空位（并发 ${cap}）`);
     pumpGmailRebind();
     return true;
 }
 
 function pumpGmailRebind() {
-    if (gmailRebindRunning) return;
-    gmailRebindRunning = true;
-    (async () => {
-        try {
-            while (gmailRebindIds.length) {
-                const id = gmailRebindIds.shift();
-                gmailRebindCurrentId = id;
-                try { await runGmailRebind(id); }
-                catch (e: any) { rechargeLog(`换绑异常 ${id}: ${e?.message || e}`); }
-                finally {
-                    gmailRebindQueued.delete(id);
-                    gmailRebindCancelled.delete(id);
-                    gmailRebindTargets.delete(id);
-                    gmailRebindPool.delete(id);
-                    gmailRebindCurrentId = 0;
-                }
-            }
-        } finally {
-            gmailRebindRunning = false;
-            gmailRebindCurrentId = 0;
-            if (gmailRebindIds.length) pumpGmailRebind();
+    const cap = rebindConcurrency();
+    while (gmailRebindActive.size < cap && gmailRebindIds.length) {
+        const id = gmailRebindIds.shift();
+        if (!Number.isInteger(id)) continue;
+        if (gmailRebindActive.has(id)) {
+            // 同一个 queueId 不能并行跑两轮：会各领一个目标邮箱，撞 alreadyLinked 烧号。
+            // enqueue 侧已用 gmailRebindQueued 挡住，这里到了就是有 bug，出个日志别静默丢。
+            rechargeLog(`换绑跳过 ${id}: 上一轮还在跑（重复入队已忽略）`);
+            continue;
         }
-    })();
+        gmailRebindActive.add(id);
+        (async () => {
+            try { await runGmailRebind(id); }
+            catch (e: any) { rechargeLog(`换绑异常 ${id}: ${e?.message || e}`); }
+            finally {
+                gmailRebindActive.delete(id);
+                gmailRebindQueued.delete(id);
+                gmailRebindCancelled.delete(id);
+                gmailRebindTargets.delete(id);
+                gmailRebindPool.delete(id);
+                pumpGmailRebind();
+            }
+        })();
+    }
 }
 
 async function runGmailRebind(queueId) {
@@ -4027,7 +4091,10 @@ async function runGmailRebind(queueId) {
         : "没有独立且未使用、已开 IMAP 的 Gmail（邮箱管理 · 独立 / 换绑池）";
     let claimed = null;
     const fail = async (msg, release = true) => {
-        if (release && claimed?.id) await db.releaseMailboxToFree(claimed.id);
+        if (release && claimed?.id) {
+            await db.releaseMailboxToFree(claimed.id);
+            liveRebindMailboxIds.delete(claimed.id);
+        }
         await db.updateQueueItem(queueId, {rebind_status: "fail", rebind_error: String(msg || "换绑失败").slice(0, 200), rebind_target: dest});
         rechargeLog(`换绑 ✗ ${acc.email}${claimed?.email ? " → " + claimed.email : ""}: ${msg}`);
         await queueSync();
@@ -4043,22 +4110,48 @@ async function runGmailRebind(queueId) {
             rememberMailcomPassword(mb.email, mb.password);
         }
     };
-    const doChange = (at, tok, mb) => changeChatgptEmail({
-        accessToken: at,
-        accountId: tok?.accountId || "",
-        proxyUrl: rechargeProxy(),
-        newEmail: mb.email,
-        imapPassword: mb.imap_password,
-        mailPassword: mb.password,
-        totpSecret: mb.totp_secret || "",
-    });
+    const doChange = async (at, tok, mb) => {
+        // 意图先落盘：官方 verify 之后若失联，只有这条记录能告诉对账任务该去比对哪个邮箱
+        await db.markRebindAttempt(queueId, {email: mb.email, mailboxId: mb.id, stage: "begin"}).catch(() => {});
+        const r = await runChangeEmailWorker({
+            accessToken: at,
+            accountId: tok?.accountId || "",
+            newEmail: mb.email,
+            imapPassword: mb.imap_password,
+            mailPassword: mb.password,
+            totpSecret: mb.totp_secret || "",
+            log: (m) => rechargeLog(`换绑 ${acc.email}: ${m}`),
+        });
+        if (r?.stage) await db.updateQueueItem(queueId, {rebind_attempt_stage: String(r.stage)}).catch(() => {});
+        return r;
+    };
 
+    let claimedKept = false;
+    // 官方侧改没改不确定时：目标邮箱可能已经是这个号的登录邮箱了，绝不能放回池给下一个号，
+    // 否则下一个号换绑会撞 alreadyLinked，把一个好号误判成废号，而这个号库里还是旧邮箱。
+    const holdForReconcile = async (mb, why) => {
+        claimedKept = true;
+        liveRebindMailboxIds.delete(mb.id);
+        await db.setMailboxNote(mb.id, "换绑待核对，勿分配").catch(() => {});
+        await db.updateQueueItem(queueId, {
+            rebind_status: "unknown",
+            rebind_target: dest,
+            rebind_attempt_email: mb.email,
+            rebind_attempt_mailbox_id: mb.id,
+            rebind_error: `状态待核对: ${String(why || "").slice(0, 150)}`,
+        });
+        rechargeLog(`换绑 ? ${acc.email} → ${mb.email}: ${why}；官方是否已改未知，挂起等对账（邮箱暂不回池）`);
+        await queueSync();
+        pumpRebindReconcile().catch(() => {});
+    };
     try {
         let fresh = acc;
-        let tok = extractTokens(getAuthData(fresh) || q.auth_data);
+        let authObj = getAuthData(fresh) || q.auth_data;
+        let tok = extractTokens(authObj);
         let at = tok?.accessToken || "";
-        if (!at) {
-            rechargeLog(`换绑 ${acc.email}: 无 at，先重登再换绑`);
+        const sessLive = isSessionJsonAlive(authObj);
+        if (!at || !sessLive.ok) {
+            rechargeLog(`换绑 ${acc.email}: ${!at ? "无 session JSON" : "session JSON 已过期"}，先重登再换绑`);
             if (isGoogleMailbox(fresh)) {
                 rememberGoogleCred({
                     email: fresh.email, password: fresh.password,
@@ -4070,6 +4163,7 @@ async function runGmailRebind(queueId) {
                 rememberMailcomPassword(acc.email, acc.password);
             }
             const re = await runReloginAtWorkerPooled(fresh, {
+                preferPool: true,
                 timeoutMs: reloginIdleMs(fresh), allowBrowser: false, skipMfa: true,
                 onProgress: (m) => rechargeLog(`换绑 ${acc.email}: 重登 ${String(m || "").slice(0, 160)}`),
             });
@@ -4078,8 +4172,9 @@ async function runGmailRebind(queueId) {
             tok = extractTokens(getAuthData(fresh));
             at = tok?.accessToken || "";
             if (!at) return fail("重登后仍无 access_token", false);
-        } else if (needsPwdReauth(at)) {
-            rechargeLog(`换绑 ${acc.email}: session 还在，但换绑接口要 5 分钟内的密码验证，先直接试，不够新再重登`);
+        } else {
+            const left = sessLive.leftMs > 0 ? formatSessionLeft(sessLive.leftMs) : "";
+            rechargeLog(`换绑 ${acc.email}: 复用已有 session JSON${left ? `（约 ${left} 后过期）` : ""}，官方接口若要重验密码再登录`);
         }
 
         const pool = dest === "gmail" ? (gmailRebindPool.get(queueId) || {}) : {};
@@ -4102,8 +4197,12 @@ async function runGmailRebind(queueId) {
             claimed = await db.claimFreeMailcomMailbox();
             if (!claimed) return fail(`${miss}${poolHint}`, false);
         } else {
-            const cand = gmailQueue.find((c) => c && !excludeIds.includes(c.id));
-            if (!cand) {
+            for (const row of gmailQueue) {
+                if (!row || excludeIds.includes(row.id)) continue;
+                const got = await db.claimMailboxForRebind(row.id);
+                if (got) { claimed = got; break; }
+            }
+            if (!claimed) {
                 let why = `${miss}${poolHint}`;
                 if (pool.emails?.length) {
                     const detail = await db.explainRebindGmailMiss(pool.emails).catch(() => "");
@@ -4111,169 +4210,367 @@ async function runGmailRebind(queueId) {
                 }
                 return fail(why, false);
             }
-            rechargeLog(`换绑 ${acc.email} → ${cand.email}：只探这 1 个 Gmail（登录）${poolHint}`);
-            const probe = await probeGmailLoginForRebind(cand, (m) => rechargeLog(`换绑 ${acc.email}: ${m}`));
+            liveRebindMailboxIds.add(claimed.id);
+            rechargeLog(`换绑 ${acc.email} → ${claimed.email}：已预占，探登录${poolHint}`);
+            const probe = await probeGmailLoginForRebind(claimed, (m) => rechargeLog(`换绑 ${acc.email}: ${m}`));
             if (!probe.ok) {
                 const step = probe.step === "login" ? "登录" : "IMAP";
                 const dead = !!probe.dead;
                 if (probe.proxyDead && !dead) {
-                    rechargeLog(`换绑 ${cand.email} 登录探活出口问题 (${probe.error})，号仍可用、本次不换下一个`);
+                    rechargeLog(`换绑 ${claimed.email} 登录探活出口问题 (${probe.error})，号仍可用、放回池`);
                     return fail(
-                        `Gmail 登录探活出口问题: ${String(probe.error || "").slice(0, 100)}（只测了 1 个号，未标废）`,
-                        false,
+                        `Gmail 登录探活出口问题: ${String(probe.error || "").slice(0, 100)}（未标废）`,
+                        true,
                     );
                 }
-                rechargeLog(`换绑 ${cand.email} 不可用 ${step}失败 (${probe.error})，${dead ? "标已售废号" : "不换下一个"}`);
+                rechargeLog(`换绑 ${claimed.email} 不可用 ${step}失败 (${probe.error})，${dead ? "标已售废号" : "放回池"}`);
                 if (dead) {
                     if (probe.step === "login") {
-                        await db.markRebindGmailUnavailable([cand.id], `登录失败: ${String(probe.error || "").slice(0, 60)}`).catch(() => {});
+                        await db.markRebindGmailUnavailable([claimed.id], `登录失败: ${String(probe.error || "").slice(0, 60)}`).catch(() => {});
                     } else {
-                        await db.quarantineMailbox(cand.id, "IMAP不通");
+                        await db.quarantineMailbox(claimed.id, "IMAP不通");
                         try {
-                            await db.refreshMailboxGoogleState(cand.id, {
+                            await db.refreshMailboxGoogleState(claimed.id, {
                                 imap: "fail",
                                 last_error: String(probe.error || "").slice(0, 120),
                             });
                         } catch { /* */ }
                     }
+                    liveRebindMailboxIds.delete(claimed.id);
+                    claimed = null;
+                    return fail(`${step}失败: ${String(probe.error || "").slice(0, 120)}`, false);
                 }
-                return fail(`${step}失败: ${String(probe.error || "").slice(0, 120)}`, false);
+                return fail(`${step}失败: ${String(probe.error || "").slice(0, 120)}`, true);
             }
             try {
-                await db.refreshMailboxGoogleState(cand.id, {login: "ok"});
+                await db.refreshMailboxGoogleState(claimed.id, {
+                    login: "ok",
+                    ...(probe.skipped ? {} : {login_at: Date.now()}),
+                });
             } catch { /* */ }
-            claimed = await db.claimMailboxForRebind(cand.id);
-            if (!claimed) {
-                return fail(`${cand.email} 探活后被别人领走，请再点一次`, false);
-            }
-            rechargeLog(`换绑 ${cand.email} 登录 OK，已预占`);
+            rechargeLog(probe.skipped
+                ? `换绑 ${claimed.email} 登录 1 小时内已验证，跳过开窗`
+                : `换绑 ${claimed.email} 登录 OK`);
         }
 
-        // 同一目标最多：限流重试 / 需重登后再换绑 各一轮；官方已占用则标废结束（不再连环领号）
-        for (let attempt = 1; attempt <= 2; attempt++) {
-            if (isGmailRebindCancelled(queueId)) {
-                if (claimed?.id) await db.releaseMailboxToFree(claimed.id);
-                rechargeLog(`换绑 ⏭ ${acc.email}: 已取消`);
-                return;
+        // 同一目标只跑这一轮。限流 / 需重登 / 官方已占用 / 24h 上限都在下面分流后直接结束，
+        // 一律不再领第二个目标邮箱——连环领号既烧号，又会把官方限流打得更深。
+        if (isGmailRebindCancelled(queueId)) {
+            if (claimed?.id) {
+                await db.releaseMailboxToFree(claimed.id);
+                liveRebindMailboxIds.delete(claimed.id);
             }
-            if (!claimed) return fail(`范围内已无可用 ${destLabel}${poolHint}`, false);
-            rememberClaimed(claimed);
-            rechargeLog(`换绑 ${acc.email} → ${claimed.email} (独立未售 ${destLabel})`);
-
-            let r = await doChange(at, tok, claimed);
-            if (!r.ok && r.rateLimited) {
-                rechargeLog(`换绑 ${acc.email}: 官方限流 429，等 90 秒再试 ${claimed.email}`);
-                await new Promise((res) => setTimeout(res, 90_000));
-                r = await doChange(at, tok, claimed);
-                if (!r.ok && r.rateLimited) {
-                    await db.releaseMailboxToFree(claimed.id);
-                    claimed = null;
-                    return fail("官方换绑限流，过几分钟再点", false);
-                }
-            }
-            if (!r.ok && r.needReauth) {
-                // 换绑要新的 pwd_auth。旧 AT 去 enroll 只会 401，别再浪费一轮。
-                if (!(fresh.totp_secret || "").trim() && at && !needsPwdReauth(at)) {
-                    rechargeLog(`换绑 ${acc.email}: 无 GPT 2FA，先用现有 AT 绑验证器（避开 mail.com 收码）`);
-                    const mfa = await enrollTotp(at, {
-                        accountId: tok?.accountId || "",
-                        proxyUrl: rechargeProxy(),
-                        cookie: String(getAuthData(fresh)?.cookie || getAuthData(acc)?.cookie || "").trim(),
-                        retryAltProxy: true,
-                        browserFallback: process.env.MFA_NO_BROWSER !== "1",
-                        log: (m) => rechargeLog(`换绑 ${acc.email}: ${m}`),
-                        reauth: async () => {
-                            rechargeLog(`换绑 ${acc.email}: 绑 2FA 需重登刷新 pwd_auth`);
-                            const re = await runReloginAtWorkerPooled(fresh, {
-                                allowBrowser: false, skipMfa: true,
-                                onProgress: (m) => rechargeLog(`换绑 ${acc.email}: 重登 ${String(m || "").slice(0, 120)}`),
-                            });
-                            if (!re?.ok) throw new Error(re?.reason || "重登失败");
-                            fresh = await db.getAccount(acc.id) || fresh;
-                            const t2 = extractTokens(getAuthData(fresh));
-                            if (!t2?.accessToken) throw new Error("重登后无 AT");
-                            return {
-                                accessToken: t2.accessToken,
-                                accountId: t2.accountId || "",
-                                cookie: String(getAuthData(fresh)?.cookie || "").trim(),
-                            };
-                        },
-                    });
-                    if (mfa.ok && mfa.secret) {
-                        await db.updateAccount(acc.id, {totp_secret: mfa.secret, mfa_status: "✅已绑"});
-                        fresh = {...fresh, totp_secret: mfa.secret};
-                        rechargeLog(`换绑 ${acc.email}: GPT 2FA 已绑(${mfa.via || "http"})，重登走验证器`);
-                    } else {
-                        rechargeLog(`换绑 ${acc.email}: 绑 2FA 未成(${mfa.already ? "已有2FA缺密钥" : (mfa.reason || "失败")})，重登仍可能卡 mail.com`);
-                    }
-                }
-                rechargeLog(`换绑 ${acc.email}: 换绑接口要重新验证密码（已存 session 不够新），开始协议登录`);
-                rememberMailcomPassword(acc.email, acc.password);
-                const re = await runReloginAtWorkerPooled(fresh, {
-                    timeoutMs: reloginIdleMs(fresh), allowBrowser: false, skipMfa: true,
-                    onProgress: (m) => rechargeLog(`换绑 ${acc.email}: 重登 ${String(m || "").slice(0, 160)}`),
-                });
-                if (!re.ok) return fail(`重登失败: ${String(re.reason || "").slice(0, 120)}`);
-                fresh = await db.getAccount(acc.id) || fresh;
-                tok = extractTokens(getAuthData(fresh));
-                at = tok?.accessToken || "";
-                if (!at) return fail("重登后仍无 access_token");
-                rechargeLog(`换绑 ${acc.email}: 重登成功，继续向 ${claimed.email} 发换绑码`);
-                r = await doChange(at, tok, claimed);
-            }
-            if (r.ok) {
-                try {
-                    await db.rebindGptMailbox(acc.id, claimed.id);
-                } catch (e: any) {
-                    await db.markMailboxSold(claimed.id, "换绑成功回写失败").catch(() => {});
-                    await db.updateQueueItem(queueId, {
-                        email: claimed.email,
-                        rebind_status: "fail",
-                        rebind_email: claimed.email,
-                        rebind_error: `平台已换绑，回写失败: ${String(e?.message || e).slice(0, 120)}`,
-                    });
-                    rechargeLog(`换绑 ✗ ${acc.email} → ${claimed.email}: 平台已换绑，回写失败 ${e?.message || e}（新邮箱已标已售）`);
-                    await queueSync();
-                    return;
-                }
-                // rebind_from：首次换绑前邮箱；之后 Gmail→Gmail 再换时保留最初原始邮箱
-                const fromEmail = String(q.rebind_from || acc.email || q.email || "").trim();
-                await db.updateQueueItem(queueId, {
-                    email: claimed.email,
-                    rebind_status: "ok",
-                    rebind_email: claimed.email,
-                    rebind_from: fromEmail,
-                    rebind_error: "",
-                    rebind_target: dest,
-                });
-                if (dest === "gmail") {
-                    try { await db.refreshMailboxGoogleState(claimed.id, {gpt: "ok"}); } catch { /* 阶段标记失败不影响换绑 */ }
-                }
-                rechargeLog(`换绑 ✓ ${fromEmail || acc.email} → ${claimed.email}（新邮箱已售并移出换绑池，旧邮箱已售，都不回池）`);
-                await queueSync();
-                try {
-                    broadcast("snapshot", await db.listAccounts());
-                    broadcast("stats", await db.stats());
-                    broadcast("mailboxes", {stats: await db.mailboxStats()});
-                    // 通知充值页换绑池计数变化（前端可据此刷新）
-                    broadcast("rebind-pool", {
-                        gmailFreeImap: await db.countFreeGoogleImapMailboxes(),
-                        mailcomFree: await db.countFreeMailcomMailboxes(),
-                    });
-                } catch { /* 面板刷新失败不影响换绑 */ }
-                return;
-            }
-            if (r.alreadyLinked || r.badTarget) {
-                const tag = r.alreadyLinked ? "官方已占用" : "目标邮箱废号";
-                await db.quarantineMailbox(claimed.id, tag);
-                claimed = null;
-                return fail(`${tag}（只测了 1 个 Gmail，已标废，请再点换绑领下一个）`, false);
-            }
-            return fail(r.reason || "换绑失败");
+            rechargeLog(`换绑 ⏭ ${acc.email}: 已取消`);
+            return;
         }
-        return fail("换绑未完成", false);
+        if (!claimed) return fail(`范围内已无可用 ${destLabel}${poolHint}`, false);
+        rememberClaimed(claimed);
+        rechargeLog(`换绑 ${acc.email} → ${claimed.email} (独立未售 ${destLabel})`);
+
+        let r = await doChange(at, tok, claimed);
+        const changeNetFail = (x) => /fetch failed|eligibility:|TLS|timed out|timeout|ECONN|ENOTFOUND|EPIPE|socket|Proxy connection|disconnected/i.test(String(x?.reason || ""));
+        const changeRateLimited = (x) => !!(x?.rateLimited || isAuthorizeRateLimited(x?.reason));
+        // 状态不确定必须最先拦：此时重试 begin 有可能把已经生效的换绑再走一遍
+        if (r.indeterminate) return holdForReconcile(claimed, r.reason || "verify 后失联");
+        if (!r.ok && changeRateLimited(r)) {
+            rechargeLog(`换绑 ${acc.email}: 官方限流 429，停止（不再换出口/重登）`);
+            return fail("官方换绑限流 429，过几分钟再点", true);
+        }
+        if (!r.ok && !r.needReauth && !r.alreadyLinked && !r.badTarget && changeNetFail(r)) {
+            rechargeLog(`换绑 ${acc.email}: 官方换绑出口断了 (${String(r.reason || "").slice(0, 80)})，换一条再试`);
+            r = await doChange(at, tok, claimed);
+            if (r.indeterminate) return holdForReconcile(claimed, r.reason || "verify 后失联");
+            if (!r.ok && changeRateLimited(r)) {
+                rechargeLog(`换绑 ${acc.email}: 官方限流 429，停止`);
+                return fail("官方换绑限流 429，过几分钟再点", true);
+            }
+        }
+        if (!r.ok && r.needReauth) {
+            // 换绑要新的 pwd_auth。旧 AT 去 enroll 只会 401，别再浪费一轮。
+            if (!(fresh.totp_secret || "").trim() && at && !needsPwdReauth(at)) {
+                rechargeLog(`换绑 ${acc.email}: 无 GPT 2FA，先用现有 AT 绑验证器（避开 mail.com 收码）`);
+                const mfa = await enrollTotp(at, {
+                    accountId: tok?.accountId || "",
+                    proxyUrl: rechargeProxy(),
+                    cookie: String(getAuthData(fresh)?.cookie || getAuthData(acc)?.cookie || "").trim(),
+                    retryAltProxy: true,
+                    browserFallback: process.env.MFA_NO_BROWSER !== "1",
+                    log: (m) => rechargeLog(`换绑 ${acc.email}: ${m}`),
+                    reauth: async () => {
+                        rechargeLog(`换绑 ${acc.email}: 绑 2FA 需重登刷新 pwd_auth`);
+                        const re = await runReloginAtWorkerPooled(fresh, {
+                            preferPool: true,
+                            allowBrowser: false, skipMfa: true,
+                            onProgress: (m) => rechargeLog(`换绑 ${acc.email}: 重登 ${String(m || "").slice(0, 120)}`),
+                        });
+                        if (!re?.ok) throw new Error(re?.reason || "重登失败");
+                        fresh = await db.getAccount(acc.id) || fresh;
+                        const t2 = extractTokens(getAuthData(fresh));
+                        if (!t2?.accessToken) throw new Error("重登后无 AT");
+                        return {
+                            accessToken: t2.accessToken,
+                            accountId: t2.accountId || "",
+                            cookie: String(getAuthData(fresh)?.cookie || "").trim(),
+                        };
+                    },
+                });
+                if (mfa.ok && mfa.secret) {
+                    await db.updateAccount(acc.id, {totp_secret: mfa.secret, mfa_status: "✅已绑"});
+                    fresh = {...fresh, totp_secret: mfa.secret};
+                    rechargeLog(`换绑 ${acc.email}: GPT 2FA 已绑(${mfa.via || "http"})，重登走验证器`);
+                } else {
+                    rechargeLog(`换绑 ${acc.email}: 绑 2FA 未成(${mfa.already ? "已有2FA缺密钥" : (mfa.reason || "失败")})，重登仍可能卡 mail.com`);
+                }
+            }
+            rechargeLog(`换绑 ${acc.email}: 换绑接口要重新验证密码（已存 session 不够新），开始协议登录`);
+            rememberMailcomPassword(acc.email, acc.password);
+            const re = await runReloginAtWorkerPooled(fresh, {
+                preferPool: true,
+                timeoutMs: reloginIdleMs(fresh), allowBrowser: false, skipMfa: true,
+                onProgress: (m) => rechargeLog(`换绑 ${acc.email}: 重登 ${String(m || "").slice(0, 160)}`),
+            });
+            if (!re.ok) return fail(`重登失败: ${String(re.reason || "").slice(0, 120)}`);
+            fresh = await db.getAccount(acc.id) || fresh;
+            tok = extractTokens(getAuthData(fresh));
+            at = tok?.accessToken || "";
+            if (!at) return fail("重登后仍无 access_token");
+            rechargeLog(`换绑 ${acc.email}: 重登成功，继续向 ${claimed.email} 发换绑码`);
+            r = await doChange(at, tok, claimed);
+            if (r.indeterminate) return holdForReconcile(claimed, r.reason || "verify 后失联");
+            if (!r.ok && changeRateLimited(r)) {
+                rechargeLog(`换绑 ${acc.email}: 重登后官方限流 429，停止`);
+                return fail("官方换绑限流 429，过几分钟再点", true);
+            }
+            if (!r.ok && !r.alreadyLinked && !r.badTarget && !r.needReauth && changeNetFail(r)) {
+                rechargeLog(`换绑 ${acc.email}: 重登后官方换绑出口断了 (${String(r.reason || "").slice(0, 80)})，换一条再试`);
+                r = await doChange(at, tok, claimed);
+                if (r.indeterminate) return holdForReconcile(claimed, r.reason || "verify 后失联");
+                if (!r.ok && changeRateLimited(r)) {
+                    rechargeLog(`换绑 ${acc.email}: 官方限流 429，停止`);
+                    return fail("官方换绑限流 429，过几分钟再点", true);
+                }
+            }
+        }
+        if (!r.ok && !r.indeterminate
+            && /^verify\b/i.test(String(r.reason || ""))
+            && CHANGE_EMAIL_NET_FAIL.test(String(r.reason || ""))) {
+            return holdForReconcile(claimed, r.reason || "verify 后失联");
+        }
+        if (r.ok) {
+            claimedKept = true;
+            try {
+                await db.rebindGptMailbox(acc.id, claimed.id);
+            } catch (e: any) {
+                // 平台确定已改、只是回写失败：挂 unknown 让对账重试改指针，别标死等人工
+                return holdForReconcile(claimed, `平台已换绑但回写失败: ${String(e?.message || e).slice(0, 100)}`);
+            }
+            // rebind_from：首次换绑前邮箱；之后 Gmail→Gmail 再换时保留最初原始邮箱
+            const fromEmail = String(q.rebind_from || acc.email || q.email || "").trim();
+            await db.updateQueueItem(queueId, {
+                email: claimed.email,
+                rebind_status: "ok",
+                rebind_email: claimed.email,
+                rebind_from: fromEmail,
+                rebind_error: "",
+                rebind_target: dest,
+                rebind_attempt_email: "",
+                rebind_attempt_mailbox_id: 0,
+                rebind_attempt_at: 0,
+                rebind_attempt_stage: "",
+            });
+            if (dest === "gmail") {
+                try { await db.refreshMailboxGoogleState(claimed.id, {gpt: "ok"}); } catch { /* 阶段标记失败不影响换绑 */ }
+            }
+            rechargeLog(`换绑 ✓ ${fromEmail || acc.email} → ${claimed.email}（新邮箱已售并移出换绑池，旧邮箱已售，都不回池）`);
+            await queueSync();
+            try {
+                broadcast("snapshot", await db.listAccounts());
+                broadcast("stats", await db.stats());
+                broadcast("mailboxes", {stats: await db.mailboxStats()});
+                // 通知充值页换绑池计数变化（前端可据此刷新）
+                broadcast("rebind-pool", {
+                    gmailFreeImap: await db.countFreeGoogleImapMailboxes(),
+                    mailcomFree: await db.countFreeMailcomMailboxes(),
+                });
+            } catch { /* 面板刷新失败不影响换绑 */ }
+            return;
+        }
+        if (r.alreadyLinked || r.badTarget) {
+            const tag = r.alreadyLinked ? "官方已占用" : "目标邮箱废号";
+            claimedKept = true;
+            await db.quarantineMailbox(claimed.id, tag);
+            liveRebindMailboxIds.delete(claimed.id);
+            claimed = null;
+            return fail(`${tag}: ${String(r.reason || "").slice(0, 120)}（已标废，请再点换绑领下一个）`, false);
+        }
+        if (r.capped24h) {
+            // 限的是这个 ChatGPT 号，不是目标邮箱、不是出口。换目标/换出口/重登全都白打，
+            // 而且每打一次都要开比特窗口探活 + 一次 begin。落盘解禁时间，把这个号先冷却掉。
+            const until = Date.now() + REBIND_CAP_COOLDOWN_MS;
+            await db.updateQueueItem(queueId, {rebind_blocked_until: until}).catch(() => {});
+            return fail(`官方 24h 换绑次数已满，${fmtUntil(until)} 后可再试（目标邮箱无责，已放回池）`, true);
+        }
+        return fail(r.reason || "换绑失败");
     } catch (e: any) {
         await fail(e?.message || e);
+    } finally {
+        if (claimed?.id) liveRebindMailboxIds.delete(claimed.id);
+        if (claimed?.id && !claimedKept) {
+            await db.releaseMailboxToFree(claimed.id).catch(() => {});
+        }
+    }
+}
+
+// ---- 换绑对账 ----
+// verify 打出去后失联的号，官方到底改没改只有官方知道。这里用 AT 读官方当前登录邮箱，
+// 和落盘的换绑意图比对后自动收敛：
+//   官方当前邮箱 == 目标邮箱 → 官方已改，补库里的指针，标 ok
+//   官方当前邮箱 == 原邮箱   → 官方没改，目标邮箱放回池，标 fail（可重新点换绑）
+//   读不到 / AT 失效        → 保持 unknown，下一轮再试（宁可占着号，也不能误放回池）
+const REBIND_RECONCILE_INTERVAL_MS = Math.max(30_000, Number(process.env.REBIND_RECONCILE_INTERVAL_MS || 60_000));
+let rebindReconcileBusy = false;
+
+/**
+ * 读官方当前登录邮箱。取 token 的顺序很关键：
+ *   ① 现有 AT —— 换绑刚超时那会儿它通常还新鲜，一次就能读到
+ *   ② RT 换新 AT —— RT 绑的是用户不是邮箱，换绑后照样能用
+ *   ③ 旧邮箱协议重登 —— 只能兜底：如果换绑真成了，用旧邮箱登本来就该失败
+ * 读不到就返回 ok:false，让调用方保持 unknown，绝不允许靠猜下结论。
+ */
+async function currentLoginEmailOf(acc) {
+    const proxyUrl = pickXrayBrowserProxy(rechargeProxy(), scheduler.rtProxy, scheduler.regProxy) || "";
+    if (!proxyUrl) return {ok: false, email: "", reason: "对账需要本机 10808（chatgpt.com HTTP）"};
+    const read = (at, accountId) => fetchCurrentLoginEmail(at, {accountId: accountId || "", proxyUrl});
+
+    const tok = extractTokens(getAuthData(acc));
+    if (tok?.accessToken) {
+        const r = await read(tok.accessToken, tok.accountId);
+        if (r.ok || !r.needReauth) return r;
+        rechargeLog(`对账 ${acc.email}: AT 已失效，改用 RT 换新 AT`);
+    }
+
+    const rtTok = extractTokens(getRtData(acc) || getAuthData(acc));
+    if (rtTok?.refreshToken) {
+        const rr = await refreshRtViaPool(acc, rtTok.refreshToken, (m) => rechargeLog(`对账 ${acc.email}: ${m}`));
+        const at2 = rr?.ok ? (rr.tokens?.access_token || "") : "";
+        if (at2) {
+            const r = await read(at2, rr.tokens?.account_id || rtTok.accountId);
+            if (r.ok || !r.needReauth) return r;
+        } else {
+            rechargeLog(`对账 ${acc.email}: RT 刷新失败(${String(rr?.reason || "").slice(0, 80)})`);
+        }
+    }
+
+    // 最后才用旧邮箱重登。这条路失败不代表换绑没成——恰恰可能是因为登录邮箱已经变了，
+    // 所以失败时只保持 unknown 并把原因写清楚，交给人工看一眼。
+    rechargeLog(`对账 ${acc.email}: AT/RT 都不可用，尝试用原邮箱协议重登`);
+    const re = await runReloginAtWorkerPooled(acc, {
+        preferPool: true, allowBrowser: false, skipMfa: true,
+        onProgress: (m) => rechargeLog(`对账 ${acc.email}: 重登 ${String(m || "").slice(0, 120)}`),
+    });
+    if (!re?.ok) {
+        return {
+            ok: false, email: "",
+            reason: `无法读官方邮箱（AT/RT 失效，原邮箱重登也失败: ${String(re?.reason || "").slice(0, 80)}）——换绑可能已生效，请人工确认`,
+        };
+    }
+    const fresh = await db.getAccount(acc.id) || acc;
+    const t2 = extractTokens(getAuthData(fresh));
+    if (!t2?.accessToken) return {ok: false, email: "", reason: "重登后仍无 AT"};
+    return read(t2.accessToken, t2.accountId);
+}
+
+async function reconcileOneRebind(q) {
+    const queueId = Number(q.id);
+    const targetEmail = String(q.rebind_attempt_email || "").trim().toLowerCase();
+    const mailboxId = Number(q.rebind_attempt_mailbox_id || 0);
+    const acc = await db.getAccount(q.account_id);
+    if (!acc) {
+        await db.updateQueueItem(queueId, {rebind_status: "fail", rebind_error: "对账失败：找不到 GPT 账号"});
+        rechargeLog(`对账 ✗ ${q.email}: 找不到 GPT 账号`);
+        return;
+    }
+    if (!targetEmail) {
+        await db.updateQueueItem(queueId, {rebind_status: "fail", rebind_error: "对账失败：没有换绑意图记录"});
+        rechargeLog(`对账 ✗ ${acc.email}: 没有换绑意图记录，无法判断`);
+        return;
+    }
+
+    const cur = await currentLoginEmailOf(acc);
+    if (!cur.ok || !cur.email) {
+        // 读不到就维持 unknown。这里绝不能猜，猜错就是把已绑出去的号放回池。
+        await db.updateQueueItem(queueId, {rebind_error: `对账未定论: ${String(cur.reason || "官方未返回邮箱").slice(0, 150)}`});
+        rechargeLog(`对账 ? ${acc.email}: ${cur.reason || "官方未返回邮箱"}，保持待核对`);
+        return;
+    }
+
+    // 换绑前邮箱：队列里记的那个最可靠（成功才会被改写）。必须在改指针之前定下来，
+    // 否则 rebindGptMailbox 一跑，acc.email 就变成新邮箱，退款发信会用错发件人。
+    const beforeEmail = String(q.rebind_from || q.email || acc.email || "").trim().toLowerCase();
+
+    if (cur.email === targetEmail) {
+        // 官方已经改了 → 把库里补齐（rebindGptMailbox 对同一指针是幂等的）
+        try {
+            if (mailboxId) await db.rebindGptMailbox(acc.id, mailboxId);
+        } catch (e: any) {
+            await db.updateQueueItem(queueId, {rebind_error: `对账回写失败: ${String(e?.message || e).slice(0, 150)}`});
+            rechargeLog(`对账 ? ${acc.email} → ${targetEmail}: 官方已改但回写失败 ${e?.message || e}，保持待核对`);
+            return;
+        }
+        await db.updateQueueItem(queueId, {
+            email: targetEmail,
+            rebind_status: "ok",
+            rebind_email: targetEmail,
+            ...(beforeEmail && beforeEmail !== targetEmail ? {rebind_from: beforeEmail} : {}),
+            rebind_error: "",
+            rebind_attempt_email: "",
+            rebind_attempt_mailbox_id: 0,
+            rebind_attempt_at: 0,
+            rebind_attempt_stage: "",
+        });
+        if (mailboxId) await db.setMailboxNote(mailboxId, "").catch(() => {});
+        rechargeLog(`对账 ✓ ${beforeEmail || acc.email} → ${targetEmail}: 官方确认已换绑，库已补齐`);
+        return;
+    }
+
+    // 官方不是目标邮箱 → 这次换绑没生效，目标邮箱没被用掉，放回池让它继续可用
+    if (mailboxId) {
+        await db.setMailboxNote(mailboxId, "").catch(() => {});
+        await db.releaseMailboxToFree(mailboxId).catch(() => {});
+    }
+    await db.updateQueueItem(queueId, {
+        rebind_status: "fail",
+        rebind_error: `官方当前是 ${cur.email}，本次换绑未生效，可重新点换绑`,
+        rebind_attempt_email: "",
+        rebind_attempt_mailbox_id: 0,
+        rebind_attempt_at: 0,
+        rebind_attempt_stage: "",
+    });
+    rechargeLog(`对账 ✗ ${acc.email}: 官方当前是 ${cur.email}，未换到 ${targetEmail}，该号已放回池`);
+}
+
+async function pumpRebindReconcile() {
+    if (rebindReconcileBusy) return;
+    rebindReconcileBusy = true;
+    try {
+        // 多实例：按行认领，一个号只被一个实例收敛
+        const rows = await db.claimRebindReconcile(5, db.instanceId);
+        if (!rows.length) return;
+        rechargeLog(`换绑对账：认领 ${rows.length} 个待核对`);
+        for (const q of rows) {
+            try {
+                await reconcileOneRebind(q);
+            } catch (e: any) {
+                rechargeLog(`对账异常 ${q.email || q.id}: ${e?.message || e}`);
+            } finally {
+                await db.releaseRebindReconcile([q.id], db.instanceId).catch(() => {});
+            }
+        }
+        await queueSync();
+    } catch (e: any) {
+        rechargeLog(`换绑对账出错: ${e?.message || e}`);
+    } finally {
+        rebindReconcileBusy = false;
     }
 }
 
@@ -4394,6 +4691,49 @@ app.post("/api/recharge/cards/validate", async (req, res) => {
     rechargeLog(`验证完成`);
 });
 
+/** 授权换号后：再问平台，unused 的卡强制放回未使用池，清本地绑定。 */
+app.post("/api/recharge/cards/reset", async (req, res) => {
+    const ids = (req.body?.ids || []).map(Number).filter(Number.isInteger);
+    const cards = (await Promise.all(ids.map((id: number) => db.getRechargeCard(id)))).filter(Boolean);
+    if (!cards.length) return res.status(400).json({error: "未选择卡密"});
+    res.json({ok: true, count: cards.length});
+    let ok = 0, skip = 0, fail = 0;
+    for (const card of cards) {
+        if (card.status === "submitted" || card.status === "submitting" || card.status === "done") {
+            skip++;
+            rechargeLog(`重置卡密 ${card.code.slice(0, 8)}… 跳过（本地 ${card.status}，等平台终态）`);
+            continue;
+        }
+        try {
+            rechargeLog(`重置卡密 ${card.code.slice(0, 8)}… 问平台`);
+            const data = await callRechargeApi("POST", "/redeem-codes/validate", {redeem_code: card.code});
+            const r = data.result || {};
+            const st = String(r.status || "");
+            const bound = r.bound_email || "-";
+            const locked = r.account_change_locked;
+            const allowed = r.account_change_allowed ?? r.account_change_verdict?.result ?? "-";
+            if (st !== "unused") {
+                skip++;
+                rechargeLog(`重置卡密 ${card.code.slice(0, 8)}… 平台=${st}，不能重置`);
+                continue;
+            }
+            await db.unpairRechargeCards([card.id]);
+            await db.updateRechargeCard(card.id, {
+                plan_type: r.plan_type || "", plan_name: r.plan_name || "",
+                product: r.product || "", category: r.category || "", auth_mode: r.auth_mode || "",
+                error: "",
+            });
+            ok++;
+            rechargeLog(`✓ 卡密 ${card.code.slice(0, 8)}… 已重置为未使用（平台 unused bound=${bound} locked=${locked} allowed=${allowed}）`);
+        } catch (e: any) {
+            fail++;
+            rechargeLog(`✗ 重置卡密 ${card.code.slice(0, 8)}… ${String(e?.message || e).slice(0, 120)}`);
+        }
+        await rechargeSync();
+    }
+    rechargeLog(`重置卡密完成: 成功 ${ok} / 跳过 ${skip} / 失败 ${fail}`);
+});
+
 // 可充值的 GPT 账号列表(success + 未售出 + 有 auth_file)。筛选在前端做,后端给全量基数。
 app.get("/api/recharge/accounts", async (req, res) => {
     const all = await db.listAccounts("success");
@@ -4484,9 +4824,16 @@ app.post("/api/recharge/queue/reclaim-cards", async (req, res) => {
             const valRes = await callRechargeApi("POST", "/redeem-codes/validate", {redeem_code: q.card_code});
             const valResult = valRes.result || {};
             if (valResult.status === "unused") {
-                await db.unpairRechargeCards([q.card_id]);
-                reclaimed++;
-                rechargeLog(`✓ 卡密 ${q.card_code.slice(0, 8)}... 平台确认未使用，已安全回收`);
+                if (cardBoundToOtherAccount(valResult, q.email)) {
+                    const bound = valResult.bound_email || "其他账号";
+                    await db.updateRechargeCard(q.card_id, {status: "error", error: `平台锁在 ${bound}，不能回收换号`});
+                    used++;
+                    rechargeLog(`✗ 卡密 ${q.card_code.slice(0, 8)}... 仍锁在 ${bound}，不能回收给别人`);
+                } else {
+                    await db.unpairRechargeCards([q.card_id]);
+                    reclaimed++;
+                    rechargeLog(`✓ 卡密 ${q.card_code.slice(0, 8)}... 平台确认未使用，已安全回收`);
+                }
             } else {
                 await db.updateRechargeCard(q.card_id, {status: "error", error: `平台状态: ${valResult.status}(不可回收)`});
                 used++;
@@ -4516,6 +4863,7 @@ app.post("/api/recharge/queue/relogin", async (req, res) => {
         queueReloginRunning = false;
         return res.status(400).json({error: skipped[0]?.reason || "未找到可认领的队列项(可能已被其他实例占用)"});
     }
+    const myIds = items.map((q: any) => Number(q.id));
     res.json({ok: true, count: items.length, claimed: items.length, skipped: skipped.length, instanceId: db.instanceId});
     (async () => {
         let ok = 0, fail = 0;
@@ -4555,7 +4903,7 @@ app.post("/api/recharge/queue/relogin", async (req, res) => {
         } finally {
         queueReloginRunning = false;
         queueReloginStop = false;
-        await db.releaseRechargeQueueByInstance(db.instanceId);
+        await db.releaseRechargeQueueByInstance(db.instanceId, myIds);
         broadcast("rechargeQueue", await db.listRechargeQueue());
         }
     })();
@@ -4572,19 +4920,20 @@ app.post("/api/recharge/queue/relogin-submit", async (req, res) => {
     if (!ids.length) return res.status(400).json({error: "未选择队列项"});
     queueReloginRunning = true;
     queueReloginStop = false;
-    rechargeRunning = true;
-    rechargeStop = false;
+    const myGen = beginRechargeBatch();
     const {claimed: items, skipped: skippedClaim} = await db.claimRechargeQueueItems(ids, db.instanceId);
     if (!items.length) {
         queueReloginRunning = false;
-        rechargeRunning = false;
+        endRechargeBatch(myGen);
         return res.status(400).json({error: skippedClaim[0]?.reason || "无可认领的队列项(已提交/已完成或已被其他实例占用)"});
     }
+    const myIds = items.map((q: any) => Number(q.id));
     res.json({ok: true, count: items.length, claimed: items.length, skipped: skippedClaim.length, instanceId: db.instanceId});
 
     (async () => {
         const intervalMs = (scheduler.rechargeInterval || 5) * 1000;
         let ok = 0, fail = 0, skipped = 0;
+        let wasStopped = false;
         try {
         rechargeLog(`[重登提交] 本实例 ${db.instanceId} 认领 ${items.length} 个(重登 → 验卡 → 重置 → 提交)${skippedClaim.length ? `，跳过 ${skippedClaim.length} 个` : ""}`);
         for (const s of skippedClaim) rechargeLog(`[重登提交] ⏭ ${s.email}: ${s.reason}`);
@@ -4605,7 +4954,17 @@ app.post("/api/recharge/queue/relogin-submit", async (req, res) => {
                     allowBrowser: false,
                     onProgress: (m) => rechargeLog(`${tag}${q0.email}: ${String(m || "").slice(0, 140)}`),
                 });
-                if (!re.ok || !re.authFile) { fail++; rechargeLog(`${tag}${q0.email}: ❌ 登录失败: ${(re as any).reason || "未知"}`); continue; }
+                if (!re.ok || !re.authFile) {
+                    fail++;
+                    const why = String((re as any).reason || "未知");
+                    rechargeLog(`${tag}${q0.email}: ❌ 登录失败: ${why.slice(0, 180)}`);
+                    if (isAccountDeadReason(why)) {
+                        await db.updateAccount(acc.id, {error: why.slice(0, 500)}).catch(() => {});
+                        await db.updateQueueItem(q0.id, {status: "error", error: "OpenAI 账号已停用/删除，重登无效"}).catch(() => {});
+                        rechargeLog(`${tag}${q0.email}: 号已停用，已标失败，换代理也登不上`);
+                    }
+                    continue;
+                }
             } catch (e: any) { fail++; rechargeLog(`${tag}${q0.email}: ❌ 登录异常: ${String(e?.message || e).slice(0, 100)}`); continue; }
             const freshAcc = await db.getAccount(q0.account_id);
             const freshAuthData = getAuthData(freshAcc);
@@ -4636,9 +4995,13 @@ app.post("/api/recharge/queue/relogin-submit", async (req, res) => {
                 }
             }
             if (!card) {
-                const picked = await db.claimUnusedCards(1);
-                if (!picked.length) { fail++; rechargeLog(`${tag}${q0.email}: ❌ 无可用卡密`); continue; }
-                card = picked[0];
+                const picked = await takeReusableCard(q0.email);
+                if (!picked.card) {
+                    fail++;
+                    rechargeLog(`${tag}${q0.email}: ❌ ${picked.empty ? "无可用卡密" : "剩下的卡密都被平台锁在别的号上"}`);
+                    continue;
+                }
+                card = picked.card;
                 rechargeLog(`${tag}${q0.email}: 分配新卡密 ${card.code.slice(0, 8)}...`);
             }
 
@@ -4657,19 +5020,39 @@ app.post("/api/recharge/queue/relogin-submit", async (req, res) => {
 
         rechargeLog(`[重登提交] 完成: 成功 ${ok} / 失败 ${fail} / 跳过 ${skipped} / 共 ${items.length}`);
         } finally {
+        wasStopped = rechargeStop || queueReloginStop;
         queueReloginRunning = false;
         queueReloginStop = false;
-        rechargeRunning = false;
-        await db.releaseRechargeQueueByInstance(db.instanceId);
+        endRechargeBatch(myGen);
+        await db.releaseRechargeQueueByInstance(db.instanceId, myIds);
         await queueSync(); await rechargeSync();
         }
-        if (ok > 0 && !rechargeStop) { rechargeLog("开始轮询任务状态…（已解锁，可继续提交其他号）"); await pollRechargeTasksLoop(); }
+        if (ok > 0 && !wasStopped) { rechargeLog("开始轮询任务状态…（已解锁，可继续提交其他号）"); await pollRechargeTasksLoop(); }
     })();
 });
 
 // ---- 充值提交(基于队列) ----
 let rechargeStop = false;
 let rechargeRunning = false;
+// 批次代号。每开一批 +1，收尾时只有"当前那批"才有资格清 rechargeRunning / rechargeStop，
+// 否则第一批跑完会顺手把第二批的锁和停止标志清掉，两批互相踩。
+let rechargeGen = 0;
+let rechargeGenAt = 0;
+// 超过这个时长还占着提交锁就认为那批卡死了，/stop 允许强解，避免面板永久点不动
+const RECHARGE_LOCK_STUCK_MS = Math.max(60_000, Number(process.env.RECHARGE_LOCK_STUCK_MS || 30 * 60_000));
+function beginRechargeBatch() {
+    rechargeRunning = true;
+    rechargeStop = false;
+    rechargeGenAt = Date.now();
+    return ++rechargeGen;
+}
+/** 只有最新那批能解锁。旧批次收尾时静默跳过，不动全局标志。 */
+function endRechargeBatch(gen) {
+    if (gen !== rechargeGen) return false;
+    rechargeRunning = false;
+    rechargeStop = false;
+    return true;
+}
 
 function emailMatchesMasked(masked, email) {
     const m = String(masked || "").trim().toLowerCase();
@@ -4685,14 +5068,84 @@ function emailMatchesMasked(masked, email) {
     return el.startsWith(prefix) && el.endsWith(suffix);
 }
 
-/** 平台明确锁死换号才拦；管理员已授权 / 未锁定的 unused 卡可以换号再提。 */
+function flagOn(v) {
+    return v === true || v === 1 || v === "1" || /^true|yes|on|allowed$/i.test(String(v || "").trim());
+}
+
+/** 只有平台明确锁死换号才拦。locked=false / 已授权 = 可换号再提。 */
 function cardBoundToOtherAccount(val, email) {
     if (String(val?.status || "") !== "unused") return false;
-    if (val?.account_change_allowed === true) return false;
-    if (val?.account_change_locked !== true) return false;
     const bound = String(val?.bound_email || "").trim();
     if (!bound) return false;
-    return !emailMatchesMasked(bound, email);
+    if (emailMatchesMasked(bound, email)) return false;
+    if (flagOn(val?.account_change_allowed) || flagOn(val?.change_allowed) || flagOn(val?.allow_account_change)) return false;
+    const verdict = val?.account_change_verdict || {};
+    if (String(verdict.result || "") === "allowed" || flagOn(verdict.allowed)) return false;
+    return val?.account_change_locked === true || val?.account_change_locked === "true" || val?.account_change_locked === 1;
+}
+
+/** 本地标失败、但平台仍是 unused（含已授权换号）的卡，放回未使用池。 */
+async function reviveErrorCardsFromPlatform() {
+    const {list} = await db.listRechargeCards();
+    let n = 0;
+    for (const card of list || []) {
+        if (card.status !== "error" || !card.code) continue;
+        try {
+            const val = (await callRechargeApi("POST", "/redeem-codes/validate", {redeem_code: card.code})).result || {};
+            if (String(val.status || "") !== "unused") continue;
+            await db.unpairRechargeCards([card.id]);
+            n++;
+            rechargeLog(`卡密 ${String(card.code).slice(0, 8)}… 平台仍 unused${flagOn(val.account_change_allowed) ? "（已授权换号）" : ""}，已放回未使用池`);
+        } catch (e: any) {
+            rechargeLog(`卡密 ${String(card.code || "").slice(0, 8)}… 复活核验失败: ${String(e?.message || e).slice(0, 80)}`);
+        }
+    }
+    return n;
+}
+
+/** 从本地 unused 池领卡，先问平台：unused 且没锁在别人号上才给。锁死的卡标 error，不再扔回池。 */
+async function takeReusableCard(forEmail, {maxTries = 20} = {}) {
+    const skipped = [];
+    let revived = false;
+    for (let i = 0; i < maxTries; i++) {
+        let cards = await db.claimUnusedCards(1);
+        if (!cards.length && !revived) {
+            revived = true;
+            const n = await reviveErrorCardsFromPlatform();
+            if (n) cards = await db.claimUnusedCards(1);
+        }
+        if (!cards.length) return {card: null, skipped, empty: true};
+        const card = cards[0];
+        try {
+            const valRes = await callRechargeApi("POST", "/redeem-codes/validate", {redeem_code: card.code});
+            const val = valRes.result || {};
+            rechargeLog(`卡密 ${String(card.code).slice(0, 8)}… 平台=${val.status || "?"} bound=${val.bound_email || "-"} locked=${val.account_change_locked} allowed=${val.account_change_allowed}`);
+            if (String(val.status || "") !== "unused") {
+                const why = `平台状态 ${val.status || "?"}，不能配`;
+                await lockRechargeCard(card.id, why);
+                skipped.push({code: card.code, reason: why});
+                rechargeLog(`跳过卡密 ${String(card.code).slice(0, 8)}… ${why}`);
+                continue;
+            }
+            if (cardBoundToOtherAccount(val, forEmail)) {
+                const bound = val.bound_email || "其他账号";
+                const why = `平台锁在 ${bound}，不能换给 ${forEmail}`;
+                // 卡仍 unused，只是绑着别人：放回池，留给对得上的号。不要标 error 把整池掏空。
+                await db.unpairRechargeCards([card.id]);
+                skipped.push({code: card.code, reason: why});
+                rechargeLog(`跳过卡密 ${String(card.code).slice(0, 8)}… ${why}（已放回未使用）`);
+                continue;
+            }
+            return {card, skipped, empty: false, val};
+        } catch (e: any) {
+            const why = `核验失败: ${String(e?.message || e).slice(0, 120)}`;
+            // 网络抖一下不要把 unused 卡锁死，否则池子被掏空
+            await db.unpairRechargeCards([card.id]);
+            skipped.push({code: card.code, reason: why});
+            rechargeLog(`跳过卡密 ${String(card.code).slice(0, 8)}… ${why}（已放回未使用）`);
+        }
+    }
+    return {card: null, skipped, empty: false};
 }
 
 async function lockRechargeCard(cardId, err) {
@@ -4761,15 +5214,15 @@ app.post("/api/recharge/submit", async (req, res) => {
     if (rechargeRunning) return res.status(400).json({error: "充值提交正在进行中"});
     const queueIds: number[] = (req.body?.queueIds || []).map(Number).filter(Number.isInteger);
     if (!queueIds.length) return res.status(400).json({error: "未选择队列项"});
-    rechargeRunning = true;
-    rechargeStop = false;
+    const myGen = beginRechargeBatch();
 
     const {claimed: claimedAll, skipped: skippedClaim} = await db.claimRechargeQueueItems(queueIds, db.instanceId);
     const items = claimedAll.filter((q: any) => q.status === "pending");
-    const releaseClaimed = () => db.releaseRechargeQueueItems(claimedAll.map((q: any) => q.id), db.instanceId);
+    const myIds = claimedAll.map((q: any) => Number(q.id));
+    const releaseClaimed = () => db.releaseRechargeQueueItems(myIds, db.instanceId);
     if (!items.length) {
         await releaseClaimed();
-        rechargeRunning = false;
+        endRechargeBatch(myGen);
         return res.status(400).json({error: skippedClaim[0]?.reason || "无可提交的队列项(需 status=pending,且未被其他实例占用)"});
     }
     if (items.length < claimedAll.length) {
@@ -4781,7 +5234,7 @@ app.post("/api/recharge/submit", async (req, res) => {
     const unusedCount = await db.rechargeUnusedCount();
     if (unusedCount < 1) {
         await releaseClaimed();
-        rechargeRunning = false;
+        endRechargeBatch(myGen);
         return res.status(400).json({error: "没有未使用卡密"});
     }
 
@@ -4792,6 +5245,7 @@ app.post("/api/recharge/submit", async (req, res) => {
         const intervalMs = (scheduler.rechargeInterval || 5) * 1000;
         const preConc = Math.max(2, Math.min(8, Number(scheduler.rechargeConcurrency) || 4));
         let submitted = 0, failed = 0, preDone = 0;
+        let wasStopped = false;
         let submitGate = Promise.resolve();
         const enqueueSubmit = (q) => {
             const run = submitGate.then(() => submitPassed(q));
@@ -4805,15 +5259,16 @@ app.post("/api/recharge/submit", async (req, res) => {
                 rechargeLog(`跳过 ${q0.email}：已人工标记失败`);
                 return;
             }
-            const cards = await db.claimUnusedCards(1);
-            if (!cards.length) {
+            const picked = await takeReusableCard(q0.email);
+            if (!picked.card) {
                 failed++;
-                await db.updateQueueItem(q0.id, {status: "error", error: "卡密分配不足", instance_id: "", finished_at: Date.now()});
-                rechargeLog(`预检 ✓ ${q0.email}，但没有未使用卡密，不提交`);
+                const why = picked.empty ? "没有未使用卡密" : "剩下的卡密都被平台锁在别的号上，不能换号";
+                await db.updateQueueItem(q0.id, {status: "error", error: why, instance_id: "", finished_at: Date.now()});
+                rechargeLog(`预检 ✓ ${q0.email}，但${why}，不提交`);
                 await queueSync();
                 return;
             }
-            const card = cards[0];
+            const card = picked.card;
             await db.updateQueueItem(q0.id, {status: "paired", card_id: card.id, card_code: card.code});
             await db.updateRechargeCard(card.id, {status: "paired", account_id: q0.account_id, account_email: q0.email});
             await queueSync(); await rechargeSync();
@@ -4866,11 +5321,13 @@ app.post("/api/recharge/submit", async (req, res) => {
         if (rechargeStop) rechargeLog("已停止充值提交");
         rechargeLog(`提交完成: 成功 ${submitted} / 失败 ${failed} / 总计 ${items.length}`);
         } finally {
-        rechargeRunning = false;
-        await db.releaseRechargeQueueByInstance(db.instanceId);
+        wasStopped = rechargeStop;
+        endRechargeBatch(myGen);
+        // 只还自己这批：同实例可能已经开了新的一批，全实例归还会把人家的认领清掉
+        await db.releaseRechargeQueueByInstance(db.instanceId, myIds);
         await queueSync();
         }
-        if (submitted > 0 && !rechargeStop) {
+        if (submitted > 0 && !wasStopped) {
             rechargeLog("开始轮询任务状态…（已解锁，可继续提交其他号）");
             await pollRechargeTasksLoop();
         }
@@ -4880,11 +5337,59 @@ app.post("/api/recharge/submit", async (req, res) => {
 app.post("/api/recharge/stop", (req, res) => {
     rechargeStop = true;
     validateStop = true;
-    rechargeRunning = false;
-    res.json({ok: true});
+    queueReloginStop = true;
+    // 不在这里清 rechargeRunning：那一批还在跑，清了就能再开一批，
+    // 而旧批收尾时会把新批的认领一起归还、把 rechargeStop 清掉。让owner自己收。
+    // 只有卡死（超过兜底时长还占着锁）才允许强解。
+    const stuckMs = rechargeGenAt ? Date.now() - rechargeGenAt : 0;
+    const force = !!req.body?.force || (rechargeRunning && stuckMs > RECHARGE_LOCK_STUCK_MS);
+    if (force && rechargeRunning) {
+        rechargeRunning = false;
+        rechargeLog(`强制解锁充值提交（已占用 ${Math.round(stuckMs / 1000)}s）`);
+    }
+    res.json({ok: true, running: rechargeRunning, forced: force});
 });
 
-// 轮询:30s 一次,最多 20 分钟(40 轮),超时后人工点「刷新状态」
+/** 拿一批 submitted 去平台对一次状态，落库 + 到 paid 就排换绑。返回这轮收敛掉几个。 */
+async function reconcileSubmittedTasks(pendingQ) {
+    let settled = 0;
+    const codes = pendingQ.filter((q: any) => q.card_code).map((q: any) => q.card_code);
+    for (let i = 0; i < codes.length; i += 50) {
+        const chunk = codes.slice(i, i + 50);
+        const data = await callRechargeApi("POST", "/tasks/lookup-batch", {redeem_codes: chunk});
+        for (const r of (data.results || [])) {
+            if (!r.ok) continue;
+            const task = r.task || {};
+            const q = pendingQ.find((x: any) => x.card_code.replace(/-/g, "") === (r.redeem_code || "").replace(/-/g, ""));
+            if (!q) continue;
+            const updates: any = {task_status: task.status || "", task_message: task.message || ""};
+            if (task.task_no && !q.task_no) updates.task_no = task.task_no;
+            if (task.status === "paid") updates.status = "done";
+            else if (["failed", "canceled", "returned"].includes(task.status)) {
+                updates.status = "error";
+                updates.card_id = 0;
+            }
+            if (updates.status === "done" || updates.status === "error") {
+                updates.finished_at = Date.now();
+                settled++;
+            }
+            await db.updateQueueItem(q.id, updates);
+            if (q.card_id) {
+                if (["failed", "canceled", "returned"].includes(task.status)) {
+                    await db.unpairRechargeCards([q.card_id]);
+                    rechargeLog(`  卡密 ${q.card_code} 任务${task.status}，已放回未使用`);
+                } else {
+                    await db.updateRechargeCard(q.card_id, updates);
+                }
+            }
+            if (updates.status) rechargeLog(`${updates.status === "done" ? "✓" : "✗"} ${q.email} → ${task.status}: ${task.message || ""}`);
+            if (task.status === "paid") enqueueGmailRebind(q);
+        }
+    }
+    return settled;
+}
+
+// 轮询:30s 一次,最多 20 分钟(40 轮)。超时后交给周期兜底 pumpRechargePollSweep 接着收。
 async function pollRechargeTasksLoop() {
     const INTERVAL = 30_000, TIMEOUT = 20 * 60_000;
     const deadline = Date.now() + TIMEOUT;
@@ -4894,36 +5399,7 @@ async function pollRechargeTasksLoop() {
         if (!pendingQ.length) { rechargeLog("所有任务已到达终态"); break; }
 
         try {
-            const codes = pendingQ.filter((q: any) => q.card_code).map((q: any) => q.card_code);
-            for (let i = 0; i < codes.length; i += 50) {
-                const chunk = codes.slice(i, i + 50);
-                const data = await callRechargeApi("POST", "/tasks/lookup-batch", {redeem_codes: chunk});
-                for (const r of (data.results || [])) {
-                    if (!r.ok) continue;
-                    const task = r.task || {};
-                    const q = pendingQ.find((x: any) => x.card_code.replace(/-/g, "") === (r.redeem_code || "").replace(/-/g, ""));
-                    if (!q) continue;
-                    const updates: any = {task_status: task.status || "", task_message: task.message || ""};
-                    if (task.task_no && !q.task_no) updates.task_no = task.task_no;
-                    if (task.status === "paid") updates.status = "done";
-                    else if (["failed", "canceled", "returned"].includes(task.status)) {
-                        updates.status = "error";
-                        updates.card_id = 0;
-                    }
-                    if (updates.status === "done" || updates.status === "error") updates.finished_at = Date.now();
-                    await db.updateQueueItem(q.id, updates);
-                    if (q.card_id) {
-                        if (["failed", "canceled", "returned"].includes(task.status)) {
-                            await db.unpairRechargeCards([q.card_id]);
-                            rechargeLog(`  卡密 ${q.card_code} 任务${task.status}，已放回未使用`);
-                        } else {
-                            await db.updateRechargeCard(q.card_id, updates);
-                        }
-                    }
-                    if (updates.status) rechargeLog(`${updates.status === "done" ? "✓" : "✗"} ${q.email} → ${task.status}: ${task.message || ""}`);
-                    if (task.status === "paid") enqueueGmailRebind(q);
-                }
-            }
+            await reconcileSubmittedTasks(pendingQ);
         } catch (e: any) {
             rechargeLog(`轮询出错: ${e?.message || e}`);
         }
@@ -4933,7 +5409,31 @@ async function pollRechargeTasksLoop() {
         await new Promise((r) => setTimeout(r, INTERVAL));
     }
     if ((await db.listQueueSubmittedPending()).length) {
-        rechargeLog("轮询超时(20分钟),请手动点击「刷新状态」查询最新进度");
+        rechargeLog("轮询超时(20分钟)，转为后台每 5 分钟兜底查一次（也可手动点「刷新状态」）");
+    }
+}
+
+// 前台轮询只跑 20 分钟，之后 submitted 会一直悬在那：钱已扣、库里没到终态、换绑也不会排。
+// 这里每 5 分钟兜一次，直到全部收敛。跟前台轮询共用同一套落库逻辑。
+const RECHARGE_POLL_SWEEP_MS = Math.max(60_000, Number(process.env.RECHARGE_POLL_SWEEP_MS || 5 * 60_000));
+const CARD_RECLAIM_INTERVAL_MS = Math.max(60_000, Number(process.env.CARD_RECLAIM_INTERVAL_MS || 5 * 60_000));
+let pollSweepBusy = false;
+async function pumpRechargePollSweep() {
+    if (pollSweepBusy) return;
+    if (!scheduler.rechargeApiKey) return;
+    pollSweepBusy = true;
+    try {
+        const pendingQ = await db.listQueueSubmittedPending();
+        if (!pendingQ.length) return;
+        const settled = await reconcileSubmittedTasks(pendingQ);
+        if (settled) {
+            rechargeLog(`[兜底轮询] ${pendingQ.length} 个悬空任务，收敛 ${settled} 个`);
+            await queueSync(); await rechargeSync();
+        }
+    } catch (e: any) {
+        rechargeLog(`[兜底轮询] 出错: ${String(e?.message || e).slice(0, 120)}`);
+    } finally {
+        pollSweepBusy = false;
     }
 }
 
@@ -5162,7 +5662,7 @@ app.post("/api/recharge/rebind-gmail/migrate", async (req, res) => {
                 if (blocked.has(r.id) || movedIds.includes(r.id)) continue;
                 const login = await probeGmailWebLogin(r, (m) => rechargeLog(`迁入探登录 ${r.email}: ${m}`));
                 if (login.ok) {
-                    try { await db.refreshMailboxGoogleState(r.id, {login: "ok"}); } catch { /* */ }
+                    try { await db.refreshMailboxGoogleState(r.id, {login: "ok", login_at: Date.now()}); } catch { /* */ }
                     await moveOneNow(r);
                     continue;
                 }
@@ -5257,15 +5757,50 @@ app.post("/api/recharge/rebind-gmail/cancel", async (req, res) => {
         gmailRebindCancelled.add(id);
         const i = gmailRebindIds.indexOf(id);
         if (i >= 0) gmailRebindIds.splice(i, 1);
-        gmailRebindQueued.delete(id);
-        gmailRebindTargets.delete(id);
-        gmailRebindPool.delete(id);
+        const active = gmailRebindActive.has(id);
+        // 正在跑的这一轮还在读 targets/pool，也还要靠 queued 挡住重复点。
+        // 这里清了，用户马上能再点一次，就会有两个 runGmailRebind 抢同一个 queueId、
+        // 各领一个目标邮箱，其中一个必然撞 alreadyLinked 把好号标废。交给它自己的 finally 收。
+        if (!active) {
+            gmailRebindQueued.delete(id);
+            gmailRebindTargets.delete(id);
+            gmailRebindPool.delete(id);
+        }
         await db.updateQueueItem(id, {rebind_status: "fail", rebind_error: "已取消换绑", rebind_pool: null});
-        rechargeLog(`换绑已取消 ${q.email}${gmailRebindCurrentId === id ? "（当前任务将在下一步停下）" : ""}`);
+        rechargeLog(`换绑已取消 ${q.email}${active ? "（当前任务将在下一步停下）" : ""}`);
         count++;
     }
     await queueSync();
     res.json({ok: true, count});
+});
+
+// 换绑对账：手动催一轮（也可只对指定 id）
+app.post("/api/recharge/rebind-gmail/reconcile", async (req, res) => {
+    const ids = (req.body?.ids || []).map(Number).filter(Number.isInteger);
+    if (!ids.length) {
+        const pending = await db.countRebindReconcile();
+        if (!pending) return res.json({ok: true, pending: 0, message: "没有待核对的换绑"});
+        pumpRebindReconcile().catch(() => {});
+        return res.json({ok: true, pending, message: `已开始对账 ${pending} 个待核对换绑`});
+    }
+    let done = 0;
+    const skipped: {email: string; reason: string}[] = [];
+    for (const id of ids) {
+        const q = await db.getRechargeQueueItem(id);
+        if (!q) { skipped.push({email: String(id), reason: "不存在"}); continue; }
+        if (String(q.rebind_status || "") !== "unknown") {
+            skipped.push({email: q.email, reason: `无需对账(${q.rebind_status || "—"})`});
+            continue;
+        }
+        try {
+            await reconcileOneRebind(q);
+            done++;
+        } catch (e: any) {
+            skipped.push({email: q.email, reason: String(e?.message || e).slice(0, 120)});
+        }
+    }
+    await queueSync();
+    res.json({ok: true, done, skipped});
 });
 
 // 导出队列账号
@@ -5273,9 +5808,17 @@ app.post("/api/recharge/queue/export", async (req, res) => {
     const ids = (req.body?.ids || []).map(Number).filter(Number.isInteger);
     const batch = req.body?.batch || "";
     const format = req.body?.format || "account"; // account | full
-    const rows = await db.listRechargeQueueFull(ids.length ? ids : undefined, batch || undefined);
+    if (!ids.length && !batch) {
+        return res.status(400).json({error: "请先勾选账号或选分组再导出，避免把全表 session 灌进内存"});
+    }
+    const rows = await db.listRechargeQueueFull(ids.length ? ids : undefined, batch || undefined, {includeAuth: format === "session"});
     if (!rows.length) return res.status(400).json({error: "无数据可导出"});
     const sep = "----";
+    const exportRtOf = (r) => {
+        if (r.refresh_token) return String(r.refresh_token);
+        const tok = extractTokens(readJsonFileSafe(r.rt_file) || readJsonFileSafe(r.gpt_auth_file));
+        return tok?.refreshToken || "";
+    };
 
     if (format === "account") {
         const text = rows.map((r: any) => formatAccountExportLine(r, {withGpt: true})).join("\n");
@@ -5301,19 +5844,7 @@ app.post("/api/recharge/queue/export", async (req, res) => {
     if (format === "sub2json") {
         let withRt = 0;
         const lines = rows.map((r: any) => {
-            const sources = [
-                r.gpt_rt_data,
-                readJsonFileSafe(r.rt_file),
-                r.gpt_auth_data,
-                readJsonFileSafe(r.gpt_auth_file),
-                r.auth_data,
-                readJsonFileSafe(r.auth_file),
-            ];
-            let rt = "";
-            for (const src of sources) {
-                const t = extractTokens(src);
-                if (t?.refreshToken) { rt = t.refreshToken; break; }
-            }
+            const rt = exportRtOf(r);
             if (rt) withRt++;
             // Gmail 必须用 GPT 密码；mail.com 通常 gpt_password 空则回落邮箱密码
             const pw = String(r.gpt_password || r.password || "").trim();
@@ -5330,16 +5861,10 @@ app.post("/api/recharge/queue/export", async (req, res) => {
 
     // full 格式: 缺 RT 则异步获取；relogin=true 则先强制重登再取 RT
     const forceRelogin = req.body?.relogin === true;
-    const needRt = rows.filter((r: any) => {
-        const tok = extractTokens(r.gpt_rt_data || r.gpt_auth_data || readJsonFileSafe(r.rt_file) || readJsonFileSafe(r.gpt_auth_file));
-        return !tok?.refreshToken;
-    });
+    const needRt = rows.filter((r: any) => !exportRtOf(r));
 
     if (!forceRelogin && !needRt.length) {
-        const text = rows.map((r: any) => {
-            const tok = extractTokens(r.gpt_rt_data || r.gpt_auth_data || readJsonFileSafe(r.rt_file) || readJsonFileSafe(r.gpt_auth_file));
-            return formatAccountExportLine(r, {rt: tok?.refreshToken || "", sep});
-        }).join("\n");
+        const text = rows.map((r: any) => formatAccountExportLine(r, {rt: exportRtOf(r), sep})).join("\n");
         return res.set("Content-Type", "text/plain; charset=utf-8").send(text);
     }
 
@@ -5412,10 +5937,7 @@ app.post("/api/recharge/queue/export", async (req, res) => {
         }
         rechargeLog(`${forceRelogin ? "重登导出" : "RT 获取"}完成: 成功 ${ok} / 失败 ${fail}`);
         const freshRows = await db.listRechargeQueueFull(ids.length ? ids : undefined, batch || undefined);
-        const text = freshRows.map((r: any) => {
-            const tok = extractTokens(r.gpt_rt_data || r.gpt_auth_data || readJsonFileSafe(r.rt_file) || readJsonFileSafe(r.gpt_auth_file));
-            return formatAccountExportLine(r, {rt: tok?.refreshToken || "", sep});
-        }).join("\n");
+        const text = freshRows.map((r: any) => formatAccountExportLine(r, {rt: exportRtOf(r), sep})).join("\n");
         broadcast("rechargeExportReady", {text, relogin: forceRelogin});
         rechargeLog(forceRelogin
             ? `重登取 RT 完成，共 ${freshRows.length} 条，点「导出含RT」即可复制`
@@ -5426,8 +5948,10 @@ app.post("/api/recharge/queue/export", async (req, res) => {
 app.post("/api/recharge/queue/export/stop", (req, res) => {
     const running = !!exportRtBusy;
     exportRtStop = true;
-    if (running) rechargeLog("已请求停止导出RT，当前这个号跑完就停，后面的不再开始");
-    res.json({ok: true, running});
+    const n = exportLiveChildren.size;
+    killExportChildren();
+    if (running) rechargeLog(n ? `已停止导出RT，杀掉 ${n} 个子进程` : "已请求停止导出RT，当前这个号跑完就停，后面的不再开始");
+    res.json({ok: true, running, killed: n});
 });
 
 
@@ -5480,6 +6004,12 @@ if (existsSync(WEB_DIST)) {
     app.use(express.static(WEB_DIST, {setHeaders: (res, p) => { if (p.endsWith(".html")) res.setHeader("Cache-Control", "no-cache"); }}));
     app.get(/^(?!\/api).*/, (req, res) => { res.set("Cache-Control", "no-cache"); res.sendFile(path.join(WEB_DIST, "index.html")); });
 }
+
+app.use((err: any, _req: any, res: any, next: any) => {
+    console.error("[http]", err?.stack || err);
+    if (res.headersSent) return next(err);
+    res.status(400).json({ok: false, error: String(err?.message || err).slice(0, 240)});
+});
 
 setMailProxy(scheduler.mailProxyEnabled !== false ? (scheduler.mailProxy || "") : ""); // 收件箱初始用邮箱代理(受开关控制)
 // GPT 注册不再走独立 vless/xray，统一用邮箱代理池（跳板 + 导入出口）。清掉旧自启。
@@ -5600,7 +6130,52 @@ const httpServer = app.listen(PORT, "0.0.0.0", () => {
     }, 30_000);
     setInterval(() => { tickMailJobs().catch(() => {}); }, 2000);
     setInterval(() => { db.heartbeatMailJobs(db.instanceId).catch(() => {}); }, 15000);
-    db.listPendingGmailRebinds().then((rows) => {
+    setInterval(() => {
+        db.releaseOrphanRebindClaims({exceptIds: [...liveRebindMailboxIds]}).then((n) => {
+            if (n) rechargeLog(`换绑预占回收：放回 ${n} 个未完成的换绑池 Gmail`);
+        }).catch(() => {});
+    }, 120_000);
+    // 待核对的换绑必须一直有人推，否则号会一直占着、库里也一直是旧邮箱
+    setInterval(() => { pumpRebindReconcile().catch(() => {}); }, REBIND_RECONCILE_INTERVAL_MS);
+    // 前台轮询只跑 20 分钟，之后 submitted 悬空：钱扣了、库里没终态、换绑也不会排
+    setInterval(() => { pumpRechargePollSweep().catch(() => {}); }, RECHARGE_POLL_SWEEP_MS);
+    // 配对后崩在提交前的卡，挂在 paired 谁也领不到，等于库存凭空少
+    setInterval(() => {
+        db.reclaimOrphanPairedCards().then(async (rows) => {
+            if (!rows.length) return;
+            rechargeLog(`卡密回收：${rows.length} 张卡配对后没提交成功，已放回未使用`);
+            await rechargeSync();
+        }).catch(() => {});
+    }, CARD_RECLAIM_INTERVAL_MS);
+    db.listPendingGmailRebinds().then(async (rows) => {
+        try {
+            const {sweepRebindProbeWindows} = await import("../src/bitbrowser.js");
+            const n = await sweepRebindProbeWindows({log: (m) => rechargeLog(m)});
+            if (n) rechargeLog(`启动恢复：先清 ${n} 个换绑残留比特窗`);
+        } catch { /* */ }
+        try {
+            const n = await db.releaseOrphanRebindClaims();
+            if (n) rechargeLog(`启动恢复：放回 ${n} 个超时未释放的换绑池 Gmail`);
+        } catch { /* */ }
+        try {
+            const n = await db.countRebindReconcile();
+            if (n) {
+                rechargeLog(`启动恢复：${n} 个换绑状态待核对，开始向官方对账`);
+                pumpRebindReconcile().catch(() => {});
+            }
+        } catch { /* */ }
+        try {
+            // 上次是崩着退出的话，配对到一半的卡还挂在 paired，先放回去再说
+            const cards = await db.reclaimOrphanPairedCards(0);
+            if (cards.length) rechargeLog(`启动恢复：${cards.length} 张卡配对后没提交成功，已放回未使用`);
+        } catch { /* */ }
+        try {
+            const stuck = await db.listQueueSubmittedPending();
+            if (stuck.length) {
+                rechargeLog(`启动恢复：${stuck.length} 个任务停在已提交，开始兜底查平台状态`);
+                pumpRechargePollSweep().catch(() => {});
+            }
+        } catch { /* */ }
         if (!rows.length) return;
         rechargeLog(`启动恢复：${rows.length} 个换绑停在进行中，重新排队`);
         for (const q of rows) enqueueGmailRebind(q, {force: true, pool: q.rebind_pool || {}});
@@ -5636,6 +6211,8 @@ async function shutdownThisInstance(signal: string) {
     } catch (e: any) {
         console.warn(`[server] 释放任务失败: ${e?.message ?? e}`);
     }
+    // 待核对的换绑认领要放回，否则本实例下线后没人接着对账
+    try { await db.releaseRebindReconcileByInstance(db.instanceId); } catch { /* */ }
     process.exit(0);
 }
 process.on("SIGINT", () => { shutdownThisInstance("SIGINT"); });

@@ -55,6 +55,8 @@ export async function init() {
     await query(`UPDATE pw_queue SET status='pending', instance_id='' WHERE status='running' AND (instance_id=$1 OR instance_id='')`, [instanceId]);
     await query(`UPDATE mail_jobs SET status='pending', instance_id='', last_line='实例重启，退回排队' WHERE status='running' AND (instance_id=$1 OR instance_id='')`, [instanceId]);
     await releaseRechargeQueueByInstance(instanceId);
+    // 上次退出时没做完的换绑对账认领要放回，否则那些 unknown 行永远等不到收敛
+    await releaseRebindReconcileByInstance(instanceId);
     console.log(`[db] 启动初始化完成 (instance=${instanceId})：本实例 running→pending, claimed→free`);
 }
 
@@ -75,6 +77,7 @@ export async function cleanupAllStale() {
             instance_id = ''
          WHERE instance_id != '' RETURNING id`
     );
+    await query(`UPDATE recharge_queue SET rebind_instance='' WHERE COALESCE(rebind_instance,'')<>''`);
     return {gpt: r1.rowCount, claude: r2.rowCount, sms: r3.rowCount, pw: r4.rowCount, recharge: r5.rowCount};
 }
 
@@ -821,8 +824,9 @@ export async function claimFreeMailcomMailbox() {
 export async function listRebindGmailCandidates(opts = {}) {
     const {sql, params} = googleImapClaimWhere(opts);
     const { rows } = await query(
+        // 最久没被试过的排前面：刚失败放回池的号会沉到队尾，不会被下一个账号立刻又领走。
         `SELECT m.id, m.email, m.password, m.totp_secret, m.recovery_email, m.imap_password, COALESCE(m.grp,'') AS grp
-         FROM mailboxes m WHERE ${sql} ORDER BY m.id DESC`,
+         FROM mailboxes m WHERE ${sql} ORDER BY COALESCE(m.rebind_tried_at,0) ASC, m.id DESC`,
         params,
     );
     return rows;
@@ -852,7 +856,10 @@ export async function claimMailboxForRebind(id) {
             [mailboxId],
         );
         if (!mb) return null;
-        await client.query(`UPDATE mailboxes SET usage='gpt' WHERE id=$1`, [mailboxId]);
+        await client.query(
+            `UPDATE mailboxes SET usage='gpt', claimed_at=$2, rebind_tried_at=$2 WHERE id=$1`,
+            [mailboxId, Date.now()],
+        );
         return { ...mb, usage: "gpt" };
     });
 }
@@ -894,8 +901,48 @@ export async function releaseMailboxToFree(id) {
     const mailboxId = Number(id);
     if (!Number.isInteger(mailboxId)) return 0;
     const { rowCount } = await query(
-        `UPDATE mailboxes SET usage='hold' WHERE id=$1 AND deleted_at=0 AND usage='gpt'`,
+        `UPDATE mailboxes SET usage='hold', claimed_at=0 WHERE id=$1 AND deleted_at=0 AND usage='gpt'`,
         [mailboxId]
+    );
+    return rowCount || 0;
+}
+
+/** 换绑预占成 gpt 后超时/重启没放回：池子只显示 hold，看起来像号没了。 */
+export async function releaseOrphanRebindClaims({exceptIds = [], maxAgeMs = 0} = {}) {
+    const except = (Array.isArray(exceptIds) ? exceptIds : []).map(Number).filter(Number.isInteger);
+    const params = [REBIND_GMAIL_POOL_GRP];
+    let extra = "";
+    if (except.length) {
+        params.push(except);
+        extra += ` AND m.id <> ALL($${params.length}::int[])`;
+    }
+    if (Number(maxAgeMs) > 0) {
+        params.push(Date.now() - Number(maxAgeMs));
+        extra += ` AND COALESCE(m.claimed_at,0) > 0 AND m.claimed_at < $${params.length}`;
+    }
+    const { rowCount } = await query(
+        `UPDATE mailboxes m SET usage='hold', claimed_at=0
+         WHERE m.deleted_at=0 AND m.usage='gpt'
+           AND COALESCE(m.sold_at,0)=0
+           AND COALESCE(m.grp,'')=$1
+           AND NOT EXISTS (SELECT 1 FROM gpt_accounts g WHERE g.mailbox_id=m.id AND COALESCE(g.deleted_at,0)=0)
+           AND NOT EXISTS (SELECT 1 FROM claude_accounts c WHERE c.mailbox_id=m.id)
+           AND NOT EXISTS (
+               SELECT 1 FROM recharge_queue rq
+               WHERE rq.rebind_status='unknown' AND rq.rebind_attempt_mailbox_id=m.id
+           )${extra}`,
+        params,
+    );
+    return rowCount || 0;
+}
+
+/** 换绑状态待核对时给邮箱挂个说明，池子里能看出来它为什么被占着。 */
+export async function setMailboxNote(id, note = "") {
+    const mailboxId = Number(id);
+    if (!Number.isInteger(mailboxId)) return 0;
+    const { rowCount } = await query(
+        `UPDATE mailboxes SET note=$1 WHERE id=$2 AND deleted_at=0`,
+        [String(note || "").slice(0, 80), mailboxId],
     );
     return rowCount || 0;
 }
@@ -1379,6 +1426,29 @@ export async function claimUnusedCards(n) {
     });
 }
 
+/**
+ * paired 是个过渡态：配对写库之后、提交给平台之前。中间崩掉/被杀，卡就一直挂在 paired，
+ * 既不在 unused 池里能被领，也没有任何队列项还指着它——等于库存凭空少一张。
+ * 这里回收「超过 graceMs 还没人认领的 paired 卡」，grace 是为了不抢正在提交的那一张。
+ */
+export async function reclaimOrphanPairedCards(graceMs = 10 * 60_000) {
+    const cutoff = Date.now() - Math.max(60_000, Number(graceMs) || 0);
+    const { rows } = await query(
+        `UPDATE recharge_cards c SET
+            status='unused', account_id=0, account_email='', error='', task_no='', updated_at=$1
+         WHERE c.status='paired'
+           AND COALESCE(c.updated_at,0) < $2
+           AND NOT EXISTS (
+               SELECT 1 FROM recharge_queue rq
+               WHERE rq.card_id=c.id
+                 AND rq.status NOT IN ('done','error')
+           )
+         RETURNING c.id, c.code`,
+        [Date.now(), cutoff],
+    );
+    return rows;
+}
+
 export async function listSubmittedPending() {
     const { rows } = await query(`SELECT * FROM recharge_cards WHERE status='submitted' AND task_status NOT IN ('paid','failed','canceled','returned') ORDER BY id`);
     return rows;
@@ -1431,7 +1501,14 @@ export async function listRechargeQueue(delivery = "undelivered") {
     const kind = rechargeQueueDeliveryKind(delivery);
     const where = rechargeQueueWhere(kind);
     const { rows: list } = await query(
-        `SELECT * FROM recharge_queue ${where} ORDER BY ${kind === "delivered" ? "delivered_at DESC NULLS LAST, id DESC" : kind === "error" ? "finished_at DESC NULLS LAST, id DESC" : "id"}`,
+        `SELECT id, account_id, email, auth_file, plan, batch, card_id, card_code,
+                status, task_no, task_status, task_message, error, created_at, plan_type,
+                submitted_at, instance_id, finished_at,
+                rebind_status, rebind_email, rebind_error, rebind_target, rebind_pool,
+                delivery_status, delivered_at, rebind_from, rebind_attempt_email,
+                rebind_blocked_until
+         FROM recharge_queue ${where}
+         ORDER BY ${kind === "delivered" ? "delivered_at DESC NULLS LAST, id DESC" : kind === "error" ? "finished_at DESC NULLS LAST, id DESC" : "id"}`,
     );
     const out = { pending: 0, paired: 0, submitting: 0, submitted: 0, done: 0, error: 0, total: 0, undelivered: 0, delivered: 0, failed: 0, working: 0, ready: 0 };
     const { rows: statsRows } = await query(
@@ -1565,7 +1642,20 @@ export async function releaseRechargeQueueItems(ids, instId = instanceId) {
     return rowCount || 0;
 }
 
-export async function releaseRechargeQueueByInstance(instId = instanceId) {
+/**
+ * 收尾归还：submitting 回退到 paired/pending，清认领。
+ * ids 给了就只收自己这一批——同实例并行跑两批时，不能把别人还在跑的行也清掉。
+ * 不给 ids 才是全实例（只用于启动/退出时的全量回收）。
+ */
+export async function releaseRechargeQueueByInstance(instId = instanceId, ids = null) {
+    const idList = ids === null ? null : (ids || []).map(Number).filter(Number.isInteger);
+    if (idList !== null && !idList.length) return 0;
+    const params: any[] = [instId];
+    let extra = "";
+    if (idList !== null) {
+        params.push(idList);
+        extra = ` AND id = ANY($${params.length})`;
+    }
     const { rowCount } = await query(
         `UPDATE recharge_queue SET
             status = CASE
@@ -1574,8 +1664,8 @@ export async function releaseRechargeQueueByInstance(instId = instanceId) {
                 ELSE status
             END,
             instance_id = ''
-         WHERE instance_id = $1`,
-        [instId]
+         WHERE instance_id = $1${extra}`,
+        params
     );
     return rowCount || 0;
 }
@@ -1591,7 +1681,7 @@ export async function releaseInstanceWork(instId = instanceId) {
 }
 
 export async function updateQueueItem(id, fields) {
-    const allowed = ["status", "card_id", "card_code", "task_no", "task_status", "task_message", "error", "batch", "plan_type", "submitted_at", "finished_at", "instance_id", "email", "rebind_status", "rebind_email", "rebind_error", "rebind_target", "rebind_pool", "rebind_from", "delivery_status", "delivered_at"];
+    const allowed = ["status", "card_id", "card_code", "task_no", "task_status", "task_message", "error", "batch", "plan_type", "submitted_at", "finished_at", "instance_id", "email", "rebind_status", "rebind_email", "rebind_error", "rebind_target", "rebind_pool", "rebind_from", "delivery_status", "delivered_at", "rebind_attempt_email", "rebind_attempt_mailbox_id", "rebind_attempt_at", "rebind_attempt_stage", "rebind_instance", "rebind_blocked_until"];
     const sets = [], vals = [];
     for (const k of allowed) {
         if (fields[k] !== undefined) {
@@ -1702,6 +1792,68 @@ export async function listPendingGmailRebinds() {
     return rows;
 }
 
+/** 换绑意图落盘：打官方 verify 之前调，失联后靠这些字段对账。 */
+export async function markRebindAttempt(queueId, {email = "", mailboxId = 0, stage = "begin"} = {}) {
+    await query(
+        `UPDATE recharge_queue
+         SET rebind_attempt_email=$1, rebind_attempt_mailbox_id=$2, rebind_attempt_at=$3, rebind_attempt_stage=$4
+         WHERE id=$5`,
+        [String(email || "").trim().toLowerCase(), Number(mailboxId) || 0, Date.now(), String(stage || ""), Number(queueId)],
+    );
+}
+
+/**
+ * 认领待对账的换绑（rebind_status='unknown'）。多实例下用 SKIP LOCKED 保证一行只被一个实例收敛。
+ * 只认领超过 graceMs 的，避免抢正在跑的那一轮。
+ */
+export async function claimRebindReconcile(limit = 5, instId = instanceId, graceMs = 30_000) {
+    const n = Math.max(1, Math.min(50, Number(limit) || 5));
+    return withTransaction(async (client) => {
+        const { rows } = await client.query(
+            `SELECT * FROM recharge_queue
+             WHERE rebind_status='unknown'
+               AND COALESCE(rebind_instance,'')=''
+               AND COALESCE(rebind_attempt_at,0) < $1
+             ORDER BY rebind_attempt_at
+             LIMIT $2
+             FOR UPDATE SKIP LOCKED`,
+            [Date.now() - Math.max(0, Number(graceMs) || 0), n],
+        );
+        if (!rows.length) return [];
+        await client.query(
+            `UPDATE recharge_queue SET rebind_instance=$1 WHERE id = ANY($2)`,
+            [instId, rows.map((r) => r.id)],
+        );
+        return rows;
+    });
+}
+
+export async function releaseRebindReconcile(ids, instId = instanceId) {
+    const idList = (ids || []).map(Number).filter(Number.isInteger);
+    if (!idList.length) return 0;
+    const { rowCount } = await query(
+        `UPDATE recharge_queue SET rebind_instance='' WHERE rebind_instance=$1 AND id = ANY($2)`,
+        [instId, idList],
+    );
+    return rowCount || 0;
+}
+
+/** 实例启动/退出时把自己没做完的对账认领放回，否则这些行永远没人收敛。 */
+export async function releaseRebindReconcileByInstance(instId = instanceId) {
+    const { rowCount } = await query(
+        `UPDATE recharge_queue SET rebind_instance='' WHERE rebind_instance=$1`,
+        [instId],
+    );
+    return rowCount || 0;
+}
+
+export async function countRebindReconcile() {
+    const { rows: [r] } = await query(
+        `SELECT COUNT(*)::int AS n FROM recharge_queue WHERE rebind_status='unknown'`,
+    );
+    return Number(r?.n || 0);
+}
+
 export async function listQueueSubmittedPending() {
     const { rows } = await query(
         `SELECT * FROM recharge_queue
@@ -1725,11 +1877,18 @@ export async function rechargeQueueBatches(delivery = "undelivered") {
     return rows;
 }
 
-export async function listRechargeQueueFull(ids?: number[], batch?: string) {
-    let sql = `SELECT rq.*, m.password, m.provider, m.totp_secret AS mailbox_totp,
+export async function listRechargeQueueFull(ids?: number[], batch?: string, opts: {includeAuth?: boolean} = {}) {
+    // 默认不带整份 auth_data/session。单条 session JSON 能到数 MB，全表会把 3100 打崩。
+    const extra = opts.includeAuth
+        ? `, g.auth_data AS gpt_auth_data, rq.auth_data, g.rt_data AS gpt_rt_data`
+        : `, NULLIF(g.rt_data->>'refresh_token','') AS refresh_token`;
+    let sql = `SELECT rq.id, rq.account_id, rq.email, rq.auth_file, rq.plan, rq.batch,
+                      rq.status, rq.card_code, rq.delivery_status,
+                      m.password, m.provider, m.totp_secret AS mailbox_totp,
                       m.imap_password AS mailbox_imap, m.imap_password,
                       g.gpt_password, g.totp_secret, g.rt_file,
-                      g.auth_file AS gpt_auth_file, g.auth_data AS gpt_auth_data, g.rt_data AS gpt_rt_data
+                      g.auth_file AS gpt_auth_file
+                      ${extra}
                FROM recharge_queue rq
                JOIN gpt_accounts g ON rq.account_id = g.id
                JOIN mailboxes m ON g.mailbox_id = m.id`;

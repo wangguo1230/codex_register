@@ -1197,7 +1197,9 @@ export async function verifyMailcomLogin(email, password, log = (m) => {}, opts 
                 profile: opts.profile,
             });
             log(`${key} 登录成功(密码正确)`);
-            return {ok: true};
+            // 成功/失败必须同形，否则调用方读 pre.wrongPassword 时是 union，
+            // 拿不到值就会把"页面异常"当成"账密无效"，好邮箱被标废。
+            return {ok: true, reason: "", wrongPassword: false};
         } catch (e) {
             const msg = String(e?.message || e);
             // 区分:明确"账密无效/跳 logout"=密码确实错;其它(page.fill timeout/网络/浏览器崩)=页面异常,不能当密码错

@@ -230,12 +230,17 @@ export interface RechargeQueueItem {
     task_message: string;
     error: string;
     plan_type: string;
-    rebind_status?: string;
+    /** ok=已换绑；pending=换绑中；fail=失败；unknown=官方是否已改未知，等对账 */
+    rebind_status?: "" | "ok" | "pending" | "fail" | "unknown" | "skipped" | string;
     rebind_email?: string;
     rebind_error?: string;
     rebind_target?: string;
     /** 换绑前原始邮箱（首次换绑写入后保留） */
     rebind_from?: string;
+    /** 待核对时正在尝试换到的目标邮箱 */
+    rebind_attempt_email?: string;
+    /** 官方 24h 换绑上限的解禁时间戳；>now 时点换绑只会白打一次官方接口 */
+    rebind_blocked_until?: number;
     /** undelivered=作业中；delivered=已交付（移出队列） */
     delivery_status?: "undelivered" | "delivered" | string;
     delivered_at?: number;
@@ -490,8 +495,13 @@ export const api = {
         j<{ok: boolean; to: string; items: {id: number; queueEmail: string; from: string; rebound: boolean; to: string; subject: string; text: string; html: string; canSend: boolean; reason: string; group: string}[]}>(
             "/api/recharge/queue/send-preview", {method: "POST", body: JSON.stringify({ids, to: to || ""})}),
     rechargeTestSend: (ids: number[], to: string, opts?: {subject?: string; html?: string; text?: string}) =>
-        j<{ok: boolean; to: string; sent: number; failed: number; skipped: number; items: any[]; error?: string}>(
+        j<{ok: boolean; async?: boolean; queued?: number; skipped?: number; to: string; sent?: number; failed?: number; error?: string; preview?: any[]}>(
             "/api/recharge/queue/test-send", {method: "POST", body: JSON.stringify({ids, to, ...opts})}),
+    rechargeTestSendStatus: () =>
+        j<{ok: boolean; running: boolean; stop?: boolean; to: string; queued: number; sent: number; failed: number; skipped: number; error: string; startedAt: number; finishedAt: number}>(
+            "/api/recharge/queue/test-send"),
+    stopTestSend: () =>
+        j<{ok: boolean; running?: boolean}>("/api/recharge/queue/test-send/stop", {method: "POST"}),
     gptProxyPool: () => j<{ok: boolean; urls: string[]; lines?: string[]; jump?: string; total: number; slots: number; leased: number; free: number; items: {url: string; masked: string; leased: boolean; owner: string}[]}>("/api/gpt/proxy-pool"),
     setGptProxyPool: (text: string, opts?: {append?: boolean; copies?: number}) =>
         j<{ok: boolean; urls: string[]; lines?: string[]; jump?: string; total: number; slots: number; leased: number; free: number; inserted?: number; skipped?: number}>(
@@ -550,6 +560,8 @@ export const api = {
         j<{ok: boolean; count: number}>("/api/recharge/cards/validate", {method: "POST", body: JSON.stringify({ids})}),
     unpairRechargeCards: (ids: number[]) =>
         j<{ok: boolean}>("/api/recharge/cards/unpair", {method: "POST", body: JSON.stringify({ids})}),
+    resetRechargeCards: (ids: number[]) =>
+        j<{ok: boolean; count: number}>("/api/recharge/cards/reset", {method: "POST", body: JSON.stringify({ids})}),
     // 充值队列（delivery: undelivered 作业中 | error 失败页 | delivered 已交付 | all）
     rechargeQueue: (delivery: "undelivered" | "ready" | "delivered" | "error" | "all" = "undelivered") =>
         j<{list: RechargeQueueItem[]; stats: RechargeQueueStats; delivery?: string}>(`/api/recharge/queue?delivery=${encodeURIComponent(delivery)}`),
@@ -605,6 +617,12 @@ export const api = {
         j<{ok: boolean; queued: number; skipped: {email: string; reason: string}[]; gmailFreeImap?: number; mailcomFree?: number}>("/api/recharge/rebind-gmail", {method: "POST", body: JSON.stringify({ids, target, ...(opts || {})})}),
     cancelRebindGmail: (ids: number[]) =>
         j<{ok: boolean; count: number}>("/api/recharge/rebind-gmail/cancel", {method: "POST", body: JSON.stringify({ids})}),
+    /** 换绑状态待核对：去官方读当前登录邮箱，自动收敛成 ok / fail */
+    reconcileRebind: (ids?: number[]) =>
+        j<{ok: boolean; done?: number; pending?: number; message?: string; skipped?: {email: string; reason: string}[]}>(
+            "/api/recharge/rebind-gmail/reconcile",
+            {method: "POST", body: JSON.stringify({ids})},
+        ),
     rechargeLogs: () => j<{ts: number; line: string}[]>("/api/recharge/logs"),
     clearRechargeLogs: () => j<{ok: boolean}>("/api/recharge/logs/clear", {method: "POST"}),
     // 导出 / RT 获取
@@ -624,7 +642,7 @@ export type StreamHandler = (event: string, data: any) => void;
 
 export function connectStream(onEvent: StreamHandler): () => void {
     const es = new EventSource("/api/stream");
-    for (const name of ["hello", "log", "status", "stats", "snapshot", "sms", "daily", "mailboxes", "mbLog", "claude", "claudeLog", "claudeScan", "batchAt", "batchPw", "batchHarden", "refreshAt", "batchRtAcquire", "recharge", "rechargeLog", "rechargeQueue", "rechargeExportReady"]) {
+    for (const name of ["hello", "log", "status", "stats", "snapshot", "sms", "daily", "mailboxes", "mbLog", "claude", "claudeLog", "claudeScan", "batchAt", "batchPw", "batchHarden", "refreshAt", "batchRtAcquire", "recharge", "rechargeLog", "rechargeQueue", "rechargeExportReady", "rechargeSendDone"]) {
         es.addEventListener(name, (e: MessageEvent) => {
             try { onEvent(name, JSON.parse(e.data)); } catch { /* ignore */ }
         });

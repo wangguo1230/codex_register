@@ -1,7 +1,8 @@
 // ChatGPT 登录邮箱换绑：走官方 backend-api change_email / add_email。
 // 账单页 /payments/checkout/update_email 不是登录邮箱，不要用。
 import {CHATGPT_BASE_URL, DEFAULT_USER_AGENT} from "./constants.js";
-import {buildProxyDispatcher, decodeJwt} from "./token-check.js";
+import {decodeJwt} from "./token-check.js";
+import {createProtocolDispatcher} from "./mail/protocol-dispatcher.js";
 import {rememberGoogleCred, waitGoogleImapOtp} from "./mail/google-account.js";
 
 const ELIGIBILITY_URL = `${CHATGPT_BASE_URL}/backend-api/accounts/change_email/eligibility`;
@@ -9,7 +10,14 @@ const BEGIN_URL = `${CHATGPT_BASE_URL}/backend-api/accounts/change_email/begin`;
 const VERIFY_URL = `${CHATGPT_BASE_URL}/backend-api/accounts/change_email/verify`;
 const ADD_BEGIN_URL = `${CHATGPT_BASE_URL}/backend-api/accounts/add_email/begin`;
 const ADD_VERIFY_URL = `${CHATGPT_BASE_URL}/backend-api/accounts/add_email/verify`;
+const ME_URL = `${CHATGPT_BASE_URL}/backend-api/me`;
 const PWD_AUTH_WINDOW_MS = 270_000;
+
+/**
+ * 换绑阶段。父进程据此判断官方侧状态是否确定：
+ * verify 之前失败 = 官方一定没改；verify 已发出但没拿到应答 = 不确定，必须对账。
+ */
+export type ChangeEmailStage = "precheck" | "eligibility" | "begin" | "otp" | "verify" | "done";
 
 function authHeaders(accessToken: string, accountId?: string): Record<string, string> {
     return {
@@ -28,10 +36,22 @@ async function readJson(res: Response): Promise<any> {
     try { return text ? JSON.parse(text) : {}; } catch { return {raw: text.slice(0, 240)}; }
 }
 
+function fetchErr(e: any): string {
+    const parts = [e?.message, e?.cause?.message, e?.cause?.code].filter(Boolean).map(String);
+    return [...new Set(parts)].join(" / ").slice(0, 200) || "fetch failed";
+}
+
 function errText(body: any, fallback = ""): string {
     if (!body) return fallback;
     if (typeof body === "string") return body.slice(0, 200);
-    return String(body.detail || body.message || body.error || body.raw || fallback || JSON.stringify(body)).slice(0, 200);
+    const pick = body.detail ?? body.message ?? body.error ?? body.raw;
+    if (typeof pick === "string") return pick.slice(0, 200);
+    if (pick && typeof pick === "object") {
+        const s = pick.message || pick.detail || pick.code || "";
+        if (s) return String(s).slice(0, 200);
+        try { return JSON.stringify(pick).slice(0, 200); } catch { /* */ }
+    }
+    try { return JSON.stringify(body).slice(0, 200); } catch { return fallback; }
 }
 
 export function needsPwdReauth(accessToken: string, windowMs = PWD_AUTH_WINDOW_MS): boolean {
@@ -44,8 +64,33 @@ export function needsPwdReauth(accessToken: string, windowMs = PWD_AUTH_WINDOW_M
     return age < 0 || age > windowMs;
 }
 
+/** 从库里的 auth_data / session JSON 取出 accessToken。 */
+export function accessTokenFromAuth(authData: any): string {
+    if (!authData || typeof authData !== "object") return "";
+    const s = authData.session && typeof authData.session === "object" ? authData.session : {};
+    return String(s.accessToken || authData.access_token || "").trim();
+}
+
+/**
+ * session JSON 还能不能用：只看 AT 和 JWT exp / session.expires。
+ * 不管 pwd_auth_time（换绑敏感接口要新密码验证时，先拿旧 session 打官方，401 再重登）。
+ */
+export function isSessionJsonAlive(authData: any, {now = Date.now(), skewMs = 60_000} = {}) {
+    const accessToken = accessTokenFromAuth(authData);
+    if (!accessToken) return {ok: false, accessToken: "", expMs: 0, leftMs: 0};
+    const jwt = decodeJwt(accessToken);
+    const jwtExp = Number(jwt?.exp || 0);
+    const jwtMs = jwtExp > 0 ? (jwtExp < 1e12 ? jwtExp * 1000 : jwtExp) : 0;
+    const s = authData.session && typeof authData.session === "object" ? authData.session : authData;
+    const sessExp = Date.parse(String(s?.expires || authData?.expires || ""));
+    const expMs = jwtMs || (Number.isFinite(sessExp) && sessExp > 0 ? sessExp : 0);
+    if (!expMs) return {ok: true, accessToken, expMs: 0, leftMs: 0};
+    const leftMs = expMs - now;
+    return {ok: leftMs > skewMs, accessToken, expMs, leftMs};
+}
+
 export async function getChangeEmailEligibility(accessToken: string, {accountId = "", proxyUrl = ""} = {}) {
-    const dispatcher = buildProxyDispatcher(proxyUrl);
+    const dispatcher = createProtocolDispatcher(proxyUrl);
     const res = await fetch(ELIGIBILITY_URL, {
         method: "GET", headers: authHeaders(accessToken, accountId), dispatcher,
     } as any);
@@ -63,6 +108,29 @@ export async function getChangeEmailEligibility(accessToken: string, {accountId 
     };
 }
 
+/**
+ * 读官方当前登录邮箱，用于换绑对账（我们不确定 verify 到底成没成时的唯一真相来源）。
+ * 返回 email 为空且 ok=true 时表示接口通了但没给邮箱，调用方不要据此下结论。
+ */
+export async function fetchCurrentLoginEmail(accessToken: string, {accountId = "", proxyUrl = ""} = {}): Promise<{
+    ok: boolean; email: string; status: number; needReauth?: boolean; reason?: string;
+}> {
+    if (!accessToken) return {ok: false, email: "", status: 0, reason: "无 access_token"};
+    const dispatcher = createProtocolDispatcher(proxyUrl);
+    try {
+        const res = await fetch(ME_URL, {
+            method: "GET", headers: authHeaders(accessToken, accountId), dispatcher,
+        } as any);
+        const body = await readJson(res);
+        if (res.status === 401) return {ok: false, email: "", status: 401, needReauth: true, reason: "AT 失效(401)"};
+        if (!res.ok) return {ok: false, email: "", status: res.status, reason: errText(body, `me ${res.status}`)};
+        const email = String(body?.email || body?.user?.email || "").trim().toLowerCase();
+        return {ok: true, email, status: res.status};
+    } catch (e: any) {
+        return {ok: false, email: "", status: 0, reason: `me: ${fetchErr(e)}`};
+    }
+}
+
 export async function changeChatgptEmail({
     accessToken,
     accountId = "",
@@ -73,6 +141,7 @@ export async function changeChatgptEmail({
     totpSecret = "",
     socialUser = false,
     useAddEmail = false,
+    onStage,
 }: {
     accessToken: string;
     accountId?: string;
@@ -83,15 +152,22 @@ export async function changeChatgptEmail({
     totpSecret?: string;
     socialUser?: boolean;
     useAddEmail?: boolean;
-}): Promise<{ok: boolean; reason?: string; needReauth?: boolean; alreadyLinked?: boolean; badTarget?: boolean; rateLimited?: boolean; code?: string}> {
+    onStage?: (stage: ChangeEmailStage) => void;
+}): Promise<{ok: boolean; reason?: string; needReauth?: boolean; alreadyLinked?: boolean; badTarget?: boolean; rateLimited?: boolean; capped24h?: boolean; indeterminate?: boolean; code?: string; stage: ChangeEmailStage}> {
+    let stage: ChangeEmailStage = "precheck";
+    const enter = (s: ChangeEmailStage) => {
+        stage = s;
+        try { onStage?.(s); } catch { /* 上报失败不影响换绑 */ }
+    };
+    enter("precheck");
     const email = String(newEmail || "").trim().toLowerCase();
-    if (!accessToken) return {ok: false, reason: "无 access_token"};
-    if (!email.includes("@")) return {ok: false, reason: "新邮箱无效"};
+    if (!accessToken) return {ok: false, reason: "无 access_token", stage};
+    if (!email.includes("@")) return {ok: false, reason: "新邮箱无效", stage};
     const isGmail = /@(gmail|googlemail)\.com$/i.test(email);
-    if (isGmail && !imapPassword) return {ok: false, reason: "目标 Gmail 无 IMAP 应用专用密码"};
-    if (!isGmail && !mailPassword && !imapPassword) return {ok: false, reason: "目标邮箱无密码"};
+    if (isGmail && !imapPassword) return {ok: false, reason: "目标 Gmail 无 IMAP 应用专用密码", stage};
+    if (!isGmail && !mailPassword && !imapPassword) return {ok: false, reason: "目标邮箱无密码", stage};
 
-    const dispatcher = buildProxyDispatcher(proxyUrl);
+    const dispatcher = createProtocolDispatcher(proxyUrl);
     const headers = authHeaders(accessToken, accountId);
     const cred = rememberGoogleCred({
         email, password: mailPassword, totpSecret, imapPassword,
@@ -107,24 +183,28 @@ export async function changeChatgptEmail({
                 ok: false,
                 badTarget: !!pre.wrongPassword,
                 reason: pre.wrongPassword ? (pre.reason || "目标 mail.com 账密无效") : `目标邮箱预检失败: ${pre.reason || "未知"}`,
+                stage,
             };
         }
     }
 
     let social = socialUser;
+    enter("eligibility");
     try {
         const elig = await getChangeEmailEligibility(accessToken, {accountId, proxyUrl});
-        if (elig.needReauth) return {ok: false, needReauth: true, reason: elig.reason};
+        if (elig.needReauth) return {ok: false, needReauth: true, reason: elig.reason, stage};
         if (elig.ok) {
             if (elig.socialUser) social = true;
             if (!elig.eligible && !useAddEmail) {
-                return {ok: false, reason: `不可换绑(${elig.eligibilityType})`};
+                return {ok: false, reason: `不可换绑(${elig.eligibilityType})`, stage};
             }
+        } else if (elig.status === 429) {
+            return {ok: false, rateLimited: true, reason: elig.reason || "eligibility 429", stage};
         } else if (elig.status !== 404) {
-            return {ok: false, needReauth: elig.status === 401, reason: elig.reason};
+            return {ok: false, needReauth: elig.status === 401, reason: elig.reason, stage};
         }
     } catch (e: any) {
-        return {ok: false, reason: `eligibility: ${String(e?.message || e).slice(0, 160)}`};
+        return {ok: false, reason: `eligibility: ${fetchErr(e)}`, stage};
     }
 
     const beginUrl = useAddEmail ? ADD_BEGIN_URL : BEGIN_URL;
@@ -133,24 +213,30 @@ export async function changeChatgptEmail({
     if (social && !useAddEmail) beginBody.remove_social_subs = true;
 
     const sentAt = Date.now();
+    enter("begin");
     let beginRes: Response;
     try {
         beginRes = await fetch(beginUrl, {
             method: "POST", headers, dispatcher, body: JSON.stringify(beginBody),
         } as any);
     } catch (e: any) {
-        return {ok: false, reason: `begin: ${String(e?.message || e).slice(0, 160)}`};
+        return {ok: false, reason: `begin: ${String(e?.message || e).slice(0, 160)}`, stage};
     }
     const beginJson = await readJson(beginRes);
-    if (beginRes.status === 401) return {ok: false, needReauth: true, reason: "begin 401，需重新登录"};
-    if (beginRes.status === 429) return {ok: false, rateLimited: true, reason: "begin 429: 换绑太勤，官方限流"};
+    if (beginRes.status === 401) return {ok: false, needReauth: true, reason: "begin 401，需重新登录", stage};
+    if (beginRes.status === 429) return {ok: false, rateLimited: true, reason: "begin 429: 换绑太勤，官方限流", stage};
     if (!beginRes.ok) {
         const why = errText(beginJson);
-        const alreadyLinked = /already linked|already (in )?use|associated with another|已绑定|已被占用/i.test(why);
-        return {ok: false, alreadyLinked, reason: `begin ${beginRes.status}: ${why}`};
+        // 只认官方换绑文案。HTML/TLS 残片里的 in use、已被占用不能当废号。
+        const alreadyLinked = /already linked|already associated with another|associated with another account|this email is already (in use|linked)/i.test(why);
+        // 24h 换绑次数上限：限的是【这个 ChatGPT 号】，跟目标邮箱和出口都无关。
+        // 换出口、换目标、重登一律没用，只能等，所以要单独标出来让上层冷却源账号。
+        const capped24h = /changed your email too many times|too many times in the last 24 hours|email change limit/i.test(why);
+        return {ok: false, alreadyLinked, capped24h, reason: `begin ${beginRes.status}: ${why}`, stage};
     }
 
     let code = "";
+    enter("otp");
     try {
         if (isGmail) {
             code = await waitGoogleImapOtp(cred, {minTimestampMs: sentAt, attempts: 10, intervalMs: 4000});
@@ -162,22 +248,35 @@ export async function changeChatgptEmail({
     } catch (e: any) {
         const why = String(e?.message || e).slice(0, 200);
         const badTarget = /账密无效|账号已停用|登录被拒|找不到密码|邮箱池中找不到/i.test(why);
-        return {ok: false, badTarget, reason: why};
+        return {ok: false, badTarget, reason: why, stage};
     }
-    if (!code) return {ok: false, reason: `未拿到换绑验证码: ${email}`};
+    if (!code) return {ok: false, reason: `未拿到换绑验证码: ${email}`, stage};
 
     const verifyBody: any = {email, code};
     if (social && !useAddEmail) verifyBody.remove_social_subs = true;
+    // 一旦进入 verify，官方侧可能已经改掉了邮箱。这之后的任何失联（超时/被杀/网络断）
+    // 都必须当"状态不确定"处理，不能直接判失败把目标邮箱放回池。
+    enter("verify");
     let verifyRes: Response;
     try {
         verifyRes = await fetch(verifyUrl, {
             method: "POST", headers, dispatcher, body: JSON.stringify(verifyBody),
         } as any);
     } catch (e: any) {
-        return {ok: false, reason: `verify: ${String(e?.message || e).slice(0, 160)}`};
+        return {
+            ok: false,
+            indeterminate: true,
+            reason: `verify: ${String(e?.message || e).slice(0, 160)}`,
+            stage,
+        };
     }
     const verifyJson = await readJson(verifyRes);
-    if (verifyRes.status === 401) return {ok: false, needReauth: true, reason: "verify 401，需重新登录"};
-    if (!verifyRes.ok) return {ok: false, reason: `verify ${verifyRes.status}: ${errText(verifyJson)}`};
-    return {ok: true, code};
+    if (verifyRes.status === 401) return {ok: false, needReauth: true, reason: "verify 401，需重新登录", stage};
+    if (!verifyRes.ok) {
+        const why = errText(verifyJson);
+        const netty = /fetch failed|timeout|timed out|ECONN|ENOTFOUND|EPIPE|socket|TLS|disconnected|Proxy connection/i.test(why);
+        return {ok: false, indeterminate: netty, reason: `verify ${verifyRes.status}: ${why}`, stage};
+    }
+    enter("done");
+    return {ok: true, code, stage};
 }

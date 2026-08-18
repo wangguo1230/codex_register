@@ -34,10 +34,29 @@ const EMPTY_Q: RechargeQueueStats = {pending: 0, paired: 0, submitting: 0, submi
 const TEST_SEND_TO = "wangguodong194@163.com";
 const EMPTY_C: RechargeCardStats = {unused: 0, paired: 0, submitting: 0, submitted: 0, done: 0, error: 0, total: 0};
 
+/** 官方 24h 换绑上限还剩多久解禁，<=0 表示没在冷却 */
+function rebindCooldownLeft(q: RechargeQueueItem): number {
+    return Math.max(0, (Number(q.rebind_blocked_until) || 0) - Date.now());
+}
+function fmtCooldown(ms: number): string {
+    const min = Math.ceil(ms / 60_000);
+    if (min < 60) return `${min} 分钟`;
+    return `${Math.floor(min / 60)} 小时 ${min % 60} 分`;
+}
+
 /** 换绑展示：原邮箱 → 现邮箱 */
 function rebindLine(q: RechargeQueueItem): {text: string; title: string; ok: boolean} {
     const from = String(q.rebind_from || "").trim();
     const to = String(q.rebind_email || q.email || "").trim();
+    // 待核对要先判：二次换绑时 rebind_from 已有值，会被下面的「已换绑」分支误吞
+    if (q.rebind_status === "unknown") {
+        const t = String(q.rebind_attempt_email || "").trim();
+        return {
+            text: t ? `待核对 → ${t}` : "待核对",
+            title: q.rebind_error || "官方是否已改未知，正在向官方对账，目标邮箱暂不回池",
+            ok: false,
+        };
+    }
     if (q.rebind_status === "ok" || (from && to && from !== to)) {
         const text = from && to && from !== to ? `${from} → ${to}` : (to || from || "已换绑");
         return {text, title: text, ok: true};
@@ -46,7 +65,17 @@ function rebindLine(q: RechargeQueueItem): {text: string; title: string; ok: boo
         const t = q.rebind_target === "mailcom" ? " mail.com" : q.rebind_target === "gmail" ? " Gmail" : "";
         return {text: `换绑中${t}`, title: q.rebind_error || "", ok: false};
     }
-    if (q.rebind_status === "fail") return {text: q.rebind_error || "失败", title: q.rebind_error || "", ok: false};
+    if (q.rebind_status === "fail") {
+        // 24h 上限是"等就好"，跟真失败区分开，不然会一直去点它
+        if (rebindCooldownLeft(q) > 0) {
+            return {
+                text: `24h 上限 · ${fmtCooldown(rebindCooldownLeft(q))}后可换`,
+                title: q.rebind_error || "官方限制单个账号 24 小时内的换绑次数，换目标邮箱/换出口都没用",
+                ok: false,
+            };
+        }
+        return {text: q.rebind_error || "失败", title: q.rebind_error || "", ok: false};
+    }
     if (q.rebind_status === "skipped") return {text: "无需换绑", title: "", ok: false};
     return {text: "—", title: "", ok: false};
 }
@@ -100,6 +129,8 @@ export function RechargePanel({notify}: {notify?: (m: string, ms?: number) => vo
     const [testSendPreview, setTestSendPreview] = useState<{id: number; from: string; queueEmail: string; rebound: boolean; subject: string; text: string; canSend: boolean; reason: string; group: string; via?: string}[]>([]);
     const [testSendResult, setTestSendResult] = useState("");
     const [testSendBusy, setTestSendBusy] = useState(false);
+    const testSendBusyRef = useRef(false);
+    testSendBusyRef.current = testSendBusy;
     const [exportRtRunning, setExportRtRunning] = useState(false);
     // 导出 sub2json
     const [showSub2json, setShowSub2json] = useState(false);
@@ -174,9 +205,28 @@ export function RechargePanel({notify}: {notify?: (m: string, ms?: number) => vo
                 else if (data?.relogin) toast("重登取 RT 完成，再点「导出含RT」即可复制", 6000);
                 else if (data?.text) void deliverExportTextRef.current(String(data.text), "full");
             }
+            if (ev === "rechargeSendDone") {
+                setTestSendBusy(false);
+                const line = data?.error && !data?.sent
+                    ? `发送失败: ${data.error}`
+                    : `发出 ${data?.sent || 0} · 失败 ${data?.failed || 0} · 跳过 ${data?.skipped || 0} → ${data?.to || ""}`;
+                setTestSendResult(line);
+                toast(data?.ok ? `测试邮件已发 ${data.sent} 封` : (data?.error || line), 6000);
+            }
         });
         // SSE 重连会丢中间事件；换绑卡在 mail.com 时也要靠轮询把磁盘日志刷出来
-        const poll = setInterval(() => { loadLogs(); loadQueue(); }, 4000);
+        const poll = setInterval(() => {
+            loadLogs();
+            loadQueue();
+            if (!testSendBusyRef.current) return;
+            api.rechargeTestSendStatus().then((s) => {
+                if (!testSendBusyRef.current || s.running || !s.finishedAt) return;
+                setTestSendBusy(false);
+                setTestSendResult(s.error && !s.sent
+                    ? `发送失败: ${s.error}`
+                    : `发出 ${s.sent} · 失败 ${s.failed} · 跳过 ${s.skipped} → ${s.to}`);
+            }).catch(() => {});
+        }, 4000);
         return () => { off(); clearInterval(poll); };
     }, []);
 
@@ -759,18 +809,32 @@ export function RechargePanel({notify}: {notify?: (m: string, ms?: number) => vo
             return;
         }
         if (!testSendTo.trim()) { toast("请填写测试收件人"); return; }
+        if (!confirm(`确认向 ${testSendTo.trim()} 发送 ${sendable.length} 封测试信？\n换绑号走原 mail.com。\n一封大约 1 分钟，点完立刻返回，进度看充值日志。`)) return;
         setTestSendBusy(true);
-        setTestSendResult(`正在发送 ${sendable.length} 封（mail.com 要登录，大约 1 分钟）…`);
-        toast("正在发测试信，请等登录完成", 8000);
+        setTestSendResult(`已排队 ${sendable.length} 封，后台登录发送中…`);
+        toast("已开始发测试信，看充值日志", 6000);
         try {
             const r = await api.rechargeTestSend(sendable.map((x) => x.id), testSendTo.trim());
+            if (r.async) {
+                setTestSendResult(`已开始 ${r.queued} 封 → ${r.to}（后台跑，当前这封跑完才停）`);
+                return;
+            }
             const line = `发出 ${r.sent} · 失败 ${r.failed} · 跳过 ${r.skipped} → ${r.to}`;
             setTestSendResult(line);
             toast(r.ok ? `测试邮件已发 ${r.sent} 封` : (r.error || line), 6000);
+            setTestSendBusy(false);
         } catch (e: any) {
             setTestSendResult("发送失败: " + e.message);
             toast("测试发送失败: " + e.message, 6000);
-        } finally { setTestSendBusy(false); }
+            setTestSendBusy(false);
+        }
+    };
+    const doStopTestSend = async () => {
+        try {
+            const r = await api.stopTestSend();
+            toast(r.running ? "已停止测试发信，当前这封跑完就停" : "当前没有发信在跑");
+            if (!r.running) setTestSendBusy(false);
+        } catch (e: any) { toast(e.message); }
     };
     const doProbePlan = async () => {
         const ids = selQIds();
@@ -801,6 +865,11 @@ export function RechargePanel({notify}: {notify?: (m: string, ms?: number) => vo
         const ids = [...cSel].filter((id) => cards.some((c) => c.id === id));
         if (!ids.length) { toast("请先选择卡密"); return; }
         try { await api.validateRechargeCards(ids); toast(`开始验证 ${ids.length} 个卡密`); } catch (e: any) { toast(e.message); }
+    };
+    const doResetCards = async () => {
+        const ids = [...cSel].filter((id) => cards.some((c) => c.id === id));
+        if (!ids.length) { toast("请先选择卡密"); return; }
+        try { await api.resetRechargeCards(ids); toast(`开始重置 ${ids.length} 张卡密（问平台后放回未使用）`); } catch (e: any) { toast(e.message); }
     };
 
     const Btn = ({onClick, disabled, className, title, children}: any) => (
@@ -1118,6 +1187,7 @@ export function RechargePanel({notify}: {notify?: (m: string, ms?: number) => vo
                                     <td className="px-2 py-1.5 max-w-[200px] truncate" title={rb.title || q.rebind_error || q.rebind_email || ""}>
                                         {rb.ok ? <span className="text-green-600" title={rb.title}>{rb.text}</span>
                                             : q.rebind_status === "pending" ? <span className="text-amber-600">{rb.text}</span>
+                                            : q.rebind_status === "unknown" ? <span className="text-purple-600 font-medium">{rb.text}</span>
                                             : q.rebind_status === "fail" ? <span className="text-red-500">{rb.text}</span>
                                             : q.rebind_status === "skipped" ? <span className="text-gray-400">{rb.text}</span>
                                             : <span className="text-gray-300">—</span>}
@@ -1144,13 +1214,26 @@ export function RechargePanel({notify}: {notify?: (m: string, ms?: number) => vo
                                             <button onClick={() => { api.rebindGmail([q.id], (q.rebind_target === "mailcom" ? "mailcom" : "gmail")).then((r) => { toast(r.queued ? "已排队换绑" : (r.skipped[0]?.reason || "已跳过")); loadQueue(); loadConfig(); }).catch((e: any) => toast(e.message)); }}
                                                     className="text-blue-500 hover:text-blue-700 text-xs hover:underline ml-2">重试换绑</button>
                                         )}
-                                        {(q.status === "done" || q.task_status === "paid") && q.rebind_status !== "pending" && (
+                                        {/* 待核对：官方可能已改，先对账定论，不给再换一轮的入口 */}
+                                        {q.rebind_status === "unknown" && (
+                                            <button onClick={() => { api.reconcileRebind([q.id]).then((r) => { toast(r.skipped?.[0]?.reason || `已对账 ${r.done || 0} 个`); loadQueue(); }).catch((e: any) => toast(e.message)); }}
+                                                    className="text-purple-600 hover:text-purple-800 text-xs hover:underline ml-2">对账</button>
+                                        )}
+                                        {(q.status === "done" || q.task_status === "paid") && q.rebind_status !== "pending" && q.rebind_status !== "unknown" && (
+                                            rebindCooldownLeft(q) > 0 ? (
+                                                // 冷却里点了后端也会直接拒，给个明确原因比让人反复点好
+                                                <span className="text-gray-400 text-xs ml-2"
+                                                      title="官方限制单个账号 24 小时内的换绑次数。换目标邮箱、换出口、重登都没用，只能等。">
+                                                    24h 上限 · {fmtCooldown(rebindCooldownLeft(q))}后可换
+                                                </span>
+                                            ) : (
                                             <>
                                                 <button onClick={() => openRebindGmail([q.id])}
                                                         className="text-blue-500 hover:text-blue-700 text-xs hover:underline ml-2">换绑Gmail</button>
                                                 <button onClick={() => { api.rebindGmail([q.id], "mailcom").then((r) => { toast(r.queued ? "已排队换绑 mail.com" : (r.skipped[0]?.reason || "已跳过")); loadQueue(); loadConfig(); }).catch((e: any) => toast(e.message)); }}
                                                         className="text-blue-500 hover:text-blue-700 text-xs hover:underline ml-2">换绑mail</button>
                                             </>
+                                            )
                                         )}
                                         {q.rebind_status === "pending" && (
                                             <button onClick={() => { api.cancelRebindGmail([q.id]).then(() => { toast("已取消换绑"); loadQueue(); }).catch((e: any) => toast(e.message)); }}
@@ -1183,6 +1266,7 @@ export function RechargePanel({notify}: {notify?: (m: string, ms?: number) => vo
                     <span className="text-sm font-semibold">卡密池</span>
                     <Btn onClick={() => setShowImport(true)}>+ 导入卡密</Btn>
                     <Btn onClick={doValidate}>验证选中</Btn>
+                    <Btn onClick={doResetCards} title="授权换号后点这个：再问平台，unused 的卡清本地绑定、放回未使用">重置选中</Btn>
                     <Btn onClick={doDeleteCards} className="bg-white border-red-200 text-red-600 hover:bg-red-50">删除选中</Btn>
                     <div className="flex-1"/>
                     <span className="text-xs text-gray-500">
@@ -1381,10 +1465,10 @@ export function RechargePanel({notify}: {notify?: (m: string, ms?: number) => vo
             )}
 
             {showTestSend && (
-                <div className="fixed inset-0 bg-black/30 flex items-center justify-center z-50" onClick={() => !testSendBusy && setShowTestSend(false)}>
+                <div className="fixed inset-0 bg-black/30 flex items-center justify-center z-50" onClick={() => setShowTestSend(false)}>
                     <div className="bg-white rounded-xl shadow-xl w-[720px] max-w-[96vw] max-h-[90vh] flex flex-col" onClick={(e) => e.stopPropagation()}>
                         <div className="px-5 py-3 border-b font-semibold text-sm">测试发送
-                            <div className="text-xs text-gray-400 font-normal mt-0.5">没勾选就发当前列表前 10 个。mail.com 走协议，Gmail 走应用密码 SMTP。</div>
+                            <div className="text-xs text-gray-400 font-normal mt-0.5">没勾选就发当前列表前 5 个。mail.com 走协议，Gmail 走应用密码 SMTP。点发送会马上返回，进度看充值日志。</div>
                         </div>
                         <div className="px-5 py-3 space-y-3 overflow-auto">
                             <label className="block text-xs text-gray-500">测试收件人
@@ -1423,8 +1507,14 @@ export function RechargePanel({notify}: {notify?: (m: string, ms?: number) => vo
                             {testSendResult && <div className="text-xs text-violet-700">{testSendResult}</div>}
                         </div>
                         <div className="px-5 py-3 border-t flex justify-end gap-2">
-                            <button type="button" disabled={testSendBusy} onClick={() => setShowTestSend(false)}
-                                    className="px-3 py-1.5 rounded text-xs font-medium border bg-white border-gray-200 text-gray-700 hover:bg-gray-50 disabled:opacity-40">关闭</button>
+                            <button type="button" onClick={() => setShowTestSend(false)}
+                                    className="px-3 py-1.5 rounded text-xs font-medium border bg-white border-gray-200 text-gray-700 hover:bg-gray-50">关闭</button>
+                            {testSendBusy && (
+                                <button type="button" onClick={() => { void doStopTestSend(); }}
+                                        className="px-3 py-1.5 rounded text-xs font-medium border bg-white border-red-200 text-red-600 hover:bg-red-50">
+                                    停止发送
+                                </button>
+                            )}
                             <button type="button" disabled={testSendBusy} onClick={doTestSend}
                                     className="px-3 py-1.5 rounded text-xs font-medium border bg-violet-600 text-white border-violet-600 hover:bg-violet-700 disabled:opacity-40">
                                 {testSendBusy ? "发送中…" : "发出测试信"}
