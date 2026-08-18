@@ -100,6 +100,7 @@ export function RechargePanel({notify}: {notify?: (m: string, ms?: number) => vo
     const [testSendPreview, setTestSendPreview] = useState<{id: number; from: string; queueEmail: string; rebound: boolean; subject: string; text: string; canSend: boolean; reason: string; group: string; via?: string}[]>([]);
     const [testSendResult, setTestSendResult] = useState("");
     const [testSendBusy, setTestSendBusy] = useState(false);
+    const [exportRtRunning, setExportRtRunning] = useState(false);
     // 导出 sub2json
     const [showSub2json, setShowSub2json] = useState(false);
     const [sub2jsonInput, setSub2jsonInput] = useState("");
@@ -167,9 +168,11 @@ export function RechargePanel({notify}: {notify?: (m: string, ms?: number) => vo
                 if (/^换绑 [✓✗]/.test(String(data?.line || ""))) loadConfig();
             }
             if (ev === "batchRtAcquire") { setBatchRtResults(data.results.map((r: any) => ({...r, status: r.status || "done"}))); if (data.done) setBatchRtRunning(false); }
-            if (ev === "rechargeExportReady" && data?.text) {
-                if (data.relogin) toast("重登取 RT 完成，再点「导出含RT」即可复制", 6000);
-                else void deliverExportTextRef.current(String(data.text), "full");
+            if (ev === "rechargeExportReady") {
+                setExportRtRunning(false);
+                if (data?.stopped) toast("导出RT已停止");
+                else if (data?.relogin) toast("重登取 RT 完成，再点「导出含RT」即可复制", 6000);
+                else if (data?.text) void deliverExportTextRef.current(String(data.text), "full");
             }
         });
         // SSE 重连会丢中间事件；换绑卡在 mail.com 时也要靠轮询把磁盘日志刷出来
@@ -326,7 +329,6 @@ export function RechargePanel({notify}: {notify?: (m: string, ms?: number) => vo
             setQSel(new Set());
             const skip = r.skipped ? `，跳过 ${r.skipped} 个未成功` : "";
             toast(r.count ? `已交付 ${r.count} 个${skip}` : (r.skipped ? "所选都还没充上，没有搬走" : "没有可交付的"));
-            if (r.count) setDeliveryTab("delivered");
             loadQueue();
         } catch (e: any) { toast("标记已交付失败: " + e.message); }
     };
@@ -720,6 +722,7 @@ export function RechargePanel({notify}: {notify?: (m: string, ms?: number) => vo
             if (r.text) {
                 await deliverExportText(r.text, format);
             } else if (r.async) {
+                setExportRtRunning(true);
                 toast(opts?.relogin
                     ? `正在重登取 RT（${r.needRt} 个），完成后点「导出含RT」复制`
                     : `${r.needRt} 个账号缺少 RT，正在自动获取，完成后自动下载...`, 6000);
@@ -997,6 +1000,15 @@ export function RechargePanel({notify}: {notify?: (m: string, ms?: number) => vo
                     <Btn onClick={() => doExport("account")}>导出账密</Btn>
                     <Btn onClick={() => doExport("full")}>导出含RT</Btn>
                     <Btn onClick={() => doExport("full", {relogin: true})} title="先强制重登再取 RT；取完后点「导出含RT」复制">重登导出含RT</Btn>
+                    <Btn onClick={async () => {
+                        try {
+                            const r = await api.stopExportRt();
+                            setExportRtRunning(false);
+                            toast(r.running ? "已停止导出RT，当前这个号跑完就停" : "当前没有导出RT在跑");
+                        } catch (e: any) { toast(e.message); }
+                    }} className="bg-white border-red-200 text-red-600 hover:bg-red-50" title="停止导出含RT / 重登导出含RT">
+                        {exportRtRunning ? "停止导出RT…" : "停止导出RT"}
+                    </Btn>
                     <Btn onClick={() => doExport("card")}>复制卡密</Btn>
                     <Btn onClick={() => doExport("session")}>复制session</Btn>
                     {isWorkingTab && (

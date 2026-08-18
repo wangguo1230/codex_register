@@ -615,6 +615,7 @@ export const api = {
         if (ct.includes("text/plain")) return {text: await res.text()};
         return res.json();
     },
+    stopExportRt: () => j<{ok: boolean; running?: boolean}>("/api/recharge/queue/export/stop", {method: "POST"}),
     probePlan: (ids?: number[], batch?: string) =>
         j<{ok: boolean; count: number}>("/api/recharge/queue/probe-plan", {method: "POST", body: JSON.stringify({ids, batch})}),
 };

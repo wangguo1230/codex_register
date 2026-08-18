@@ -3895,6 +3895,7 @@ function rechargeLog(line: string) {
     broadcast("rechargeLog", rec);
 }
 let exportRtBusy = false;
+let exportRtStop = false;
 async function rechargeSync() { broadcast("recharge", await db.listRechargeCards()); }
 async function queueSync() { broadcast("rechargeQueue", await db.listRechargeQueue()); }
 
@@ -5344,8 +5345,8 @@ app.post("/api/recharge/queue/export", async (req, res) => {
 
     const work = forceRelogin ? rows : needRt;
     if (exportRtBusy) {
-        rechargeLog("已有导出含RT在跑，请等当前这批打出「RT 获取完成」");
-        return res.status(409).json({error: "已有导出含RT在跑"});
+        rechargeLog("已有导出含RT在跑，请先点「停止导出RT」");
+        return res.status(409).json({error: "已有导出含RT在跑，请先停止"});
     }
     const rtConc = forceRelogin ? 1 : Math.min(2, scheduler.rtConcurrency || 4);
     res.json({ok: true, async: true, total: rows.length, needRt: work.length, relogin: forceRelogin});
@@ -5353,10 +5354,12 @@ app.post("/api/recharge/queue/export", async (req, res) => {
         ? `重登导出含RT: ${work.length} 个账号将先重登再取 RT，串行进行…`
         : `导出含RT: ${needRt.length}/${rows.length} 个账号缺少 RT，并发${rtConc}获取中...`);
     exportRtBusy = true;
+    exportRtStop = false;
     (async () => {
         let ok = 0, fail = 0, done = 0;
         try {
         await runPool(work, async (r) => {
+            if (exportRtStop) return;
             const idx = ++done;
             let acc = await db.getAccount(r.account_id);
             if (!acc) { fail++; rechargeLog(`[${idx}/${work.length}] ✗ ${r.email} 账号不存在`); return; }
@@ -5374,6 +5377,7 @@ app.post("/api/recharge/queue/export", async (req, res) => {
                         return;
                     }
                     acc = await db.getAccount(r.account_id) || acc;
+                    if (exportRtStop) return;
                     rechargeLog(`[${idx}/${work.length}] 重登成功，取 RT: ${r.email}`);
                 } catch (e: any) {
                     fail++;
@@ -5401,6 +5405,11 @@ app.post("/api/recharge/queue/export", async (req, res) => {
         } finally {
             exportRtBusy = false;
         }
+        if (exportRtStop) {
+            rechargeLog(`${forceRelogin ? "重登导出" : "导出含RT"}已停止: 已完成 ${ok} / 失败 ${fail}`);
+            broadcast("rechargeExportReady", {stopped: true, relogin: forceRelogin});
+            return;
+        }
         rechargeLog(`${forceRelogin ? "重登导出" : "RT 获取"}完成: 成功 ${ok} / 失败 ${fail}`);
         const freshRows = await db.listRechargeQueueFull(ids.length ? ids : undefined, batch || undefined);
         const text = freshRows.map((r: any) => {
@@ -5412,6 +5421,13 @@ app.post("/api/recharge/queue/export", async (req, res) => {
             ? `重登取 RT 完成，共 ${freshRows.length} 条，点「导出含RT」即可复制`
             : `导出含RT 已就绪，共 ${freshRows.length} 条`);
     })();
+});
+
+app.post("/api/recharge/queue/export/stop", (req, res) => {
+    const running = !!exportRtBusy;
+    exportRtStop = true;
+    if (running) rechargeLog("已请求停止导出RT，当前这个号跑完就停，后面的不再开始");
+    res.json({ok: true, running});
 });
 
 
