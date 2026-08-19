@@ -132,6 +132,7 @@ export function RechargePanel({notify}: {notify?: (m: string, ms?: number) => vo
     const testSendBusyRef = useRef(false);
     testSendBusyRef.current = testSendBusy;
     const [exportRtRunning, setExportRtRunning] = useState(false);
+    const [sub2jsonConc, setSub2jsonConc] = useState(2);
     const [jobSubmit, setJobSubmit] = useState(false);
     const [jobReloginSubmit, setJobReloginSubmit] = useState(false);
     const [showExportMenu, setShowExportMenu] = useState(false);
@@ -214,6 +215,16 @@ export function RechargePanel({notify}: {notify?: (m: string, ms?: number) => vo
             if (ev === "rechargeExportReady") {
                 setExportRtRunning(false);
                 if (data?.stopped) toast("导出已停止");
+                else if (data?.format === "sub2json" && data?.text) {
+                    const n = Number(data.ok) || 0;
+                    const blob = new Blob([String(data.text)], {type: "application/json;charset=utf-8"});
+                    const a = document.createElement("a");
+                    a.href = URL.createObjectURL(blob);
+                    a.download = `sub2api-import-${n}.json`;
+                    a.click();
+                    URL.revokeObjectURL(a.href);
+                    toast(`已导出 sub2json ${n}/${data.total || n}（失败 ${data.fail || 0}），一个 JSON`);
+                }
                 else if (data?.text) void deliverExportTextRef.current(String(data.text), "full");
                 else if (data?.relogin) toast("重登取 RT 完成，但没有可复制内容");
             }
@@ -399,13 +410,15 @@ export function RechargePanel({notify}: {notify?: (m: string, ms?: number) => vo
     const doRemoveFromQueue = async () => {
         const ids = selQIds();
         if (!ids.length) return;
-        if (!confirm(`确认将选中项里「已充上」的号标记为已交付？\n失败 / 退回 / 待提交的不会搬走。`)) return;
+        if (!confirm(`确认将选中项里「已充上」的号标记为已交付？\n失败 / 退回 / 待提交的不会搬走。\n这些号用掉的卡密会从卡密池移除（卡号仍留在队列记录里可查）。`)) return;
         try {
             const r = await api.deliverRechargeQueue(ids);
             setQSel(new Set());
             const skip = r.skipped ? `，跳过 ${r.skipped} 个未成功` : "";
-            toast(r.count ? `已交付 ${r.count} 个${skip}` : (r.skipped ? "所选都还没充上，没有搬走" : "没有可交付的"));
+            const cards = r.cardsRemoved ? `，卡密池移除 ${r.cardsRemoved} 张已用卡` : "";
+            toast(r.count ? `已交付 ${r.count} 个${skip}${cards}` : (r.skipped ? "所选都还没充上，没有搬走" : "没有可交付的"));
             loadQueue();
+            loadCards();
         } catch (e: any) { toast("标记已交付失败: " + e.message); }
     };
 
@@ -788,6 +801,20 @@ export function RechargePanel({notify}: {notify?: (m: string, ms?: number) => vo
         }
     };
     deliverExportTextRef.current = deliverExportText;
+    const doExportSub2json = async () => {
+        const picked = selQIds();
+        const ids = picked.length ? picked : filteredQueue.map((q) => q.id);
+        if (!ids.length) { toast("请先勾选账号，或当前列表不能为空"); return; }
+        const conc = Math.max(1, Math.min(20, Number(configRtConcurrency || sub2jsonConc) || 4));
+        if (!confirm(`导出 ${ids.length} 个账号的 sub2json？\n缺 RT 的会先按并发 ${conc} 获取，再刷新 token，最后下一个 JSON。`)) return;
+        try {
+            const r = await api.exportRechargeSub2json({ids, concurrency: conc});
+            if (r.async) {
+                setExportRtRunning(true);
+                toast(`已开始 ${r.total} 个（缺 RT ${r.needRt || 0}，并发 ${r.concurrency}），完成后自动下载`, 6000);
+            }
+        } catch (e: any) { toast("导出失败: " + (e?.message || e)); }
+    };
     const doExport = async (format: "account" | "full" | "card" | "session", opts?: {relogin?: boolean}) => {
         const ids = selQIds();
         try {
@@ -1038,7 +1065,7 @@ export function RechargePanel({notify}: {notify?: (m: string, ms?: number) => vo
                     </button>
                     <div className="flex-1"/>
                     <span className="text-[11px] text-gray-400 pb-2 pr-1">
-                        {isDeliveredTab ? "已交付可按分组筛选，也可测试发信"
+                        {isDeliveredTab ? "已交付可按分组筛选、测试发信，也可一条龙导出 sub2json"
                             : isReadyTab ? "充值完成、尚未交付；点「标记已交付」后进已交付"
                             : isFailedTab ? "只有点过「标记失败」的号；提交失败不会自动进来"
                             : "作业中；完成后会进「可交付」"}
@@ -1095,6 +1122,15 @@ export function RechargePanel({notify}: {notify?: (m: string, ms?: number) => vo
                                 测试发送（原邮箱）
                             </button>
                             <span className="text-xs text-gray-500 tabular-nums">已选 <b className="text-emerald-600">{selQIds().length}</b> / {filteredQueue.length}</span>
+                            <Btn onClick={doExportSub2json} disabled={exportRtRunning} className="bg-violet-600 text-white border-violet-600 hover:bg-violet-700" title="缺 RT 先按并发获取，再刷新 token，导出一个 sub2api JSON">
+                                导出 sub2json
+                            </Btn>
+                            <label className="inline-flex items-center gap-1 text-xs text-gray-500" title="读充值配置里的 RT 并发数，1–20">
+                                并发
+                                <input type="number" min={1} max={20} value={configRtConcurrency}
+                                       onChange={(e) => setConfigRtConcurrency(Math.max(1, Math.min(20, Number(e.target.value) || 4)))}
+                                       className="w-11 px-1 py-0.5 border rounded text-xs outline-none"/>
+                            </label>
                             <div className="border-l mx-1 h-5"/>
                         </>
                     )}
@@ -1107,6 +1143,7 @@ export function RechargePanel({notify}: {notify?: (m: string, ms?: number) => vo
                                 <button type="button" className="block w-full text-left px-3 py-1.5 hover:bg-gray-50" title="每个号先强制重登再取 RT，完成后自动复制/下载" onClick={() => { setShowExportMenu(false); void doExport("full", {relogin: true}); }}>含 RT（先重登再取）</button>
                                 <button type="button" className="block w-full text-left px-3 py-1.5 hover:bg-gray-50" onClick={() => { setShowExportMenu(false); void doExport("card"); }}>复制卡密</button>
                                 <button type="button" className="block w-full text-left px-3 py-1.5 hover:bg-gray-50" onClick={() => { setShowExportMenu(false); void doExport("session"); }}>复制 session</button>
+                                <button type="button" className="block w-full text-left px-3 py-1.5 hover:bg-gray-50" title="缺 RT 先获取，再刷新，导出一个 JSON" onClick={() => { setShowExportMenu(false); void doExportSub2json(); }}>sub2json（缺 RT 自动补）</button>
                             </div>
                         )}
                     </div>
@@ -1116,7 +1153,7 @@ export function RechargePanel({notify}: {notify?: (m: string, ms?: number) => vo
                                 const r = await api.stopExportRt();
                                 toast(r.running ? "已请求停止导出，当前这个号跑完就停" : "当前没有导出在跑");
                             } catch (e: any) { toast(e.message); }
-                        }} className="bg-white border-red-200 text-red-600 hover:bg-red-50 animate-pulse" title="停止正在进行的含 RT 导出">
+                        }} className="bg-white border-red-200 text-red-600 hover:bg-red-50 animate-pulse" title="停止正在进行的含 RT / sub2json 导出">
                             停止导出
                         </Btn>
                     )}

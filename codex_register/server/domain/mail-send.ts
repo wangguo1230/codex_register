@@ -56,6 +56,7 @@ function runSendWorker(job, log) {
         const pump = (buf) => {
             const s = String(buf || "");
             out += s;
+            if (out.length > 512 * 1024) out = out.slice(-256 * 1024);
             for (const line of s.split(/\r?\n/)) {
                 const t = line.trim();
                 if (!t || t.startsWith("@@RESULT@@")) continue;

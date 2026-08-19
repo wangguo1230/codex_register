@@ -238,6 +238,7 @@ export async function hardenGoogleAccountOnPage(page, cred, log = () => {}, onCh
         devicesDone: false,
         passwordChanged: false,
         totpRotated: false,
+        totpChanged: false,
         imapPassword: "",
         missing: [],
         errors: [],
@@ -372,7 +373,6 @@ export async function hardenGoogleAccountOnPage(page, cred, log = () => {}, onCh
     if (skip.totp) {
         log("[邮箱管理 4/6] 换 2FA 已做过，跳过");
         out.totpRotated = true;
-        out.totpSecret = cred.totpSecret || out.totpSecret;
     } else {
         log("[邮箱管理 4/6] 更换 Google 2FA");
         const oldTotp = cred.totpSecret;
@@ -385,9 +385,10 @@ export async function hardenGoogleAccountOnPage(page, cred, log = () => {}, onCh
             cred.totpPrev = oldTotp && oldTotp !== t.totpSecret ? oldTotp : cred.totpPrev;
             cred.totpSecret = t.totpSecret;
             out.totpSecret = t.totpSecret;
+            out.totpChanged = true;
             out.totpRotated = true;
             log("[邮箱管理] 新 Google TOTP 已生效");
-            await onCheckpoint({totpSecret: t.totpSecret});
+            await onCheckpoint({totpSecret: t.totpSecret, totpPrevious: oldTotp});
         } else {
             noteErr(t?.error, "换 2FA 失败");
             log(`[邮箱管理] 换 2FA 失败: ${t?.error || ""}`);
@@ -491,13 +492,18 @@ async function openGoogleBitOnce({proxyUrl = "", jumpUrl, name = "gmail", remark
         try { onProxy?.(liveProxy, picked.probe.ip || ""); } catch { /* */ }
         const jump = jumpNow;
         if (jump) {
-            const {wrapExitThroughJump, timezoneFromExitUrl} = await import("./proxy-chain.js");
-            const wrapped = await wrapExitThroughJump(liveProxy, jump);
-            chainClose = wrapped.close;
-            bitProxy = wrapped.url;
-            extractIp = false;
-            timeZone = timezoneFromExitUrl(liveProxy);
-            log(`[网络] 链式 跳板→${wrapped.destHost}:${wrapped.destPort} 本机转发 :${wrapped.localPort}${timeZone ? " tz=" + timeZone : ""}`);
+            try {
+                const {wrapExitThroughJump, timezoneFromExitUrl} = await import("./proxy-chain.js");
+                const wrapped = await wrapExitThroughJump(liveProxy, jump);
+                chainClose = wrapped.close;
+                bitProxy = wrapped.url;
+                extractIp = false;
+                timeZone = timezoneFromExitUrl(liveProxy);
+                log(`[网络] 链式 跳板→${wrapped.destHost}:${wrapped.destPort} 本机转发 :${wrapped.localPort}${timeZone ? " tz=" + timeZone : ""}`);
+            } catch (e) {
+                log(`[网络] 主进程不套跳板转发，比特直连出口 (${String((e as Error)?.message || e).slice(0, 80)})`);
+                bitProxy = liveProxy;
+            }
         } else {
             bitProxy = liveProxy;
         }
@@ -568,6 +574,14 @@ async function openGoogleBitOnce({proxyUrl = "", jumpUrl, name = "gmail", remark
  * 一旦 markLoggedIn，窗里已有账号会话，再关会拆掉刚换的 2FA/密码，只许记步骤失败。
  */
 export async function withGoogleBitSession({proxyUrl = "", jumpUrl, name = "gmail", remark = "gmail-manage", log = () => {}, signal, onProxy} = {}, fn) {
+    if (process.env.MAILCOM_WORKER !== "1" && process.env.GMAIL_WORKER !== "1") {
+        try {
+            const {isBrowserWorkBlocked} = await import("../../server/rss-guard.js");
+            if (isBrowserWorkBlocked()) throw new Error("主进程内存过高，拒绝在 :3100 接比特 CDP");
+        } catch (e) {
+            if (/主进程内存过高/.test(String(e?.message || e))) throw e;
+        }
+    }
     const {isMailboxJobStopped} = await import("./mailbox-job-stop.js");
     const {isProxySessionDead, mintStickySession, kookeeySessionOf} = await import("./proxy-pool.js");
     const stopped = () => !!(signal?.aborted || isMailboxJobStopped());
@@ -645,13 +659,15 @@ export async function runGoogleHardenWithBit(acc, {proxyUrl = "", jumpUrl = "", 
     if (skip.all) {
         log("[整备] 缺口已齐，不再开窗");
         return {
-            ok: true, skipped: true, password: cred.password, totpSecret: cred.totpSecret,
-            totpRotated: true,
+            ok: true, skipped: true, password: cred.password,
+            totpRotated: true, totpChanged: false,
             imapPassword: cred.imapPassword, recoveryCleared: true, passwordChanged: true, devicesDone: true,
         };
     }
     const short = String(acc.email || "").split("@")[0].slice(0, 12);
-    return withGoogleBitSession({proxyUrl, jumpUrl, name: `harden-${short}`, remark: "gmail-harden", log, signal, onProxy}, async (page, sess) => {
+    const {lookupMailboxesByEmails, withMailboxWorkLock} = await import("../../server/db.js");
+    const [lockRow] = await lookupMailboxesByEmails([acc.email]).catch(() => []);
+    const run = () => withGoogleBitSession({proxyUrl, jumpUrl, name: `harden-${short}`, remark: "gmail-harden", log, signal, onProxy}, async (page, sess) => {
         try {
             const {lookupMailboxesByEmails} = await import("../../server/db.js");
             const [fresh] = await lookupMailboxesByEmails([acc.email]);
@@ -688,4 +704,10 @@ export async function runGoogleHardenWithBit(acc, {proxyUrl = "", jumpUrl = "", 
             leave();
         }
     });
+    if (lockRow?.id) {
+        const locked = await withMailboxWorkLock(lockRow.id, run);
+        if (locked?.locked) log(`[整备] ${locked.error}`);
+        return locked;
+    }
+    return run();
 }

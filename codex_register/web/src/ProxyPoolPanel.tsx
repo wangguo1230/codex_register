@@ -101,7 +101,7 @@ export function ProxyPoolPanel({
             <div style={{display: "flex", alignItems: "baseline", gap: 8, flexWrap: "wrap", marginBottom: 8}}>
                 <span style={{fontSize: 13, fontWeight: 600, color: "#111827"}}>{title}</span>
                 <span style={{fontSize: 11, color: "#9ca3af"}}>{hint || (isGpt
-                    ? "GPT 注册专用。先贴跳板 vless，再导入出口代理。"
+                    ? "GPT 注册专用。跳板可空：空则直连出口代理池，不走邮箱跳板。"
                     : "邮箱整备专用。先贴跳板 vless，再导入出口代理。")}</span>
             </div>
             <div style={{marginBottom: 14, padding: 12, background: "#eef2ff", border: "1px solid #c7d2fe", borderRadius: 10}}>
@@ -161,7 +161,9 @@ export function ProxyPoolPanel({
                 <div style={{fontSize: 11, color: jumpItems.some((x) => x.xray === false || x.ok === false) ? "#b91c1c" : "#4338ca", marginTop: 8}}>
                     {jumpText.trim()
                         ? "保存后每条 vless 起一个独立 xray（10811 起往上排）。10808 是你自己的，任务不占用。"
-                        : "还没贴跳板。把机场/节点的 vless:// 整行复制进来，点「保存并起 xray」。"}
+                        : (isGpt
+                            ? "没贴跳板时注册直连上面的出口代理池。"
+                            : "还没贴跳板。把机场/节点的 vless:// 整行复制进来，点「保存并起 xray」。")}
                 </div>
             </div>
             <div style={{fontSize: 12, color: "#374151", marginBottom: 4}}>出口代理（kookeey / socks5，一行一个）</div>

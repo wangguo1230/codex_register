@@ -127,6 +127,12 @@ class Scheduler extends EventEmitter {
         } catch { /* 损坏则保留默认 */ }
     }
 
+    /** 用户有没有给 GPT 单独配跳板。没有就不要借用邮箱跳板，注册直连代理池。 */
+    hasGptJumpConfig() {
+        if (String(this.gptProxyJump || "").trim()) return true;
+        return (this.gptJumpPool || []).some((x) => String(x || "").trim());
+    }
+
     collectJumpLines() {
         const out = [];
         const seen = new Set();
@@ -644,8 +650,14 @@ class Scheduler extends EventEmitter {
                 this.logJob(info, `浏览器走 xray ${xray}（不用 JS 转发 kookeey）`);
             } else if (info.wantGptPool) {
                 try {
-                    if (gptJumpPool.urls.length) {
-                        info.jumpLease = await gptJumpPool.lease(acc.email, {timeoutMs: 20_000, maxPerJump: JUMP_MAX_EXITS});
+                    const wantJump = this.hasGptJumpConfig();
+                    if (wantJump && gptJumpPool.urls.length) {
+                        try {
+                            info.jumpLease = await gptJumpPool.lease(acc.email, {timeoutMs: 20_000, maxPerJump: JUMP_MAX_EXITS});
+                        } catch (e) {
+                            this.logJob(info, `跳板租不到（${String(e?.message || e).slice(0, 80)}），直连 GPT 代理池`);
+                            info.jumpLease = null;
+                        }
                     }
                     info.mailLease = await gptProxyPool.lease(acc.email, {
                         fallback: "",
@@ -653,10 +665,10 @@ class Scheduler extends EventEmitter {
                         maxPerTemplate: 1,
                         freshSession: true,
                     });
-                    const jump = info.jumpLease?.url || this.gptProxyJump || "";
+                    const jump = wantJump ? (info.jumpLease?.url || this.gptProxyJump || "") : "";
                     env.PROXY_URL = info.mailLease.url || "";
                     env.MAIL_PROXY_JUMP = jump;
-                    this.logJob(info, `GPT 代理池租到 ${String(info.mailLease.url || "直连").replace(/:[^:@/]+@/, ":***@")}（协议自行转发${jump ? `，跳板 ${jump}` : "，无跳板"}）`);
+                    this.logJob(info, `GPT 代理池租到 ${String(info.mailLease.url || "直连").replace(/:[^:@/]+@/, ":***@")}（${jump ? "跳板 " + jump : "无跳板，直连代理池"}）`);
                 } catch (e) {
                     try { info.jumpLease?.release(); } catch { /* */ }
                     this.running.delete(runId);
@@ -679,6 +691,7 @@ class Scheduler extends EventEmitter {
             let buf = "";
             const onData = (chunk) => {
                 buf += chunk.toString();
+                if (buf.length > 512 * 1024) buf = buf.slice(-256 * 1024);
                 let idx;
                 const run = async () => {
                     while ((idx = buf.indexOf("\n")) >= 0) {
@@ -691,7 +704,7 @@ class Scheduler extends EventEmitter {
                 void run();
             };
             child.stdout.on("data", onData);
-            child.stderr.on("data", (d) => { const t = d.toString().trim(); if (t) this.logJob(info, `[stderr] ${t}`); });
+            child.stderr.on("data", (d) => { const t = d.toString().trim(); if (t) this.logJob(info, `[stderr] ${t.slice(0, 160)}`); });
             child.on("error", (err) => this.logJob(info, `[spawn error] ${err?.message ?? err}`));
             child.on("exit", (code) => { void this.onExit(runId, code); });
         } catch (e) {

@@ -52,9 +52,8 @@ async function persist(mb, r) {
     } else if (!r.ok) {
         await pool.query(`UPDATE mailboxes SET pw_status=$1 WHERE id=$2`, [`⚠整备部分 ${pwStamp()}`, mb.id]);
     }
-    if (r.totpSecret) {
-        await db.setMailboxTotp(mb.id, r.totpSecret);
-        await db.refreshMailboxGoogleState(mb.id, {totp: "ok", totp_rotated: true}).catch(() => {});
+    if (r.totpChanged && r.totpSecret) {
+        await db.commitRotatedTotp(mb.id, r.totpSecret, mb.totp_secret);
     }
     await db.applyMailboxUpdate(mb.email, {
         imap_password: r.imapPassword || undefined,
@@ -113,9 +112,9 @@ async function runOne(email, idx) {
                 }
             }
             if (patch.totpSecret) {
-                await db.setMailboxTotp(mb.id, patch.totpSecret);
-                await db.refreshMailboxGoogleState(mb.id, {totp: "ok", totp_rotated: true}).catch(() => {});
-                console.log(`${email} [落库] 新 TOTP 已写入`);
+                const cr = await db.commitRotatedTotp(mb.id, patch.totpSecret, patch.totpPrevious || mb.totp_secret);
+                if (cr.ok && cr.totp) mb.totp_secret = cr.totp;
+                console.log(`${email} [落库] ${cr.ok ? "新 TOTP 已写入" : "TOTP 未覆盖(" + (cr.reason || "失败") + ")"}`);
             }
             if (patch.imapPassword) await db.applyMailboxUpdate(mb.email, {imap_password: patch.imapPassword});
             if (patch.recoveryCleared) await db.applyMailboxUpdate(mb.email, {recovery_email: ""});

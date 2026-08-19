@@ -83,16 +83,17 @@ export async function waitGoogleImapOtp(cred, {minTimestampMs = 0, excludeCode =
     const overBudget = () => deadlineMs > 0 && Date.now() >= deadlineMs;
     for (let i = 0; i < n; i++) {
         if (overBudget()) break;
-        console.log(`[google] IMAP 收码 ${i + 1}/${n} ${c.email}`);
+        imapLog(`[google] IMAP 收码 ${i + 1}/${n} ${c.email}`);
         try {
             const code = await tryImapOtp(c, {minTimestampMs, excludeCode, deadlineMs});
             if (code) {
-                console.log(`[google] IMAP 拿到验证码 ${code}`);
+                imapLog(`[google] IMAP 拿到验证码 ${code}`);
                 return code;
             }
+            imapLog(`[google] IMAP 本轮没有新验证码，${Math.round(intervalMs / 1000)}s 后再看`);
         } catch (e) {
             lastErr = String(e?.message || e);
-            console.log(`[google] IMAP 不可用(${lastErr.slice(0, 80)})`);
+            imapLog(`[google] IMAP 不可用(${lastErr.slice(0, 100)})，${Math.round(intervalMs / 1000)}s 后换出口重试`);
         }
         if (i < n - 1 && !overBudget()) await new Promise((r) => setTimeout(r, intervalMs));
     }
@@ -118,15 +119,27 @@ function parseProxyOpt(url) {
     } catch { return {server: url}; }
 }
 
+function imapLog(msg) {
+    console.log(msg);
+    try { process.stdout.write(""); } catch { /* */ }
+}
+
 function imapViaList() {
     const out = [];
     const push = (u) => {
         const s = String(u || "").trim();
-        if (s && !out.includes(s)) out.push(s);
+        if (!s || out.includes(s)) return;
+        // MAILCOM_PROXY 空串常被拼成 socks5:// ，ImapFlow 会一直挂到超时、中间没日志
+        if (/^socks5h?:\/\/:?\d*$/i.test(s) || /^https?:\/\/:?\d*$/i.test(s)) return;
+        try {
+            const parsed = new URL(/^[a-z][a-z0-9+.-]*:\/\//i.test(s) ? s.split("#")[0] : `socks5://${s}`);
+            if (!parsed.hostname) return;
+        } catch { return; }
+        out.push(s);
     };
     push(process.env.IMAP_PROXY || "");
+    push(process.env.MAILCOM_PROXY || "");
     push("socks5://127.0.0.1:10808");
-    push("socks5://127.0.0.1:10811");
     return ["", ...out];
 }
 
@@ -138,15 +151,35 @@ async function collectMailboxCandidates(client, box, limit, minTimestampMs) {
             const total = Number(status?.messages || 0);
             if (!total) return [];
             const start = Math.max(1, total - Math.max(8, limit) + 1);
-            const out = [];
             const since = (minTimestampMs || Date.now()) - 30 * 60 * 1000;
-            for await (const msg of client.fetch(`${start}:*`, {envelope: true, source: true})) {
+            const metas = [];
+            for await (const msg of client.fetch(`${start}:*`, {envelope: true, uid: true})) {
                 const ts = msg?.envelope?.date?.getTime?.() || 0;
                 if (ts && ts < since) continue;
-                const src = msg?.source ? msg.source.toString("utf8") : "";
-                const subject = msg?.envelope?.subject || "";
+                const subject = String(msg?.envelope?.subject || "");
                 const from = (msg?.envelope?.from || []).map((x) => x.address || "").join(" ");
-                out.push({subject, from, content: src, timestamp: ts});
+                const uid = Number(msg.uid || 0);
+                if (!uid) continue;
+                metas.push({uid, subject, from, timestamp: ts});
+            }
+            const interesting = metas.filter((m) =>
+                /openai|chatgpt|noreply|verify|verification|code|login|验证|登录|代码/i.test(`${m.subject} ${m.from}`)
+            ).slice(-8);
+            if (!interesting.length) return [];
+            const want = new Set(interesting.map((m) => m.uid));
+            const byUid = new Map(interesting.map((m) => [m.uid, m]));
+            const out = [];
+            for await (const msg of client.fetch(interesting.map((m) => m.uid).join(","), {source: true, uid: true})) {
+                const uid = Number(msg.uid || 0);
+                if (!want.has(uid)) continue;
+                const meta = byUid.get(uid);
+                const raw = msg?.source ? msg.source.toString("utf8") : "";
+                out.push({
+                    subject: meta?.subject || "",
+                    from: meta?.from || "",
+                    content: raw.length > 80_000 ? raw.slice(0, 80_000) : raw,
+                    timestamp: meta?.timestamp || 0,
+                });
             }
             return out;
         } finally {
@@ -173,11 +206,12 @@ async function tryImapOtpOnce(cred, {minTimestampMs = 0, excludeCode = "", proxy
     client.on("error", () => {});
     try {
         await client.connect();
-        const boxes = ["INBOX", "[Gmail]/Spam", "[Gmail]/All Mail", "Junk"];
+        const boxes = ["INBOX", "[Gmail]/Spam", "Junk"];
         const candidates = [];
         for (const box of boxes) {
-            const part = await collectMailboxCandidates(client, box, box === "INBOX" ? 20 : 10, minTimestampMs);
+            const part = await collectMailboxCandidates(client, box, box === "INBOX" ? 12 : 6, minTimestampMs);
             candidates.push(...part);
+            if (box === "INBOX" && part.some((m) => m?.content)) break;
         }
         await client.logout().catch(() => {});
         const found = findLatestVerificationMail(candidates, {targetEmail: cred.email, excludeCode});
@@ -195,10 +229,13 @@ async function tryImapOtp(cred, {minTimestampMs = 0, excludeCode = "", deadlineM
         // 一轮要试 4 个出口、每个 connectionTimeout 16s，不在出口之间看截止时间的话
         // 单轮就能冲过整个取码预算（换绑那边靠这个预算保证 verify 落在 pwd_auth 窗口内）
         if (deadlineMs && Date.now() >= deadlineMs) break;
+        const viaLabel = via ? via.replace(/\/\/([^/@]+)@/, "//***@") : "直连";
+        imapLog(`[google] IMAP 试 ${viaLabel}`);
         try {
             return await tryImapOtpOnce(cred, {minTimestampMs, excludeCode, proxy: via});
         } catch (e) {
             lastErr = String(e?.message || e);
+            imapLog(`[google] IMAP ${viaLabel} 失败: ${lastErr.slice(0, 100)}`);
             if (!/Unexpected close|ECONNRESET|ETIMEDOUT|timeout|Socket timeout|closed|EPIPE|proxy/i.test(lastErr)) {
                 throw e;
             }
@@ -274,16 +311,17 @@ export async function getGoogleEmailVerificationCode(email, options = {}) {
 
     let imapErr = "";
     for (let i = 0; i < 16; i++) {
-        console.log(`[google] IMAP 收码 ${i + 1}/16 ${email}`);
+        imapLog(`[google] IMAP 收码 ${i + 1}/16 ${email}`);
         try {
             const imapCode = await tryImapOtp(cred, {minTimestampMs, excludeCode});
             if (imapCode) {
-                console.log(`[google] IMAP 拿到验证码 ${imapCode}`);
+                imapLog(`[google] IMAP 拿到验证码 ${imapCode}`);
                 return imapCode;
             }
+            imapLog(`[google] IMAP 本轮没有新验证码，5s 后再看`);
         } catch (e) {
             imapErr = String(e?.message || e);
-            console.log(`[google] IMAP 不可用(${imapErr.slice(0, 80)})，稍后重试`);
+            imapLog(`[google] IMAP 不可用(${imapErr.slice(0, 100)})，5s 后重试`);
         }
         if (i < 15) await new Promise((r) => setTimeout(r, 5000));
     }

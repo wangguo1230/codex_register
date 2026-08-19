@@ -208,6 +208,8 @@ export async function ensureSchema() {
         await client.query(`ALTER TABLE mailboxes ADD COLUMN IF NOT EXISTS totp_secret TEXT DEFAULT ''`);
         // 导入时的卖家 2FA：换密钥只改 totp_secret，这份永远不覆盖
         await client.query(`ALTER TABLE mailboxes ADD COLUMN IF NOT EXISTS totp_secret_orig TEXT DEFAULT ''`);
+        await client.query(`ALTER TABLE mailboxes ADD COLUMN IF NOT EXISTS job_lock_instance TEXT DEFAULT ''`);
+        await client.query(`ALTER TABLE mailboxes ADD COLUMN IF NOT EXISTS job_lock_at BIGINT DEFAULT 0`);
         await client.query(`ALTER TABLE mailboxes ADD COLUMN IF NOT EXISTS imap_password TEXT DEFAULT ''`);
         await client.query(`
             UPDATE mailboxes
@@ -337,8 +339,16 @@ export async function ensureSchema() {
         await client.query(`CREATE INDEX IF NOT EXISTS idx_mail_jobs_status ON mail_jobs(status, kind)`);
         await client.query(`CREATE INDEX IF NOT EXISTS idx_mail_jobs_batch ON mail_jobs(batch_id)`);
         await client.query(`
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_mail_jobs_active
-            ON mail_jobs(kind, mailbox_id)
+            DELETE FROM mail_jobs a USING mail_jobs b
+            WHERE a.status IN ('pending', 'running')
+              AND b.status IN ('pending', 'running')
+              AND a.mailbox_id = b.mailbox_id
+              AND a.id > b.id
+        `);
+        await client.query(`DROP INDEX IF EXISTS idx_mail_jobs_active`);
+        await client.query(`
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_mail_jobs_active_mailbox
+            ON mail_jobs(mailbox_id)
             WHERE status IN ('pending', 'running')
         `);
         await client.query(`

@@ -54,6 +54,7 @@ export async function init() {
     await query(`UPDATE sms_pool SET status='free', bound_email='', claimed_by='' WHERE status='claimed' AND (claimed_by=$1 OR claimed_by='')`, [instanceId]);
     await query(`UPDATE pw_queue SET status='pending', instance_id='' WHERE status='running' AND (instance_id=$1 OR instance_id='')`, [instanceId]);
     await query(`UPDATE mail_jobs SET status='pending', instance_id='', last_line='实例重启，退回排队' WHERE status='running' AND (instance_id=$1 OR instance_id='')`, [instanceId]);
+    await query(`UPDATE mailboxes SET job_lock_instance='', job_lock_at=0 WHERE job_lock_instance=$1 OR (COALESCE(job_lock_at,0)>0 AND job_lock_at < $2)`, [instanceId, Date.now() - 20 * 60_000]);
     await releaseRechargeQueueByInstance(instanceId);
     // 上次退出时没做完的换绑对账认领要放回，否则那些 unknown 行永远等不到收敛
     await releaseRebindReconcileByInstance(instanceId);
@@ -581,7 +582,11 @@ export async function importFreeMailboxes(rows, grp = "", usage = "free", provid
                 ids.push(ins[0].id);
             } else {
                 const { rows: upd } = await client.query(
-                    `UPDATE mailboxes SET deleted_at=0, usage=$1, password=$2, provider=$3, grp=$4, recovery_email=$5, totp_secret=$6,
+                    `UPDATE mailboxes SET deleted_at=0, usage=$1, password=$2, provider=$3, grp=$4, recovery_email=$5,
+                        totp_secret=CASE
+                          WHEN COALESCE(google_state->>'totp_rotated','')='true' THEN totp_secret
+                          WHEN COALESCE(totp_secret,'')<>'' THEN totp_secret
+                          ELSE $6 END,
                         totp_secret_orig=CASE WHEN COALESCE(totp_secret_orig,'')<>'' THEN totp_secret_orig WHEN COALESCE(totp_secret,'')<>'' THEN totp_secret ELSE $6 END
                      WHERE email=$7 AND deleted_at>0 RETURNING id`,
                     [u, r.password, prov, g, row.recovery_email || "", totp, email]
@@ -1152,9 +1157,68 @@ export async function setMailboxBrowserFp(id, profile) {
     await query(`UPDATE mailboxes SET browser_fp=$1::jsonb WHERE id=$2`, [JSON.stringify(profile), id]);
 }
 
-export async function setMailboxTotp(id, totpSecret) {
-    const next = String(totpSecret || "");
+const MAILBOX_WORK_LOCK_TTL_MS = 20 * 60_000;
+
+export async function claimMailboxWorkLock(mailboxId, instId = instanceId, ttlMs = MAILBOX_WORK_LOCK_TTL_MS) {
+    const id = Number(mailboxId);
+    if (!Number.isInteger(id) || id <= 0) return false;
+    const now = Date.now();
+    const {rowCount} = await query(
+        `UPDATE mailboxes
+         SET job_lock_instance=$2, job_lock_at=$3
+         WHERE id=$1 AND (
+           COALESCE(job_lock_instance,'')='' OR COALESCE(job_lock_at,0) < $4 OR job_lock_instance=$2
+         )`,
+        [id, instId, now, now - ttlMs],
+    );
+    return (rowCount || 0) > 0;
+}
+
+export async function touchMailboxWorkLock(mailboxId, instId = instanceId) {
     await query(
+        `UPDATE mailboxes SET job_lock_at=$3 WHERE id=$1 AND job_lock_instance=$2`,
+        [mailboxId, instId, Date.now()],
+    );
+}
+
+export async function releaseMailboxWorkLock(mailboxId, instId = instanceId) {
+    await query(
+        `UPDATE mailboxes SET job_lock_instance='', job_lock_at=0 WHERE id=$1 AND job_lock_instance=$2`,
+        [mailboxId, instId],
+    );
+}
+
+export async function withMailboxWorkLock(mailboxId, fn, instId = instanceId) {
+    const got = await claimMailboxWorkLock(mailboxId, instId);
+    if (!got) {
+        return {ok: false, skipped: true, locked: true, error: "该邮箱正在被其他实例整备，跳过以免覆盖 2FA"};
+    }
+    const timer = setInterval(() => { touchMailboxWorkLock(mailboxId, instId).catch(() => {}); }, 60_000);
+    try {
+        return await fn();
+    } finally {
+        clearInterval(timer);
+        await releaseMailboxWorkLock(mailboxId, instId);
+    }
+}
+
+/** 只有本轮在 Google 上验证过的新密钥才能覆盖 totp_secret。跳过/旧值/并发败者写不进去。 */
+export async function commitRotatedTotp(id, nextSecret, previousSecret = "") {
+    const {normalizeTotpSecret, looksLikeTotpSecret} = await import("../src/mfa.js");
+    const next = normalizeTotpSecret(nextSecret);
+    if (!looksLikeTotpSecret(next)) return {ok: false, reason: "invalid"};
+    const prev = normalizeTotpSecret(previousSecret);
+    const {rows} = await query(
+        `SELECT totp_secret, COALESCE(google_state->>'totp_rotated','') AS rotated FROM mailboxes WHERE id=$1`,
+        [id],
+    );
+    if (!rows[0]) return {ok: false, reason: "missing"};
+    const cur = normalizeTotpSecret(rows[0].totp_secret);
+    if (cur === next) {
+        await refreshMailboxGoogleState(id, {totp: "ok", totp_rotated: true}).catch(() => {});
+        return {ok: true, unchanged: true, totp: next};
+    }
+    const {rowCount} = await query(
         `UPDATE mailboxes SET
             totp_secret_orig=CASE
               WHEN COALESCE(totp_secret_orig,'')<>'' THEN totp_secret_orig
@@ -1162,10 +1226,52 @@ export async function setMailboxTotp(id, totpSecret) {
               ELSE totp_secret_orig
             END,
             totp_secret=$1
+         WHERE id=$2 AND (
+           COALESCE(totp_secret,'')=''
+           OR totp_secret=$1
+           OR totp_secret=$3
+           OR COALESCE(google_state->>'totp_rotated','') <> 'true'
+         )`,
+        [next, id, prev || ""],
+    );
+    if (!rowCount) return {ok: false, reason: "stale", kept: cur};
+    await refreshMailboxGoogleState(id, {totp: "ok", totp_rotated: true}).catch(() => {});
+    return {ok: true, totp: next};
+}
+
+/** 导入/字段对调：已换过 2FA 或库里已是合法密钥时不覆盖。 */
+export async function importMailboxTotp(id, incoming) {
+    const {normalizeTotpSecret, looksLikeTotpSecret, looksLikeEmail} = await import("../src/mfa.js");
+    const next = normalizeTotpSecret(incoming);
+    const {rows} = await query(
+        `SELECT totp_secret, COALESCE(google_state->>'totp_rotated','') AS rotated FROM mailboxes WHERE id=$1`,
+        [id],
+    );
+    if (!rows[0]) return {ok: false, reason: "missing"};
+    const curRaw = String(rows[0].totp_secret || "").trim();
+    const cur = normalizeTotpSecret(curRaw);
+    if (rows[0].rotated === "true" && looksLikeTotpSecret(cur)) {
+        return {ok: true, skipped: true, kept: cur};
+    }
+    if (looksLikeTotpSecret(cur) && looksLikeTotpSecret(next) && cur !== next) {
+        return {ok: true, skipped: true, kept: cur};
+    }
+    if (!next) return {ok: true, skipped: true};
+    if (looksLikeTotpSecret(cur) && !looksLikeEmail(curRaw)) {
+        return {ok: true, skipped: true, kept: cur};
+    }
+    await query(
+        `UPDATE mailboxes SET
+            totp_secret=$1,
+            totp_secret_orig=CASE WHEN COALESCE(totp_secret_orig,'')<>'' THEN totp_secret_orig ELSE $1 END
          WHERE id=$2`,
         [next, id],
     );
-    await refreshMailboxGoogleState(id).catch(() => {});
+    return {ok: true, totp: next};
+}
+
+export async function setMailboxTotp(id, totpSecret, previousSecret = "") {
+    return commitRotatedTotp(id, totpSecret, previousSecret);
 }
 
 export async function setMailboxImapPassword(id, imapPassword) {
@@ -1180,10 +1286,8 @@ export async function applyMailboxUpdate(email, patch = {}) {
     const vals = [];
     if (patch.password != null) { sets.push(`password=$${sets.length + 1}`); vals.push(patch.password); }
     if (patch.totp_secret != null) {
-        const p = sets.length + 1;
-        sets.push(`totp_secret_orig=CASE WHEN COALESCE(totp_secret_orig,'')<>'' THEN totp_secret_orig WHEN COALESCE(totp_secret,'')<>'' AND totp_secret IS DISTINCT FROM $${p} THEN totp_secret ELSE totp_secret_orig END`);
-        sets.push(`totp_secret=$${p}`);
-        vals.push(patch.totp_secret);
+        const row = await getMailboxByEmail(em);
+        if (row?.id) await importMailboxTotp(row.id, patch.totp_secret);
     }
     if (patch.imap_password != null) { sets.push(`imap_password=$${sets.length + 1}`); vals.push(patch.imap_password); }
     if (patch.recovery_email != null) { sets.push(`recovery_email=$${sets.length + 1}`); vals.push(patch.recovery_email); }
@@ -1545,32 +1649,60 @@ export async function removeFromRechargeQueue(ids) {
     return deliverRechargeQueue(ids);
 }
 
-/** 标记为已交付。只收已充上的（status=done / paid），失败/退回/待提交一律不搬。 */
+/**
+ * 标记为已交付。只收已充上的（status=done / paid），失败/退回/待提交一律不搬。
+ * 交付的同时把该号用掉的卡密从卡密池删掉：已交付说明卡已经充上、这辈子不会再用，
+ * 留在池里只会虚增"可用/已完成"计数、干扰取卡。卡号本身留在
+ * recharge_queue.card_code 上，审计仍可查，所以删的是池子不是记录。
+ * 标记与删卡放在同一个事务里，避免出现"标了已交付但卡还在池里"的中间态。
+ */
 export async function deliverRechargeQueue(ids) {
     const list = [...new Set((ids || []).map(Number).filter(Number.isInteger))];
-    if (!list.length) return { count: 0, skipped: 0 };
+    if (!list.length) return { count: 0, skipped: 0, cardsRemoved: 0 };
     const now = Date.now();
-    const { rows: skipRows } = await query(
-        `SELECT COUNT(*)::int AS n FROM recharge_queue
-         WHERE id = ANY($1)
-           AND COALESCE(delivery_status,'undelivered')<>'delivered'
-           AND NOT (status='done' OR task_status='paid')`,
-        [list],
-    );
-    const { rowCount } = await query(
-        `UPDATE recharge_queue
-         SET delivery_status='delivered',
-             delivered_at=CASE WHEN COALESCE(delivered_at,0)>0 THEN delivered_at ELSE $1 END,
-             instance_id=''
-         WHERE id = ANY($2)
-           AND COALESCE(delivery_status,'undelivered')<>'delivered'
-           AND (status='done' OR task_status='paid')`,
-        [now, list],
-    );
-    return { count: rowCount || 0, skipped: Number(skipRows[0]?.n || 0) };
+    return withTransaction(async (client) => {
+        const { rows: skipRows } = await client.query(
+            `SELECT COUNT(*)::int AS n FROM recharge_queue
+             WHERE id = ANY($1)
+               AND COALESCE(delivery_status,'undelivered')<>'delivered'
+               AND NOT (status='done' OR task_status='paid')`,
+            [list],
+        );
+        const { rows: delivered } = await client.query(
+            `UPDATE recharge_queue
+             SET delivery_status='delivered',
+                 delivered_at=CASE WHEN COALESCE(delivered_at,0)>0 THEN delivered_at ELSE $1 END,
+                 instance_id=''
+             WHERE id = ANY($2)
+               AND COALESCE(delivery_status,'undelivered')<>'delivered'
+               AND (status='done' OR task_status='paid')
+             RETURNING id`,
+            [now, list],
+        );
+        let cardsRemoved = 0;
+        if (delivered.length) {
+            // 只走队列行自己的 card_id 关联，不按邮箱匹配：换绑后 queue.email 会变成新
+            // Gmail，而卡上的 account_email 还是旧的，按邮箱匹配会漏。
+            // status='unused' 的不动：那种是已经被放回池子的可用卡，不能误删。
+            const res = await client.query(
+                `DELETE FROM recharge_cards c
+                 USING recharge_queue q
+                 WHERE q.id = ANY($1)
+                   AND c.id = q.card_id
+                   AND c.status <> 'unused'`,
+                [delivered.map((r) => Number(r.id))],
+            );
+            cardsRemoved = res.rowCount || 0;
+        }
+        return { count: delivered.length, skipped: Number(skipRows[0]?.n || 0), cardsRemoved };
+    });
 }
 
-/** 已交付 → 退回未交付（误点恢复） */
+/**
+ * 已交付 → 退回未交付（误点恢复）。
+ * 注意交付时删掉的卡密不会一起回来 —— 那张卡已经充上用掉了，本来也不能再提，
+ * 真要重提得走「重新登录并提交」重新配一张新卡。
+ */
 export async function undeliverRechargeQueue(ids) {
     const list = [...new Set((ids || []).map(Number).filter(Number.isInteger))];
     if (!list.length) return { count: 0 };
@@ -1983,7 +2115,7 @@ export async function enqueueMailJobs(items, kind = "harden", batchId = "") {
                  SELECT $1,$2,$3,$4,'pending',$5,$6::jsonb
                  WHERE NOT EXISTS (
                     SELECT 1 FROM mail_jobs
-                    WHERE kind=$1 AND mailbox_id=$2 AND status IN ('pending','running')
+                    WHERE mailbox_id=$2 AND status IN ('pending','running')
                  )`,
                 [kind, mailboxId, email, bid, now, payload],
             );

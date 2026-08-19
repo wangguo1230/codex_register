@@ -153,6 +153,7 @@ export function runGmailLoginWorker(mb, log = () => {}) {
             cwd: ROOT,
             env: cleanSpawnEnv({
                 MAIL_PROXY_JUMP: scheduler.mailProxyJump || scheduler.gptProxyJump || "",
+                GMAIL_WORKER: "1",
             }),
             stdio: ["ignore", "pipe", "pipe"],
             detached: process.platform !== "win32",
@@ -169,6 +170,7 @@ export function runGmailLoginWorker(mb, log = () => {}) {
         const pump = (buf) => {
             const s = String(buf || "");
             out += s;
+            if (out.length > 512 * 1024) out = out.slice(-256 * 1024);
             for (const line of s.split(/\r?\n/)) {
                 const t = line.trim();
                 if (!t) continue;

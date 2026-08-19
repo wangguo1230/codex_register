@@ -40,13 +40,16 @@ async function persist(mb, r) {
     } else {
         await pool.query(`UPDATE mailboxes SET pw_status=$1 WHERE id=$2`, [r.ok ? `✅整备 ${stamp()}` : `⚠整备部分 ${stamp()}`, mb.id]);
     }
-    if (r.totpSecret) {
+    if (r.totpChanged && r.totpSecret) {
         await pool.query(
             `UPDATE mailboxes SET
                 totp_secret_orig=CASE WHEN COALESCE(totp_secret_orig,'')<>'' THEN totp_secret_orig WHEN COALESCE(totp_secret,'')<>'' AND totp_secret IS DISTINCT FROM $1 THEN totp_secret ELSE totp_secret_orig END,
                 totp_secret=$1
-             WHERE id=$2`,
-            [r.totpSecret, mb.id],
+             WHERE id=$2 AND (
+               COALESCE(totp_secret,'')='' OR totp_secret=$1 OR totp_secret=$3
+               OR COALESCE(google_state->>'totp_rotated','') <> 'true'
+             )`,
+            [r.totpSecret, mb.id, mb.totp_secret || ""],
         );
     }
     if (r.imapPassword) await pool.query(`UPDATE mailboxes SET imap_password=$1 WHERE id=$2`, [r.imapPassword, mb.id]);

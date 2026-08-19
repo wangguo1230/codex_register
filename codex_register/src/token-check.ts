@@ -3,11 +3,31 @@
 // 独立模块，不依赖 check-auth-quota.ts(那是 CLI)。undici ProxyAgent 支持科学上网代理过 Cloudflare。
 import {ProxyAgent} from "undici";
 import {DEFAULT_USER_AGENT, CHATGPT_BASE_URL, DEFAULT_CLIENT_ID, AUTH_OAUTH_TOKEN_URLS} from "./constants.js";
+import {createProtocolDispatcher} from "./mail/protocol-dispatcher.js";
 
-/** 用代理 URL 构造 undici dispatcher(测 at 过 CF 需要科学上网代理);空则直连 */
+/**
+ * :3100 里禁止用 undici ProxyAgent 吃 socks5。
+ * Node 24 的实验 SOCKS 会把流读进主进程，几十秒堆到几十 GB，页面全超时。
+ * 本机 10808 是 v2rayN HTTP，也不能当 socks5 喂进去。
+ */
 export function buildProxyDispatcher(proxyUrl) {
-    if (!proxyUrl) return undefined;
-    try { return new ProxyAgent(proxyUrl); } catch { return undefined; }
+    const raw = String(proxyUrl || "").trim();
+    if (!raw) return undefined;
+    try {
+        const cleaned = raw.replace(/#.*$/, "");
+        const u = new URL(/^[a-z][a-z0-9+.-]*:\/\//i.test(cleaned) ? cleaned : `socks5://${cleaned}`);
+        const local = u.hostname === "127.0.0.1" || u.hostname === "localhost";
+        if (local && String(u.port || "") === "10808") {
+            return new ProxyAgent({uri: "http://127.0.0.1:10808"});
+        }
+        if (u.protocol === "http:" || u.protocol === "https:") {
+            return new ProxyAgent({uri: cleaned});
+        }
+        if (u.protocol.startsWith("socks")) {
+            return createProtocolDispatcher(cleaned);
+        }
+    } catch { /* */ }
+    return undefined;
 }
 
 function fetchWithTimeout(url, opts, ms = 12000) {

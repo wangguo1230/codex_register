@@ -574,8 +574,9 @@ export const api = {
     /** 标记已交付（原「移出队列」）：进已交付 tab，保留换绑记录，不删号 */
     removeFromRechargeQueue: (ids: number[]) =>
         j<{ok: boolean; count: number}>("/api/recharge/queue/remove", {method: "POST", body: JSON.stringify({ids})}),
+    /** cardsRemoved：交付时顺带从卡密池删掉的已用卡数量 */
     deliverRechargeQueue: (ids: number[]) =>
-        j<{ok: boolean; count: number; skipped?: number}>("/api/recharge/queue/deliver", {method: "POST", body: JSON.stringify({ids})}),
+        j<{ok: boolean; count: number; skipped?: number; cardsRemoved?: number}>("/api/recharge/queue/deliver", {method: "POST", body: JSON.stringify({ids})}),
     /** 已交付 → 退回未交付（误点恢复） */
     undeliverRechargeQueue: (ids: number[]) =>
         j<{ok: boolean; count: number}>("/api/recharge/queue/undeliver", {method: "POST", body: JSON.stringify({ids})}),
@@ -634,6 +635,11 @@ export const api = {
         if (ct.includes("text/plain")) return {text: await res.text()};
         return res.json();
     },
+    exportRechargeSub2json: (opts: {ids: number[]; concurrency?: number}) =>
+        j<{ok: boolean; async?: boolean; total?: number; needRt?: number; concurrency?: number; error?: string}>(
+            "/api/recharge/queue/export-sub2json",
+            {method: "POST", body: JSON.stringify(opts)},
+        ),
     stopExportRt: () => j<{ok: boolean; running?: boolean}>("/api/recharge/queue/export/stop", {method: "POST"}),
     probePlan: (ids?: number[], batch?: string) =>
         j<{ok: boolean; count: number}>("/api/recharge/queue/probe-plan", {method: "POST", body: JSON.stringify({ids, batch})}),

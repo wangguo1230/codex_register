@@ -23,6 +23,28 @@ const POOL_FILE = process.env.MAILCOM_TOKENS_FILE
     : path.resolve(process.cwd(), "mailcom", "tokens.txt");
 
 const HEADLESS = process.env.MAILCOM_HEADLESS === "1";
+// 验密/收信/改密都在 :3100 里开 Chrome。同时开超过 2 个就会把事件循环堵死。
+const MAILCOM_CHROME_MAX = Math.max(1, Math.min(3, Number(process.env.MAILCOM_CHROME_CONC || 2)));
+let mailcomChromeActive = 0;
+const mailcomChromeWaiters = [];
+function acquireMailcomChrome(email) {
+    if (mailcomChromeActive < MAILCOM_CHROME_MAX) {
+        mailcomChromeActive += 1;
+        return Promise.resolve();
+    }
+    console.log(`[mailcom] ${email} 等 Chrome 空位（在跑 ${mailcomChromeActive}/${MAILCOM_CHROME_MAX}）`);
+    return new Promise((resolve) => {
+        mailcomChromeWaiters.push(() => {
+            mailcomChromeActive += 1;
+            resolve();
+        });
+    });
+}
+function releaseMailcomChrome() {
+    mailcomChromeActive = Math.max(0, mailcomChromeActive - 1);
+    const next = mailcomChromeWaiters.shift();
+    if (next) next();
+}
 
 // 邮箱登录代理(默认空=直连)；env 初始 + setMailProxy 运行时覆盖(server 用)
 let mailProxy = (process.env.MAILCOM_PROXY || "").trim();
@@ -466,10 +488,11 @@ async function clickIfVisible(root, sel, timeout = 800) {
 }
 
 async function dismissCookieBanners(page) {
+    // 只点明确的同意按钮。裸 Continue 会误点登录层，isVisible(400) 扫多 frame 会把 3100 拖死。
     const names = [
         /Continue to Mail\.?com/i, /Continue to Mail/i, /Accept all cookies/i,
-        /Accept All/i, /Accept all/i, /Agree and continue/i, /Agree/i, /I agree/i,
-        /Allow all/i, /Alle akzeptieren/i, /Continue/i,
+        /Accept All/i, /Accept all/i, /Agree and continue/i, /I agree/i,
+        /Allow all/i, /Alle akzeptieren/i,
     ];
     const sels = [
         "#onetrust-accept-btn-handler",
@@ -478,24 +501,24 @@ async function dismissCookieBanners(page) {
         '[id*="accept-all" i]',
         '[id*="acceptAll" i]',
         '[data-testid*="accept" i]',
-        "button[mode='primary']",
         "button[name='accept']",
     ];
     const roots = [page, ...page.frames()];
     for (const root of roots) {
         for (const sel of sels) {
-            if (await clickIfVisible(root, sel, 400)) return;
+            if (await clickIfVisible(root, sel, 0)) return true;
         }
         for (const name of names) {
             try {
                 const btn = root.getByRole("button", {name}).first();
-                if (await btn.isVisible({timeout: 400}).catch(() => false)) {
+                if (await btn.isVisible({timeout: 0}).catch(() => false)) {
                     await btn.click({force: true, timeout: 2000}).catch(() => {});
-                    return;
+                    return true;
                 }
             } catch { /* ignore */ }
         }
     }
+    return false;
 }
 
 async function dismissPopups(page) {
@@ -608,52 +631,27 @@ function isConsentUrl(url) {
 }
 
 async function onConsentWall(page) {
-    if (isConsentUrl(page.url())) return true;
     if (await inboxAlready(page)) return false;
-    const body = String(await page.innerText("body").catch(() => "")).slice(0, 700);
-    return /continue to mail|accept all cookies|privacy preference|we (use|value) cookies|manage cookies/i.test(body);
+    // 只认 URL。首页页脚常有 we use cookies / manage cookies，不能当同意墙，
+    // 否则 leaveConsentPage 会空转 8 轮，把验密拖过 50s。
+    return isConsentUrl(page.url());
 }
 
 /** consent 页底下仍有 #login-email，这时提交等于没登。必须先离开同意墙。 */
 async function leaveConsentPage(page) {
-    for (let i = 0; i < 8; i++) {
+    if (!(await onConsentWall(page))) return true;
+    for (let i = 0; i < 4; i++) {
+        console.log(`[mailcom] 同意页第 ${i + 1} 次处理 url=${String(page.url() || "").slice(0, 90)}`);
         await dismissCookieBanners(page);
-        await dismissPopups(page);
+        await page.waitForURL((u) => !isConsentUrl(String(u)), {timeout: 4000}).catch(() => {});
         if (!(await onConsentWall(page))) {
-            if (i) console.log(`[mailcom] 已离开同意页 url=${String(page.url() || "").slice(0, 80)}`);
+            console.log(`[mailcom] 已离开同意页 url=${String(page.url() || "").slice(0, 80)}`);
             return true;
         }
-        console.log(`[mailcom] 同意页第 ${i + 1} 次处理 url=${String(page.url() || "").slice(0, 90)}`);
-        const names = [
-            /Continue to Mail\.?com/i, /Continue to Mail/i, /Accept all cookies/i,
-            /Accept All/i, /Accept all/i, /Agree and continue/i, /I agree/i, /Agree/i,
-            /Allow all/i, /Alle akzeptieren/i, /Continue/i,
-        ];
-        let clicked = false;
-        for (const root of [page, ...page.frames()]) {
-            for (const name of names) {
-                try {
-                    const btn = root.getByRole("button", {name}).first();
-                    if (await btn.isVisible({timeout: 350}).catch(() => false)) {
-                        await btn.click({timeout: 4000}).catch(() => {});
-                        clicked = true;
-                        break;
-                    }
-                    const link = root.getByRole("link", {name}).first();
-                    if (await link.isVisible({timeout: 250}).catch(() => false)) {
-                        await link.click({timeout: 4000}).catch(() => {});
-                        clicked = true;
-                        break;
-                    }
-                } catch { /* ignore */ }
-            }
-            if (clicked) break;
-        }
-        await page.waitForURL((u) => !isConsentUrl(String(u)), {timeout: 6000}).catch(() => {});
-        await page.waitForTimeout(700);
-        if (isConsentUrl(page.url())) {
-            await page.goto("https://www.mail.com/", {waitUntil: "domcontentloaded", timeout: 30000}).catch(() => {});
-            await page.waitForTimeout(800);
+        if (i === 2) {
+            await page.goto("https://www.mail.com/", {waitUntil: "domcontentloaded", timeout: 20000}).catch(() => {});
+        } else {
+            await page.waitForTimeout(400);
         }
     }
     return !(await onConsentWall(page));
@@ -891,6 +889,23 @@ async function gotoMailcomHome(page, {retries = 3} = {}) {
 }
 
 async function loginMailcom(email, password, opts = {}) {
+    if (process.env.MAILCOM_WORKER !== "1") {
+        try {
+            const {isBrowserWorkBlocked} = await import("../../server/rss-guard.js");
+            if (isBrowserWorkBlocked()) throw new Error("主进程内存过高，拒绝在 :3100 开 mail.com 浏览器");
+        } catch (e) {
+            if (/主进程内存过高/.test(String(e?.message || e))) throw e;
+        }
+    }
+    await acquireMailcomChrome(email);
+    try {
+        return await loginMailcomUnlocked(email, password, opts);
+    } finally {
+        releaseMailcomChrome();
+    }
+}
+
+async function loginMailcomUnlocked(email, password, opts = {}) {
     const launchOpts: any = {
         channel: "chrome",
         headless: opts.headless ?? HEADLESS,

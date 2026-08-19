@@ -76,15 +76,9 @@ async function persist(mb, r) {
     } else {
         await db.query(`UPDATE mailboxes SET pw_status=$1 WHERE id=$2`, [r.ok ? `✅整备 ${stamp()}` : `⚠整备部分 ${stamp()}`, mb.id]);
     }
-    if (r.totpSecret) {
-        await db.query(
-            `UPDATE mailboxes SET
-                totp_secret_orig=CASE WHEN COALESCE(totp_secret_orig,'')<>'' THEN totp_secret_orig WHEN COALESCE(totp_secret,'')<>'' AND totp_secret IS DISTINCT FROM $1 THEN totp_secret ELSE totp_secret_orig END,
-                totp_secret=$1
-             WHERE id=$2`,
-            [r.totpSecret, mb.id],
-        );
-        mb.totp_secret = r.totpSecret;
+    if (r.totpChanged && r.totpSecret) {
+        const cr = await db.commitRotatedTotp(mb.id, r.totpSecret, mb.totp_secret);
+        if (cr.ok && cr.totp) mb.totp_secret = cr.totp;
     }
     if (r.imapPassword) await db.query(`UPDATE mailboxes SET imap_password=$1 WHERE id=$2`, [r.imapPassword, mb.id]);
     if (r.recoveryCleared) await db.query(`UPDATE mailboxes SET recovery_email='' WHERE id=$1`, [mb.id]);
@@ -116,13 +110,20 @@ async function runOne(mb, proxyUrl, idx, total) {
     const straight = straightenGoogleCreds({totpSecret: mb.totp_secret, recoveryEmail: mb.recovery_email});
     if (straight.swapped) {
         await db.query(
-            `UPDATE mailboxes SET totp_secret=$1, recovery_email=$2,
+            `UPDATE mailboxes SET recovery_email=$2,
+                totp_secret=CASE
+                  WHEN COALESCE(google_state->>'totp_rotated','')='true' THEN totp_secret
+                  WHEN COALESCE(totp_secret,'')<>'' THEN totp_secret
+                  ELSE $1 END,
                 totp_secret_orig=CASE WHEN COALESCE(totp_secret_orig,'')<>'' THEN totp_secret_orig ELSE $1 END
              WHERE id=$3`,
             [straight.totpSecret, straight.recoveryEmail, mb.id],
         );
-        mb.totp_secret = straight.totpSecret;
-        mb.recovery_email = straight.recoveryEmail;
+        const {rows: [freshTotp]} = await db.query(`SELECT totp_secret, recovery_email FROM mailboxes WHERE id=$1`, [mb.id]);
+        if (freshTotp) {
+            mb.totp_secret = freshTotp.totp_secret;
+            mb.recovery_email = freshTotp.recovery_email;
+        }
         log("导入字段对调已写回库");
     }
     const acc = {
@@ -143,19 +144,17 @@ async function runOne(mb, proxyUrl, idx, total) {
             log(`[落库] 新密码已写入 ${patch.password}`);
         }
         if (patch.totpSecret) {
-            await db.query(
-                `UPDATE mailboxes SET
-                    totp_secret_orig=CASE WHEN COALESCE(totp_secret_orig,'')<>'' THEN totp_secret_orig WHEN COALESCE(totp_secret,'')<>'' AND totp_secret IS DISTINCT FROM $1 THEN totp_secret ELSE totp_secret_orig END,
-                    totp_secret=$1
-                 WHERE id=$2`,
-                [patch.totpSecret, mb.id],
-            );
-            mb.totp_secret = patch.totpSecret;
-            acc.totpSecret = patch.totpSecret;
-            acc.totp_secret = patch.totpSecret;
+            const cr = await db.commitRotatedTotp(mb.id, patch.totpSecret, patch.totpPrevious || mb.totp_secret);
+            if (cr.ok && cr.totp) {
+                mb.totp_secret = cr.totp;
+                acc.totpSecret = cr.totp;
+                acc.totp_secret = cr.totp;
+            }
             await db.query(`INSERT INTO mailbox_logs(mailbox_id,ts,line) VALUES($1,$2,$3)`,
-                [mb.id, Date.now(), `[落库] 新 TOTP ${patch.totpSecret}`.slice(0, 220)]);
-            log("[落库] 新 TOTP 已写入");
+                [mb.id, Date.now(), cr.ok
+                    ? `[落库] 新 TOTP ${String(cr.totp || "").slice(0, 8)}…`
+                    : `[落库] TOTP 未覆盖(${cr.reason || "失败"})`].slice(0, 220));
+            log(cr.ok ? "[落库] 新 TOTP 已写入" : `[落库] TOTP 未覆盖(${cr.reason || "失败"})`);
         }
         if (patch.imapPassword) {
             await db.query(`UPDATE mailboxes SET imap_password=$1 WHERE id=$2`, [patch.imapPassword, mb.id]);

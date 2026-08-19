@@ -36,7 +36,11 @@ for (const line of lines) {
     if (exist) {
         await pool.query(
             `UPDATE mailboxes SET deleted_at=0, usage=CASE WHEN usage='deleted' THEN 'hold' ELSE usage END,
-             password=$1, provider='google', grp=$2, recovery_email=$3, totp_secret=$4, note=$5,
+             password=$1, provider='google', grp=$2, recovery_email=$3, note=$5,
+             totp_secret=CASE
+               WHEN COALESCE(google_state->>'totp_rotated','')='true' THEN totp_secret
+               WHEN COALESCE(totp_secret,'')<>'' THEN totp_secret
+               ELSE $4 END,
              totp_secret_orig=CASE WHEN COALESCE(totp_secret_orig,'')<>'' THEN totp_secret_orig WHEN COALESCE(totp_secret,'')<>'' THEN totp_secret ELSE $4 END
              WHERE id=$6`,
             [password, grp, recovery, totp, note, exist.id],

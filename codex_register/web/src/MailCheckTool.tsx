@@ -32,7 +32,7 @@ export function MailCheckTool({notify, separator = "----"}: {notify?: (m: string
         // 逐个请求 + 前端并发池,实时更新每行进度(pending→checking→ok/fail)
         const rows: Row[] = items.map((it) => ({email: it.email, status: "pending"}));
         setResults([...rows]);
-        const CONC = changePw ? 2 : 4; // 改密 headed 弹窗,并发压低
+        const CONC = 2; // 后端每个请求都会开 Chrome，前端也顶 2，避免 4 路打满 3100
         let idx = 0;
         const worker = async () => {
             while (idx < items.length) {

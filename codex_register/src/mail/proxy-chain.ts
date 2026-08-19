@@ -160,7 +160,14 @@ export async function openLocalRelay(jumpRaw: string, destHost: string, destPort
     };
 }
 
+function assertRelayAllowed(kind: string) {
+    if (process.env.CODEX_HTTP === "1" && process.env.ALLOW_LOCAL_SOCKS_RELAY !== "1") {
+        throw new Error(`禁止在 :3100 主进程起${kind}（会把 RSS 打到几十 GB）`);
+    }
+}
+
 export async function wrapExitThroughJump(exitUrl: string, jumpRaw: string) {
+    assertRelayAllowed("跳板本地转发");
     const exit = parseProxyEndpoint(exitUrl);
     if (!exit) throw new Error("出口代理无效");
     const relay = await openLocalRelay(jumpRaw, exit.host, exit.port);
@@ -265,6 +272,7 @@ export async function connectExitViaJump(exitUrl: string, jumpRaw: string, destH
 }
 
 export async function openNoAuthSocksToAuthedProxy(exitUrl: string, jumpRaw = "") {
+    assertRelayAllowed("无账密 socks 转发环");
     const exit = parseProxyEndpoint(exitUrl);
     if (!exit || !exit.isSocks) throw new Error("出口须是 socks5");
     const clients = new Set<net.Socket>();

@@ -293,10 +293,14 @@ async function probeMailProxyOnce(url: string, timeoutSec: number, jump: string 
     let curlUrl = url;
     let relayClose = () => {};
     if (viaJump) {
-        const {wrapExitThroughJump} = await import("./proxy-chain.js");
-        const wrapped = await wrapExitThroughJump(url, viaJump);
-        curlUrl = wrapped.url;
-        relayClose = wrapped.close;
+        try {
+            const {wrapExitThroughJump} = await import("./proxy-chain.js");
+            const wrapped = await wrapExitThroughJump(url, viaJump);
+            curlUrl = wrapped.url;
+            relayClose = wrapped.close;
+        } catch {
+            curlUrl = url;
+        }
     }
     let ipR, gR, aR, ip = "";
     try {

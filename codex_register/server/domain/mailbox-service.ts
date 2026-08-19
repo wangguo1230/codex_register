@@ -3,10 +3,17 @@
 //   - 资源池:按 usage(free/gpt/claude)查询/统计 + CAS 隔离分配(★不能串)
 //   - 邮箱能力:登录验证/收信/取OTP/改密 —— 按 mailbox.provider 路由
 // 设计:上层(server/scheduler)只依赖本服务,不再直接 import 具体 provider 文件,满足 DIP。
+import {existsSync, unlinkSync, writeFileSync} from "node:fs";
+import {spawn} from "node:child_process";
+import os from "node:os";
+import path from "node:path";
+import {fileURLToPath} from "node:url";
 import * as db from "../db.js";
+import {attachBoundedStdio} from "../bounded-stdio.js";
+import {cleanSpawnEnv} from "../strip-env-proxy.js";
 import {
     changeMailcomPassword,
-    verifyMailcomLogin,
+    verifyMailcomLogin as verifyMailcomLoginInProcess,
     fetchInboxList as fetchMailcomInboxList,
     fetchMailBodyFor as fetchMailcomBodyFor,
     setMailProxy,
@@ -15,6 +22,65 @@ import {
 } from "../../src/mail/mailcom.js";
 import {fetchGmailImapInbox, fetchGmailImapBody} from "../../src/mail/google-imap.js";
 import {getEmailVerificationCode} from "../../src/mailbox.js";
+
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
+const TSX_BIN = existsSync(path.join(ROOT, "node_modules", ".bin", "tsx"))
+    ? path.join(ROOT, "node_modules", ".bin", "tsx")
+    : "tsx";
+const VERIFY_MS = Math.max(60_000, Number(process.env.MAILCOM_VERIFY_TIMEOUT_MS || 90_000));
+
+/** :3100 里只派子进程；worker 自己再走进程内 Playwright。 */
+export async function verifyMailcomLogin(email, password, log = (m) => {}, opts = {}) {
+    if (process.env.MAILCOM_WORKER === "1" || process.env.MAILCOM_INPROCESS === "1") {
+        return verifyMailcomLoginInProcess(email, password, log, opts);
+    }
+    const jobFile = path.join(os.tmpdir(), `mailcom-verify-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.json`);
+    writeFileSync(jobFile, JSON.stringify({email, password, opts}));
+    return new Promise((resolve) => {
+        const child = spawn(TSX_BIN, ["scripts/worker-mailcom-verify.ts", jobFile], {
+            cwd: ROOT,
+            env: cleanSpawnEnv({
+                MAILCOM_HEADLESS: opts.headless === false ? "0" : "1",
+                MAILCOM_WORKER: "1",
+            }),
+            stdio: ["ignore", "pipe", "pipe"],
+            detached: process.platform !== "win32",
+        });
+        const killChild = () => {
+            try {
+                if (process.platform !== "win32" && child.pid) process.kill(-child.pid, "SIGKILL");
+                else child.kill("SIGKILL");
+            } catch {
+                try { child.kill("SIGKILL"); } catch { /* */ }
+            }
+        };
+        let result = null;
+        attachBoundedStdio(child, {
+            onLine: (t) => {
+                if (t.startsWith("@@RESULT@@")) {
+                    try { result = JSON.parse(t.slice("@@RESULT@@".length)); } catch { /* */ }
+                    return;
+                }
+                try { log(t.slice(0, 200)); } catch { /* */ }
+            },
+        });
+        const timer = setTimeout(() => {
+            killChild();
+            resolve({ok: false, reason: `验密超时(${Math.round(VERIFY_MS / 1000)}s)`, wrongPassword: false});
+        }, VERIFY_MS);
+        const done = (r) => {
+            clearTimeout(timer);
+            try { unlinkSync(jobFile); } catch { /* */ }
+            resolve(r);
+        };
+        child.on("error", (e) => done({ok: false, reason: String(e?.message || e).slice(0, 160), wrongPassword: false}));
+        child.on("close", () => {
+            if (result) done(result);
+            else done({ok: false, reason: "验密子进程无结果", wrongPassword: false});
+            setTimeout(killChild, 2000);
+        });
+    });
+}
 
 // ---- 资源池(隔离核心) ----
 /** 列邮箱资源:usage 不传=全部;'free'=待分配;'gpt'/'claude'=已归属某业务 */
@@ -30,7 +96,7 @@ export const deleteMailbox = (id) => db.deleteMailbox(id);
 export const setMailboxPassword = (id, pw, pwStatus) => db.setMailboxPassword(id, pw, pwStatus);
 
 // ---- 邮箱能力 ----
-export {changeMailcomPassword, verifyMailcomLogin, setMailProxy, getMailProxy, sendMailcomMail};
+export {changeMailcomPassword, setMailProxy, getMailProxy, sendMailcomMail};
 /** 取邮箱验证码(注册/绑定用);支持 minTimestampMs 只取新码、excludeCode 排除旧码 */
 export const getOtp = (email, opts) => getEmailVerificationCode(email, opts);
 
