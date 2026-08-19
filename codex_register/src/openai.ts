@@ -297,6 +297,8 @@ export class OpenAIClient {
     readonly otpSingle: boolean;
     readonly totpSecret: string;
     lastMfaFactorId = "";
+    /** 进入 /email-verification 的时间，IMAP 只收这之后的登录码，避免套餐/欢迎信里的 6 位数字抢码 */
+    emailOtpSinceMs = 0;
 
     constructor(options: OpenAIClientOptions) {
         this.smsBroker = options.smsBroker;
@@ -1135,6 +1137,7 @@ export class OpenAIClient {
             }
             if (/email-verification/i.test(url) && !didEmail) {
                 didEmail = true;
+                this.emailOtpSinceMs = Date.now();
                 this.logProgress("otp", 0, "提交邮箱验证码");
                 continueURL = await this.emailOtpValidate();
                 continue;
@@ -1493,7 +1496,10 @@ export class OpenAIClient {
             return this.promptEmailOtp();
         }
         console.log(`autoEmailOtp: provider=${MAILBOX_CONFIG.provider} targetEmail=${this.email}`);
-        return getEmailVerificationCode(this.email, excludeCode ? {excludeCode} : undefined);
+        return getEmailVerificationCode(this.email, {
+            excludeCode: excludeCode || undefined,
+            minTimestampMs: this.emailOtpSinceMs || (Date.now() - 3 * 60 * 1000),
+        });
     }
 
     private async generateRegisterEmail(): Promise<string> {

@@ -408,6 +408,9 @@ function sourceToReadable(raw) {
     const plain = s.match(/Content-Type:\s*text\/plain[\s\S]*?\r?\n\r?\n([\s\S]*?)(?=\r?\n--|\r?\nContent-Type:|$)/i);
     const html = s.match(/Content-Type:\s*text\/html[\s\S]*?\r?\n\r?\n([\s\S]*?)(?=\r?\n--|\r?\nContent-Type:|$)/i);
     let body = (plain?.[1] || html?.[1] || s).trim();
+    if (/=(?:\r?\n|[0-9A-Fa-f]{2})/.test(body.slice(0, 800))) {
+        body = body.replace(/=\r?\n/g, "").replace(/=([0-9A-Fa-f]{2})/g, (_, h) => String.fromCharCode(parseInt(h, 16)));
+    }
     // 去 base64 块（简单场景）
     if (/^[A-Za-z0-9+/=\r\n]+$/.test(body.slice(0, 200)) && body.length > 80) {
         try {

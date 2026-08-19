@@ -143,6 +143,43 @@ function imapViaList() {
     return ["", ...out];
 }
 
+function decodeQuotedPrintable(s) {
+    return String(s || "")
+        .replace(/=\r?\n/g, "")
+        .replace(/=([0-9A-Fa-f]{2})/g, (_, h) => String.fromCharCode(parseInt(h, 16)));
+}
+
+/** 从 RFC822 抽出可读正文。OpenAI 登录码是 quoted-printable HTML，主题里没有 6 位数字。 */
+function decodeMimeSource(raw) {
+    const s = Buffer.isBuffer(raw) ? raw.toString("utf8") : String(raw || "");
+    const blank = s.search(/\r?\n\r?\n/);
+    const head = blank >= 0 ? s.slice(0, blank) : s.slice(0, 4000);
+    let body = blank >= 0 ? s.slice(blank).replace(/^\s+/, "") : s;
+    if (/quoted-printable/i.test(head)) body = decodeQuotedPrintable(body);
+    else if (/base64/i.test(head) && !/multipart/i.test(head)) {
+        try {
+            const b64 = body.replace(/\s+/g, "");
+            if (b64.length > 40 && b64.length % 4 === 0) body = Buffer.from(b64, "base64").toString("utf8");
+        } catch { /* keep */ }
+    }
+    return body
+        .replace(/<(script|style)\b[^>]*>[\s\S]*?<\/\1>/gi, " ")
+        .replace(/<br\s*\/?>/gi, "\n")
+        .replace(/<\/(p|div|tr|li|h[1-6])>/gi, "\n")
+        .replace(/<[^>]+>/g, " ")
+        .replace(/&nbsp;/gi, " ")
+        .replace(/&#39;/g, "'")
+        .replace(/&amp;/gi, "&")
+        .replace(/\s+/g, " ")
+        .trim();
+}
+
+function isChatGptLoginMail(m) {
+    return /login code|verification code|temporary code|security code|验证码|临时.*码/i.test(
+        `${m?.subject || ""} ${String(m?.content || "").slice(0, 400)}`,
+    );
+}
+
 async function collectMailboxCandidates(client, box, limit, minTimestampMs) {
     try {
         const lock = await client.getMailboxLock(box);
@@ -151,7 +188,10 @@ async function collectMailboxCandidates(client, box, limit, minTimestampMs) {
             const total = Number(status?.messages || 0);
             if (!total) return [];
             const start = Math.max(1, total - Math.max(8, limit) + 1);
-            const since = (minTimestampMs || Date.now()) - 30 * 60 * 1000;
+            // 调用方传了 minTimestampMs 就按它（再留 2 分钟时钟偏差），不要再减 30 分钟把套餐/欢迎信捞进来
+            const since = minTimestampMs > 0
+                ? minTimestampMs - 2 * 60 * 1000
+                : Date.now() - 30 * 60 * 1000;
             const metas = [];
             for await (const msg of client.fetch(`${start}:*`, {envelope: true, uid: true})) {
                 const ts = msg?.envelope?.date?.getTime?.() || 0;
@@ -163,29 +203,41 @@ async function collectMailboxCandidates(client, box, limit, minTimestampMs) {
                 metas.push({uid, subject, from, timestamp: ts});
             }
             const interesting = metas.filter((m) =>
-                /openai|chatgpt|noreply|verify|verification|code|login|验证|登录|代码/i.test(`${m.subject} ${m.from}`)
+                /openai|chatgpt|verify|verification|login code|验证码/i.test(`${m.subject} ${m.from}`)
             ).slice(-8);
-            if (!interesting.length) return [];
+            if (!interesting.length) {
+                imapLog(`[google] IMAP ${box} 近${total}封里没有 OpenAI 登录信`);
+                return [];
+            }
             const want = new Set(interesting.map((m) => m.uid));
             const byUid = new Map(interesting.map((m) => [m.uid, m]));
             const out = [];
-            for await (const msg of client.fetch(interesting.map((m) => m.uid).join(","), {source: true, uid: true})) {
+            // ImapFlow：第三参 {uid:true} 才是 UID FETCH。第二参里的 uid 只表示“响应里带 UID”。
+            // 以前把 UID 当序号去拉，邮箱有删信缺口时就会空返回，日志却像“连上了但没验证码”。
+            for await (const msg of client.fetch(interesting.map((m) => m.uid), {source: true, uid: true}, {uid: true})) {
                 const uid = Number(msg.uid || 0);
                 if (!want.has(uid)) continue;
                 const meta = byUid.get(uid);
-                const raw = msg?.source ? msg.source.toString("utf8") : "";
+                const decoded = decodeMimeSource(msg?.source);
+                const content = decoded.length > 20_000 ? decoded.slice(0, 20_000) : decoded;
                 out.push({
                     subject: meta?.subject || "",
                     from: meta?.from || "",
-                    content: raw.length > 80_000 ? raw.slice(0, 80_000) : raw,
+                    content: content || meta?.subject || "",
+                    extraTexts: [meta?.subject || ""],
                     timestamp: meta?.timestamp || 0,
                 });
+            }
+            imapLog(`[google] IMAP ${box} 候选${interesting.length} 正文${out.length} uid=${interesting.map((m) => m.uid).join(",")}`);
+            if (interesting.length && !out.length) {
+                imapLog(`[google] IMAP ${box} UID 拉正文为空（先前当序号拉会整批丢掉）`);
             }
             return out;
         } finally {
             try { lock.release(); } catch { /* */ }
         }
-    } catch {
+    } catch (e) {
+        imapLog(`[google] IMAP ${box} 扫信失败: ${String(e?.message || e).slice(0, 120)}`);
         return [];
     }
 }
@@ -209,11 +261,15 @@ async function tryImapOtpOnce(cred, {minTimestampMs = 0, excludeCode = "", proxy
         const boxes = ["INBOX", "[Gmail]/Spam", "Junk"];
         const candidates = [];
         for (const box of boxes) {
-            const part = await collectMailboxCandidates(client, box, box === "INBOX" ? 12 : 6, minTimestampMs);
+            const part = await collectMailboxCandidates(client, box, box === "INBOX" ? 20 : 8, minTimestampMs);
             candidates.push(...part);
-            if (box === "INBOX" && part.some((m) => m?.content)) break;
+            if (part.some(isChatGptLoginMail)) break;
         }
         await client.logout().catch(() => {});
+        const preferLogin = findLatestVerificationMail(candidates, {
+            targetEmail: cred.email, excludeCode, candidateMatcher: isChatGptLoginMail,
+        });
+        if (preferLogin?.verificationCode) return preferLogin.verificationCode;
         const found = findLatestVerificationMail(candidates, {targetEmail: cred.email, excludeCode});
         if (found?.verificationCode) return found.verificationCode;
     } catch (e) {
