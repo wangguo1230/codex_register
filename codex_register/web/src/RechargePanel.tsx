@@ -132,6 +132,10 @@ export function RechargePanel({notify}: {notify?: (m: string, ms?: number) => vo
     const testSendBusyRef = useRef(false);
     testSendBusyRef.current = testSendBusy;
     const [exportRtRunning, setExportRtRunning] = useState(false);
+    const [jobSubmit, setJobSubmit] = useState(false);
+    const [jobReloginSubmit, setJobReloginSubmit] = useState(false);
+    const [showExportMenu, setShowExportMenu] = useState(false);
+    const exportMenuRef = useRef<HTMLDivElement>(null);
     // 导出 sub2json
     const [showSub2json, setShowSub2json] = useState(false);
     const [sub2jsonInput, setSub2jsonInput] = useState("");
@@ -184,7 +188,13 @@ export function RechargePanel({notify}: {notify?: (m: string, ms?: number) => vo
         if (c.rebindAfterPaid === "off" || c.rebindAfterPaid === "gmail" || c.rebindAfterPaid === "mailcom") setConfigRebindAfterPaid(c.rebindAfterPaid);
         else if (typeof c.rebindGmailAfterPaid === "boolean") setConfigRebindAfterPaid(c.rebindGmailAfterPaid ? "gmail" : "off");
     };
-    const loadConfig = () => api.rechargeConfig().then((c) => { setConfigBase(c.baseUrl); setConfigAppId(c.appId || ""); setConfigKey(c.apiKey); setConfigIp(c.forwardIp); setConfigConcurrency(c.concurrency || 3); setConfigInterval(c.interval || 3); setConfigRtProxy(c.rtProxy || ""); setConfigRtConcurrency(c.rtConcurrency || 4); applyRebindCounts(c); setHasKey(!!c.hasKey); setInstanceId(c.instanceId || ""); }).catch(() => {});
+    const applyJobs = (j?: {submit?: boolean; reloginSubmit?: boolean; relogin?: boolean; exportRt?: boolean}) => {
+        if (!j) return;
+        setJobSubmit(!!j.submit);
+        setJobReloginSubmit(!!(j.reloginSubmit || j.relogin));
+        setExportRtRunning(!!j.exportRt);
+    };
+    const loadConfig = () => api.rechargeConfig().then((c) => { setConfigBase(c.baseUrl); setConfigAppId(c.appId || ""); setConfigKey(c.apiKey); setConfigIp(c.forwardIp); setConfigConcurrency(c.concurrency || 3); setConfigInterval(c.interval || 3); setConfigRtProxy(c.rtProxy || ""); setConfigRtConcurrency(c.rtConcurrency || 4); applyRebindCounts(c); setHasKey(!!c.hasKey); setInstanceId(c.instanceId || ""); applyJobs(c.jobs); }).catch(() => {});
     const loadLogs = () => api.rechargeLogs().then((rows) => setLogs(Array.isArray(rows) ? rows.slice(-500) : [])).catch(() => {});
 
     useEffect(() => {
@@ -200,11 +210,12 @@ export function RechargePanel({notify}: {notify?: (m: string, ms?: number) => vo
                 if (/^换绑 [✓✗]/.test(String(data?.line || ""))) loadConfig();
             }
             if (ev === "batchRtAcquire") { setBatchRtResults(data.results.map((r: any) => ({...r, status: r.status || "done"}))); if (data.done) setBatchRtRunning(false); }
+            if (ev === "rechargeJobs") applyJobs(data);
             if (ev === "rechargeExportReady") {
                 setExportRtRunning(false);
-                if (data?.stopped) toast("导出RT已停止");
-                else if (data?.relogin) toast("重登取 RT 完成，再点「导出含RT」即可复制", 6000);
+                if (data?.stopped) toast("导出已停止");
                 else if (data?.text) void deliverExportTextRef.current(String(data.text), "full");
+                else if (data?.relogin) toast("重登取 RT 完成，但没有可复制内容");
             }
             if (ev === "rechargeSendDone") {
                 setTestSendBusy(false);
@@ -249,6 +260,14 @@ export function RechargePanel({notify}: {notify?: (m: string, ms?: number) => vo
         if (!el || !logStickBottomRef.current) return;
         el.scrollTop = el.scrollHeight;
     }, [logs]);
+    useEffect(() => {
+        if (!showExportMenu) return;
+        const onDoc = (e: MouseEvent) => {
+            if (!exportMenuRef.current?.contains(e.target as Node)) setShowExportMenu(false);
+        };
+        document.addEventListener("mousedown", onDoc);
+        return () => document.removeEventListener("mousedown", onDoc);
+    }, [showExportMenu]);
 
     // 队列筛选
     const filteredQueue = useMemo(() => {
@@ -419,6 +438,7 @@ export function RechargePanel({notify}: {notify?: (m: string, ms?: number) => vo
         setBusy(true);
         try {
             await api.submitRecharge(pendingIds);
+            setJobSubmit(true);
             toast(`已开始提交 ${pendingIds.length} 个充值任务`);
         } catch (e: any) { toast("提交失败: " + e.message); } finally { setBusy(false); }
     };
@@ -441,17 +461,18 @@ export function RechargePanel({notify}: {notify?: (m: string, ms?: number) => vo
             toast(r.count ? `已标失败 ${r.count} 个，已移入失败页${r.reclaimed ? `，收回卡密 ${r.reclaimed}` : ""}${r.skipped ? `，跳过 ${r.skipped} 个已充上` : ""}` : (r.skipped ? "所选都已充上，不能改标失败" : "没有可标记的"));
         } catch (e: any) { toast(e.message); }
     };
-    const doStop = async () => { try { await api.stopRecharge(); toast("已发送停止信号"); } catch (e: any) { toast(e.message); } };
+    const doStop = async () => { try { await api.stopRecharge(); toast("已请求停止提交"); } catch (e: any) { toast(e.message); } };
     const doRelogin = async () => {
         const ids = selQIds();
         if (!ids.length) { toast("请先选择队列项"); return; }
-        if (!confirm(`确认对 ${ids.length} 个账号「重登并提交」？\n由本机执行（其他实例不会抢）。\n逐个执行：浏览器重新登录取 session → 查卡密平台状态 → 重置任务 → 用原卡密重新提交。\n原卡密若在平台已被消费(可能已充值成功)会自动跳过，不会重复扣卡。`)) return;
+        if (!confirm(`确认对 ${ids.length} 个账号「重新登录并提交」？\n由本机执行。会重新登录、查卡密、用原卡密再提。\n卡密若已被消费会跳过，避免重复扣卡。`)) return;
         try {
             const r = await api.rechargeQueueReloginSubmit(ids);
-            toast(`本机开始重登并提交 ${r.claimed ?? r.count} 个${r.skipped ? `，${r.skipped} 个已被其他实例占用` : ""}，进度见日志`);
+            setJobReloginSubmit(true);
+            toast(`本机开始重新登录并提交 ${r.claimed ?? r.count} 个${r.skipped ? `，${r.skipped} 个已被其他实例占用` : ""}，进度见日志`);
         } catch (e: any) { toast(e.message); }
     };
-    const doStopRelogin = async () => { try { await api.stopRechargeQueueRelogin(); toast("已发送停止信号"); } catch (e: any) { toast(e.message); } };
+    const doStopRelogin = async () => { try { await api.stopRechargeQueueRelogin(); toast("已请求停止重新提交"); } catch (e: any) { toast(e.message); } };
     const doReclaimCards = async () => {
         const ids = selQIds();
         if (!ids.length) { toast("请先选择队列项"); return; }
@@ -781,8 +802,8 @@ export function RechargePanel({notify}: {notify?: (m: string, ms?: number) => vo
             } else if (r.async) {
                 setExportRtRunning(true);
                 toast(opts?.relogin
-                    ? `正在重登取 RT（${r.needRt} 个），完成后点「导出含RT」复制`
-                    : `${r.needRt} 个账号缺少 RT，正在自动获取，完成后自动下载...`, 6000);
+                    ? `正在重登取 RT（${r.needRt} 个），完成后自动复制/下载`
+                    : `${r.needRt} 个账号缺少 RT，正在自动获取，完成后自动复制/下载`, 6000);
             }
         } catch (e: any) { toast("导出失败: " + e.message); }
     };
@@ -1035,14 +1056,18 @@ export function RechargePanel({notify}: {notify?: (m: string, ms?: number) => vo
                             <Btn onClick={doReclaimCards}>回收卡密</Btn>
                             <div className="border-l mx-1 h-5"/>
                             <span className="text-xs text-gray-500 tabular-nums">已选 <b className="text-blue-600">{selQIds().length}</b> / {filteredQueue.length}</span>
-                            <Btn onClick={() => doSubmit(selQIds())} disabled={!hasKey || cStats.unused === 0} className="bg-green-600 text-white border-green-600 hover:bg-green-700">提交选中 ({selQIds().length})</Btn>
-                            <Btn onClick={() => doSubmit(filteredQueue.filter((q) => q.status === "pending").map((q) => q.id))} disabled={!hasKey || cStats.unused === 0}>全部提交 ({filteredQueue.filter((q) => q.status === "pending").length})</Btn>
+                            <Btn onClick={() => doSubmit(selQIds())} disabled={!hasKey || cStats.unused === 0 || jobSubmit || jobReloginSubmit} className="bg-green-600 text-white border-green-600 hover:bg-green-700">提交选中 ({selQIds().length})</Btn>
+                            <Btn onClick={() => doSubmit(filteredQueue.filter((q) => q.status === "pending").map((q) => q.id))} disabled={!hasKey || cStats.unused === 0 || jobSubmit || jobReloginSubmit}>全部提交 ({filteredQueue.filter((q) => q.status === "pending").length})</Btn>
+                            {jobSubmit && (
+                                <Btn onClick={doStop} className="bg-white border-red-200 text-red-600 hover:bg-red-50 animate-pulse" title="只停当前这批充值提交，不影响重新登录并提交">停止提交</Btn>
+                            )}
                             <Btn onClick={doPoll}>刷新状态</Btn>
                             <Btn onClick={() => doRebind("gmail")} title="对已付费项换绑 Gmail（mail.com→Gmail 或 Gmail→Gmail 均可）；迁入时探 IMAP，换绑领号时探网页登录">换绑 Gmail</Btn>
                             <Btn onClick={() => doRebind("mailcom")} title="对已付费项手动换绑 mail.com；旧邮箱标已售">换绑 mail.com</Btn>
-                            <Btn onClick={doStop} className="bg-white border-red-200 text-red-600 hover:bg-red-50">停止</Btn>
-                            <Btn onClick={doRelogin} title="重登取 session → 验卡 → 重置 → 用原卡密重提(卡密已消费则跳过)" className="bg-amber-500 text-white border-amber-500 hover:bg-amber-600">重登并提交</Btn>
-                            <Btn onClick={doStopRelogin} className="bg-white border-red-200 text-red-600 hover:bg-red-50">停止登录</Btn>
+                            <Btn onClick={doRelogin} disabled={jobReloginSubmit || jobSubmit} title="重新登录后验卡，再用原卡密提交。卡密已消费会跳过。" className="bg-amber-500 text-white border-amber-500 hover:bg-amber-600">重新登录并提交</Btn>
+                            {jobReloginSubmit && (
+                                <Btn onClick={doStopRelogin} className="bg-white border-red-200 text-red-600 hover:bg-red-50 animate-pulse" title="只停重新登录并提交，不影响普通提交">停止重新提交</Btn>
+                            )}
                             <div className="border-l mx-1 h-5"/>
                         </>
                     )}
@@ -1073,20 +1098,28 @@ export function RechargePanel({notify}: {notify?: (m: string, ms?: number) => vo
                             <div className="border-l mx-1 h-5"/>
                         </>
                     )}
-                    <Btn onClick={() => doExport("account")}>导出账密</Btn>
-                    <Btn onClick={() => doExport("full")}>导出含RT</Btn>
-                    <Btn onClick={() => doExport("full", {relogin: true})} title="先强制重登再取 RT；取完后点「导出含RT」复制">重登导出含RT</Btn>
-                    <Btn onClick={async () => {
-                        try {
-                            const r = await api.stopExportRt();
-                            setExportRtRunning(false);
-                            toast(r.running ? "已停止导出RT，当前这个号跑完就停" : "当前没有导出RT在跑");
-                        } catch (e: any) { toast(e.message); }
-                    }} className="bg-white border-red-200 text-red-600 hover:bg-red-50" title="停止导出含RT / 重登导出含RT">
-                        {exportRtRunning ? "停止导出RT…" : "停止导出RT"}
-                    </Btn>
-                    <Btn onClick={() => doExport("card")}>复制卡密</Btn>
-                    <Btn onClick={() => doExport("session")}>复制session</Btn>
+                    <div ref={exportMenuRef} className="relative">
+                        <Btn onClick={() => setShowExportMenu((v) => !v)} title="导出账密 / 含 RT / 卡密 / session">导出 ▾</Btn>
+                        {showExportMenu && (
+                            <div className="absolute left-0 top-full mt-1 z-20 min-w-[200px] rounded-lg border border-gray-200 bg-white shadow-lg py-1 text-xs">
+                                <button type="button" className="block w-full text-left px-3 py-1.5 hover:bg-gray-50" onClick={() => { setShowExportMenu(false); void doExport("account"); }}>账密</button>
+                                <button type="button" className="block w-full text-left px-3 py-1.5 hover:bg-gray-50" title="缺 RT 的会自动补，完成后复制/下载" onClick={() => { setShowExportMenu(false); void doExport("full"); }}>含 RT（缺的自动补）</button>
+                                <button type="button" className="block w-full text-left px-3 py-1.5 hover:bg-gray-50" title="每个号先强制重登再取 RT，完成后自动复制/下载" onClick={() => { setShowExportMenu(false); void doExport("full", {relogin: true}); }}>含 RT（先重登再取）</button>
+                                <button type="button" className="block w-full text-left px-3 py-1.5 hover:bg-gray-50" onClick={() => { setShowExportMenu(false); void doExport("card"); }}>复制卡密</button>
+                                <button type="button" className="block w-full text-left px-3 py-1.5 hover:bg-gray-50" onClick={() => { setShowExportMenu(false); void doExport("session"); }}>复制 session</button>
+                            </div>
+                        )}
+                    </div>
+                    {exportRtRunning && (
+                        <Btn onClick={async () => {
+                            try {
+                                const r = await api.stopExportRt();
+                                toast(r.running ? "已请求停止导出，当前这个号跑完就停" : "当前没有导出在跑");
+                            } catch (e: any) { toast(e.message); }
+                        }} className="bg-white border-red-200 text-red-600 hover:bg-red-50 animate-pulse" title="停止正在进行的含 RT 导出">
+                            停止导出
+                        </Btn>
+                    )}
                     {isWorkingTab && (
                         <>
                             <Btn onClick={() => setShowBatchRt(true)} className="bg-amber-600 text-white border-amber-600 hover:bg-amber-700">批量获取RT</Btn>

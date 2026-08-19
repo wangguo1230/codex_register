@@ -897,25 +897,29 @@ export default function App() {
                             title="批量测 at，失效的号走登录重新获取 at"
                             className={`px-2 py-1 text-white rounded text-xs ${batchAt.running ? "bg-blue-300 cursor-not-allowed" : "bg-blue-700"}`}
                         >批量重登at</button>
+                        {batchAt.running && (
                         <button
                             onClick={() => api.stopBatchAt(false).then((r) => {
                                 notify(r.msg || "已请求停止");
                                 if (r.running === false) setBatchAt({running: false, done: 0, total: 0});
                             }).catch((e) => notify(e.message))}
-                            title="请求停止：当前正在跑的号结束后停"
-                            className={`px-2 py-1 rounded text-xs text-white ${batchAt.running ? "bg-red-600 animate-pulse" : "bg-red-400 hover:bg-red-500"}`}
-                        >⏹ 停止重登{batchAt.running && batchAt.total ? ` ${batchAt.done}/${batchAt.total}` : ""}</button>
+                            title="只停批量重登 AT：当前正在跑的号结束后停"
+                            className="px-2 py-1 rounded text-xs text-white bg-red-600 animate-pulse"
+                        >停止批量重登 AT{batchAt.total ? ` ${batchAt.done}/${batchAt.total}` : ""}</button>
+                        )}
+                        {batchAt.running && (
                         <button
                             onClick={() => {
-                                if (!window.confirm("强制结束批量重登？（立刻清锁，可马上重新开始）")) return;
+                                if (!window.confirm("强制结束批量重登 AT？（立刻清锁，可马上重新开始）")) return;
                                 api.stopBatchAt(true).then((r) => {
                                     setBatchAt({running: false, done: 0, total: 0});
                                     notify(r.msg || "已强制结束");
                                 }).catch((e) => notify(e.message));
                             }}
-                            title="卡死/刷新后没停止按钮时用：立刻清锁"
+                            title="卡死时立刻清锁"
                             className="px-2 py-1 bg-red-900 text-white rounded text-xs"
-                        >强制结束</button>
+                        >强制结束重登 AT</button>
+                        )}
                         <button onClick={() => api.batchTestRt(selectedIds.size ? [...selectedIds] : actionable.map((a) => a.id)).then((r) => notify(`批量测 rt：${r.count} 个(只刷新有效的)`)).catch((e) => notify(e.message))} title="只刷新有效 rt、标记失效的;不重登、不耗接码" className="px-2 py-1 bg-teal-600 text-white rounded text-xs">批量测 rt</button>
                         <button onClick={() => { const ids = selectedIds.size ? [...selectedIds] : actionable.map((a) => a.id); if (!ids.length) { notify("无账号"); return; } if (!window.confirm(`对 ${ids.length} 个号批量测 rt，过期/无rt 的会【重登获取 rt】(走 codex OAuth + add-phone 接码，每号消耗一个接码号、有成本、较慢)。开始？`)) return; api.batchTestRt(ids, true).then((r) => notify(`已开始批量重取 rt ${r.count} 个(过期/无rt 会重登获取)`)).catch((e) => notify(e.message)); }} title="过期/无rt 的号重登获取 rt(codex OAuth+接码,有成本)" className="px-2 py-1 bg-teal-700 text-white rounded text-xs">批量重取rt(耗接码)</button>
                         <button onClick={() => api.batchTestChat(selectedIds.size ? [...selectedIds] : actionable.map((a) => a.id)).then((r) => notify(`批量测聊天：${r.count} 个（逐个开浏览器）`)).catch((e) => notify(e.message))} className="px-2 py-1 bg-fuchsia-600 text-white rounded text-xs">批量测聊天</button>

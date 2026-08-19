@@ -1561,27 +1561,38 @@ export class OpenAIClient {
     }
 
     async getChatGPTAccessToken(): Promise<string> {
-        const response = await this.fetch(`${CHATGPT_BASE_URL}/api/auth/session`, {
-            method: "GET",
-            headers: this.createBrowserHeaders({
-                accept: "application/json",
-                "sec-fetch-dest": "empty",
-                "sec-fetch-mode": "cors",
-                "sec-fetch-site": "same-origin",
-                referer: `${CHATGPT_BASE_URL}/`,
-            }),
-        });
-        if (!response.ok) {
-            throw new Error(`获取 ChatGPT accessToken 失败: ${await this.formatErrorResponse(response)}`);
+        let lastPayload: any = {};
+        let lastStatus = 0;
+        for (let attempt = 1; attempt <= 4; attempt++) {
+            if (attempt > 1) {
+                const wait = 700 * attempt;
+                this.logProgress("session", 0, `session 无 accessToken，${wait}ms 后重试 ${attempt}/4`);
+                await sleep(wait);
+            }
+            const response = await this.fetch(`${CHATGPT_BASE_URL}/api/auth/session`, {
+                method: "GET",
+                headers: this.createBrowserHeaders({
+                    accept: "application/json",
+                    "sec-fetch-dest": "empty",
+                    "sec-fetch-mode": "cors",
+                    "sec-fetch-site": "same-origin",
+                    referer: `${CHATGPT_BASE_URL}/`,
+                }),
+            });
+            lastStatus = response.status;
+            if (!response.ok) {
+                if (attempt < 4 && (response.status === 403 || response.status >= 500)) continue;
+                throw new Error(`获取 ChatGPT accessToken 失败: ${await this.formatErrorResponse(response)}`);
+            }
+            const payload = (await response.json()) as ChatGPTAuthSession;
+            lastPayload = payload;
+            const accessToken = String(payload.accessToken ?? payload.access_token ?? "").trim();
+            if (accessToken) {
+                this.lastSession = payload;
+                return accessToken;
+            }
         }
-
-        const payload = (await response.json()) as ChatGPTAuthSession;
-        const accessToken = String(payload.accessToken ?? payload.access_token ?? "").trim();
-        if (!accessToken) {
-            throw new Error(`ChatGPT session 中缺少 accessToken: ${JSON.stringify(payload)}`);
-        }
-        this.lastSession = payload;
-        return accessToken;
+        throw new Error(`ChatGPT session 中缺少 accessToken: ${JSON.stringify(lastPayload).slice(0, 240)} status=${lastStatus}`);
     }
 
     async saveChatGPTAccessToken(accessToken: string): Promise<string> {

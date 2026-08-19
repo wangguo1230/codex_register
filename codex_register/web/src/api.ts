@@ -203,6 +203,7 @@ export interface RechargeConfig {
     rebindAfterPaid?: "off" | "gmail" | "mailcom";
     gmailFreeImap?: number;
     mailcomFree?: number;
+    jobs?: {submit?: boolean; reloginSubmit?: boolean; relogin?: boolean; exportRt?: boolean};
 }
 
 export interface RechargeCardStats {
@@ -642,7 +643,7 @@ export type StreamHandler = (event: string, data: any) => void;
 
 export function connectStream(onEvent: StreamHandler): () => void {
     const es = new EventSource("/api/stream");
-    for (const name of ["hello", "log", "status", "stats", "snapshot", "sms", "daily", "mailboxes", "mbLog", "claude", "claudeLog", "claudeScan", "batchAt", "batchPw", "batchHarden", "refreshAt", "batchRtAcquire", "recharge", "rechargeLog", "rechargeQueue", "rechargeExportReady", "rechargeSendDone"]) {
+    for (const name of ["hello", "log", "status", "stats", "snapshot", "sms", "daily", "mailboxes", "mbLog", "claude", "claudeLog", "claudeScan", "batchAt", "batchPw", "batchHarden", "refreshAt", "batchRtAcquire", "recharge", "rechargeLog", "rechargeQueue", "rechargeExportReady", "rechargeSendDone", "rechargeJobs"]) {
         es.addEventListener(name, (e: MessageEvent) => {
             try { onEvent(name, JSON.parse(e.data)); } catch { /* ignore */ }
         });

@@ -5033,6 +5033,7 @@ app.post("/api/recharge/queue/relogin", async (req, res) => {
     const {claimed: items, skipped} = await db.claimRechargeQueueItems(ids, db.instanceId);
     if (!items.length) {
         queueReloginRunning = false;
+        broadcastRechargeJobs();
         return res.status(400).json({error: skipped[0]?.reason || "未找到可认领的队列项(可能已被其他实例占用)"});
     }
     const myIds = items.map((q: any) => Number(q.id));

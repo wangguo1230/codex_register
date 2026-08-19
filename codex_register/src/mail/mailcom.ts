@@ -466,14 +466,20 @@ async function clickIfVisible(root, sel, timeout = 800) {
 }
 
 async function dismissCookieBanners(page) {
-    const names = [/Accept all/i, /Accept All/i, /Agree/i, /I agree/i, /Continue to Mail/i, /Allow all/i, /Alle akzeptieren/i];
+    const names = [
+        /Continue to Mail\.?com/i, /Continue to Mail/i, /Accept all cookies/i,
+        /Accept All/i, /Accept all/i, /Agree and continue/i, /Agree/i, /I agree/i,
+        /Allow all/i, /Alle akzeptieren/i, /Continue/i,
+    ];
     const sels = [
         "#onetrust-accept-btn-handler",
         "#accept-all",
         "button#accept",
         '[id*="accept-all" i]',
+        '[id*="acceptAll" i]',
         '[data-testid*="accept" i]',
         "button[mode='primary']",
+        "button[name='accept']",
     ];
     const roots = [page, ...page.frames()];
     for (const root of roots) {
@@ -597,6 +603,62 @@ function isMarketingHome(url) {
     return /^https:\/\/www\.mail\.com\/?(?:\?|#|$)/i.test(String(url || ""));
 }
 
+function isConsentUrl(url) {
+    return /\/consent|privacy-preference|cookie-settings|cookieconsent/i.test(String(url || ""));
+}
+
+async function onConsentWall(page) {
+    if (isConsentUrl(page.url())) return true;
+    if (await inboxAlready(page)) return false;
+    const body = String(await page.innerText("body").catch(() => "")).slice(0, 700);
+    return /continue to mail|accept all cookies|privacy preference|we (use|value) cookies|manage cookies/i.test(body);
+}
+
+/** consent 页底下仍有 #login-email，这时提交等于没登。必须先离开同意墙。 */
+async function leaveConsentPage(page) {
+    for (let i = 0; i < 8; i++) {
+        await dismissCookieBanners(page);
+        await dismissPopups(page);
+        if (!(await onConsentWall(page))) {
+            if (i) console.log(`[mailcom] 已离开同意页 url=${String(page.url() || "").slice(0, 80)}`);
+            return true;
+        }
+        console.log(`[mailcom] 同意页第 ${i + 1} 次处理 url=${String(page.url() || "").slice(0, 90)}`);
+        const names = [
+            /Continue to Mail\.?com/i, /Continue to Mail/i, /Accept all cookies/i,
+            /Accept All/i, /Accept all/i, /Agree and continue/i, /I agree/i, /Agree/i,
+            /Allow all/i, /Alle akzeptieren/i, /Continue/i,
+        ];
+        let clicked = false;
+        for (const root of [page, ...page.frames()]) {
+            for (const name of names) {
+                try {
+                    const btn = root.getByRole("button", {name}).first();
+                    if (await btn.isVisible({timeout: 350}).catch(() => false)) {
+                        await btn.click({timeout: 4000}).catch(() => {});
+                        clicked = true;
+                        break;
+                    }
+                    const link = root.getByRole("link", {name}).first();
+                    if (await link.isVisible({timeout: 250}).catch(() => false)) {
+                        await link.click({timeout: 4000}).catch(() => {});
+                        clicked = true;
+                        break;
+                    }
+                } catch { /* ignore */ }
+            }
+            if (clicked) break;
+        }
+        await page.waitForURL((u) => !isConsentUrl(String(u)), {timeout: 6000}).catch(() => {});
+        await page.waitForTimeout(700);
+        if (isConsentUrl(page.url())) {
+            await page.goto("https://www.mail.com/", {waitUntil: "domcontentloaded", timeout: 30000}).catch(() => {});
+            await page.waitForTimeout(800);
+        }
+    }
+    return !(await onConsentWall(page));
+}
+
 async function waitForFormOrInbox(page, emailBox, seconds, why) {
     console.log(`[mailcom] ${why}，窗口先留着，最多 ${seconds}s（可手点右上角 Login）`);
     const deadline = Date.now() + seconds * 1000;
@@ -701,6 +763,90 @@ async function openMailcomLoginForm(page, {headed = false} = {}) {
     // 最后兜底：看 body 是否整页失败
     const body = String(await page.innerText("body").catch(() => "")).replace(/\s+/g, " ").slice(0, 80);
     throw new Error(`mail.com 首页登录层没展开，#login-email 不可见（不要走 /login/ 404） body=${body}`);
+}
+
+async function fillAndSubmitHomeLogin(page, email, password, {headed = false} = {}) {
+    if (/\/login\/?(\?|$)/i.test(page.url())) {
+        console.log("[mailcom] 当前是 /login/ 404 壳，回到首页再开下拉");
+        await gotoMailcomHome(page, {retries: 2});
+        await page.waitForTimeout(800);
+    }
+    let submitted = false;
+    try {
+        const emailBox = await openMailcomLoginForm(page, {headed});
+        if (await inboxAlready(page)) {
+            console.log(`[mailcom] 已在收件箱 url=${page.url().slice(0, 80)}`);
+            return {submitted: true, alreadyIn: true};
+        }
+        const visible = await emailBox.isVisible({timeout: 2000}).catch(() => false);
+        if (visible) {
+            await emailBox.click({timeout: 4000}).catch(() => {});
+            await emailBox.fill("");
+            await emailBox.pressSequentially(email, {delay: 35 + Math.floor(Math.random() * 45), timeout: 12000});
+            const pwdBox = page.locator("#login-password").first();
+            await forceShowLoginLayer(page);
+            await pwdBox.waitFor({state: "attached", timeout: 8000});
+            await page.waitForTimeout(180 + Math.floor(Math.random() * 320));
+            await pwdBox.click({force: true, timeout: 4000}).catch(() => {});
+            await pwdBox.fill("").catch(() => {});
+            await pwdBox.pressSequentially(password, {delay: 30 + Math.floor(Math.random() * 40), timeout: 12000}).catch(async () => {
+                await pwdBox.fill(password, {force: true, timeout: 8000}).catch(async () => {
+                    await pwdBox.evaluate((el, v) => { el.value = v; el.dispatchEvent(new Event("input", {bubbles: true})); }, password);
+                });
+            });
+            await page.waitForTimeout(220 + Math.floor(Math.random() * 400));
+            for (const sel of [
+                "button.login-submit",
+                "#header-login-box button[type='submit']",
+                "form[action*='login.mail.com'] button[type='submit']",
+                ".login-layer button[type='submit']",
+                "form[data-mod-name='loginform'] button[type='submit']",
+            ]) {
+                if (await clickIfVisible(page, sel, 800)) { submitted = true; break; }
+            }
+            if (!submitted) {
+                submitted = await page.locator("form[action*='login.mail.com'], form[data-mod-name='loginform']").first()
+                    .evaluate((f) => { f.requestSubmit(); return true; }).catch(() => false);
+            }
+            if (!submitted) {
+                await pwdBox.press("Enter").catch(() => {});
+                submitted = true;
+            }
+        } else {
+            console.log("[mailcom] 输入框不可见，改用 DOM 强制填提交");
+            const fr = await forceFillAndSubmitLogin(page, email, password);
+            if (!fr?.ok) throw new Error(fr?.reason || "强制提交失败");
+            submitted = true;
+        }
+    } catch (uiErr) {
+        console.log(`[mailcom] 常规打开登录层失败，DOM 强制提交: ${String(uiErr?.message || uiErr).slice(0, 100)}`);
+        const fr = await forceFillAndSubmitLogin(page, email, password);
+        if (!fr?.ok) throw uiErr;
+        submitted = true;
+    }
+    console.log(`[mailcom] 已点登录 submitted=${submitted} url=${page.url().slice(0, 80)}`);
+    if (/\/login\/?(\?|$)/i.test(page.url()) && !submitted) {
+        throw new Error("mail.com 还停在 /login/ 404，表单没提交成功");
+    }
+    return {submitted, alreadyIn: false};
+}
+
+async function waitHomeLoginResult(page, session, {ms = 20000} = {}) {
+    const waitStart = Date.now();
+    let sawNavigator = false;
+    while (Date.now() - waitStart < ms && !session.bearer) {
+        const u = page.url() || "";
+        if (isLoginFailedUrl(u)) return {ok: false, sawNavigator, failedUrl: true};
+        if (/navigator-lxa\.mail\.com/i.test(u)) sawNavigator = true;
+        if (await inboxAlready(page)) return {ok: true, sawNavigator, ready: true};
+        // 提交后仍停在营销首页：多半是 consent 挡提交，不是确认账密错。交给上层重试。
+        if (Date.now() - waitStart > 8000 && isMarketingHome(u) && await loginFormAttached(page) && !isConsentUrl(u)) {
+            return {ok: false, sawNavigator, bounced: true};
+        }
+        await page.waitForTimeout(500);
+    }
+    if (await inboxAlready(page) || session.bearer) return {ok: true, sawNavigator, ready: true};
+    return {ok: false, sawNavigator, timeout: true};
 }
 
 async function gotoMailcomHome(page, {retries = 3} = {}) {
@@ -810,119 +956,46 @@ async function loginMailcom(email, password, opts = {}) {
         await gotoMailcomHome(page, {retries: 3});
         await page.waitForTimeout(1200);
 
-        // consent / cookie（mail.com 常先落 /consentpage，无登录层）
-        for (let c = 0; c < 3; c++) {
-            await dismissCookieBanners(page);
-            await dismissPopups(page);
-            const onConsent = /consent|privacy|cookie/i.test(page.url())
-                || /consent|cookie settings|privacy preference/i.test(String(await page.innerText("body").catch(() => "")).slice(0, 400));
-            if (!onConsent && await loginFormAttached(page)) break;
-            for (const name of [/Continue to Mail/i, /Accept All/i, /Accept all/i, /Accept/i, /Agree/i, /I agree/i, /Allow all/i]) {
-                try {
-                    const btn = page.getByRole("button", {name}).first();
-                    if (await btn.isVisible({timeout: 600}).catch(() => false)) {
-                        await btn.click({timeout: 4000}).catch(() => {});
-                        await page.waitForTimeout(1200);
-                        break;
-                    }
-                } catch { /* ignore */ }
-            }
-            if (/consent/i.test(page.url())) {
-                // 仍卡 consent：回首页再试
-                await page.goto("https://www.mail.com/", {waitUntil: "domcontentloaded", timeout: 30000}).catch(() => {});
-                await page.waitForTimeout(1000);
-            }
+        // consent 页底下仍挂着 #login-email，这时填表等于没登。必须先离开同意墙。
+        const leftConsent = await leaveConsentPage(page);
+        if (!leftConsent) {
+            console.log(`[mailcom] 同意页未清干净 url=${page.url().slice(0, 80)}，回首页再试`);
+            await gotoMailcomHome(page, {retries: 2});
+            await leaveConsentPage(page);
         }
         await dismissPopups(page);
 
-        // 登录表单：先关 cookie/弹窗，再展开首页下拉（#login-email 未展开时 display:none）
-        if (!page.url().includes("navigator-lxa")) {
+        let sawNavigator = false;
+        if (!page.url().includes("navigator-lxa") && !(await inboxAlready(page))) {
             const pwHint = `${String(password || "").slice(0, 4)}…(${String(password || "").length}位)`;
-            console.log(`[mailcom] 填库内当前密码 ${pwHint}（首页下拉，不走 /login/ 404）`);
-            if (/\/login\/?(\?|$)/i.test(page.url())) {
-                console.log("[mailcom] 当前是 /login/ 404 壳，回到首页再开下拉");
-                await gotoMailcomHome(page, {retries: 2});
-                await page.waitForTimeout(800);
-            }
-
-            let submitted = false;
-            try {
-                const emailBox = await openMailcomLoginForm(page, {headed});
-                if (await inboxAlready(page)) {
-                    console.log(`[mailcom] 已在收件箱 url=${page.url().slice(0, 80)}`);
-                    submitted = true;
-                } else {
-                    // 优先可见填写；失败则 DOM 强制提交
-                    const visible = await emailBox.isVisible({timeout: 2000}).catch(() => false);
-                    if (visible) {
-                        await emailBox.click({timeout: 4000}).catch(() => {});
-                        await emailBox.fill("");
-                        await emailBox.pressSequentially(email, {delay: 35 + Math.floor(Math.random() * 45), timeout: 12000});
-                        const pwdBox = page.locator("#login-password").first();
-                        await forceShowLoginLayer(page);
-                        await pwdBox.waitFor({state: "attached", timeout: 8000});
-                        await page.waitForTimeout(180 + Math.floor(Math.random() * 320));
-                        await pwdBox.click({force: true, timeout: 4000}).catch(() => {});
-                        await pwdBox.fill("").catch(() => {});
-                        await pwdBox.pressSequentially(password, {delay: 30 + Math.floor(Math.random() * 40), timeout: 12000}).catch(async () => {
-                            await pwdBox.fill(password, {force: true, timeout: 8000}).catch(async () => {
-                                await pwdBox.evaluate((el, v) => { el.value = v; el.dispatchEvent(new Event("input", {bubbles: true})); }, password);
-                            });
-                        });
-                        await page.waitForTimeout(220 + Math.floor(Math.random() * 400));
-                        for (const sel of [
-                            "button.login-submit",
-                            "#header-login-box button[type='submit']",
-                            "form[action*='login.mail.com'] button[type='submit']",
-                            ".login-layer button[type='submit']",
-                            "form[data-mod-name='loginform'] button[type='submit']",
-                        ]) {
-                            if (await clickIfVisible(page, sel, 800)) { submitted = true; break; }
-                        }
-                        if (!submitted) {
-                            submitted = await page.locator("form[action*='login.mail.com'], form[data-mod-name='loginform']").first()
-                                .evaluate((f) => { f.requestSubmit(); return true; }).catch(() => false);
-                        }
-                        if (!submitted) {
-                            await pwdBox.press("Enter").catch(() => {});
-                            submitted = true;
-                        }
-                    } else {
-                        console.log("[mailcom] 输入框不可见，改用 DOM 强制填提交");
-                        const fr = await forceFillAndSubmitLogin(page, email, password);
-                        if (!fr?.ok) throw new Error(fr?.reason || "强制提交失败");
-                        submitted = true;
+            for (let attempt = 1; attempt <= 3; attempt++) {
+                if (await onConsentWall(page)) {
+                    console.log(`[mailcom] 第 ${attempt} 次提交前仍在同意墙，先处理`);
+                    await leaveConsentPage(page);
+                    if (await onConsentWall(page)) {
+                        await gotoMailcomHome(page, {retries: 2});
+                        await leaveConsentPage(page);
                     }
                 }
-            } catch (uiErr) {
-                console.log(`[mailcom] 常规打开登录层失败，DOM 强制提交: ${String(uiErr?.message || uiErr).slice(0, 100)}`);
-                const fr = await forceFillAndSubmitLogin(page, email, password);
-                if (!fr?.ok) throw uiErr;
-                submitted = true;
-            }
-            console.log(`[mailcom] 已点登录 submitted=${submitted} url=${page.url().slice(0, 80)}`);
-            if (/\/login\/?(\?|$)/i.test(page.url()) && !submitted) {
-                throw new Error("mail.com 还停在 /login/ 404，表单没提交成功");
-            }
-        }
-        // 等登录结果：真正成功是 sid/webmailer/3c；中间页 /login 不算；logout/首页回落=失败
-        console.log(`[mailcom] 等登录结果（最多 40s）`);
-        const waitStart = Date.now();
-        let sawNavigator = false;
-        while (Date.now() - waitStart < 40_000 && !session.bearer) {
-            const u = page.url() || "";
-            if (isLoginFailedUrl(u)) break;
-            if (/navigator-lxa\.mail\.com/i.test(u)) sawNavigator = true;
-            if (await inboxAlready(page)) {
-                console.log(`[mailcom] 登录壳就绪 url=${u.slice(0, 90)}`);
+                if (await inboxAlready(page)) break;
+                console.log(`[mailcom] 填库内当前密码 ${pwHint}（第 ${attempt}/3 次，首页下拉）`);
+                await fillAndSubmitHomeLogin(page, email, password, {headed});
+                console.log(`[mailcom] 等登录结果（最多 20s）`);
+                const wr = await waitHomeLoginResult(page, session, {ms: 20_000});
+                sawNavigator = sawNavigator || !!wr.sawNavigator;
+                if (wr.ok) {
+                    console.log(`[mailcom] 登录壳就绪 url=${page.url().slice(0, 90)}`);
+                    break;
+                }
+                if (wr.failedUrl) break;
+                if ((wr.bounced || wr.timeout) && attempt < 3) {
+                    console.log(`[mailcom] 提交后仍停在首页（${wr.bounced ? "被弹回" : "超时"}），不是确认账密错，回首页重试`);
+                    await gotoMailcomHome(page, {retries: 2});
+                    await leaveConsentPage(page);
+                    continue;
+                }
                 break;
             }
-            // 提交后几秒仍停在首页且能看见登录框 → 提交没生效或被弹回
-            if (Date.now() - waitStart > 10_000 && isMarketingHome(u) && await loginFormAttached(page)) {
-                console.log(`[mailcom] 已回首页登录层，判定未登录成功`);
-                break;
-            }
-            await page.waitForTimeout(500);
         }
         console.log(`[mailcom] 当前 url=${page.url().slice(0, 100)} sawNavigator=${sawNavigator}`);
 
@@ -997,12 +1070,14 @@ async function loginMailcom(email, password, opts = {}) {
                 const u = page.url() || "";
                 if (/blocked your account|irregular activity|contact.*support|precautionary measure/i.test(body)) {
                     reason = "mail.com 账号被风控封禁(irregular activity blocked)";
-                } else if (/invalid email address|password combination/i.test(body)) {
+                } else if (/invalid email address|password combination|incorrect password|wrong password/i.test(body)) {
                     reason = "mail.com 账密无效(邮箱/密码组合错误)";
                 } else if (isLoginFailedUrl(u)) {
                     reason = "mail.com 账密无效或账号已停用(登录被拒)";
+                } else if (isConsentUrl(u) || /continue to mail|accept all cookies/i.test(body)) {
+                    reason = "mail.com 卡在 cookie 同意页，登录没真正提交";
                 } else if (isMarketingHome(u) && /log in|sign up|sign in/i.test(body)) {
-                    reason = "mail.com 登录未成功(已回首页，可能账密错或会话未建立)";
+                    reason = "mail.com 登录未成功(会话没建起来，页面未报账密错)";
                 } else if (/password/i.test(body) && /try again/i.test(body)) {
                     reason = "mail.com 登录失败(页面提示再试，可能账密或验证码)";
                 } else if (/navigator-lxa\.mail\.com\/login/i.test(u) && !/[?&](?:sid|navsid)=/i.test(u)) {
