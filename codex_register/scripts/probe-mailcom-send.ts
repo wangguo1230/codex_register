@@ -4,7 +4,7 @@
  *   npx tsx scripts/probe-mailcom-send.ts
  */
 import pg from "pg";
-import {sendMailcomMail} from "../src/mail/mailcom.ts";
+import {sendMailcomSmtp} from "../src/mail/mailcom-smtp.ts";
 
 const DATABASE_URL = process.env.DATABASE_URL || "postgresql://postgres:123456@192.168.1.126:5432/all_register";
 const TO = process.env.MAILCOM_SEND_TO || "wangguodong194@163.com";
@@ -61,12 +61,13 @@ async function main() {
         for (const acc of accounts) {
             console.log(`[probe] 尝试发件 ${acc.email}`);
             try {
+                const message = payload(acc.email);
                 let r: any = null;
                 try {
                     const resp = await fetch(API, {
                         method: "POST",
                         headers: {"content-type": "application/json"},
-                        body: JSON.stringify(payload(acc.email)),
+                        body: JSON.stringify(message),
                     });
                     const data = await resp.json().catch(() => ({}));
                     if (resp.ok && data?.ok) {
@@ -79,9 +80,15 @@ async function main() {
                 } catch (apiErr: any) {
                     console.warn(`[probe] API 不可用 (${String(apiErr?.message || apiErr).slice(0, 80)})，改本地直发`);
                 }
-                r = await sendMailcomMail(acc.email, acc.password, {
-                    ...payload(acc.email),
-                    headless: process.env.MAILCOM_HEADLESS !== "0",
+                r = await sendMailcomSmtp({
+                    email: acc.email,
+                    password: acc.password,
+                    to: TO,
+                    fromName: acc.email.split("@")[0],
+                    subject: message.subject,
+                    text: message.text,
+                    html: message.html,
+                    timeoutMs: Number(process.env.MAILCOM_SMTP_TIMEOUT_MS || 30_000),
                     proxy: process.env.MAILCOM_PROXY || "",
                     jump: process.env.MAILCOM_JUMP || "",
                 });

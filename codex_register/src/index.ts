@@ -134,6 +134,9 @@ async function runOnce(): Promise<void> {
                         console.log(`[codex-cpa] 收到 OTP: ${code}`);
                         return code;
                     });
+                    try { await smsBroker.markAsSucceed(); } catch (e) {
+                        console.warn(`[codex-cpa] ${phoneNumber} 已注册，但接码状态收尾失败: ${(e as Error)?.message || e}`);
+                    }
                     phone = phoneNumber;
                     signupClientRef = signupClient;
                     console.log(`[codex-cpa] [✅️phone signup 成功] ${phone}`);
@@ -415,6 +418,9 @@ async function runOnce(): Promise<void> {
                         return code;
                     });
                     if (result) {
+                        try { await smsBroker.markAsSucceed(); } catch (e) {
+                            console.warn(`[phone-signup] ${phoneNumber} 已注册，但接码状态收尾失败: ${(e as Error)?.message || e}`);
+                        }
                         registeredPhone = phoneNumber;
                         break;
                     }

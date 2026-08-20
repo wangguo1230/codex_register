@@ -1,47 +1,23 @@
 // @ts-nocheck
 // 并发调度器：worker 子进程池，支持并发数配置 / 暂停 / 恢复 / 重跑
 import {EventEmitter} from "node:events";
-import {spawn, execSync} from "node:child_process";
-import {writeFileSync, rmSync, mkdtempSync, readFileSync, existsSync} from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import {fileURLToPath} from "node:url";
 import * as db from "./db.js";
 import {appConfig} from "../src/config.js";
-import {randomPassword} from "../src/utils.js";
-import {resolveEngine} from "./domain/register-engine.js";
-import {mailProxyPool, gptProxyPool, mailJumpPool, gptJumpPool, expandProxyImport, toProxyImportLine, setMailProxyJump, JUMP_MAX_EXITS, maskProxyUrl, normalizeProxyUrl} from "../src/mail/proxy-pool.js";
-import {startJumpFleet, stopJumpFleet, isVlessUrl, listJumpXrays, pickXrayBrowserProxy, isMainHttpServer, localPortListening} from "./xray-proxy.js";
-import {cleanSpawnEnv} from "./strip-env-proxy.js";
+import {mailProxyPool, gptProxyPool, toProxyImportLine, setMailProxyJump} from "../src/mail/proxy-pool.js";
+import {listJumpXrays} from "./xray-proxy.js";
+import {createSchedulerSettingsStore, SCHEDULER_SETTINGS_KEYS} from "./domain/scheduler-settings-store.js";
+import {createOwnedOperationLock} from "./domain/owned-operation-lock.js";
+import {startSchedulerPollLoop} from "./domain/scheduler-poll-loop.js";
+import {createRegistrationWorkerRunner} from "./domain/registration-worker-runner.js";
+import {createSchedulerProxyService} from "./domain/scheduler-proxy-service.js";
+import {terminateChildProcess} from "./domain/child-process-control.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const CODEX_ROOT = path.resolve(__dirname, "..");
-const IS_WIN = process.platform === "win32";
-const TSX_BIN = (() => {
-    const local = path.resolve(CODEX_ROOT, "node_modules", ".bin", "tsx" + (IS_WIN ? ".cmd" : ""));
-    if (existsSync(local)) return local;
-    return "tsx";
-})();
-const EVENT_PREFIX = "@@EVENT@@";
 const DAILY_FILE = path.resolve(CODEX_ROOT, "data", "daily.json"); // 定时任务配置+统计持久化
 const SETTINGS_FILE = path.resolve(CODEX_ROOT, "data", "settings.json"); // 运行时配置持久化(前端改的开关/代理/上限等)
-// 持久化的运行时配置字段(其余如 paused/running 是运行态不存)
-const SETTINGS_KEYS = ["concurrency", "otpSingle", "simulateChat", "regProxy", "mailProxy", "mailProxyEnabled", "smsEnabled", "smsLinkTemplate", "rtEnabled", "smsMaxBind", "xrayVless", "regEngine", "bitBrowser", "claudeProxy", "claudeXrayVless", "regProxyPort", "claudeProxyPort", "jumpProxyPort", "jumpXrayVless", "mailSeparator", "rechargeBaseUrl", "rechargeAppId", "rechargeApiKey", "rechargeForwardIp", "rechargeConcurrency", "rechargeInterval", "xrayBinPath", "pwConcurrency", "rtProxy", "rtConcurrency", "mfaEnabled", "rebindGmailAfterPaid", "rebindAfterPaid", "mailProxyPool", "mailProxyJump", "mailJumpPool", "gptProxyPool", "gptProxyJump", "gptJumpPool"];
-
-// 定时任务默认配置(含运行统计)。持久化到 data/daily.json，重启保留。
-const DAILY_DEFAULT = {
-    enabled: false,
-    hour: 4,                              // 每天几点跑(0-23，本地时区)
-    items: {chat: true, rt: true, at: true}, // 跑哪些:养号/rt续期/at续期
-    lastRunAt: 0,                         // 最后一次运行时间戳(ms)
-    runCount: 0,                          // 累计运行(触发)次数
-    chatTotal: 0,                         // 累计养号次数(每次运行的养号账号数累加)
-    rtTotal: 0,                           // 累计 rt 续期次数
-    atTotal: 0,                           // 累计 at 续期次数
-    lastResult: "",                       // 最后一次运行摘要
-    running: false,                       // 运行中标志(防重入，不持久化)
-};
-
 class Scheduler extends EventEmitter {
     constructor() {
         super();
@@ -65,6 +41,7 @@ class Scheduler extends EventEmitter {
         this.rechargeApiKey = "";      // 充值平台 API Key(sk_xxxx)
         this.rechargeForwardIp = "";   // 充值请求 X-Forwarded-For 透传 IP(空则用直连 IP)
         this.rechargeConcurrency = 3;  // 充值提交并发数
+        this.rebindConcurrency = 3;    // Gmail 换绑并发数
         this.rechargeInterval = 3;     // 每批次间隔(秒)
         this.paused = true;            // GPT 域暂停(默认暂停，前端点"开始"才跑)
         this.pausedClaude = true;      // Claude 域暂停(独立,三域各自控制)
@@ -84,199 +61,80 @@ class Scheduler extends EventEmitter {
         this.rtConcurrency = 4;        // 导出含RT时并发获取数
         this.rebindAfterPaid = "gmail";   // 充值平台回 paid 后换绑目标: off | gmail | mailcom
         this.rebindGmailAfterPaid = true; // 兼容旧配置(true=gmail)
+        this.rebindGmailProbeLogin = false; // Gmail 换绑前是否额外开比特探网页登录；默认只依赖换绑池的 IMAP 校验
         this.mailProxyPool = [];          // 邮箱整备/换2FA/改密专用代理池(一行一个,1代理=1指纹)
         this.mailProxyJump = "";          // 兼容：单条跳板（会并进 mailJumpPool）
         this.mailJumpPool = [];           // 邮箱跳板池，1 跳板最多带 2 条出口
         this.gptProxyPool = [];           // GPT 注册专用代理池，和邮箱池分开租
         this.gptProxyJump = "";           // 兼容：单条 GPT 跳板
         this.gptJumpPool = [];            // GPT 跳板池，1 跳板最多带 2 条出口
+        // 统一代理池配置；mail/gpt 开关只控制业务视图，底层租约池是同一个。
+        this.proxyPool = [];
+        this.proxyPoolMailEnabled = true;
+        this.proxyPoolGptEnabled = true;
+        this.proxyJumpPool = [];
+        this.proxyJumpMailEnabled = true;
+        this.proxyJumpGptEnabled = true;
         this.running = new Map();      // runId(`${domain}:${id}`) -> { child, tmpFile, gotResult, domain, id, mailboxId, engine }
-        this.maintLock = null; // 浏览器维护互斥锁:null=空闲, string=持有者标识(如 "batch-at-relogin")
+        this.workerRunner = createRegistrationWorkerRunner({scheduler: this, rootDir: CODEX_ROOT});
+        this.proxyService = createSchedulerProxyService({settings: this});
+        this.maintenanceLock = createOwnedOperationLock();
         this.releasingGpt = false;     // 本实例停止 GPT:被杀 worker 退回 pending,供其他实例认领
         this.releasingClaude = false;
-        this.tmpDir = mkdtempSync(path.join(os.tmpdir(), "codex-reg-"));
-        this.daily = this.loadDaily(); // 定时任务配置+统计(持久化)
+        this.settingsStore = createSchedulerSettingsStore({settingsFile: SETTINGS_FILE, dailyFile: DAILY_FILE});
+        this.daily = this.settingsStore.readDaily();
         this.loadSettings();           // 覆盖上面默认值为上次持久化的运行时配置
-        mailProxyPool.setUrls(this.mailProxyPool || []);
-        gptProxyPool.setUrls(this.gptProxyPool || []);
+        this.syncProxyPoolsFromSettings();
         this.syncJumpPoolsFromSettings();
         setMailProxyJump(this.mailProxyJump || "");
         // 多实例:其他实例退回的 pending 不会触发本机事件,空闲时靠这轮询接着认领
-        setInterval(() => { if (!this.paused || !this.pausedClaude) this.tick(); }, 3000);
+        this.stopPollLoop = startSchedulerPollLoop({
+            tick: () => this.tick(),
+            isActive: () => !this.paused || !this.pausedClaude,
+        });
     }
 
     // ---- 运行时配置持久化(data/settings.json) ----
     loadSettings() {
         try {
-            if (existsSync(SETTINGS_FILE)) {
-                const s = JSON.parse(readFileSync(SETTINGS_FILE, "utf8"));
-                for (const k of SETTINGS_KEYS) if (s[k] !== undefined) this[k] = s[k];
-                if (Array.isArray(s.mailProxyPool)) this.mailProxyPool = s.mailProxyPool;
+            const s = this.settingsStore.readSettings();
+            if (s) {
+                for (const k of SCHEDULER_SETTINGS_KEYS) if (s[k] !== undefined) this[k] = s[k];
+                const legacyMailPool = Array.isArray(s.mailProxyPool) ? s.mailProxyPool : [];
+                const legacyGptPool = Array.isArray(s.gptProxyPool) ? s.gptProxyPool : legacyMailPool;
+                const hasSavedProxyPool = Array.isArray(s.proxyPool) && s.proxyPool.length > 0;
+                if (!hasSavedProxyPool && (legacyMailPool.length || legacyGptPool.length)) this.proxyPool = [...legacyMailPool, ...legacyGptPool];
+                this.proxyPool = [...new Set((this.proxyPool || []).map((value) => String(value || "").trim()).filter(Boolean))];
+                if (s.proxyPoolMailEnabled === undefined) this.proxyPoolMailEnabled = legacyMailPool.length > 0 || hasSavedProxyPool;
+                if (s.proxyPoolGptEnabled === undefined) this.proxyPoolGptEnabled = legacyGptPool.length > 0 || hasSavedProxyPool;
+
+                const legacyMailJump = Array.isArray(s.mailJumpPool) ? s.mailJumpPool : (s.mailProxyJump ? [s.mailProxyJump] : []);
+                const legacyGptJump = Array.isArray(s.gptJumpPool) ? s.gptJumpPool : (s.gptProxyJump ? [s.gptProxyJump] : legacyMailJump);
+                const hasSavedJumpPool = Array.isArray(s.proxyJumpPool) && s.proxyJumpPool.length > 0;
+                if (!hasSavedJumpPool && (legacyMailJump.length || legacyGptJump.length)) this.proxyJumpPool = [...legacyMailJump, ...legacyGptJump];
+                this.proxyJumpPool = [...new Set((this.proxyJumpPool || []).map((value) => String(value || "").trim()).filter(Boolean))];
+                if (s.proxyJumpMailEnabled === undefined) this.proxyJumpMailEnabled = legacyMailJump.length > 0 || hasSavedJumpPool;
+                if (s.proxyJumpGptEnabled === undefined) this.proxyJumpGptEnabled = legacyGptJump.length > 0 || hasSavedJumpPool;
                 if (s.mailProxyJump === undefined) this.mailProxyJump = this.detectMailProxyJump();
-                if (s.gptProxyPool === undefined) this.gptProxyPool = Array.isArray(this.mailProxyPool) ? this.mailProxyPool.slice() : [];
-                else if (Array.isArray(s.gptProxyPool)) this.gptProxyPool = s.gptProxyPool;
                 if (s.gptProxyJump === undefined) this.gptProxyJump = this.mailProxyJump || this.detectMailProxyJump();
                 this.normalizeRebindAfterPaid();
-                this.syncJumpPoolsFromSettings();
-                if (s.gptProxyPool === undefined || s.gptProxyJump === undefined) this.saveSettings();
             } else {
                 this.mailProxyJump = this.detectMailProxyJump();
                 this.gptProxyJump = this.mailProxyJump;
-                this.syncJumpPoolsFromSettings();
             }
         } catch { /* 损坏则保留默认 */ }
     }
 
     /** 用户有没有给 GPT 单独配跳板。没有就不要借用邮箱跳板，注册直连代理池。 */
-    hasGptJumpConfig() {
-        if (String(this.gptProxyJump || "").trim()) return true;
-        return (this.gptJumpPool || []).some((x) => String(x || "").trim());
-    }
-
-    collectJumpLines() {
-        const out = [];
-        const seen = new Set();
-        const push = (raw) => {
-            const s = String(raw || "").trim();
-            if (!s || seen.has(s)) return;
-            seen.add(s);
-            out.push(s);
-        };
-        for (const x of (this.mailJumpPool || [])) push(x);
-        for (const x of (this.gptJumpPool || [])) push(x);
-        push(this.jumpXrayVless);
-        if (!out.length) {
-            push(this.mailProxyJump);
-            push(this.gptProxyJump);
-        }
-        return out;
-    }
-
-    resolveJumpLine(raw, fleet = this.jumpFleet || []) {
-        const s = String(raw || "").trim();
-        if (!s) return "";
-        if (isVlessUrl(s)) {
-            let key = s;
-            try {
-                const u = new URL(s);
-                key = `${decodeURIComponent(u.username || "")}@${u.hostname}:${u.port}`;
-            } catch { /* */ }
-            const hit = (fleet || []).find((f) => {
-                if (f.vless === s) return true;
-                try {
-                    const u = new URL(f.vless);
-                    return `${decodeURIComponent(u.username || "")}@${u.hostname}:${u.port}` === key;
-                } catch { return false; }
-            });
-            return hit?.socks || "";
-        }
-        return normalizeProxyUrl(s) || s;
-    }
-
-    jumpPoolSnapshot() {
-        const snap = mailJumpPool.snapshot();
-        const fleet = this.jumpFleet || [];
-        const bySocks = new Map(fleet.map((f) => [f.socks, f]));
-        return {
-            ...snap,
-            lines: this.collectJumpLines(),
-            xrays: fleet,
-            items: (snap.items || []).map((it) => {
-                const f = bySocks.get(it.url);
-                return {
-                    ...it,
-                    node: f?.node || "",
-                    port: f?.port || 0,
-                    xray: f ? !!f.running : null,
-                    xrayError: f?.error || "",
-                    source: f ? maskProxyUrl(f.vless) : it.masked,
-                };
-            }),
-        };
-    }
-
-    async ensureJumpFleet() {
-        if (!isMainHttpServer()) {
-            const {liveJumpSocks} = await import("./xray-proxy.js");
-            const live = await liveJumpSocks();
-            if (live) {
-                mailJumpPool.setUrls([live]);
-                gptJumpPool.setUrls([live]);
-                this.mailProxyJump = live;
-                this.gptProxyJump = live;
-                setMailProxyJump(live);
-            }
-            return [];
-        }
-        const lines = this.collectJumpLines();
-        const vless = lines.filter((x) => isVlessUrl(x));
-        if (!vless.length) {
-            if ((this.jumpFleet || []).length) stopJumpFleet();
-            this.jumpFleet = [];
-            const socks = [];
-            const seen = new Set();
-            for (const raw of lines) {
-                const url = this.resolveJumpLine(raw, []);
-                if (!url || seen.has(url)) continue;
-                seen.add(url);
-                socks.push(url);
-            }
-            mailJumpPool.setUrls(socks);
-            gptJumpPool.setUrls(socks);
-            this.mailProxyJump = socks[0] || "";
-            this.gptProxyJump = socks[0] || "";
-            if (this.mailProxyJump) setMailProxyJump(this.mailProxyJump);
-            try { this.saveSettings(); } catch { /* */ }
-            return [];
-        }
-        this.jumpFleet = await startJumpFleet(vless, {
-            binPath: this.xrayBinPath || undefined,
-            basePort: Number(this.jumpProxyPort) || 10811,
-        });
-        if (this.jumpFleet[0]) {
-            this.jumpXrayVless = this.jumpFleet[0].vless;
-            this.jumpProxyPort = this.jumpFleet[0].port || this.jumpProxyPort;
-        }
-        const socks = [];
-        const seen = new Set();
-        for (const raw of lines) {
-            const url = this.resolveJumpLine(raw, this.jumpFleet);
-            if (!url || seen.has(url)) continue;
-            if (isVlessUrl(raw)) {
-                const hit = (this.jumpFleet || []).find((f) => f.socks === url || f.vless === raw);
-                if (!hit?.running) continue;
-            }
-            seen.add(url);
-            socks.push(url);
-        }
-        mailJumpPool.setUrls(socks);
-        gptJumpPool.setUrls(socks);
-        this.mailProxyJump = socks[0] || "";
-        this.gptProxyJump = socks[0] || "";
-        if (this.mailProxyJump) setMailProxyJump(this.mailProxyJump);
-        try { this.saveSettings(); } catch { /* 跳板端口必须写回，避免子进程还读 10812 死口 */ }
-        const dead = this.jumpFleet.filter((f) => !f.running);
-        if (dead.length) {
-            console.warn(`[jump] ${dead.length} 条 vless xray 没起来: ${dead.map((f) => f.error || f.node).join(" ; ")}`);
-        }
-        return this.jumpFleet;
-    }
-
-    syncJumpPoolsFromSettings() {
-        const mail = Array.isArray(this.mailJumpPool) && this.mailJumpPool.length
-            ? this.mailJumpPool
-            : (this.mailProxyJump ? [this.mailProxyJump] : []);
-        const gpt = Array.isArray(this.gptJumpPool) && this.gptJumpPool.length
-            ? this.gptJumpPool
-            : (this.gptProxyJump ? [this.gptProxyJump] : mail.slice());
-        this.mailJumpPool = mail;
-        this.gptJumpPool = gpt;
-        const mailSocks = mail.map((x) => this.resolveJumpLine(x, [])).filter((u) => u && !isVlessUrl(u));
-        const gptSocks = gpt.map((x) => this.resolveJumpLine(x, [])).filter((u) => u && !isVlessUrl(u));
-        mailJumpPool.setUrls(mailSocks);
-        gptJumpPool.setUrls(gptSocks.length ? gptSocks : mailSocks);
-        if (mail[0] && !isVlessUrl(mail[0])) setMailProxyJump(this.resolveJumpLine(mail[0], []) || "");
-    }
+    hasGptJumpConfig(...args) { return this.proxyService.hasGptJumpConfig(...args); }
+    collectJumpLines(...args) { return this.proxyService.collectJumpLines(...args); }
+    resolveJumpLine(raw, fleet = this.jumpFleet || []) { return this.proxyService.resolveJumpLine(raw, fleet); }
+    jumpPoolSnapshot(...args) { return this.proxyService.jumpPoolSnapshot(...args); }
+    ensureJumpFleet(...args) { return this.proxyService.ensureJumpFleet(...args); }
+    syncJumpPoolsFromSettings(...args) { return this.proxyService.syncJumpPoolsFromSettings(...args); }
+    syncProxyPoolsFromSettings(...args) { return this.proxyService.syncProxyPoolsFromSettings(...args); }
+    configureProxyPoolBackend(...args) { return this.proxyService.configureDistributedBackend(...args); }
+    initializeSharedProxyPool(...args) { return this.proxyService.initializeSharedConfiguration(...args); }
     normalizeRebindAfterPaid() {
         const v = String(this.rebindAfterPaid || "");
         if (v === "off" || v === "gmail" || v === "mailcom") {
@@ -287,29 +145,15 @@ class Scheduler extends EventEmitter {
         this.rebindGmailAfterPaid = this.rebindAfterPaid === "gmail";
     }
     saveSettings() {
-        try {
-            const out = {};
-            for (const k of SETTINGS_KEYS) out[k] = this[k];
-            writeFileSync(SETTINGS_FILE, JSON.stringify(out, null, 2) + "\n", "utf8");
-        } catch { /* 忽略写失败 */ }
+        this.settingsStore.writeSettings(this);
     }
 
     // ---- 定时任务(每天养号+rt续期+at续期) ----
     loadDaily() {
-        const d = {...DAILY_DEFAULT, items: {...DAILY_DEFAULT.items}};
-        try {
-            if (existsSync(DAILY_FILE)) {
-                const saved = JSON.parse(readFileSync(DAILY_FILE, "utf8"));
-                Object.assign(d, saved, {items: {...d.items, ...(saved.items || {})}, running: false});
-            }
-        } catch { /* 损坏则用默认 */ }
-        return d;
+        return this.settingsStore.readDaily();
     }
     saveDaily() {
-        try {
-            const {running, ...persist} = this.daily; // running 是内存态，不持久化
-            writeFileSync(DAILY_FILE, JSON.stringify(persist, null, 2) + "\n", "utf8");
-        } catch { /* 忽略写失败 */ }
+        this.settingsStore.writeDaily(this.daily);
     }
     setDaily({enabled, hour, items} = {}) {
         if (typeof enabled === "boolean") this.daily.enabled = enabled;
@@ -344,128 +188,26 @@ class Scheduler extends EventEmitter {
         return this.pwConcurrency;
     }
 
-    setMailProxyPool(textOrList, {append = false, copies = 1} = {}) {
-        const incoming = Array.isArray(textOrList)
-            ? expandProxyImport(textOrList.join("\n"), copies)
-            : expandProxyImport(String(textOrList || ""), copies);
-        const prev = Array.isArray(this.mailProxyPool) ? this.mailProxyPool.slice() : [];
-        const prevSet = new Set(prev);
-        const inserted = incoming.filter((u) => !prevSet.has(u));
-        const skipped = incoming.length - inserted.length;
-        const urls = append ? [...prev, ...inserted] : incoming;
-        this.mailProxyPool = urls;
-        mailProxyPool.setUrls(urls);
-        this.saveSettings();
-        return {
-            ...this.mailProxyPoolSnap(),
-            inserted: append ? inserted.length : incoming.length,
-            skipped: append ? skipped : 0,
-            lines: urls.map(toProxyImportLine),
-        };
-    }
-
-    mailProxyFallback() {
-        if (this.mailProxyEnabled !== false && this.mailProxy) return this.mailProxy;
-        return this.regProxy || "";
-    }
-
-    mailProxyPoolSnap() {
-        return mailProxyPool.snapshot(this.mailProxyFallback());
-    }
-
-    detectMailProxyJump() {
-        if (this.portListening(10808)) return "socks5://127.0.0.1:10808";
-        return this.regProxy || "";
-    }
-
-    /**
-     * 端口在不在听。复用 xray-proxy 的带缓存实现，别再自己 execSync 一份——
-     * lsof 一次 0.4s，execSync 会把事件循环整个冻住，:3100 期间不响应任何请求。
-     */
-    portListening(port) {
-        return localPortListening(port);
-    }
-
-    setMailProxyJump(url) {
-        this.mailProxyJump = String(url || "").trim();
-        if (this.mailProxyJump) this.mailJumpPool = [this.mailProxyJump];
-        else this.mailJumpPool = [];
-        this.gptJumpPool = this.mailJumpPool.slice();
-        this.gptProxyJump = this.mailProxyJump;
-        if (isMainHttpServer()) {
-            const pending = this.ensureJumpFleet();
-            if (pending && typeof pending.then === "function") pending.catch((e) => console.warn("[jump] 起 xray 失败", e?.message || e));
-            this.saveSettings();
-        }
-        return this.mailProxyJump;
-    }
-
-    async setMailJumpPool(list) {
-        const urls = Array.isArray(list) ? list.map((x) => String(x || "").trim()).filter(Boolean) : [];
-        this.mailJumpPool = urls;
-        this.gptJumpPool = urls.slice();
-        if (!urls.length) {
-            this.jumpXrayVless = "";
-            this.mailProxyJump = "";
-            this.gptProxyJump = "";
-        }
-        await this.ensureJumpFleet();
-        this.saveSettings();
-        return this.jumpPoolSnapshot();
-    }
-
-    async setGptJumpPool(list) {
-        const urls = Array.isArray(list) ? list.map((x) => String(x || "").trim()).filter(Boolean) : [];
-        this.gptJumpPool = urls;
-        this.mailJumpPool = urls.slice();
-        if (!urls.length) {
-            this.jumpXrayVless = "";
-            this.mailProxyJump = "";
-            this.gptProxyJump = "";
-        }
-        await this.ensureJumpFleet();
-        this.saveSettings();
-        return this.jumpPoolSnapshot();
-    }
-
-    applyJumpSocks(port) {
-        const jump = `socks5://127.0.0.1:${Number(port) || this.jumpProxyPort || 10811}`;
-        this.mailProxyJump = jump;
-        this.gptProxyJump = jump;
-        mailJumpPool.addUrl(jump);
-        this.saveSettings();
-        return jump;
-    }
-
-    setGptProxyPool(textOrList, {append = false, copies = 1} = {}) {
-        const incoming = Array.isArray(textOrList)
-            ? expandProxyImport(textOrList.join("\n"), copies)
-            : expandProxyImport(String(textOrList || ""), copies);
-        const prev = Array.isArray(this.gptProxyPool) ? this.gptProxyPool.slice() : [];
-        const prevSet = new Set(prev);
-        const inserted = incoming.filter((u) => !prevSet.has(u));
-        const skipped = incoming.length - inserted.length;
-        const urls = append ? [...prev, ...inserted] : incoming;
-        this.gptProxyPool = urls;
-        gptProxyPool.setUrls(urls);
-        this.saveSettings();
-        return {
-            ...this.gptProxyPoolSnap(),
-            inserted: append ? inserted.length : incoming.length,
-            skipped: append ? skipped : 0,
-            lines: urls.map(toProxyImportLine),
-        };
-    }
-
-    gptProxyPoolSnap() {
-        return gptProxyPool.snapshot("");
-    }
-
-    setGptProxyJump(url) {
-        this.gptProxyJump = String(url || "").trim();
-        this.saveSettings();
-        return this.gptProxyJump;
-    }
+    setMailProxyPool(...args) { return this.proxyService.setMailProxyPool(...args); }
+    setProxyPool(...args) { return this.proxyService.setProxyPool(...args); }
+    setProxyPoolScopes(...args) { return this.proxyService.setProxyPoolScopes(...args); }
+    proxyPoolSnap(...args) { return this.proxyService.proxyPoolSnap(...args); }
+    publicProxyPoolSnap(...args) { return this.proxyService.publicProxyPoolSnap(...args); }
+    proxyPoolEnabled(...args) { return this.proxyService.proxyPoolEnabled(...args); }
+    mailProxyFallback(...args) { return this.proxyService.mailProxyFallback(...args); }
+    mailProxyPoolSnap(...args) { return this.proxyService.mailProxyPoolSnap(...args); }
+    detectMailProxyJump(...args) { return this.proxyService.detectMailProxyJump(...args); }
+    portListening(...args) { return this.proxyService.portListening(...args); }
+    setMailProxyJump(...args) { return this.proxyService.setMailProxyJump(...args); }
+    setMailJumpPool(...args) { return this.proxyService.setMailJumpPool(...args); }
+    setGptJumpPool(...args) { return this.proxyService.setGptJumpPool(...args); }
+    applyJumpSocks(...args) { return this.proxyService.applyJumpSocks(...args); }
+    setGptProxyPool(...args) { return this.proxyService.setGptProxyPool(...args); }
+    gptProxyPoolSnap(...args) { return this.proxyService.gptProxyPoolSnap(...args); }
+    publicJumpPoolSnapshot(...args) { return this.proxyService.publicJumpPoolSnapshot(...args); }
+    setGptProxyJump(...args) { return this.proxyService.setGptProxyJump(...args); }
+    setProxyJumpPool(...args) { return this.proxyService.setProxyJumpPool(...args); }
+    setProxyJumpScopes(...args) { return this.proxyService.setProxyJumpScopes(...args); }
 
     // ---- 域级控制(GPT/Claude 各自暂停/停止,共用同一进程池) ----
     start() {
@@ -484,14 +226,22 @@ class Scheduler extends EventEmitter {
         for (const info of this.running.values()) {
             if (info.domain === domain) {
                 info.releasing = true;
-                try { info.child.kill("SIGTERM"); } catch { /* ignore */ }
+                info.cancelTermination?.();
+                info.cancelTermination = terminateChildProcess(info.child, {graceMs: 12_000});
             }
         }
     }
 
     // 浏览器维护互斥:acquireLock 成功返回 true 并设置持有者;releaseLock 只有持有者自己能释放
-    acquireLock(owner) { if (this.maintLock) return false; this.maintLock = owner; return true; }
-    releaseLock(owner) { if (this.maintLock === owner) { this.maintLock = null; return true; } return false; }
+    get maintLock() { return this.maintenanceLock.owner(); }
+    acquireLock(owner) { return this.maintenanceLock.acquire(owner); }
+    releaseLock(owner) { return this.maintenanceLock.release(owner); }
+
+    dispose() {
+        this.stopPollLoop?.();
+        this.stopPollLoop = null;
+        this.workerRunner.dispose();
+    }
 
     // 某业务号是否正在跑(默认 gpt 域;index.ts 删/改前检查用)。running 键是复合 `${domain}:${id}`。
     isRunning(id, domain = "gpt") { return this.running.has(`${domain}:${id}`); }
@@ -519,9 +269,11 @@ class Scheduler extends EventEmitter {
     state() {
         return {instanceId: db.instanceId, paused: this.paused, pausedClaude: this.pausedClaude, concurrency: this.concurrency, otpSingle: this.otpSingle, simulateChat: this.simulateChat, smsEnabled: this.smsEnabled, smsLinkTemplate: this.smsLinkTemplate, rtEnabled: this.rtEnabled, mfaEnabled: this.mfaEnabled !== false, smsMaxBind: this.smsMaxBind, regEngine: this.regEngine, bitBrowser: this.bitBrowser, daily: this.daily, regProxy: this.regProxy, mailProxy: this.mailProxy, mailProxyEnabled: this.mailProxyEnabled !== false, claudeProxy: this.claudeProxy, xrayVless: this.xrayVless || "", claudeXrayVless: this.claudeXrayVless, jumpXrayVless: this.jumpXrayVless || "", jumpProxyPort: this.jumpProxyPort || 10811, regProxyPort: this.regProxyPort, claudeProxyPort: this.claudeProxyPort, mailSeparator: this.mailSeparator, xrayBinPath: this.xrayBinPath || "",
             pwConcurrency: this.pwConcurrency, rtProxy: this.rtProxy || "", rtConcurrency: this.rtConcurrency, defaultPassword: String(appConfig.defaultPassword || "").trim(),
+            proxyPool: this.proxyPool || [], proxyPoolLines: (this.proxyPool || []).map(toProxyImportLine), proxyPoolSnap: this.proxyPoolSnap(), proxyPoolMailEnabled: this.proxyPoolMailEnabled !== false, proxyPoolGptEnabled: this.proxyPoolGptEnabled !== false,
+            proxyJumpPool: this.proxyJumpPool || [], proxyJumpMailEnabled: this.proxyJumpMailEnabled !== false, proxyJumpGptEnabled: this.proxyJumpGptEnabled !== false,
             mailProxyPool: this.mailProxyPool || [], mailProxyPoolLines: (this.mailProxyPool || []).map(toProxyImportLine), mailProxyPoolSnap: this.mailProxyPoolSnap(),
             mailProxyJump: this.mailProxyJump || "",
-            mailJumpPool: this.mailJumpPool || [], mailJumpPoolSnap: this.jumpPoolSnapshot(),
+            mailJumpPool: this.mailJumpPool || [], mailJumpPoolSnap: this.jumpPoolSnapshot(), jumpPoolSnap: this.jumpPoolSnapshot(),
             gptProxyPool: this.gptProxyPool || [], gptProxyPoolLines: (this.gptProxyPool || []).map(toProxyImportLine), gptProxyPoolSnap: this.gptProxyPoolSnap(),
             gptProxyJump: this.gptProxyJump || "",
             gptJumpPool: this.gptJumpPool || [], gptJumpPoolSnap: this.jumpPoolSnapshot(),
@@ -586,184 +338,11 @@ class Scheduler extends EventEmitter {
         }
     }
 
-    // running Map 键=复合 runId(`${domain}:${id}`),避免 gpt/claude 各自自增 id 重叠碰撞。
-    async spawnWorker(acc) {
-        const domain = acc.domain || "gpt";
-        const runId = `${domain}:${acc.id}`;
-        let info = null;
-        try {
-            if (domain === "gpt") {
-                const cur = String(acc.gpt_password || "").trim();
-                const started = !!(acc.auth_file || acc.token || acc.started_at);
-                const defaultPw = String(appConfig.defaultPassword || "").trim();
-                // 未真正开过号：空密码或库里仍是统一默认密码 → 每人随机一串
-                if (!started && (!cur || (defaultPw && cur === defaultPw))) {
-                    const pw = randomPassword(16);
-                    await db.updateAccount(acc.id, {gpt_password: pw});
-                    acc.gpt_password = pw;
-                    this.log(acc.id, "GPT 密码已按号随机生成");
-                } else if (!cur) {
-                    const pw = randomPassword(16);
-                    await db.updateAccount(acc.id, {gpt_password: pw});
-                    acc.gpt_password = pw;
-                }
-            }
-            const tmpFile = path.join(this.tmpDir, `mc-${domain}-${acc.id}.txt`);
-            writeFileSync(tmpFile, [acc.email, acc.password, acc.mailbox_totp || "", acc.recovery_email || "", acc.mailbox_imap || ""].join("----") + "\n", "utf8");
-            info = {child: null, tmpFile, gotResult: false, engine: null, domain, id: acc.id, mailboxId: acc.mailbox_id, releasing: false, wantGptPool: domain === "gpt", mailLease: null, jumpLease: null};
-            this.running.set(runId, info);
-
-            // 注册知识收敛在引擎:调度器只管进程/并发/事件(通用)。按账号所属域选引擎。
-            const engine = resolveEngine(domain);
-            let script, env;
-            try {
-                ({script, env} = engine.buildSpawn(acc, this, tmpFile));
-            } catch (e) {
-                this.running.delete(runId);
-                const err = String(e?.message || e);
-                this.log(acc.id, `❌ 无法启动注册: ${err}`);
-                if (domain === "gpt") {
-                    await db.markFailed(acc.id, err);
-                    this.emit("status", {id: acc.id, status: "failed"});
-                    try { this.emit("stats", await db.stats()); } catch { /* */ }
-                }
-                try { rmSync(tmpFile, {force: true}); } catch { /* */ }
-                return;
-            }
-            const isBrowserWorker = /worker-register-browser|register-browser|worker-register-claude/i.test(String(script || ""));
-            if (isBrowserWorker) {
-                const xray = await pickXrayBrowserProxy(this.regProxy, this.rtProxy, "socks5://127.0.0.1:10811", "socks5://127.0.0.1:10808");
-                if (!xray) {
-                    this.running.delete(runId);
-                    const err = "浏览器必须走 xray，本机没有可用的 xray socks（10811/10808）";
-                    this.log(acc.id, `❌ 无法启动注册: ${err}`);
-                    if (domain === "gpt") {
-                        await db.markFailed(acc.id, err);
-                        this.emit("status", {id: acc.id, status: "failed"});
-                        try { this.emit("stats", await db.stats()); } catch { /* */ }
-                    }
-                    try { rmSync(tmpFile, {force: true}); } catch { /* */ }
-                    return;
-                }
-                env.PROXY_URL = xray;
-                env.MAIL_PROXY_JUMP = "";
-                this.logJob(info, `浏览器走 xray ${xray}（不用 JS 转发 kookeey）`);
-            } else if (info.wantGptPool) {
-                try {
-                    const wantJump = this.hasGptJumpConfig();
-                    if (wantJump && gptJumpPool.urls.length) {
-                        try {
-                            info.jumpLease = await gptJumpPool.lease(acc.email, {timeoutMs: 20_000, maxPerJump: JUMP_MAX_EXITS});
-                        } catch (e) {
-                            this.logJob(info, `跳板租不到（${String(e?.message || e).slice(0, 80)}），直连 GPT 代理池`);
-                            info.jumpLease = null;
-                        }
-                    }
-                    info.mailLease = await gptProxyPool.lease(acc.email, {
-                        fallback: "",
-                        timeoutMs: 20_000,
-                        maxPerTemplate: 1,
-                        freshSession: true,
-                    });
-                    const jump = wantJump ? (info.jumpLease?.url || this.gptProxyJump || "") : "";
-                    env.PROXY_URL = info.mailLease.url || "";
-                    env.MAIL_PROXY_JUMP = jump;
-                    this.logJob(info, `GPT 代理池租到 ${String(info.mailLease.url || "直连").replace(/:[^:@/]+@/, ":***@")}（${jump ? "跳板 " + jump : "无跳板，直连代理池"}）`);
-                } catch (e) {
-                    try { info.jumpLease?.release(); } catch { /* */ }
-                    this.running.delete(runId);
-                    await db.releaseGptIfRunning(acc.id);
-                    this.log(acc.id, `GPT 代理池租不到: ${e?.message || e}，退回排队`);
-                    try { rmSync(tmpFile, {force: true}); } catch { /* */ }
-                    return;
-                }
-            }
-            const child = spawn(TSX_BIN, [script], {cwd: CODEX_ROOT, env: cleanSpawnEnv(env), shell: IS_WIN});
-            info.child = child;
-            info.engine = engine;
-            if (domain === "claude") this.emit("claude", {stats: await db.claudeStats()});
-            else {
-                this.emit("status", {id: acc.id, status: "running"});
-                try { this.emit("stats", await db.stats()); } catch { /* */ }
-            }
-            this.logJob(info, `▶ 启动注册 worker (pid=${child.pid})`);
-
-            let buf = "";
-            const onData = (chunk) => {
-                buf += chunk.toString();
-                if (buf.length > 512 * 1024) buf = buf.slice(-256 * 1024);
-                let idx;
-                const run = async () => {
-                    while ((idx = buf.indexOf("\n")) >= 0) {
-                        const line = buf.slice(0, idx);
-                        buf = buf.slice(idx + 1);
-                        try { await this.handleLine(info, line); }
-                        catch (e) { this.logJob(info, `[handleLine] ${String(e?.message || e).slice(0, 120)}`); }
-                    }
-                };
-                void run();
-            };
-            child.stdout.on("data", onData);
-            child.stderr.on("data", (d) => { const t = d.toString().trim(); if (t) this.logJob(info, `[stderr] ${t.slice(0, 160)}`); });
-            child.on("error", (err) => this.logJob(info, `[spawn error] ${err?.message ?? err}`));
-            child.on("exit", (code) => { void this.onExit(runId, code); });
-        } catch (e) {
-            // 兜底：任何未预期错误都回收 running，避免卡槽 + unhandledRejection 打崩进程
-            try { info?.mailLease?.release(); } catch { /* */ }
-            try { info?.jumpLease?.release(); } catch { /* */ }
-            this.running.delete(runId);
-            try { await db.releaseGptIfRunning(acc.id); } catch { /* */ }
-            try { if (info?.tmpFile) rmSync(info.tmpFile, {force: true}); } catch { /* */ }
-            throw e;
-        }
-    }
-
-    // job runner 只做:分帧解析 worker 输出 → result 事件转发给该 job 的引擎解释,普通行落日志。
-    async handleLine(info, line) {
-        if (!line.trim()) return;
-        if (line.startsWith(EVENT_PREFIX)) {
-            let ev;
-            try { ev = JSON.parse(line.slice(EVENT_PREFIX.length)); } catch { return; }
-            if (ev.type === "result") { info.gotResult = true; await info.engine.onResult(this, info.id, ev); }
-            else if (ev.type === "mailbox_update") {
-                await db.applyMailboxUpdate(ev.email || "", {
-                    password: ev.password, totp_secret: ev.totp_secret,
-                    imap_password: ev.imap_password, recovery_email: ev.recovery_email,
-                }).catch(() => {});
-                if (ev.message) this.logJob(info, ev.message);
-                else this.logJob(info, `邮箱凭证已更新${ev.imap_password ? "(应用专用密码)" : ""}`);
-            }
-            else if (ev.message) this.logJob(info, ev.message);
-        } else {
-            this.logJob(info, line);
-        }
-    }
-
-    // 帧日志(内部)按域路由:claude→独立 claude_logs(键 claude_account id);gpt→logs 表。三域日志各自独立。fire-and-forget 写库,不阻塞事件流。
-    logJob(info, line) {
-        if (info.domain === "claude") { db.appendClaudeLog(info.id, line).catch(() => {}); this.emit("claudeLog", {id: info.id, line, ts: Date.now()}); }
-        else { db.appendLog(info.id, line).catch(() => {}); this.emit("log", {id: info.id, line, ts: Date.now()}); }
-    }
-
-    // 引擎用的公共日志(GPT onResult 调 runner.log(id,...))→ logs 表。claude onResult 不用(见 register-engine)。fire-and-forget。
-    log(id, line) {
-        db.appendLog(id, line).catch(() => {});
-        this.emit("log", {id, line, ts: Date.now()});
-    }
-
-    async onExit(runId, code) {
-        const info = this.running.get(runId);
-        this.running.delete(runId);
-        if (info) {
-            try { info.mailLease?.release(); } catch { /* */ }
-            try { info.jumpLease?.release(); } catch { /* */ }
-            try { rmSync(info.tmpFile, {force: true}); } catch { /* ignore */ }
-            // 没收到结果事件就退出 = 异常,交由引擎按域解释
-            if (!info.gotResult && info.engine) await info.engine.onAbnormalExit(this, info.id, code, info);
-        }
-        this.emit("stats", await db.stats());
-        this.tick(); // 释放槽位，继续下一个
-    }
+    spawnWorker(acc) { return this.workerRunner.spawnWorker(acc); }
+    handleLine(info, line) { return this.workerRunner.handleLine(info, line); }
+    logJob(info, line) { return this.workerRunner.logJob(info, line); }
+    log(id, line) { return this.workerRunner.log(id, line); }
+    onExit(runId, code) { return this.workerRunner.onExit(runId, code); }
 }
 
 export const scheduler = new Scheduler();

@@ -33,10 +33,15 @@ echo   前端开发:  http://localhost:5173
 echo   (Ctrl+C 退出)
 echo ============================================================
 
+:: 主服务使用预构建产物，避免 tsx 在大依赖图下并发写缓存耗尽文件描述符。
+echo([构建] 后端服务 ...
+call npm run build:server
+if errorlevel 1 exit /b 1
+
 :: 后台启动前端 Vite
 set MAILCOM_HEADLESS=1
 start "前端Vite" /min cmd /c "cd /d "%~dp0\web" && npx --yes vite"
 
 :: 前台启动后端
-npx --yes tsx server/index.ts
+node bundle/server.mjs
 pause

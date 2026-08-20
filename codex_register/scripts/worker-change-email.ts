@@ -1,7 +1,7 @@
 // @ts-nocheck
 // 官方换绑 HTTP：协议 worker，跳板+GPT 池，不进 :3100。
 import {readFileSync} from "node:fs";
-import {installWorkerProxyFromEnv} from "../src/mail/install-worker-proxy.js";
+import {installWorkerImapProxyFromEnv, installWorkerProxyFromEnv} from "../src/mail/install-worker-proxy.js";
 import {changeChatgptEmail} from "../src/change-email.js";
 
 const jobFile = process.argv[2] || "";
@@ -12,6 +12,7 @@ if (!jobFile) {
 
 const job = JSON.parse(readFileSync(jobFile, "utf8"));
 await installWorkerProxyFromEnv();
+await installWorkerImapProxyFromEnv();
 
 // 阶段实时上报：父进程超时把我杀掉时，靠最后一个 stage 判断官方侧状态确不确定。
 let lastStage = "precheck";
@@ -33,6 +34,7 @@ try {
         accountId: job.accountId || "",
         cookie: job.cookie || "",
         proxyUrl: process.env.PROXY_URL || job.proxyUrl || "",
+        imapProxyUrl: process.env.IMAP_PROXY || job.imapProxyUrl || "",
         newEmail: job.newEmail || "",
         imapPassword: job.imapPassword || "",
         mailPassword: job.mailPassword || "",

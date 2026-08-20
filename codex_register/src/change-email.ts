@@ -207,6 +207,7 @@ export async function changeChatgptEmail({
     accountId = "",
     cookie = "",
     proxyUrl = "",
+    imapProxyUrl = "",
     newEmail,
     imapPassword,
     mailPassword = "",
@@ -219,6 +220,7 @@ export async function changeChatgptEmail({
     accountId?: string;
     cookie?: string;
     proxyUrl?: string;
+    imapProxyUrl?: string;
     newEmail: string;
     imapPassword: string;
     mailPassword?: string;
@@ -327,7 +329,13 @@ export async function changeChatgptEmail({
     try {
         if (isGmail) {
             code = await waitGoogleImapOtp(cred, {
-                minTimestampMs: sentAt, attempts: 10, intervalMs: 4000, deadlineMs: otpDeadlineMs,
+                minTimestampMs: sentAt,
+                attempts: 10,
+                intervalMs: 4000,
+                deadlineMs: otpDeadlineMs,
+                proxy: imapProxyUrl,
+                skipDirect: !!imapProxyUrl,
+                includeLocals: !imapProxyUrl,
             });
         } else {
             const {createMailcomProvider, rememberMailcomPassword} = await import("./mail/mailcom.js");

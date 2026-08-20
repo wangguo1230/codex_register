@@ -14,6 +14,7 @@
 import {existsSync, readFileSync} from "node:fs";
 import path from "node:path";
 import {chromium} from "playwright-core";
+import {SocksClient} from "socks";
 import {findLatestVerificationMail} from "./verification-matcher.js";
 import {formatBeijingDateTime} from "../utils.js";
 import {applyMailcomFingerprint, ensureMailcomProfile, playwrightContextOptions} from "./mailcom-fingerprint.js";
@@ -69,6 +70,83 @@ function parseProxyOpt(url) {
         return {server: String(url).trim().replace(/#.*$/, "")};
     }
 }
+
+async function launchBrowserWithTimeout(launchOpts, timeoutMs) {
+    const limit = Math.max(5_000, Number(timeoutMs) || 30_000);
+    let timer;
+    let launchPromise;
+    try {
+        launchPromise = chromium.launch(launchOpts);
+        const timeoutPromise = new Promise((_, reject) => {
+            timer = setTimeout(() => reject(new Error(`Chrome 启动超时 ${Math.round(limit / 1000)}s`)), limit);
+        });
+        return await Promise.race([launchPromise, timeoutPromise]);
+    } catch (error) {
+        // launch 超时后 Playwright 可能晚到返回 browser，提前挂上关闭回调避免遗留 Chrome。
+        void launchPromise?.then((browser) => browser?.close?.().catch?.(() => {}), () => {});
+        throw error;
+    } finally {
+        if (timer) clearTimeout(timer);
+    }
+}
+
+function mailcomBrowserTargets() {
+    const testingPath = String(process.env.MAILCOM_BROWSER_PATH || "").trim() || chromium.executablePath();
+    const testing = testingPath && existsSync(testingPath)
+        ? {label: "Chrome for Testing", executablePath: testingPath}
+        : null;
+    const system = {label: "系统 Chrome", channel: "chrome"};
+    const mode = String(process.env.MAILCOM_BROWSER_MODE || "testing").trim().toLowerCase();
+    if (mode === "system") return testing ? [system, testing] : [system];
+    return testing ? [testing, system] : [system];
+}
+
+async function launchMailcomBrowser(baseOpts, timeoutMs) {
+    let lastError = null;
+    for (const target of mailcomBrowserTargets()) {
+        const started = Date.now();
+        try {
+            const browser = await launchBrowserWithTimeout({...baseOpts, ...target}, timeoutMs);
+            console.log(`[mailcom] ${target.label} 已启动 ${Date.now() - started}ms`);
+            return browser;
+        } catch (error) {
+            lastError = error;
+            console.warn(`[mailcom] ${target.label} 启动失败 ${Date.now() - started}ms: ${String(error?.message || error).replace(/\s+/g, " ").slice(0, 220)}`);
+        }
+    }
+    throw lastError || new Error("没有可用的 Chrome 浏览器");
+}
+
+async function probeBrowserProxy(proxyUrl, timeoutMs = 8000) {
+    const raw = String(proxyUrl || "").trim();
+    if (!raw) return {ok: true, ms: 0};
+    let parsed;
+    try { parsed = new URL(raw); } catch { return {ok: false, ms: 0, reason: "代理地址无效"}; }
+    if (!parsed.protocol.startsWith("socks")) return {ok: true, ms: 0};
+    const started = Date.now();
+    let socket;
+    try {
+        const result = await SocksClient.createConnection({
+            proxy: {
+                host: parsed.hostname,
+                port: Number(parsed.port || 1080),
+                type: parsed.protocol.startsWith("socks4") ? 4 : 5,
+                userId: parsed.username ? decodeURIComponent(parsed.username) : undefined,
+                password: parsed.password ? decodeURIComponent(parsed.password) : undefined,
+            },
+            command: "connect",
+            destination: {host: "www.mail.com", port: 443},
+            timeout: Math.max(1000, Number(timeoutMs) || 8000),
+        });
+        socket = result.socket;
+        return {ok: true, ms: Date.now() - started};
+    } catch (error) {
+        return {ok: false, ms: Date.now() - started, reason: String(error?.message || error).slice(0, 180)};
+    } finally {
+        try { socket?.destroy(); } catch { /* ignore */ }
+    }
+}
+
 const POLL_ATTEMPTS = Number(process.env.MAILCOM_POLL_ATTEMPTS || 24);
 const POLL_INTERVAL_MS = Number(process.env.MAILCOM_POLL_INTERVAL_MS || 5000);
 
@@ -361,6 +439,11 @@ export async function sendMailcomMail(email, password, opts = {}) {
         relayClose = via.close;
         if (via.localPort) {
             console.log(`[mailcom] 发信链式 本机:${via.localPort}${jumpUrl ? " ←跳板" : ""} ← 粘性出口`);
+        }
+        if (via.url) {
+            const probe = await probeBrowserProxy(via.url, Number(process.env.MAILCOM_BROWSER_PROXY_PROBE_MS || 8000));
+            if (!probe.ok) throw new Error(`发信浏览器代理预检失败 ${probe.reason || "代理不可用"}（${probe.ms}ms）`);
+            console.log(`[mailcom] 发信浏览器代理预检通过 ${probe.ms}ms`);
         }
         const {kookeeySessionOf} = await import("./proxy-pool.js");
         const profile = ensureMailcomProfile(opts.profile, exitUrl);
@@ -907,8 +990,8 @@ async function loginMailcom(email, password, opts = {}) {
 
 async function loginMailcomUnlocked(email, password, opts = {}) {
     const launchOpts: any = {
-        channel: "chrome",
         headless: opts.headless ?? HEADLESS,
+        timeout: Math.max(5_000, Number(process.env.MAILCOM_BROWSER_LAUNCH_TIMEOUT_MS || 10_000)),
         args: [
             "--disable-blink-features=AutomationControlled",
             "--disable-dev-shm-usage",
@@ -920,7 +1003,8 @@ async function loginMailcomUnlocked(email, password, opts = {}) {
     const proxyOpt = parseProxyOpt(proxyRaw);
     if (proxyOpt) launchOpts.proxy = proxyOpt;
     const headed = !(launchOpts.headless);
-    const browser = await chromium.launch(launchOpts);
+    console.log(`[mailcom] 启动 Chrome${proxyRaw ? "（经本地链式代理）" : "（直连）"}，上限 ${Math.round(launchOpts.timeout / 1000)}s`);
+    const browser = await launchMailcomBrowser(launchOpts, launchOpts.timeout);
     let page = null;
     try {
         const profile = ensureMailcomProfile(opts.profile, proxyRaw);
@@ -1602,8 +1686,11 @@ export async function findLatestClaudeMagicLink(email, password, {attempts = 20,
 }
 
 export async function closeMailcomSessions() {
-    for (const session of sessions.values()) {
-        try { await session.browser.close(); } catch { /* ignore */ }
-    }
+    const browsers = new Set([
+        ...[...sessions.values()].map((session) => session?.browser),
+        ...[...inboxSessions.values()].map((entry) => entry?.session?.browser),
+    ].filter(Boolean));
+    await Promise.all([...browsers].map((browser) => browser.close().catch(() => {})));
     sessions.clear();
+    inboxSessions.clear();
 }

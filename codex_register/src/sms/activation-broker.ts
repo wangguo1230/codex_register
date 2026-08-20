@@ -49,17 +49,30 @@ export interface ActivationBrokerHistoryStats {
   phoneStats: Record<string, PhoneUsageStats>;
 }
 
-export interface ActivationLease extends SmsActivation {
-  isNewActivation: boolean;
-  requestedAnotherSms: boolean;
-  round: number;
-  waitForVerificationCode(): Promise<SmsVerificationCode>;
+export type ActivationVerificationCode = Pick<SmsVerificationCode, "code"> &
+  Partial<Omit<SmsVerificationCode, "code">>;
+
+export interface ActivationLease {
+  activationId?: string;
+  phoneNumber: string;
+  expiresAt?: Date;
+  canRequestAnotherSms?: boolean;
+  isNewActivation?: boolean;
+  requestedAnotherSms?: boolean;
+  round?: number;
+  precheck?(): Promise<"code" | "waiting" | "fatal">;
+  waitForVerificationCode(options?: {excludeCode?: string}): Promise<ActivationVerificationCode>;
+}
+
+export interface ActivationFailureOptions {
+  exhausted?: boolean;
 }
 
 export interface ISMSActivationBroker {
   getActivation(): Promise<ActivationLease>;
+  markAsUsed?(): Promise<void>;
   markAsSucceed(): Promise<void>;
-  markAsFailed(rotate?: boolean): Promise<void>;
+  markAsFailed(rotate?: boolean, options?: ActivationFailureOptions): Promise<void>;
 }
 
 export interface ActivationBrokerState<Activation extends SmsActivation> {
@@ -196,7 +209,7 @@ export class ActivationBroker<
     await this.finishAttempt("success");
   }
 
-  async markAsFailed(rotate?: boolean): Promise<void> {
+  async markAsFailed(rotate?: boolean, _options?: ActivationFailureOptions): Promise<void> {
     await this.finishAttempt("failed", rotate);
   }
 
@@ -372,22 +385,16 @@ export class ActivationBroker<
       requestedAnotherSms,
       round: this.round,
       waitForVerificationCode: async () => {
-        try {
-          const verification = await this.provider.waitForVerificationCode(
-            activation.activationId,
-          );
-          await this.markAsSucceed();
-          return {
-            code: verification.code,
-            source: verification.source,
-            text: verification.text,
-            receivedAt: verification.receivedAt,
-            rawStatus: verification.rawStatus,
-          };
-        } catch (e) {
-          await this.markAsFailed();
-          throw e;
-        }
+        const verification = await this.provider.waitForVerificationCode(
+          activation.activationId,
+        );
+        return {
+          code: verification.code,
+          source: verification.source,
+          text: verification.text,
+          receivedAt: verification.receivedAt,
+          rawStatus: verification.rawStatus,
+        };
       },
     };
   }

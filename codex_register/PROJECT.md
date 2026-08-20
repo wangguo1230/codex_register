@@ -8,7 +8,7 @@ ChatGPT批量注册 + 管理控制台。用成品mailcom邮箱批量注册ChatGP
 
 ```bash
 cd codex_register
-./start-console.sh          # 或 npm run console (= tsx server/index.ts)
+./start-console.sh          # 生产启动：先构建 server bundle，再运行 node bundle/server.mjs
 # → http://localhost:3100   首次自动 build 前端(web/)
 ```
 - 端口 env `PORT`(默认3100)。前端改动: `cd web && npm run build`, 浏览器强刷(Cmd+Shift+R)。

@@ -40,6 +40,15 @@ import {connectExitViaJump} from "./mail/proxy-chain.js";
 
 type FetchLike = typeof fetch;
 
+interface PhoneOtpError extends Error {
+    phoneRejected?: boolean;
+    phoneExhausted?: boolean;
+}
+
+function asPhoneOtpError(error: unknown): PhoneOtpError {
+    return (error instanceof Error ? error : new Error(String(error))) as PhoneOtpError;
+}
+
 const DEFAULT_INSECURE_TLS = true;
 // 重登 worker 可经 env 收紧，避免单出口连 Timeout×4 拖到一分钟以上
 const FETCH_RETRY_COUNT = Math.max(1, Math.min(6, Number(process.env.OPENAI_FETCH_RETRY || 4) || 4));
@@ -650,11 +659,11 @@ export class OpenAIClient {
      * 处理 add-phone(手机验证)：从注入的 smsBroker 取号 → 提交手机号(add-phone/send) → 收码 → phone-otp/validate。
      * 号码不可用(send 400)或收码失败都换号重试，最多 5 个号。仅在 continueURL===/add-phone 时被调用。
      */
-    async resolveAddPhone(continueURL) {
+    async resolveAddPhone(continueURL: string): Promise<string> {
         if (continueURL !== `${AUTH_BASE_URL}/add-phone`) return continueURL;
         if (!this.smsBroker) throw new Error("注册要求手机验证，但未启用接码池(smsBroker)");
         const MAX_PHONE_ATTEMPTS = 5;
-        let lastErr;
+        let lastErr: unknown = null;
         let phoneTry = 0;
         for (; phoneTry < MAX_PHONE_ATTEMPTS; phoneTry += 1) {
             const lease = await this.smsBroker.getActivation();
@@ -672,10 +681,11 @@ export class OpenAIClient {
             try {
                 continueURL = await this.sendPhoneOtp(phoneNumber);
             } catch (e) {
-                lastErr = e;
-                const rejected = !!(e && e.phoneRejected);
-                const exhausted = !!(e && e.phoneExhausted);
-                console.warn(`[add-phone] ${phoneNumber} 提交${exhausted ? "被拒(号已达绑定上限，永久剔除)" : rejected ? "被拒(号作废)" : "临时失败(号保留)"}: ${(e && e.message) || e}`);
+                const error = asPhoneOtpError(e);
+                lastErr = error;
+                const rejected = !!error.phoneRejected;
+                const exhausted = !!error.phoneExhausted;
+                console.warn(`[add-phone] ${phoneNumber} 提交${exhausted ? "被拒(号已达绑定上限，永久剔除)" : rejected ? "被拒(号作废)" : "临时失败(号保留)"}: ${error.message}`);
                 await this.smsBroker.markAsFailed(rejected, {exhausted}); // true=标坏号；false=释放回池；exhausted=达上限强制剔除(绕过复用豁免)
                 continue;
             }
@@ -685,12 +695,13 @@ export class OpenAIClient {
             // 收码 + 验证：Invalid OTP(常因接码平台返回旧短信残留码)→排除旧码等【新】码重试；同号仍失败→跳出去换号
             let validated = false, lastCode = "";
             for (let vtry = 0; vtry < 3 && !validated; vtry += 1) {
-                let code;
+                let code = "";
                 try {
                     ({code} = await lease.waitForVerificationCode(vtry > 0 ? {excludeCode: lastCode} : {}));
                 } catch (e) {
-                    lastErr = e;
-                    console.warn(`[add-phone] ${phoneNumber} 收码失败: ${(e && e.message) || e}`);
+                    const error = asPhoneOtpError(e);
+                    lastErr = error;
+                    console.warn(`[add-phone] ${phoneNumber} 收码失败: ${error.message}`);
                     break; // 收不到码 → 跳出换号
                 }
                 lastCode = code;
@@ -698,8 +709,9 @@ export class OpenAIClient {
                     continueURL = await this.validatePhone(code);
                     validated = true;
                 } catch (e) {
-                    lastErr = e;
-                    const invalidOtp = /Invalid OTP|invalid_input|invalid.*(otp|code)/i.test((e && e.message) || "");
+                    const error = asPhoneOtpError(e);
+                    lastErr = error;
+                    const invalidOtp = /Invalid OTP|invalid_input|invalid.*(otp|code)/i.test(error.message);
                     if (invalidOtp && vtry < 2) {
                         console.warn(`[add-phone] 验证码 ${code} 被 OpenAI 拒(疑旧短信残留)，等新码重试(${vtry + 1}/3)…`);
                         continue;
@@ -708,7 +720,11 @@ export class OpenAIClient {
                 }
             }
             if (validated) {
-                await this.smsBroker.markAsSucceed?.();
+                try {
+                    await this.smsBroker.markAsSucceed();
+                } catch (error) {
+                    console.warn(`[add-phone] ${phoneNumber} 已验证，但接码状态收尾失败: ${asPhoneOtpError(error).message}`);
+                }
                 return continueURL;
             }
             // 此号验证失败(码错/收不到真码) → 标坏号 + 换池里下一个号【重新 add-phone】,利用剩余号(不是一次失败就放弃)
@@ -1310,7 +1326,7 @@ export class OpenAIClient {
         if (!response.ok) {
             const err = new Error(
               `SendPhoneOtp请求失败(HTTP ${response.status}): ${await this.formatErrorResponse(response)}`,
-            );
+            ) as PhoneOtpError;
             // 4xx(非429)= OpenAI 明确拒号(已用过/黑名单/无效) → 该号作废换新号；
             // 429限流 / 5xx服务端错 = 临时问题，非号本身问题 → 号应保留可重用(省接码费)。
             err.phoneRejected = response.status >= 400 && response.status < 500 && response.status !== 429;

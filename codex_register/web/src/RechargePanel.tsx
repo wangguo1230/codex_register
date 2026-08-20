@@ -1,16 +1,20 @@
 import {useEffect, useState, useMemo, useRef, type Dispatch, type SetStateAction} from "react";
 import {api, connectStream, type Account, type RebindGmailPoolItem, type RechargeCard, type RechargeCardStats, type RechargeQueueItem, type RechargeQueueStats} from "./api";
+import {filterRechargeQueue} from "./recharge-queue-filter";
 
-const p2 = (n: number) => String(n).padStart(2, "0");
+const BJ_TIME_FORMATTERS = {
+    minute: new Intl.DateTimeFormat("en-CA", {
+        timeZone: "Asia/Shanghai",
+        month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false,
+    }),
+    second: new Intl.DateTimeFormat("en-CA", {
+        timeZone: "Asia/Shanghai",
+        month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false,
+    }),
+};
 /** 北京时间固定 Asia/Shanghai，不跟浏览器本地时区 */
 const fmtBjParts = (ts: number, withSec = false) => {
-    const parts = new Intl.DateTimeFormat("en-CA", {
-        timeZone: "Asia/Shanghai",
-        month: "2-digit", day: "2-digit",
-        hour: "2-digit", minute: "2-digit",
-        second: withSec ? "2-digit" : undefined,
-        hour12: false,
-    }).formatToParts(new Date(ts));
+    const parts = BJ_TIME_FORMATTERS[withSec ? "second" : "minute"].formatToParts(new Date(ts));
     const g = (t: string) => parts.find((p) => p.type === t)?.value || "00";
     return withSec
         ? `${g("month")}-${g("day")} ${g("hour")}:${g("minute")}:${g("second")}`
@@ -33,6 +37,7 @@ const TASK_COLOR: Record<string, string> = {pending: "#6b7280", leased: "#2563eb
 const EMPTY_Q: RechargeQueueStats = {pending: 0, paired: 0, submitting: 0, submitted: 0, done: 0, error: 0, total: 0, undelivered: 0, delivered: 0, failed: 0, working: 0, ready: 0};
 const TEST_SEND_TO = "wangguodong194@163.com";
 const EMPTY_C: RechargeCardStats = {unused: 0, paired: 0, submitting: 0, submitted: 0, done: 0, error: 0, total: 0};
+type RechargeLogEntry = {ts: number; line: string};
 
 /** 官方 24h 换绑上限还剩多久解禁，<=0 表示没在冷却 */
 function rebindCooldownLeft(q: RechargeQueueItem): number {
@@ -90,6 +95,9 @@ export function RechargePanel({notify}: {notify?: (m: string, ms?: number) => vo
     const [qSel, setQSel] = useState<Set<number>>(new Set());
     const [qFilter, setQFilter] = useState("all");
     const [qBatchFilter, setQBatchFilter] = useState("");
+    const [qMailboxType, setQMailboxType] = useState("");
+    const [qRebindFilter, setQRebindFilter] = useState("");
+    const [qEmailFilter, setQEmailFilter] = useState("");
     const [qBatches, setQBatches] = useState<{name: string; n: number}[]>([]);
     // 卡密
     const [cards, setCards] = useState<RechargeCard[]>([]);
@@ -101,10 +109,12 @@ export function RechargePanel({notify}: {notify?: (m: string, ms?: number) => vo
     const [configKey, setConfigKey] = useState("");
     const [configIp, setConfigIp] = useState("");
     const [configConcurrency, setConfigConcurrency] = useState(3);
+    const [configRebindConcurrency, setConfigRebindConcurrency] = useState(3);
     const [configInterval, setConfigInterval] = useState(3);
     const [configRtProxy, setConfigRtProxy] = useState("");
     const [configRtConcurrency, setConfigRtConcurrency] = useState(4);
     const [configRebindAfterPaid, setConfigRebindAfterPaid] = useState<"off" | "gmail" | "mailcom">("gmail");
+    const [configRebindGmailProbeLogin, setConfigRebindGmailProbeLogin] = useState(false);
     const [gmailFreeImap, setGmailFreeImap] = useState(0);
     const [mailcomFree, setMailcomFree] = useState(0);
     const [hasKey, setHasKey] = useState(false);
@@ -121,6 +131,7 @@ export function RechargePanel({notify}: {notify?: (m: string, ms?: number) => vo
     const [pickerSel, setPickerSel] = useState<Set<number>>(new Set());
     const [rechargeBatch, setRechargeBatch] = useState("");
     const [rechargeGrpNew, setRechargeGrpNew] = useState("");
+    const [inheritSourceBatch, setInheritSourceBatch] = useState(true);
     const [queueGroups, setQueueGroups] = useState<{name: string; n: number}[]>([]);
     const [showSetBatch, setShowSetBatch] = useState(false);
     const [batchInput, setBatchInput] = useState("");
@@ -149,9 +160,16 @@ export function RechargePanel({notify}: {notify?: (m: string, ms?: number) => vo
     const [batchRtRunning, setBatchRtRunning] = useState(false);
     // 状态
     const [busy, setBusy] = useState(false);
-    const [logs, setLogs] = useState<{ts: number; line: string}[]>([]);
+    const [logs, setLogs] = useState<RechargeLogEntry[]>([]);
+    const [detailItem, setDetailItem] = useState<RechargeQueueItem | null>(null);
+    const [detailLogs, setDetailLogs] = useState<RechargeLogEntry[]>([]);
+    const [detailLoading, setDetailLoading] = useState(false);
+    const detailItemRef = useRef<RechargeQueueItem | null>(null);
+    const detailRequestRef = useRef(0);
+    detailItemRef.current = detailItem;
     const logBoxRef = useRef<HTMLDivElement>(null);
     const logStickBottomRef = useRef(true);
+    const streamConnectedRef = useRef(false);
     const [showRebindGmail, setShowRebindGmail] = useState(false);
     const [rebindIds, setRebindIds] = useState<number[]>([]);
     /** 验证区分组；换绑只从「换绑池」ready 列表选 */
@@ -183,11 +201,13 @@ export function RechargePanel({notify}: {notify?: (m: string, ms?: number) => vo
         api.rechargeQueueBatches(d).then(setQBatches).catch(() => {});
     };
     const loadCards = () => api.rechargeCards().then((r) => { setCards(r.list); setCStats(r.stats); }).catch(() => {});
-    const applyRebindCounts = (c: {gmailFreeImap?: number; mailcomFree?: number; rebindAfterPaid?: string; rebindGmailAfterPaid?: boolean}) => {
+    const applyRebindCounts = (c: {gmailFreeImap?: number; mailcomFree?: number; rebindAfterPaid?: string; rebindGmailAfterPaid?: boolean; rebindGmailProbeLogin?: boolean; rebindConcurrency?: number}) => {
         if (typeof c.gmailFreeImap === "number") setGmailFreeImap(c.gmailFreeImap);
         if (typeof c.mailcomFree === "number") setMailcomFree(c.mailcomFree);
         if (c.rebindAfterPaid === "off" || c.rebindAfterPaid === "gmail" || c.rebindAfterPaid === "mailcom") setConfigRebindAfterPaid(c.rebindAfterPaid);
         else if (typeof c.rebindGmailAfterPaid === "boolean") setConfigRebindAfterPaid(c.rebindGmailAfterPaid ? "gmail" : "off");
+        if (typeof c.rebindGmailProbeLogin === "boolean") setConfigRebindGmailProbeLogin(c.rebindGmailProbeLogin);
+        if (Number.isFinite(Number(c.rebindConcurrency)) && Number(c.rebindConcurrency) > 0) setConfigRebindConcurrency(Math.floor(Number(c.rebindConcurrency)));
     };
     const applyJobs = (j?: {submit?: boolean; reloginSubmit?: boolean; relogin?: boolean; exportRt?: boolean}) => {
         if (!j) return;
@@ -195,8 +215,46 @@ export function RechargePanel({notify}: {notify?: (m: string, ms?: number) => vo
         setJobReloginSubmit(!!(j.reloginSubmit || j.relogin));
         setExportRtRunning(!!j.exportRt);
     };
-    const loadConfig = () => api.rechargeConfig().then((c) => { setConfigBase(c.baseUrl); setConfigAppId(c.appId || ""); setConfigKey(c.apiKey); setConfigIp(c.forwardIp); setConfigConcurrency(c.concurrency || 3); setConfigInterval(c.interval || 3); setConfigRtProxy(c.rtProxy || ""); setConfigRtConcurrency(c.rtConcurrency || 4); applyRebindCounts(c); setHasKey(!!c.hasKey); setInstanceId(c.instanceId || ""); applyJobs(c.jobs); }).catch(() => {});
+    const refreshJobs = () => api.rechargeJobs().then(applyJobs).catch(() => {});
+    const loadConfig = () => api.rechargeConfig().then((c) => { setConfigBase(c.baseUrl); setConfigAppId(c.appId || ""); setConfigKey(c.apiKey); setConfigIp(c.forwardIp); setConfigConcurrency(c.concurrency || 3); setConfigRebindConcurrency(c.rebindConcurrency || 3); setConfigInterval(c.interval ?? 3); setConfigRtProxy(c.rtProxy || ""); setConfigRtConcurrency(c.rtConcurrency || 4); applyRebindCounts(c); setHasKey(!!c.hasKey); setInstanceId(c.instanceId || ""); applyJobs(c.jobs); }).catch(() => {});
     const loadLogs = () => api.rechargeLogs().then((rows) => setLogs(Array.isArray(rows) ? rows.slice(-500) : [])).catch(() => {});
+    const detailLogKeys = (item: RechargeQueueItem) => {
+        const card = String(item.card_code || "").trim();
+        return [...new Set([
+            item.email,
+            item.rebind_from,
+            item.rebind_email,
+            item.rebind_attempt_email,
+            item.task_no,
+            card,
+            card.length >= 8 ? card.slice(0, 8) : "",
+        ].map((value) => String(value || "").trim()).filter((value) => value.length >= 3))];
+    };
+    const refreshDetailLogs = async (item: RechargeQueueItem) => {
+        const requestId = ++detailRequestRef.current;
+        setDetailLoading(true);
+        try {
+            const rows = await api.rechargeLogs();
+            if (requestId !== detailRequestRef.current) return;
+            const keys = detailLogKeys(item);
+            setDetailLogs((Array.isArray(rows) ? rows : []).filter((entry) => {
+                const line = String(entry?.line || "");
+                return keys.some((key) => line.includes(key));
+            }));
+        } catch (error: any) {
+            if (requestId === detailRequestRef.current) {
+                setDetailLogs([]);
+                toast(`读取详细日志失败: ${error?.message || error}`);
+            }
+        } finally {
+            if (requestId === detailRequestRef.current) setDetailLoading(false);
+        }
+    };
+    const openDetailLogs = (item: RechargeQueueItem) => {
+        setDetailItem(item);
+        setDetailLogs([]);
+        void refreshDetailLogs(item);
+    };
 
     useEffect(() => {
         loadQueue(); loadCards(); loadConfig(); loadLogs();
@@ -204,16 +262,22 @@ export function RechargePanel({notify}: {notify?: (m: string, ms?: number) => vo
             if (ev === "rechargeQueue") {
                 setQStats(data.stats || EMPTY_Q);
                 if (deliveryTabRef.current === "undelivered") setQueue(data.list || []);
+                else loadQueue();
             }
             if (ev === "recharge") { setCards(data.list || []); setCStats(data.stats || EMPTY_C); }
             if (ev === "rechargeLog") {
                 setLogs((prev) => [...prev.slice(-500), data]);
+                const currentDetail = detailItemRef.current;
+                if (currentDetail && detailLogKeys(currentDetail).some((key) => String(data?.line || "").includes(key))) {
+                    setDetailLogs((prev) => prev.some((entry) => entry.ts === data.ts && entry.line === data.line) ? prev : [...prev, data]);
+                }
                 if (/^换绑 [✓✗]/.test(String(data?.line || ""))) loadConfig();
             }
             if (ev === "batchRtAcquire") { setBatchRtResults(data.results.map((r: any) => ({...r, status: r.status || "done"}))); if (data.done) setBatchRtRunning(false); }
             if (ev === "rechargeJobs") applyJobs(data);
             if (ev === "rechargeExportReady") {
                 setExportRtRunning(false);
+                void refreshJobs();
                 if (data?.stopped) toast("导出已停止");
                 else if (data?.format === "sub2json" && data?.text) {
                     const n = Number(data.ok) || 0;
@@ -236,11 +300,15 @@ export function RechargePanel({notify}: {notify?: (m: string, ms?: number) => vo
                 setTestSendResult(line);
                 toast(data?.ok ? `测试邮件已发 ${data.sent} 封` : (data?.error || line), 6000);
             }
-        });
+        }, (connected) => { streamConnectedRef.current = connected; });
         // SSE 重连会丢中间事件；换绑卡在 mail.com 时也要靠轮询把磁盘日志刷出来
         const poll = setInterval(() => {
-            loadLogs();
-            loadQueue();
+            // 任务状态是轻量内存状态；即使 SSE 丢了完成事件，也不能让停止按钮永久残留。
+            refreshJobs();
+            if (!streamConnectedRef.current) {
+                loadLogs();
+                loadQueue();
+            }
             if (!testSendBusyRef.current) return;
             api.rechargeTestSendStatus().then((s) => {
                 if (!testSendBusyRef.current || s.running || !s.finishedAt) return;
@@ -282,20 +350,22 @@ export function RechargePanel({notify}: {notify?: (m: string, ms?: number) => vo
 
     // 队列筛选
     const filteredQueue = useMemo(() => {
-        return queue.filter((q) => {
-            if (qFilter === "undone") { if (q.status === "done" || q.status === "error") return false; }
-            else if (qFilter === "finished" || qFilter === "done") { if (q.status !== "done") return false; }
-            else if (qFilter !== "all" && q.status !== qFilter) return false;
-            if (qBatchFilter && (q.batch || "") !== qBatchFilter) return false;
-            return true;
+        return filterRechargeQueue(queue, {
+            status: qFilter,
+            batch: qBatchFilter,
+            mailboxType: qMailboxType,
+            rebind: qRebindFilter,
+            email: qEmailFilter,
         });
-    }, [queue, qFilter, qBatchFilter]);
+    }, [queue, qFilter, qBatchFilter, qMailboxType, qRebindFilter, qEmailFilter]);
 
     const toggleQSel = (id: number) => setQSel((s) => { const n = new Set(s); n.has(id) ? n.delete(id) : n.add(id); return n; });
-    const fqIds = filteredQueue.map((q) => q.id);
+    const fqIds = useMemo(() => filteredQueue.map((q) => q.id), [filteredQueue]);
+    const fqIdSet = useMemo(() => new Set(fqIds), [fqIds]);
+    const selectedQueueIds = useMemo(() => [...qSel].filter((id) => fqIdSet.has(id)), [qSel, fqIdSet]);
     const allQSel = fqIds.length > 0 && fqIds.every((id) => qSel.has(id));
     const toggleAllQ = () => setQSel(allQSel ? new Set() : new Set(fqIds));
-    const selQIds = () => [...qSel].filter((id) => filteredQueue.some((q) => q.id === id));
+    const selQIds = () => selectedQueueIds;
 
     // 卡密列表(简化显示)
     const toggleCSel = (id: number) => setCSel((s) => { const n = new Set(s); n.has(id) ? n.delete(id) : n.add(id); return n; });
@@ -304,7 +374,7 @@ export function RechargePanel({notify}: {notify?: (m: string, ms?: number) => vo
     const doSaveConfig = async () => {
         setBusy(true);
         try {
-            const body: any = {baseUrl: configBase, appId: configAppId, forwardIp: configIp, concurrency: configConcurrency, interval: configInterval, rtProxy: configRtProxy, rtConcurrency: configRtConcurrency, rebindAfterPaid: configRebindAfterPaid};
+            const body: any = {baseUrl: configBase, appId: configAppId, forwardIp: configIp, concurrency: configConcurrency, rebindConcurrency: configRebindConcurrency, interval: configInterval, rtProxy: configRtProxy, rtConcurrency: configRtConcurrency, rebindAfterPaid: configRebindAfterPaid, rebindGmailProbeLogin: configRebindGmailProbeLogin};
             if (configKey && !configKey.includes("****")) body.apiKey = configKey;
             await api.setRechargeConfig(body);
             loadConfig(); toast("配置已保存"); setShowConfig(false);
@@ -345,7 +415,18 @@ export function RechargePanel({notify}: {notify?: (m: string, ms?: number) => vo
         } catch (e: any) { toast("获取账号列表失败: " + e.message); }
     };
 
-    const resolvedEnqueueGrp = () => (rechargeGrpNew.trim() || rechargeBatch.trim());
+    const selectedSourceBatches = useMemo(() => [...new Set(
+        [...pickerSel]
+            .map((id) => accounts.find((account) => account.id === id)?.batch || "")
+            .map((batch) => String(batch).trim())
+            .filter(Boolean),
+    )].sort(), [accounts, pickerSel]);
+    const inheritedSourceBatch = pickerBatch.trim() || (selectedSourceBatches.length === 1 ? selectedSourceBatches[0] : "");
+    const resolvedEnqueueGrp = () => (
+        rechargeGrpNew.trim()
+        || rechargeBatch.trim()
+        || (inheritSourceBatch ? inheritedSourceBatch : "")
+    );
 
     const pickerBatches = useMemo(() => {
         const map = new Map<string, number>();
@@ -396,7 +477,10 @@ export function RechargePanel({notify}: {notify?: (m: string, ms?: number) => vo
         const pick = ids && ids.length ? ids : [...pickerSel];
         if (!pick.length) return;
         const grp = resolvedEnqueueGrp();
-        if (!confirm(`确认将 ${pick.length} 个账号加入充值队列?\n分组：${grp || "（无分组）"}\n这些账号将在 GPT 面板中标记为已售出。`)) return;
+        const groupSource = rechargeGrpNew.trim() || rechargeBatch.trim()
+            ? "手工指定充值分组"
+            : grp ? "继承账号来源批次" : "未设置充值分组";
+        if (!confirm(`确认将 ${pick.length} 个账号加入充值队列?\n充值/交付分组：${grp || "（无分组）"}\n分组来源：${groupSource}\n这些账号将在 GPT 面板中标记为已售出。`)) return;
         setBusy(true); setShowPicker(false);
         try {
             const r = await api.addToRechargeQueue(pick, grp);
@@ -438,7 +522,7 @@ export function RechargePanel({notify}: {notify?: (m: string, ms?: number) => vo
         if (!ids.length) { toast("请先选择队列项"); return; }
         try {
             await api.setRechargeQueueBatch(ids, batchInput);
-            setShowSetBatch(false); loadQueue(); toast("批次已设置");
+            setShowSetBatch(false); loadQueue(); toast("充值/交付分组已设置");
         } catch (e: any) { toast("设置失败: " + e.message); }
     };
 
@@ -459,7 +543,13 @@ export function RechargePanel({notify}: {notify?: (m: string, ms?: number) => vo
     const doReset = async () => {
         const ids = selQIds();
         if (!ids.length) { toast("请先选择队列项"); return; }
-        try { await api.resetRechargeQueue(ids); setQSel(new Set()); loadQueue(); toast("已重置为待提交"); } catch (e: any) { toast(e.message); }
+        try {
+            const result = await api.resetRechargeQueue(ids);
+            setQSel(new Set());
+            loadQueue();
+            loadCards();
+            toast(`已重置 ${result.reset ?? 0} 项${result.skipped ? `，跳过 ${result.skipped} 项（保留待核对）` : ""}`);
+        } catch (e: any) { toast(e.message); }
     };
     const doMarkError = async (ids?: number[]) => {
         const pick = ids && ids.length ? ids : selQIds();
@@ -475,14 +565,35 @@ export function RechargePanel({notify}: {notify?: (m: string, ms?: number) => vo
         } catch (e: any) { toast(e.message); }
     };
     const doStop = async () => { try { await api.stopRecharge(); toast("已请求停止提交"); } catch (e: any) { toast(e.message); } };
+    const doRecover = async () => {
+        const ids = selQIds();
+        if (!ids.length) { toast("请先选择要恢复的队列项"); return; }
+        const picked = queue.filter((item) => ids.includes(item.id));
+        const leased = picked.filter((item) => item.instance_id || item.rebind_instance).length;
+        if (!confirm(
+            `人工恢复选中的 ${ids.length} 项${leased ? `（检测到租约 ${leased} 项）` : ""}？\n`
+            + "paired 会在队列与卡密状态一致时安全解配；submitting/submitted 不会回退，恢复后请点“刷新状态”；换绑停在 verify 会转为“待核对”。",
+        )) return;
+        setBusy(true);
+        try {
+            const result = await api.recoverRecharge(ids);
+            toast(`恢复完成：租约 ${result.rechargeLeases}，解配 ${result.pairedReset}，保留待对账 ${result.preserved}，换绑租约 ${result.rebindLeases}${result.rebindUnknown ? `，待核对 ${result.rebindUnknown}` : ""}${result.review ? `，需人工检查 ${result.review}` : ""}${result.activeSkipped ? `，跳过其他活实例 ${result.activeSkipped}` : ""}`);
+            loadQueue();
+            loadCards();
+        } catch (e: any) {
+            toast(e.message);
+        } finally {
+            setBusy(false);
+        }
+    };
     const doRelogin = async () => {
         const ids = selQIds();
         if (!ids.length) { toast("请先选择队列项"); return; }
-        if (!confirm(`确认对 ${ids.length} 个账号「重新登录并提交」？\n由本机执行。会重新登录、查卡密、用原卡密再提。\n卡密若已被消费会跳过，避免重复扣卡。`)) return;
+        if (!confirm(`确认对 ${ids.length} 个账号「重新登录并提交」？\n任务会进入分布式队列，由各实例按并发自动分片执行。\n会重新登录、查卡密、用原卡密再提；卡密若已被消费会跳过，避免重复扣卡。`)) return;
         try {
             const r = await api.rechargeQueueReloginSubmit(ids);
             setJobReloginSubmit(true);
-            toast(`本机开始重新登录并提交 ${r.claimed ?? r.count} 个${r.skipped ? `，${r.skipped} 个已被其他实例占用` : ""}，进度见日志`);
+            toast(`已入队重新登录并提交 ${r.claimed ?? r.count} 个${r.skipped ? `，跳过 ${r.skipped} 个` : ""}，各实例会自动分片执行`);
         } catch (e: any) { toast(e.message); }
     };
     const doStopRelogin = async () => { try { await api.stopRechargeQueueRelogin(); toast("已请求停止重新提交"); } catch (e: any) { toast(e.message); } };
@@ -503,12 +614,20 @@ export function RechargePanel({notify}: {notify?: (m: string, ms?: number) => vo
         });
         if (selected.length && !pollable.length) {
             const q = queue.find((x) => selected.includes(x.id));
+            loadQueue();
             toast(q && !q.card_code ? `${q.email} 仍是待提交、没有卡密，刷新不到平台状态` : "选中项无需刷新");
             return;
         }
         setBusy(true);
-        try { const r = await api.pollRecharge(selected.length ? pollable : undefined); toast(`已刷新 ${r.updated} 个任务状态`); loadQueue(); }
-        catch (e: any) { toast(e.message); } finally { setBusy(false); }
+        try {
+            const r = await api.pollRecharge(selected.length ? pollable : undefined);
+            toast(`已刷新 ${r.updated} 个任务状态`);
+        } catch (e: any) {
+            toast(e.message);
+        } finally {
+            loadQueue();
+            setBusy(false);
+        }
     };
     const doSetRebindAfterPaid = async (v: "off" | "gmail" | "mailcom") => {
         const prev = configRebindAfterPaid;
@@ -539,6 +658,7 @@ export function RechargePanel({notify}: {notify?: (m: string, ms?: number) => vo
      * 打开换绑 Gmail 弹窗。
      * - 可不勾选充值队列：只管理验证区 / 迁入换绑池（独立 Gmail，不需要 GPT 队列项）
      * - 勾选了已付费队列项：可同时「确认换绑」把池里的 Gmail 绑到这些号上
+     * - 已交付页签：允许人工补做 Gmail 换绑，不改变交付状态
      */
     const openRebindGmail = async (ids?: number[]) => {
         const pick = ids && ids.length ? ids : selQIds();
@@ -565,7 +685,10 @@ export function RechargePanel({notify}: {notify?: (m: string, ms?: number) => vo
         const label = target === "mailcom" ? "mail.com" : "Gmail";
         setBusy(true);
         try {
-            const r = await api.rebindGmail(ids, target, opts);
+            const r = await api.rebindGmail(ids, target, {
+                ...(opts || {}),
+                ...(target === "gmail" && isDeliveredTab ? {allowDelivered: true} : {}),
+            });
             applyRebindCounts(r);
             const skip = (r.skipped || []).map((s) => `${s.email}: ${s.reason}`).join("；");
             toast(`换绑 ${label} 已排队 ${r.queued} 个${skip ? `，跳过 ${r.skipped.length}（${skip}）` : ""}`);
@@ -634,7 +757,7 @@ export function RechargePanel({notify}: {notify?: (m: string, ms?: number) => vo
             loadRebindPool().then((next) => refreshStageGrp(next.groups, next.staging)).catch(() => {});
         }, 1500);
         try {
-            const r = await api.migrateToRebindGmailPool(ids);
+            const r = await api.migrateToRebindGmailPool(ids, {concurrency: configRebindConcurrency});
             applyRebindCounts(r);
             const rej = r.skipped?.length || 0;
             toast(rej
@@ -753,13 +876,17 @@ export function RechargePanel({notify}: {notify?: (m: string, ms?: number) => vo
         }
         return {email: "", password: "", rt: ""};
     };
-    /** 从勾选队列项（或当前批次）拉取 email----gpt密码----rt，Gmail 用 gpt_password */
+    /** 从勾选队列项（否则当前筛选结果）拉取 email----gpt密码----rt，Gmail 用 gpt_password */
     const fillSub2jsonFromSelection = async (opts?: {silent?: boolean}) => {
-        const ids = selQIds();
+        const picked = selQIds();
+        const ids = picked.length ? picked : filteredQueue.map((item) => item.id);
+        if (!ids.length) {
+            if (!opts?.silent) toast("当前筛选没有可填充账号");
+            return false;
+        }
         try {
             const r = await api.exportRechargeQueue({
-                ids: ids.length ? ids : undefined,
-                batch: !ids.length && qBatchFilter ? qBatchFilter : undefined,
+                ids,
                 format: "sub2json",
             });
             if (!r.text) {
@@ -773,7 +900,7 @@ export function RechargePanel({notify}: {notify?: (m: string, ms?: number) => vo
             const total = r.total ?? r.text.split("\n").filter(Boolean).length;
             if (!opts?.silent) {
                 if (miss > 0) toast(`已填充 ${total} 行（有 RT ${withRt}，缺 RT ${miss}；缺 RT 请先「批量获取RT」）`);
-                else toast(`已从${ids.length ? `勾选 ${ids.length} 项` : qBatchFilter ? `批次 ${qBatchFilter}` : "队列"}填充 ${total} 行`);
+                else toast(`已从${picked.length ? `勾选 ${picked.length} 项` : `当前筛选 ${ids.length} 项`}填充 ${total} 行`);
             }
             return true;
         } catch (e: any) {
@@ -784,8 +911,7 @@ export function RechargePanel({notify}: {notify?: (m: string, ms?: number) => vo
     const openSub2json = async () => {
         setShowSub2json(true);
         setSub2jsonResults([]);
-        const ids = selQIds();
-        if (ids.length || qBatchFilter) {
+        if (selQIds().length || filteredQueue.length) {
             await fillSub2jsonFromSelection({silent: false});
         }
     };
@@ -805,34 +931,50 @@ export function RechargePanel({notify}: {notify?: (m: string, ms?: number) => vo
         const picked = selQIds();
         const ids = picked.length ? picked : filteredQueue.map((q) => q.id);
         if (!ids.length) { toast("请先勾选账号，或当前列表不能为空"); return; }
-        const conc = Math.max(1, Math.min(20, Number(configRtConcurrency || sub2jsonConc) || 4));
+        const conc = Math.max(1, Math.floor(Number(configRtConcurrency || sub2jsonConc) || 4));
         if (!confirm(`导出 ${ids.length} 个账号的 sub2json？\n缺 RT 的会先按并发 ${conc} 获取，再刷新 token，最后下一个 JSON。`)) return;
+        setExportRtRunning(true);
         try {
             const r = await api.exportRechargeSub2json({ids, concurrency: conc});
             if (r.async) {
                 setExportRtRunning(true);
+                void refreshJobs();
                 toast(`已开始 ${r.total} 个（缺 RT ${r.needRt || 0}，并发 ${r.concurrency}），完成后自动下载`, 6000);
+            } else {
+                setExportRtRunning(false);
             }
-        } catch (e: any) { toast("导出失败: " + (e?.message || e)); }
+        } catch (e: any) {
+            setExportRtRunning(false);
+            void refreshJobs();
+            toast("导出失败: " + (e?.message || e));
+        }
     };
     const doExport = async (format: "account" | "full" | "card" | "session", opts?: {relogin?: boolean}) => {
-        const ids = selQIds();
+        const picked = selQIds();
+        const ids = picked.length ? picked : filteredQueue.map((item) => item.id);
+        if (!ids.length) { toast("当前筛选没有可导出账号"); return; }
+        setExportRtRunning(true);
         try {
             const r = await api.exportRechargeQueue({
-                ids: ids.length ? ids : undefined,
-                batch: qBatchFilter || undefined,
+                ids,
                 format,
                 relogin: !!opts?.relogin,
             });
             if (r.text) {
+                setExportRtRunning(false);
                 await deliverExportText(r.text, format);
             } else if (r.async) {
                 setExportRtRunning(true);
+                void refreshJobs();
                 toast(opts?.relogin
                     ? `正在重登取 RT（${r.needRt} 个），完成后自动复制/下载`
                     : `${r.needRt} 个账号缺少 RT，正在自动获取，完成后自动复制/下载`, 6000);
             }
-        } catch (e: any) { toast("导出失败: " + e.message); }
+        } catch (e: any) {
+            setExportRtRunning(false);
+            void refreshJobs();
+            toast("导出失败: " + e.message);
+        }
     };
     const openTestSend = async () => {
         let ids = selQIds();
@@ -864,7 +1006,7 @@ export function RechargePanel({notify}: {notify?: (m: string, ms?: number) => vo
             return;
         }
         if (!testSendTo.trim()) { toast("请填写测试收件人"); return; }
-        if (!confirm(`确认向 ${testSendTo.trim()} 发送 ${sendable.length} 封测试信？\n换绑号走原 mail.com。\n一封大约 1 分钟，点完立刻返回，进度看充值日志。`)) return;
+        if (!confirm(`确认向 ${testSendTo.trim()} 发送 ${sendable.length} 封测试信？\n换绑号走原 mail.com SMTP 协议。\n任务会后台执行，进度看充值日志。`)) return;
         setTestSendBusy(true);
         setTestSendResult(`已排队 ${sendable.length} 封，后台登录发送中…`);
         toast("已开始发测试信，看充值日志", 6000);
@@ -892,9 +1034,11 @@ export function RechargePanel({notify}: {notify?: (m: string, ms?: number) => vo
         } catch (e: any) { toast(e.message); }
     };
     const doProbePlan = async () => {
-        const ids = selQIds();
+        const picked = selQIds();
+        const ids = picked.length ? picked : filteredQueue.map((item) => item.id);
+        if (!ids.length) { toast("当前筛选没有可查询账号"); return; }
         try {
-            const r = await api.probePlan(ids.length ? ids : undefined, qBatchFilter || undefined);
+            const r = await api.probePlan(ids);
             toast(`查询套餐: ${r.count} 个账号`);
         } catch (e: any) { toast("查询失败: " + e.message); }
     };
@@ -984,9 +1128,15 @@ export function RechargePanel({notify}: {notify?: (m: string, ms?: number) => vo
                             <input value={configRtProxy} onChange={(e) => setConfigRtProxy(e.target.value)}
                                    placeholder="socks5://... 或留空"
                                    className="w-full px-2 py-1.5 text-sm border rounded outline-none font-mono"/></label>
+                        <label className="block"><span className="text-xs text-gray-500 mb-1 block">充值提交并发数</span>
+                            <input type="number" value={configConcurrency} onChange={(e) => setConfigConcurrency(Math.max(1, Math.floor(Number(e.target.value) || 3)))}
+                                   min={1} className="w-full px-2 py-1.5 text-sm border rounded outline-none"/></label>
+                        <label className="block"><span className="text-xs text-gray-500 mb-1 block">Gmail 换绑并发数</span>
+                            <input type="number" value={configRebindConcurrency} onChange={(e) => setConfigRebindConcurrency(Math.max(1, Math.floor(Number(e.target.value) || 3)))}
+                                   min={1} className="w-full px-2 py-1.5 text-sm border rounded outline-none"/></label>
                         <label className="block"><span className="text-xs text-gray-500 mb-1 block">RT 并发数</span>
-                            <input type="number" value={configRtConcurrency} onChange={(e) => setConfigRtConcurrency(Math.max(1, Math.min(20, Number(e.target.value) || 4)))}
-                                   min={1} max={20} className="w-full px-2 py-1.5 text-sm border rounded outline-none"/></label>
+                            <input type="number" value={configRtConcurrency} onChange={(e) => setConfigRtConcurrency(Math.max(1, Math.floor(Number(e.target.value) || 4)))}
+                                   min={1} className="w-full px-2 py-1.5 text-sm border rounded outline-none"/></label>
                         <label className="block col-span-2">
                             <span className="text-xs text-gray-500 mb-1 block">平台回 paid 后换绑（不在点提交时换；旧邮箱标已售、不返还）</span>
                             <select value={configRebindAfterPaid} onChange={(e) => setConfigRebindAfterPaid(e.target.value as "off" | "gmail" | "mailcom")}
@@ -995,6 +1145,14 @@ export function RechargePanel({notify}: {notify?: (m: string, ms?: number) => vo
                                 <option value="gmail">换绑空闲 Gmail（需已开 IMAP）</option>
                                 <option value="mailcom">换绑空闲 mail.com</option>
                             </select>
+                        </label>
+                        <label className="flex items-center gap-2 col-span-2 text-xs text-gray-600">
+                            <input type="checkbox" checked={configRebindGmailProbeLogin}
+                                   onChange={(e) => setConfigRebindGmailProbeLogin(e.target.checked)}/>
+                            <span>
+                                Gmail 换绑前开启比特网页登录探活
+                                <span className="block text-[11px] text-gray-400">关闭时只依赖迁入换绑池时的 IMAP 校验，推荐关闭</span>
+                            </span>
                         </label>
                     </div>
                     <div className="flex justify-end">
@@ -1074,10 +1232,12 @@ export function RechargePanel({notify}: {notify?: (m: string, ms?: number) => vo
 
                 <div className="px-4 py-3 border-b flex items-center gap-2 flex-wrap">
                     <span className="text-sm font-semibold">{isDeliveredTab ? "已交付列表" : isReadyTab ? "可交付列表" : isFailedTab ? "失败列表" : "充值队列"}</span>
+                    <Btn onClick={() => { setShowSetBatch(true); setBatchInput(""); }} title="对当前页签选中的充值提交账号重新设置充值/交付分组">
+                        设置分组
+                    </Btn>
                     {isWorkingTab && (
                         <>
                             <Btn onClick={openPicker} className="bg-blue-600 text-white border-blue-600 hover:bg-blue-700">+ 选择账号入队</Btn>
-                            <Btn onClick={() => { setShowSetBatch(true); setBatchInput(""); }}>设置批次</Btn>
                             <Btn onClick={doReset}>重置</Btn>
                             <Btn onClick={() => doMarkError()} className="bg-white border-red-200 text-red-600 hover:bg-red-50" title="号进失败页，卡密放回未使用，方便换号再提；已充上的不动">标记失败</Btn>
                             <Btn onClick={doReclaimCards}>回收卡密</Btn>
@@ -1088,8 +1248,15 @@ export function RechargePanel({notify}: {notify?: (m: string, ms?: number) => vo
                             {jobSubmit && (
                                 <Btn onClick={doStop} className="bg-white border-red-200 text-red-600 hover:bg-red-50 animate-pulse" title="只停当前这批充值提交，不影响重新登录并提交">停止提交</Btn>
                             )}
+                            <Btn onClick={doRecover} disabled={!selQIds().length || jobSubmit || jobReloginSubmit || exportRtRunning}
+                                 title="人工释放崩溃残留租约；不会把可能已提交的平台任务退回重提">恢复残留</Btn>
                             <Btn onClick={doPoll}>刷新状态</Btn>
-                            <Btn onClick={() => doRebind("gmail")} title="对已付费项换绑 Gmail（mail.com→Gmail 或 Gmail→Gmail 均可）；迁入时探 IMAP，换绑领号时探网页登录">换绑 Gmail</Btn>
+                            <Btn
+                                onClick={() => doRebind("gmail")}
+                                title={configRebindGmailProbeLogin
+                                    ? "对已付费项换绑 Gmail（mail.com→Gmail 或 Gmail→Gmail 均可）；验证 IMAP 后额外探网页登录"
+                                    : "对已付费项换绑 Gmail（mail.com→Gmail 或 Gmail→Gmail 均可）；仅验证 IMAP，不探网页登录"}
+                            >换绑 Gmail</Btn>
                             <Btn onClick={() => doRebind("mailcom")} title="对已付费项手动换绑 mail.com；旧邮箱标已售">换绑 mail.com</Btn>
                             <Btn onClick={doRelogin} disabled={jobReloginSubmit || jobSubmit} title="重新登录后验卡，再用原卡密提交。卡密已消费会跳过。" className="bg-amber-500 text-white border-amber-500 hover:bg-amber-600">重新登录并提交</Btn>
                             {jobReloginSubmit && (
@@ -1117,6 +1284,7 @@ export function RechargePanel({notify}: {notify?: (m: string, ms?: number) => vo
                     {isDeliveredTab && (
                         <>
                             <Btn onClick={doUndeliver} className="bg-white border-blue-200 text-blue-700 hover:bg-blue-50">退回未交付</Btn>
+                            <Btn onClick={() => doRebind("gmail")} title="对已交付且已支付项人工换绑 Gmail">换绑 Gmail</Btn>
                             <button type="button" onClick={() => { void openTestSend(); }}
                                     className="px-3 py-1.5 rounded text-xs font-medium border bg-violet-600 text-white border-violet-600 hover:bg-violet-700">
                                 测试发送（原邮箱）
@@ -1125,11 +1293,11 @@ export function RechargePanel({notify}: {notify?: (m: string, ms?: number) => vo
                             <Btn onClick={doExportSub2json} disabled={exportRtRunning} className="bg-violet-600 text-white border-violet-600 hover:bg-violet-700" title="缺 RT 先按并发获取，再刷新 token，导出一个 sub2api JSON">
                                 导出 sub2json
                             </Btn>
-                            <label className="inline-flex items-center gap-1 text-xs text-gray-500" title="读充值配置里的 RT 并发数，1–20">
+                            <label className="inline-flex items-center gap-1 text-xs text-gray-500" title="读充值配置里的 RT 并发数">
                                 并发
-                                <input type="number" min={1} max={20} value={configRtConcurrency}
-                                       onChange={(e) => setConfigRtConcurrency(Math.max(1, Math.min(20, Number(e.target.value) || 4)))}
-                                       className="w-11 px-1 py-0.5 border rounded text-xs outline-none"/>
+                                <input type="number" min={1} value={configRtConcurrency}
+                                       onChange={(e) => setConfigRtConcurrency(Math.max(1, Math.floor(Number(e.target.value) || 4)))}
+                                       className="w-20 px-1 py-0.5 border rounded text-xs outline-none"/>
                             </label>
                             <div className="border-l mx-1 h-5"/>
                         </>
@@ -1151,8 +1319,10 @@ export function RechargePanel({notify}: {notify?: (m: string, ms?: number) => vo
                         <Btn onClick={async () => {
                             try {
                                 const r = await api.stopExportRt();
+                                if (!r.running) setExportRtRunning(false);
+                                else void refreshJobs();
                                 toast(r.running ? "已请求停止导出，当前这个号跑完就停" : "当前没有导出在跑");
-                            } catch (e: any) { toast(e.message); }
+                            } catch (e: any) { toast(e.message); void refreshJobs(); }
                         }} className="bg-white border-red-200 text-red-600 hover:bg-red-50 animate-pulse" title="停止正在进行的含 RT / sub2json 导出">
                             停止导出
                         </Btn>
@@ -1165,8 +1335,7 @@ export function RechargePanel({notify}: {notify?: (m: string, ms?: number) => vo
                         </>
                     )}
                     <div className="flex-1"/>
-                    {/* 筛选：已交付主要看批次；未交付看作业状态 */}
-                    <div className="flex items-center gap-1 text-xs">
+                    <div className="flex flex-wrap items-center justify-end gap-1 text-xs">
                         {isWorkingTab && [{k: "all", l: "全部", n: qStats.total}, {k: "undone", l: "未完成", n: qStats.pending + qStats.submitted},
                           {k: "pending", l: "待提交", n: qStats.pending},
                           {k: "submitted", l: "已提交", n: qStats.submitted},
@@ -1184,10 +1353,37 @@ export function RechargePanel({notify}: {notify?: (m: string, ms?: number) => vo
                         {qBatches.length > 0 && (
                             <select value={qBatchFilter} onChange={(e) => setQBatchFilter(e.target.value)}
                                     className="px-1.5 py-0.5 border rounded text-xs outline-none ml-1">
-                                <option value="">{isDeliveredTab || isReadyTab ? "全部分组" : "全部批次"}</option>
+                                <option value="">{isDeliveredTab || isReadyTab ? "全部充值/交付分组" : "全部充值批次"}</option>
                                 {qBatches.map((b) => <option key={b.name} value={b.name}>{b.name} ({b.n})</option>)}
                             </select>
                         )}
+                        <select value={qMailboxType} onChange={(e) => setQMailboxType(e.target.value)}
+                                className="px-1.5 py-0.5 border rounded text-xs outline-none">
+                            <option value="">全部邮箱类型</option>
+                            <option value="gmail">Gmail</option>
+                            <option value="mailcom">mail.com</option>
+                            <option value="icloud">iCloud</option>
+                            <option value="other">其他邮箱</option>
+                        </select>
+                        <select value={qRebindFilter} onChange={(e) => setQRebindFilter(e.target.value)}
+                                className="px-1.5 py-0.5 border rounded text-xs outline-none">
+                            <option value="">全部换绑状态</option>
+                            <option value="none">未换绑</option>
+                            <option value="ok">已换绑</option>
+                            <option value="pending">换绑中</option>
+                            <option value="unknown">待核对</option>
+                            <option value="fail">换绑失败</option>
+                            <option value="gmail">目标 Gmail</option>
+                            <option value="mailcom">目标 mail.com</option>
+                        </select>
+                        <input value={qEmailFilter} onChange={(e) => setQEmailFilter(e.target.value)}
+                               placeholder="筛当前/原/目标邮箱"
+                               className="w-48 px-2 py-0.5 border rounded text-xs font-mono outline-none focus:border-gray-500"/>
+                        {(qMailboxType || qRebindFilter || qEmailFilter) && (
+                            <button type="button" onClick={() => { setQMailboxType(""); setQRebindFilter(""); setQEmailFilter(""); }}
+                                    className="px-2 py-0.5 rounded border border-gray-200 bg-white text-gray-500 hover:bg-gray-50">清除</button>
+                        )}
+                        <span className="px-1 text-gray-400 tabular-nums">{filteredQueue.length}/{queue.length}</span>
                     </div>
                 </div>
 
@@ -1199,7 +1395,7 @@ export function RechargePanel({notify}: {notify?: (m: string, ms?: number) => vo
                                 <th className="text-left px-2 py-2 font-medium text-gray-500">当前邮箱</th>
                                 {isDeliveredTab && <th className="text-left px-2 py-2 font-medium text-gray-500">换绑记录</th>}
                                 <th className="text-left px-2 py-2 font-medium text-gray-500">套餐</th>
-                                <th className="text-left px-2 py-2 font-medium text-gray-500">{isDeliveredTab || isReadyTab ? "分组" : "批次"}</th>
+                                <th className="text-left px-2 py-2 font-medium text-gray-500">{isDeliveredTab || isReadyTab ? "充值/交付分组" : "充值批次"}</th>
                                 {isWorkingTab && <th className="text-left px-2 py-2 font-medium text-gray-500">实例</th>}
                                 <th className="text-left px-2 py-2 font-medium text-gray-500">状态</th>
                                 <th className="text-left px-2 py-2 font-medium text-gray-500">卡密</th>
@@ -1210,7 +1406,7 @@ export function RechargePanel({notify}: {notify?: (m: string, ms?: number) => vo
                                 <th className="text-left px-2 py-2 font-medium text-gray-500">任务状态</th>
                                 {(isWorkingTab || isReadyTab) && <th className="text-left px-2 py-2 font-medium text-gray-500">换绑</th>}
                                 <th className="text-left px-2 py-2 font-medium text-gray-500">消息</th>
-                                {(isWorkingTab || isFailedTab || isReadyTab) && <th className="text-left px-2 py-2 font-medium text-gray-500">操作</th>}
+                                {(isWorkingTab || isFailedTab || isReadyTab || isDeliveredTab) && <th className="text-left px-2 py-2 font-medium text-gray-500">操作</th>}
                             </tr>
                         </thead>
                         <tbody>
@@ -1228,12 +1424,15 @@ export function RechargePanel({notify}: {notify?: (m: string, ms?: number) => vo
                                         </td>
                                     )}
                                     <td className="px-2 py-1.5 text-gray-500">{q.plan_type || q.plan || "—"}</td>
-                                    <td className="px-2 py-1.5 text-gray-500">{q.batch || "—"}</td>
+                                    <td className="px-2 py-1.5 text-gray-500" title={`充值/交付分组: ${q.recharge_group || q.batch || "（无）"}\nGPT来源批次: ${q.source_batch || "（无）"}\n邮箱管理分组: ${q.mailbox_group || "（无）"}`}>
+                                        <div>{q.recharge_group || q.batch || "—"}</div>
+                                        {(q.source_batch || q.mailbox_group) && <div className="text-[10px] text-gray-400 truncate max-w-[180px]">来源 {q.source_batch || "—"} · 邮箱组 {q.mailbox_group || "—"}</div>}
+                                    </td>
                                     {isWorkingTab && (
-                                    <td className="px-2 py-1.5 text-xs font-mono" title={q.instance_id || ""}>
-                                        {!q.instance_id ? <span className="text-gray-300">—</span>
-                                            : q.instance_id === instanceId ? <span className="text-blue-600">本机</span>
-                                            : <span className="text-amber-600">{q.instance_id}</span>}
+                                    <td className="px-2 py-1.5 text-xs font-mono" title={[q.instance_id && `充值 ${q.instance_id}`, q.rebind_instance && `换绑 ${q.rebind_instance}`].filter(Boolean).join(" · ")}>
+                                        {!q.instance_id && !q.rebind_instance ? <span className="text-gray-300">—</span>
+                                            : q.instance_id === instanceId || q.rebind_instance === instanceId ? <span className="text-blue-600">本机{q.rebind_instance ? "·换绑" : ""}</span>
+                                            : <span className="text-amber-600">{q.instance_id || q.rebind_instance}</span>}
                                     </td>
                                     )}
                                     <td className="px-2 py-1.5">
@@ -1273,10 +1472,12 @@ export function RechargePanel({notify}: {notify?: (m: string, ms?: number) => vo
                                     <td className="px-2 py-1.5 text-gray-500 max-w-[180px] truncate" title={q.task_message || q.error || ""}>
                                         {q.error ? <span className="text-red-500">{q.error}</span> : (q.task_message || "—")}
                                     </td>
-                                    {(isWorkingTab || isFailedTab || isReadyTab) && (
-                                    <td className="px-2 py-1.5" onClick={(e) => e.stopPropagation()}>
+                                    {(isWorkingTab || isFailedTab || isReadyTab || isDeliveredTab) && (
+                                        <td className="px-2 py-1.5" onClick={(e) => e.stopPropagation()}>
+                                        <button onClick={() => openDetailLogs(q)}
+                                                className="text-gray-600 hover:text-gray-900 text-xs hover:underline">详细日志</button>
                                         {q.status !== "done" && q.status !== "pending" && q.card_code && (
-                                            <button onClick={() => { api.pollRecharge([q.id]).then(() => { toast(`已刷新 ${q.email}`); loadQueue(); }).catch((e: any) => toast(e.message)); }}
+                                            <button onClick={() => { api.pollRecharge([q.id]).then(() => { toast(`已刷新 ${q.email}`); loadQueue(); }).catch((e: any) => { loadQueue(); toast(e.message); }); }}
                                                     className="text-blue-500 hover:text-blue-700 text-xs hover:underline">刷新</button>
                                         )}
                                         {isWorkingTab && q.status !== "done" && q.task_status !== "paid" && (
@@ -1288,7 +1489,7 @@ export function RechargePanel({notify}: {notify?: (m: string, ms?: number) => vo
                                                     className="text-amber-500 hover:text-amber-700 text-xs hover:underline ml-2">{q.status === "error" ? "重置回队列" : "重置"}</button>
                                         )}
                                         {(q.status === "done" || q.task_status === "paid") && q.rebind_status === "pending" && (
-                                            <button onClick={() => { api.rebindGmail([q.id], (q.rebind_target === "mailcom" ? "mailcom" : "gmail")).then((r) => { toast(r.queued ? "已排队换绑" : (r.skipped[0]?.reason || "已跳过")); loadQueue(); loadConfig(); }).catch((e: any) => toast(e.message)); }}
+                                            <button onClick={() => { api.rebindGmail([q.id], (q.rebind_target === "mailcom" ? "mailcom" : "gmail"), {allowDelivered: isDeliveredTab}).then((r) => { toast(r.queued ? "已排队换绑" : (r.skipped[0]?.reason || "已跳过")); loadQueue(); loadConfig(); }).catch((e: any) => toast(e.message)); }}
                                                     className="text-blue-500 hover:text-blue-700 text-xs hover:underline ml-2">重试换绑</button>
                                         )}
                                         {/* 待核对：官方可能已改，先对账定论，不给再换一轮的入口 */}
@@ -1307,8 +1508,10 @@ export function RechargePanel({notify}: {notify?: (m: string, ms?: number) => vo
                                             <>
                                                 <button onClick={() => openRebindGmail([q.id])}
                                                         className="text-blue-500 hover:text-blue-700 text-xs hover:underline ml-2">换绑Gmail</button>
-                                                <button onClick={() => { api.rebindGmail([q.id], "mailcom").then((r) => { toast(r.queued ? "已排队换绑 mail.com" : (r.skipped[0]?.reason || "已跳过")); loadQueue(); loadConfig(); }).catch((e: any) => toast(e.message)); }}
-                                                        className="text-blue-500 hover:text-blue-700 text-xs hover:underline ml-2">换绑mail</button>
+                                                {!isDeliveredTab && (
+                                                    <button onClick={() => { api.rebindGmail([q.id], "mailcom").then((r) => { toast(r.queued ? "已排队换绑 mail.com" : (r.skipped[0]?.reason || "已跳过")); loadQueue(); loadConfig(); }).catch((e: any) => toast(e.message)); }}
+                                                            className="text-blue-500 hover:text-blue-700 text-xs hover:underline ml-2">换绑mail</button>
+                                                )}
                                             </>
                                             )
                                         )}
@@ -1387,7 +1590,7 @@ export function RechargePanel({notify}: {notify?: (m: string, ms?: number) => vo
             <div className="bg-white rounded-lg border shadow-sm">
                 <div className="px-4 py-2 border-b flex items-center justify-between">
                     <span className="text-sm font-semibold">操作日志 <span className="text-xs font-normal text-gray-400">{logs.length ? `${logs.length} 条` : ""}</span></span>
-                    <button onClick={() => { api.clearRechargeLogs().then(() => setLogs([])).catch(() => setLogs([])); }} className="text-xs text-gray-400 hover:text-gray-600">清空</button>
+                    <button onClick={() => { api.clearRechargeLogs().then(() => { setLogs([]); setDetailLogs([]); }).catch(() => { setLogs([]); setDetailLogs([]); }); }} className="text-xs text-gray-400 hover:text-gray-600">清空</button>
                 </div>
                 <div ref={logBoxRef} onScroll={onLogBoxScroll} className="max-h-[280px] overflow-auto bg-gray-50 p-3 font-mono text-xs text-gray-600 space-y-0.5">
                     {logs.length ? logs.map((l, i) => {
@@ -1405,6 +1608,60 @@ export function RechargePanel({notify}: {notify?: (m: string, ms?: number) => vo
                     }) : <div className="text-gray-400">暂无日志。提交/轮询/换绑会写到这里，刷新页面也会保留。</div>}
                 </div>
             </div>
+
+            {detailItem && (
+                <div className="fixed inset-0 bg-black/40 flex items-center justify-center z-50 p-4" onClick={() => setDetailItem(null)}>
+                    <div className="bg-white rounded-xl shadow-xl w-[min(1000px,calc(100vw-2rem))] max-h-[88vh] flex flex-col" onClick={(e) => e.stopPropagation()}>
+                        <div className="px-5 py-3 border-b flex items-center gap-3">
+                            <div className="min-w-0 flex-1">
+                                <div className="font-semibold text-sm">详细日志</div>
+                                <div className="text-xs text-gray-500 truncate mt-0.5" title={detailItem.email}>{detailItem.email}</div>
+                            </div>
+                            <button type="button" onClick={() => void refreshDetailLogs(detailItem)} disabled={detailLoading}
+                                    className="px-2.5 py-1.5 rounded border text-xs text-gray-600 hover:bg-gray-50 disabled:opacity-50">
+                                {detailLoading ? "读取中..." : "刷新日志"}
+                            </button>
+                            <button type="button" onClick={() => {
+                                const text = detailLogs.map((entry) => `${fmtLogTime(entry.ts)} ${entry.line}`).join("\n");
+                                if (!text) { toast("暂无可复制的详细日志"); return; }
+                                navigator.clipboard?.writeText(text);
+                                toast("详细日志已复制");
+                            }} className="px-2.5 py-1.5 rounded border text-xs text-gray-600 hover:bg-gray-50">复制日志</button>
+                            <button type="button" onClick={() => setDetailItem(null)} className="px-2.5 py-1.5 rounded border text-xs text-gray-600 hover:bg-gray-50">关闭</button>
+                        </div>
+                        <div className="px-5 py-3 border-b grid grid-cols-2 md:grid-cols-4 gap-x-5 gap-y-2 text-xs">
+                            <div><span className="text-gray-400">队列状态</span><div className="font-medium mt-0.5" style={{color: Q_COLOR[detailItem.status] || "#6b7280"}}>{Q_LABEL[detailItem.status] || detailItem.status}</div></div>
+                            <div><span className="text-gray-400">平台任务</span><div className="font-mono mt-0.5 break-all">{detailItem.task_no || "—"}</div></div>
+                            <div><span className="text-gray-400">任务状态</span><div className="mt-0.5" style={{color: TASK_COLOR[detailItem.task_status] || "#6b7280"}}>{detailItem.task_status || "—"}</div></div>
+                            <div><span className="text-gray-400">执行实例</span><div className="font-mono mt-0.5 break-all">{detailItem.instance_id || detailItem.rebind_instance || "—"}</div></div>
+                            <div><span className="text-gray-400">卡密</span><div className="font-mono mt-0.5 break-all">{detailItem.card_code || "—"}</div></div>
+                            <div><span className="text-gray-400">提交时间</span><div className="mt-0.5">{fmtTime(detailItem.submitted_at)}</div></div>
+                            <div><span className="text-gray-400">完成时间</span><div className="mt-0.5">{fmtTime(detailItem.finished_at)}</div></div>
+                            <div><span className="text-gray-400">充值耗时</span><div className="mt-0.5">{fmtDur(detailItem.submitted_at, detailItem.finished_at)}</div></div>
+                            {(detailItem.rebind_from || detailItem.rebind_email || detailItem.rebind_attempt_email) && (
+                                <div className="col-span-2 md:col-span-4"><span className="text-gray-400">换绑信息</span><div className="font-mono mt-0.5 break-all">{[detailItem.rebind_from, detailItem.rebind_email || detailItem.rebind_attempt_email].filter(Boolean).join(" → ") || "—"}{detailItem.rebind_status ? ` · ${detailItem.rebind_status}` : ""}</div></div>
+                            )}
+                            {(detailItem.error || detailItem.task_message) && (
+                                <div className="col-span-2 md:col-span-4"><span className="text-gray-400">当前消息</span><div className="text-red-500 mt-0.5 break-all">{detailItem.error || detailItem.task_message}</div></div>
+                            )}
+                        </div>
+                        <div className="px-5 py-2 border-b flex items-center justify-between text-xs">
+                            <span className="font-semibold">执行时间线</span>
+                            <span className="text-gray-400">{detailLoading ? "正在同步" : `${detailLogs.length} 条`}</span>
+                        </div>
+                        <div className="flex-1 min-h-0 overflow-auto bg-gray-50 px-5 py-3 font-mono text-xs text-gray-600 space-y-1">
+                            {detailLogs.length ? detailLogs.map((entry, index) => {
+                                const line = String(entry.line || "");
+                                const cls = /换绑 ✗|^✗/.test(line) ? "text-red-500"
+                                    : /换绑 ✓|^✓/.test(line) ? "text-green-600"
+                                    : /换绑/.test(line) ? "text-amber-800"
+                                    : "";
+                                return <div key={`${entry.ts}-${index}`} className="flex gap-3 items-start"><span className="text-gray-400 shrink-0">{fmtLogTime(entry.ts)}</span><span className={cls}>{line}</span></div>;
+                            }) : <div className="text-gray-400">{detailLoading ? "正在读取日志..." : "暂无该账号详细日志"}</div>}
+                        </div>
+                    </div>
+                </div>
+            )}
 
             {/* ====== 导入卡密弹窗 ====== */}
             {showImport && (
@@ -1448,21 +1705,28 @@ export function RechargePanel({notify}: {notify?: (m: string, ms?: number) => vo
                                 <input value={pickerSearch} onChange={(e) => setPickerSearch(e.target.value)} placeholder="搜索邮箱..."
                                        className="flex-1 px-2 py-1 text-xs border rounded outline-none"/>
                                 <select value={pickerBatch} onChange={(e) => setPickerBatch(e.target.value)} className="px-2 py-1 text-xs border rounded outline-none">
-                                    <option value="">全部来源批次 ({accounts.length})</option>
+                                    <option value="">全部 GPT 来源批次 ({accounts.length})</option>
                                     {pickerBatches.map((b) => <option key={b.name} value={b.name}>{b.name || "(无批次)"} ({b.n})</option>)}
                                 </select>
                             </div>
                             <div className="flex items-center gap-2 flex-wrap">
-                                <span className="text-[11px] text-gray-500 shrink-0">入队分组</span>
+                                <span className="text-[11px] text-gray-500 shrink-0">充值/交付分组</span>
                                 <select value={rechargeGrpNew.trim() ? "" : rechargeBatch} onChange={(e) => { setRechargeBatch(e.target.value); if (e.target.value) setRechargeGrpNew(""); }}
                                         className="px-2 py-1 text-xs border rounded outline-none min-w-[160px]">
-                                    <option value="">选择已有分组</option>
+                                    <option value="">选择已有充值分组</option>
                                     {queueGroups.map((g) => <option key={g.name} value={g.name}>{g.name} ({g.n})</option>)}
                                 </select>
                                 <span className="text-[11px] text-gray-400">或</span>
                                 <input value={rechargeGrpNew} onChange={(e) => setRechargeGrpNew(e.target.value)} placeholder="新建分组名"
                                        className="w-40 px-2 py-1 text-xs border rounded outline-none"/>
-                                <span className="text-[11px] text-gray-400">将记为：<b className="text-gray-700">{resolvedEnqueueGrp() || "（无分组）"}</b></span>
+                                <label className="inline-flex items-center gap-1 text-[11px] text-gray-600" title="仅当选中账号来自同一个来源批次时自动继承">
+                                    <input type="checkbox" checked={inheritSourceBatch} onChange={(e) => setInheritSourceBatch(e.target.checked)}/>
+                                    来源批次自动作为充值分组
+                                </label>
+                                <span className="text-[11px] text-gray-400">
+                                    将记为：<b className="text-gray-700">{resolvedEnqueueGrp() || "（无分组）"}</b>
+                                    {inheritSourceBatch && selectedSourceBatches.length > 1 && !rechargeGrpNew.trim() && !rechargeBatch.trim() && <span className="text-amber-600">（选中了多个来源批次，请手工指定）</span>}
+                                </span>
                             </div>
                             {/* facet 筛选条(同 GPT 面板逻辑:组内 OR、跨组 AND) */}
                             <div className="flex items-center gap-1.5 flex-wrap">
@@ -1545,7 +1809,7 @@ export function RechargePanel({notify}: {notify?: (m: string, ms?: number) => vo
                 <div className="fixed inset-0 bg-black/30 flex items-center justify-center z-50" onClick={() => setShowTestSend(false)}>
                     <div className="bg-white rounded-xl shadow-xl w-[720px] max-w-[96vw] max-h-[90vh] flex flex-col" onClick={(e) => e.stopPropagation()}>
                         <div className="px-5 py-3 border-b font-semibold text-sm">测试发送
-                            <div className="text-xs text-gray-400 font-normal mt-0.5">没勾选就发当前列表前 5 个。mail.com 走协议，Gmail 走应用密码 SMTP。点发送会马上返回，进度看充值日志。</div>
+                            <div className="text-xs text-gray-400 font-normal mt-0.5">没勾选就发当前列表前 5 个。mail.com 和 Gmail 都走 SMTP 协议，点发送会马上返回，进度看充值日志。</div>
                         </div>
                         <div className="px-5 py-3 space-y-3 overflow-auto">
                             <label className="block text-xs text-gray-500">测试收件人
@@ -1609,8 +1873,9 @@ export function RechargePanel({notify}: {notify?: (m: string, ms?: number) => vo
                             <div className="flex-1 min-w-0">
                                 换绑 Gmail
                                 <div className="text-xs text-gray-400 font-normal mt-0.5">
-                                    给 <b className="text-gray-600">{rebindIds.length}</b> 个已付费号（支持 mail.com→Gmail，也支持 Gmail→Gmail 再换一把）。
-                                    流程：① 左侧按分组选号 → ② 迁入「{rebindPool.poolGrp}」时并行探 IMAP（只探一次）→ ③ 换绑领号时只探网页登录。
+                                    给 <b className="text-gray-600">{rebindIds.length}</b> 个{isDeliveredTab ? "已交付且已支付号人工换绑 Gmail" : "已付费号（支持 mail.com→Gmail，也支持 Gmail→Gmail 再换一把）"}。
+                                    流程：① 左侧按分组选号 → ② 迁入「{rebindPool.poolGrp}」时并行探 IMAP（只探一次）
+                                    → ③ 换绑前{configRebindGmailProbeLogin ? "探网页登录" : "跳过网页登录探活"}。
                                 </div>
                             </div>
                             <button type="button" disabled={busy}
@@ -1778,15 +2043,15 @@ export function RechargePanel({notify}: {notify?: (m: string, ms?: number) => vo
                 </div>
             )}
 
-            {/* ====== 设置批次弹窗 ====== */}
+            {/* ====== 设置充值/交付分组弹窗 ====== */}
             {showSetBatch && (
                 <div className="fixed inset-0 bg-black/30 flex items-center justify-center z-50" onClick={() => setShowSetBatch(false)}>
                     <div className="bg-white rounded-xl shadow-xl w-[360px] flex flex-col" onClick={(e) => e.stopPropagation()}>
-                        <div className="px-5 py-3 border-b font-semibold text-sm">设置批次</div>
+                        <div className="px-5 py-3 border-b font-semibold text-sm">设置充值/交付分组</div>
                         <div className="p-5">
-                            <input value={batchInput} onChange={(e) => setBatchInput(e.target.value)} placeholder="输入批次名"
+                            <input value={batchInput} onChange={(e) => setBatchInput(e.target.value)} placeholder="输入充值/交付分组名"
                                    className="w-full px-2 py-1.5 text-sm border rounded outline-none" autoFocus/>
-                            <div className="text-xs text-gray-400 mt-2">将为选中的 {selQIds().length} 项设置批次名(留空则清除)</div>
+                            <div className="text-xs text-gray-400 mt-2">将为当前页签选中的 {selQIds().length} 项设置分组(留空则清除)</div>
                         </div>
                         <div className="px-5 py-3 border-t flex justify-end gap-2">
                             <Btn onClick={() => setShowSetBatch(false)}>取消</Btn>
@@ -1867,7 +2132,7 @@ export function RechargePanel({notify}: {notify?: (m: string, ms?: number) => vo
                                 <button type="button" disabled={sub2jsonRefreshing}
                                         onClick={() => fillSub2jsonFromSelection()}
                                         className="px-3 py-1 rounded text-xs font-medium border border-violet-300 text-violet-700 bg-violet-50 hover:bg-violet-100 disabled:opacity-40">
-                                    从勾选填充{selQIds().length ? ` (${selQIds().length})` : qBatchFilter ? ` (批次)` : ""}
+                                    从{selQIds().length ? `勾选填充 (${selQIds().length})` : `当前筛选填充 (${filteredQueue.length})`}
                                 </button>
                                 <span className="text-xs text-gray-400">未勾选时按当前批次/全队列导出预备行</span>
                             </div>

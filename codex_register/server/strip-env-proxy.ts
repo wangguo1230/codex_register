@@ -17,5 +17,7 @@ if (stripped.length) {
 export function cleanSpawnEnv(extra: Record<string, string> = {}) {
     const env = {...process.env, ...extra};
     for (const k of KEYS) delete env[k];
+    // CODEX_HTTP 只标记当前 HTTP 主进程，不能泄漏到可创建本地 relay 的 worker。
+    delete env.CODEX_HTTP;
     return env;
 }

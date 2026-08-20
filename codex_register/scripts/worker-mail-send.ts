@@ -1,7 +1,7 @@
 // @ts-nocheck
 // 子进程发信：Playwright + 跳板不能跑在 :3100 里，否则整站卡死，前端看到 500。
 import {readFileSync} from "node:fs";
-import {sendMailcomMail} from "../src/mail/mailcom.ts";
+import {sendMailcomSmtp} from "../src/mail/mailcom-smtp.ts";
 
 const jobFile = process.argv[2] || "";
 if (!jobFile) {
@@ -12,7 +12,9 @@ if (!jobFile) {
 const job = JSON.parse(readFileSync(jobFile, "utf8"));
 
 try {
-    const r = await sendMailcomMail(job.email, job.password, {
+    const r = await sendMailcomSmtp({
+        email: job.email,
+        password: job.password,
         to: job.to,
         subject: job.subject,
         html: job.html,
@@ -21,15 +23,15 @@ try {
         headless: job.headless ?? true,
         proxy: job.proxy,
         jump: job.jump,
-        profile: job.profile,
+        timeoutMs: Number(process.env.MAILCOM_SMTP_TIMEOUT_MS || 30_000),
     });
     process.stdout.write("@@RESULT@@" + JSON.stringify({
         ok: true,
         status: r.status,
         location: r.location || "",
-        from: r.from,
-        to: r.to,
-        subject: r.subject,
+        from: job.email,
+        to: job.to,
+        subject: job.subject,
         proxySession: r.proxySession || "",
     }) + "\n");
 } catch (e) {

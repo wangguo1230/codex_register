@@ -1,10 +1,60 @@
 // @ts-nocheck
-import {pool} from "./pg.js";
+import {PG_QUERY_TIMEOUT_MS, PG_STATEMENT_TIMEOUT_MS, pool} from "./pg.js";
 import {appConfig} from "../src/config.js";
 
-export async function ensureSchema() {
-    const client = await pool.connect();
+const SCHEMA_LOCK_NAME = "codex-register:schema";
+const SCHEMA_LOCK_TIMEOUT_MS = 5_000;
+
+export function schemaStatementLabel(sql) {
+    const normalized = String(sql || "").replace(/\s+/g, " ").trim();
+    const match = normalized.match(/^(CREATE TABLE(?: IF NOT EXISTS)?\s+\S+|CREATE (?:UNIQUE )?INDEX(?: IF NOT EXISTS)?\s+\S+|ALTER TABLE\s+\S+\s+ADD COLUMN(?: IF NOT EXISTS)?\s+\S+|UPDATE\s+\S+|DELETE FROM\s+\S+|DROP INDEX(?: IF EXISTS)?\s+\S+|INSERT INTO\s+\S+)/i);
+    return (match?.[1] || normalized.slice(0, 100) || "SQL").replace(/[;(]+$/, "");
+}
+
+export async function ensureSchemaWithPool(databasePool, {
+    logger = console,
+    lockTimeoutMs = SCHEMA_LOCK_TIMEOUT_MS,
+    statementTimeoutMs = PG_STATEMENT_TIMEOUT_MS,
+    queryTimeoutMs = PG_QUERY_TIMEOUT_MS,
+} = {}) {
+    const dbClient = await databasePool.connect();
+    let acquired = false;
+    let step = 0;
     try {
+        await dbClient.query(`SELECT set_config('lock_timeout', $1, false)`, [`${lockTimeoutMs}ms`]);
+        await dbClient.query(`SELECT set_config('statement_timeout', $1, false)`, [`${statementTimeoutMs}ms`]);
+        const {rows: [lock]} = await dbClient.query(
+            `SELECT pg_try_advisory_lock(hashtext($1)::bigint) AS acquired`,
+            [SCHEMA_LOCK_NAME],
+        );
+        acquired = lock?.acquired === true;
+        if (!acquired) {
+            const error = new Error("另一个实例正在执行 Schema 迁移");
+            error.code = "SCHEMA_MIGRATION_BUSY";
+            throw error;
+        }
+
+        const client = {
+            async query(queryOrConfig, values) {
+                const text = typeof queryOrConfig === "string" ? queryOrConfig : queryOrConfig?.text;
+                const label = schemaStatementLabel(text);
+                const currentStep = ++step;
+                const startedAt = Date.now();
+                logger.log(`[pg] Schema [${currentStep}] ${label}`);
+                try {
+                    const config = typeof queryOrConfig === "string"
+                        ? {text: queryOrConfig, values, query_timeout: queryTimeoutMs}
+                        : {...queryOrConfig, query_timeout: queryOrConfig?.query_timeout || queryTimeoutMs};
+                    return await dbClient.query(config);
+                } catch (error) {
+                    throw new Error(`Schema [${currentStep}] ${label} 失败: ${error?.message || error}`, {cause: error});
+                } finally {
+                    const elapsed = Date.now() - startedAt;
+                    if (elapsed >= 1_000) logger.warn(`[pg] Schema [${currentStep}] ${label} 耗时 ${elapsed}ms`);
+                }
+            },
+        };
+
         await client.query(`
             CREATE TABLE IF NOT EXISTS accounts (
                 id SERIAL PRIMARY KEY,
@@ -211,6 +261,7 @@ export async function ensureSchema() {
         await client.query(`ALTER TABLE mailboxes ADD COLUMN IF NOT EXISTS job_lock_instance TEXT DEFAULT ''`);
         await client.query(`ALTER TABLE mailboxes ADD COLUMN IF NOT EXISTS job_lock_at BIGINT DEFAULT 0`);
         await client.query(`ALTER TABLE mailboxes ADD COLUMN IF NOT EXISTS imap_password TEXT DEFAULT ''`);
+        await client.query(`ALTER TABLE mailboxes ADD COLUMN IF NOT EXISTS google_state JSONB DEFAULT '{}'::jsonb`);
         await client.query(`
             UPDATE mailboxes
             SET totp_secret_orig = totp_secret
@@ -218,7 +269,6 @@ export async function ensureSchema() {
               AND COALESCE(totp_secret,'')<>''
               AND COALESCE(google_state->>'totp_rotated','') <> 'true'
         `);
-        await client.query(`ALTER TABLE mailboxes ADD COLUMN IF NOT EXISTS google_state JSONB DEFAULT '{}'::jsonb`);
         await client.query(`ALTER TABLE mailboxes ADD COLUMN IF NOT EXISTS google_stage TEXT DEFAULT ''`);
         await client.query(`ALTER TABLE mailboxes ADD COLUMN IF NOT EXISTS sold_at BIGINT DEFAULT 0`);
         await client.query(`ALTER TABLE mailboxes ADD COLUMN IF NOT EXISTS password_prev TEXT DEFAULT ''`);
@@ -260,7 +310,104 @@ export async function ensureSchema() {
         // 官方 24h 换绑次数上限：限的是这个 ChatGPT 号，换目标/换出口都没用，只能等。
         // 记下解禁时间，拦住"反复点换绑"——每点一次都要探活+begin，白烧目标号和限流额度。
         await client.query(`ALTER TABLE recharge_queue ADD COLUMN IF NOT EXISTS rebind_blocked_until BIGINT DEFAULT 0`);
-
+        // 充值提交、人工卡密处理与换绑对账的高频过滤条件。
+        await client.query(`CREATE INDEX IF NOT EXISTS idx_recharge_queue_card ON recharge_queue(card_id)`);
+        // 统一跨实例任务控制面。业务表保存最终状态，本表只保存调度、租约和 fencing token。
+        await client.query(`
+            CREATE TABLE IF NOT EXISTS work_tasks (
+                id BIGSERIAL PRIMARY KEY,
+                kind TEXT NOT NULL,
+                entity_id BIGINT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+                priority INTEGER NOT NULL DEFAULT 0,
+                available_at BIGINT NOT NULL DEFAULT 0,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                lease_owner TEXT NOT NULL DEFAULT '',
+                lease_token TEXT NOT NULL DEFAULT '',
+                lease_until BIGINT NOT NULL DEFAULT 0,
+                heartbeat_at BIGINT NOT NULL DEFAULT 0,
+                started_at BIGINT NOT NULL DEFAULT 0,
+                finished_at BIGINT NOT NULL DEFAULT 0,
+                last_error TEXT NOT NULL DEFAULT '',
+                result JSONB NOT NULL DEFAULT '{}'::jsonb,
+                created_at BIGINT NOT NULL,
+                updated_at BIGINT NOT NULL
+            )
+        `);
+        await client.query(`CREATE INDEX IF NOT EXISTS idx_work_tasks_claim ON work_tasks(kind, status, available_at, priority DESC, id)`);
+        await client.query(`CREATE INDEX IF NOT EXISTS idx_work_tasks_owner ON work_tasks(lease_owner, status)`);
+        await client.query(`DROP INDEX IF EXISTS idx_work_tasks_active`);
+        await client.query(`
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_work_tasks_active_entity
+            ON work_tasks(kind, entity_id)
+            WHERE status IN ('pending','running')
+        `);
+        await client.query(`
+            CREATE INDEX IF NOT EXISTS idx_recharge_queue_active_submission
+            ON recharge_queue(id)
+            WHERE status IN ('submitting','submitted')
+              AND COALESCE(delivery_status,'undelivered') <> 'delivered'
+        `);
+        await client.query(`
+            CREATE INDEX IF NOT EXISTS idx_recharge_queue_rebind_reconcile
+            ON recharge_queue(rebind_attempt_at, id)
+            WHERE rebind_status='unknown' AND COALESCE(rebind_instance,'')=''
+        `);
+        // 公共代理池：配置和租约均落 PostgreSQL，多个 HTTP 实例通过同一租约表互斥。
+        await client.query(`
+            CREATE TABLE IF NOT EXISTS proxy_pool_config (
+                id INTEGER PRIMARY KEY DEFAULT 1,
+                initialized BOOLEAN NOT NULL DEFAULT FALSE,
+                exit_mail_enabled BOOLEAN NOT NULL DEFAULT TRUE,
+                exit_gpt_enabled BOOLEAN NOT NULL DEFAULT TRUE,
+                jump_mail_enabled BOOLEAN NOT NULL DEFAULT TRUE,
+                jump_gpt_enabled BOOLEAN NOT NULL DEFAULT TRUE,
+                updated_at BIGINT NOT NULL DEFAULT 0,
+                CHECK (id = 1)
+            )
+        `);
+        await client.query(`
+            CREATE TABLE IF NOT EXISTS proxy_pool_entries (
+                id BIGSERIAL PRIMARY KEY,
+                kind TEXT NOT NULL,
+                resource_key TEXT NOT NULL,
+                url TEXT NOT NULL,
+                template_key TEXT NOT NULL DEFAULT '',
+                active BOOLEAN NOT NULL DEFAULT TRUE,
+                health_ok BOOLEAN,
+                health_at BIGINT NOT NULL DEFAULT 0,
+                health_ms INTEGER NOT NULL DEFAULT 0,
+                health_ip TEXT NOT NULL DEFAULT '',
+                health_google INTEGER NOT NULL DEFAULT 0,
+                health_reason TEXT NOT NULL DEFAULT '',
+                last_used_at BIGINT NOT NULL DEFAULT 0,
+                created_at BIGINT NOT NULL,
+                updated_at BIGINT NOT NULL,
+                UNIQUE(kind, resource_key)
+            )
+        `);
+        await client.query(`CREATE INDEX IF NOT EXISTS idx_proxy_pool_entries_active ON proxy_pool_entries(kind, active, id)`);
+        await client.query(`
+            CREATE TABLE IF NOT EXISTS proxy_pool_leases (
+                id BIGSERIAL PRIMARY KEY,
+                kind TEXT NOT NULL,
+                resource_key TEXT NOT NULL,
+                template_key TEXT NOT NULL DEFAULT '',
+                lease_key TEXT NOT NULL,
+                lease_url TEXT NOT NULL DEFAULT '',
+                owner TEXT NOT NULL DEFAULT '',
+                lease_token TEXT NOT NULL UNIQUE,
+                lease_until BIGINT NOT NULL,
+                heartbeat_at BIGINT NOT NULL,
+                created_at BIGINT NOT NULL,
+                UNIQUE(kind, resource_key, lease_key)
+            )
+        `);
+        await client.query(`ALTER TABLE proxy_pool_leases ADD COLUMN IF NOT EXISTS template_key TEXT NOT NULL DEFAULT ''`);
+        await client.query(`CREATE INDEX IF NOT EXISTS idx_proxy_pool_leases_active ON proxy_pool_leases(kind, resource_key, lease_until)`);
+        await client.query(`CREATE INDEX IF NOT EXISTS idx_proxy_pool_leases_template ON proxy_pool_leases(kind, template_key, lease_until)`);
+        await client.query(`CREATE INDEX IF NOT EXISTS idx_proxy_pool_leases_expire ON proxy_pool_leases(lease_until)`);
         // 发信：每次使用的粘性代理 session（一号一出口，日志可回放）
         await client.query(`
             CREATE TABLE IF NOT EXISTS mail_send_logs (
@@ -370,8 +517,17 @@ export async function ensureSchema() {
             )
         `);
 
-        console.log("[pg] Schema 已就绪");
+        logger.log(`[pg] Schema 已就绪，共 ${step} 条`);
     } finally {
-        client.release();
+        if (acquired) {
+            try {
+                await dbClient.query(`SELECT pg_advisory_unlock(hashtext($1)::bigint)`, [SCHEMA_LOCK_NAME]);
+            } catch { /* 连接释放后 PostgreSQL 会自动释放会话锁 */ }
+        }
+        dbClient.release();
     }
+}
+
+export async function ensureSchema() {
+    return ensureSchemaWithPool(pool);
 }

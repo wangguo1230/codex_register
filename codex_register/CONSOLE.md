@@ -12,8 +12,8 @@ cd codex_register
 
 开发模式（前端热更新）：
 ```bash
-# 终端1: 后端
-npx tsx server/index.ts
+# 终端1: 后端（使用生产 bundle，避免 tsx 在大依赖图启动阶段写缓存）
+npm run build:server && npm run server
 # 终端2: 前端(vite dev, 代理 /api 到 3100)
 cd web && npm run dev               # 打开 http://localhost:5173
 ```

@@ -8,7 +8,6 @@ import {api, connectStream, type Mailbox, type MailboxJob} from "./api";
 import {formatHardenListReason, gmailHealth, GMAIL_HEALTH_LABEL, GMAIL_HEALTH_COLOR, type GmailHealth} from "./google-harden-reason";
 import {MailCheckTool} from "./MailCheckTool";
 import {MailboxDetail} from "./MailboxDetail";
-import {ProxyPoolPanel} from "./ProxyPoolPanel";
 
 /** 列表一次最多挂 DOM 的行数；全量仍在内存里筛，避免 3000+ tr 卡死主线程 */
 const LIST_PAGE_SIZE = 150;
@@ -166,11 +165,9 @@ export function MailboxPanel({notify}: {notify?: (m: string) => void}) {
     const [pwConc, setPwConc] = useState(1); // 改密并发
     const [detailMb, setDetailMb] = useState<Mailbox | null>(null); // 详情弹窗(日志+收件箱)
     const [poolSnap, setPoolSnap] = useState({total: 0, slots: 0, leased: 0, free: 0});
-    // 默认收起代理池 / 导入分配 / 任务详情，主屏留给列表
-    const [showPool, setShowPool] = useState(false);
+    // 默认收起导入分配 / 任务详情，主屏留给列表
     const [toolsOpen, setToolsOpen] = useState<null | "import" | "alloc">(null);
     const [jobDetailOpen, setJobDetailOpen] = useState(false);
-    const [jumpText, setJumpText] = useState("");
     const [job, setJob] = useState<MailboxJob>(emptyJob());
     const [stopping, setStopping] = useState(false);
     const [listLimit, setListLimit] = useState(LIST_PAGE_SIZE);
@@ -209,7 +206,6 @@ export function MailboxPanel({notify}: {notify?: (m: string) => void}) {
             const st = s.state as any;
             const snap = st.mailProxyPoolSnap;
             if (snap) setPoolSnap({total: snap.total || 0, slots: snap.slots || 0, leased: snap.leased || 0, free: snap.free || 0});
-            if (typeof st.mailProxyJump === "string") setJumpText(st.mailProxyJump);
             const incoming = st.mailJob || st.batchHarden;
             if (incoming) {
                 setJob((p) => mergeJob(p, incoming));
@@ -267,7 +263,6 @@ export function MailboxPanel({notify}: {notify?: (m: string) => void}) {
                     const snap = data.state.mailProxyPoolSnap;
                     setPoolSnap({total: snap.total || 0, slots: snap.slots || 0, leased: snap.leased || 0, free: snap.free || 0});
                 }
-                if (typeof data.state.mailProxyJump === "string") setJumpText(data.state.mailProxyJump);
             }
         });
         return off;
@@ -541,7 +536,7 @@ export function MailboxPanel({notify}: {notify?: (m: string) => void}) {
             if (!confirm(`${verb}：${scope}？`)) return;
             const r = onlyFailed ? await api.retryFailedMailboxJobs(ids) : await api.resumeHardenMailboxGoogle(ids);
             toast(r.count
-                ? `已${verb} ${r.count} 个${r.skippedDone ? `（${r.skippedDone} 个已齐跳过）` : ""}`
+                ? `已${verb} ${r.count} 个${r.recovered ? `（恢复残留 ${r.recovered} 个）` : ""}${r.skippedDone ? `（${r.skippedDone} 个已齐跳过）` : ""}`
                 : (r.msg || `没有可${verb}的`));
         } catch (e: any) { toast(e.message); }
     };
@@ -672,10 +667,10 @@ export function MailboxPanel({notify}: {notify?: (m: string) => void}) {
                             style={{padding: "5px 10px", fontSize: 12, border: "none", background: jobBusy ? "#dc2626" : "#e5e7eb", color: jobBusy ? "#fff" : "#9ca3af", borderRadius: 8, cursor: jobBusy ? "pointer" : "not-allowed"}}>
                         {stopping ? "停止中" : "停止"}
                     </button>
-                    <button onClick={() => setShowPool((v) => !v)}
-                            style={{padding: "5px 10px", fontSize: 12, border: "1px solid #d1d5db", borderRadius: 8, background: showPool ? "#eef2ff" : "#fff", cursor: "pointer", color: "#4338ca"}}>
-                        代理池 {poolSnap.total || 0}{poolSnap.leased ? ` · 占用${poolSnap.leased}` : ""}{jumpText.trim() ? " · 链式" : ""}
-                    </button>
+                    <span title="代理池配置已移至顶部的独立代理池功能页"
+                          style={{padding: "5px 10px", fontSize: 12, color: "#4338ca", background: "#eef2ff", borderRadius: 8}}>
+                        代理 空闲{poolSnap.free || 0}/占用{poolSnap.leased || 0}
+                    </span>
                     <MailCheckTool notify={notify} separator={mailSep}/>
                 </div>
             </div>
@@ -754,20 +749,6 @@ export function MailboxPanel({notify}: {notify?: (m: string) => void}) {
                     ) : null}
                 </div>
             ) : null}
-
-            {showPool && (
-                <div style={{flexShrink: 0, maxHeight: "28vh", overflow: "auto", minHeight: 0}}>
-                    <ProxyPoolPanel
-                        notify={toast}
-                        kind="mail"
-                        title="邮箱代理池"
-                        onMeta={(m) => {
-                            setPoolSnap({total: m.total, slots: m.slots, leased: m.leased, free: m.free});
-                            setJumpText(m.jump);
-                        }}
-                    />
-                </div>
-            )}
 
             {/* 批量操作：有勾选就出现。任务在跑也要能「完全整备」，不能把按钮藏掉。 */}
             {selCount > 0 && (

@@ -76,7 +76,17 @@ export function rememberGoogleImapPassword(email, imapPassword) {
 
 /** 只走 IMAP 轮询 ChatGPT 验证码（换绑/注册都可复用）。 */
 /** deadlineMs：绝对截止时间戳。换绑用它保证 verify 还落在 pwd_auth 窗口内。 */
-export async function waitGoogleImapOtp(cred, {minTimestampMs = 0, excludeCode = "", attempts = 16, intervalMs = 5000, deadlineMs = 0} = {}) {
+export async function waitGoogleImapOtp(cred, {
+    minTimestampMs = 0,
+    excludeCode = "",
+    attempts = 16,
+    intervalMs = 5000,
+    deadlineMs = 0,
+    proxy = "",
+    extraProxies = [],
+    skipDirect = false,
+    includeLocals = true,
+} = {}) {
     const c = rememberGoogleCred(cred) || cred;
     let lastErr = "";
     const n = Math.max(1, Number(attempts) || 16);
@@ -85,7 +95,15 @@ export async function waitGoogleImapOtp(cred, {minTimestampMs = 0, excludeCode =
         if (overBudget()) break;
         imapLog(`[google] IMAP 收码 ${i + 1}/${n} ${c.email}`);
         try {
-            const code = await tryImapOtp(c, {minTimestampMs, excludeCode, deadlineMs});
+            const code = await tryImapOtp(c, {
+                minTimestampMs,
+                excludeCode,
+                deadlineMs,
+                proxy,
+                extraProxies,
+                skipDirect,
+                includeLocals,
+            });
             if (code) {
                 imapLog(`[google] IMAP 拿到验证码 ${code}`);
                 return code;
@@ -124,7 +142,7 @@ function imapLog(msg) {
     try { process.stdout.write(""); } catch { /* */ }
 }
 
-function imapViaList() {
+function imapViaList({proxy = "", extraProxies = [], skipDirect = false, includeLocals = true} = {}) {
     const out = [];
     const push = (u) => {
         const s = String(u || "").trim();
@@ -137,10 +155,12 @@ function imapViaList() {
         } catch { return; }
         out.push(s);
     };
+    push(proxy);
+    for (const value of (Array.isArray(extraProxies) ? extraProxies : [])) push(value);
     push(process.env.IMAP_PROXY || "");
     push(process.env.MAILCOM_PROXY || "");
-    push("socks5://127.0.0.1:10808");
-    return ["", ...out];
+    if (includeLocals) push("socks5://127.0.0.1:10808");
+    return skipDirect ? out : ["", ...out];
 }
 
 function decodeQuotedPrintable(s) {
@@ -279,9 +299,17 @@ async function tryImapOtpOnce(cred, {minTimestampMs = 0, excludeCode = "", proxy
     return "";
 }
 
-async function tryImapOtp(cred, {minTimestampMs = 0, excludeCode = "", deadlineMs = 0} = {}) {
+async function tryImapOtp(cred, {
+    minTimestampMs = 0,
+    excludeCode = "",
+    deadlineMs = 0,
+    proxy = "",
+    extraProxies = [],
+    skipDirect = false,
+    includeLocals = true,
+} = {}) {
     let lastErr = "";
-    for (const via of imapViaList()) {
+    for (const via of imapViaList({proxy, extraProxies, skipDirect, includeLocals})) {
         // 一轮要试 4 个出口、每个 connectionTimeout 16s，不在出口之间看截止时间的话
         // 单轮就能冲过整个取码预算（换绑那边靠这个预算保证 verify 落在 pwd_auth 窗口内）
         if (deadlineMs && Date.now() >= deadlineMs) break;
@@ -369,7 +397,14 @@ export async function getGoogleEmailVerificationCode(email, options = {}) {
     for (let i = 0; i < 16; i++) {
         imapLog(`[google] IMAP 收码 ${i + 1}/16 ${email}`);
         try {
-            const imapCode = await tryImapOtp(cred, {minTimestampMs, excludeCode});
+            const imapCode = await tryImapOtp(cred, {
+                minTimestampMs,
+                excludeCode,
+                proxy: options.proxy || "",
+                extraProxies: options.extraProxies || [],
+                skipDirect: options.skipDirect === true,
+                includeLocals: options.includeLocals !== false,
+            });
             if (imapCode) {
                 imapLog(`[google] IMAP 拿到验证码 ${imapCode}`);
                 return imapCode;
@@ -439,7 +474,15 @@ export function createGoogleAccountProvider() {
         },
         async getMailboxCredential(email) {
             const c = resolveGoogleCred(email);
-            return {email: c.email, password: c.password};
+            return {
+                provider: "google",
+                email: c.email,
+                login: c.email,
+                password: c.password,
+                client_id: "",
+                refresh_token: "",
+                line: [c.email, c.password, c.totpSecret, c.recoveryEmail, c.imapPassword].join("----"),
+            };
         },
     };
 }

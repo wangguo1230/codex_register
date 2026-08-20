@@ -38,7 +38,11 @@ const emitVerdict = (r) => {
 };
 
 try {
-    const r = await probeGmailWebLogin(job, log, emitVerdict);
+    const r = await probeGmailWebLogin(job, log, emitVerdict, {
+        hasLease: job.probe_has_lease === true,
+        proxyUrl: job.probe_proxy_url || "",
+        jumpUrl: job.probe_jump_url || "",
+    });
     emitVerdict(r);
     process.exit(r.ok ? 0 : 2);
 } catch (e) {

@@ -52,14 +52,14 @@ export async function connectViaJump(jumpRaw: string, destHost: string, destPort
     throw new Error(`跳板只支持 socks5/http，当前 ${jump.proto}`);
 }
 
-function connectHttpConnect(jump, destHost: string, destPort: number, timeoutMs: number): Promise<net.Socket> {
+function connectHttpConnect(jump: {host: string; port: number; user: string; pass: string}, destHost: string, destPort: number, timeoutMs: number): Promise<net.Socket> {
     return new Promise((resolve, reject) => {
         const sock = net.connect({host: jump.host, port: jump.port});
         const timer = setTimeout(() => {
             try { sock.destroy(); } catch { /* */ }
             reject(new Error("跳板 HTTP CONNECT 超时"));
         }, timeoutMs);
-        const fail = (e) => {
+        const fail = (e: Error) => {
             clearTimeout(timer);
             try { sock.destroy(); } catch { /* */ }
             reject(e instanceof Error ? e : new Error(String(e)));
@@ -72,7 +72,7 @@ function connectHttpConnect(jump, destHost: string, destPort: number, timeoutMs:
             sock.write(`CONNECT ${destHost}:${destPort} HTTP/1.1\r\nHost: ${destHost}:${destPort}\r\n${auth}\r\n`);
         });
         let buf = "";
-        const onData = (chunk) => {
+        const onData = (chunk: Buffer) => {
             buf += chunk.toString("latin1");
             const idx = buf.indexOf("\r\n\r\n");
             if (idx < 0) return;
@@ -123,8 +123,23 @@ async function connectViaJumpRetry(jumpRaw: string, destHost: string, destPort: 
 }
 
 export async function openLocalRelay(jumpRaw: string, destHost: string, destPort: number) {
+    const connections = new Set<{client: net.Socket; upstream?: net.Socket}>();
     const server = net.createServer((client) => {
+        const state: {client: net.Socket; upstream?: net.Socket} = {client};
+        connections.add(state);
+        const cleanup = () => {
+            connections.delete(state);
+            try { state.upstream?.destroy(); } catch { /* */ }
+            try { client.destroy(); } catch { /* */ }
+        };
+        client.once("close", cleanup);
         connectViaJumpRetry(jumpRaw, destHost, destPort, 3).then((up) => {
+            if (client.destroyed) {
+                try { up.destroy(); } catch { /* */ }
+                cleanup();
+                return;
+            }
+            state.upstream = up;
             try { client.setKeepAlive(true, 15000); } catch { /* */ }
             try { up.setKeepAlive(true, 15000); } catch { /* */ }
             const pump = (a: net.Socket, b: net.Socket) => {
@@ -137,7 +152,7 @@ export async function openLocalRelay(jumpRaw: string, destHost: string, destPort
             };
             pump(client, up);
         }).catch(() => {
-            try { client.destroy(); } catch { /* */ }
+            cleanup();
         });
     });
     await new Promise((resolve, reject) => {
@@ -155,6 +170,11 @@ export async function openLocalRelay(jumpRaw: string, destHost: string, destPort
         destHost,
         destPort,
         close() {
+            for (const state of [...connections]) {
+                try { state.client.destroy(); } catch { /* */ }
+                try { state.upstream?.destroy(); } catch { /* */ }
+            }
+            connections.clear();
             try { server.close(); } catch { /* */ }
         },
     };
@@ -254,10 +274,16 @@ export async function connectExitViaJump(exitUrl: string, jumpRaw: string, destH
     const exit = parseProxyEndpoint(exitUrl);
     if (!exit || !exit.isSocks) throw new Error("出口须是 socks5");
     if (jumpRaw) {
-        const raw = await connectViaJumpRetry(jumpRaw, exit.host, exit.port, 3);
-        // SocksClient + existing_socket 经 xray 跳板会卡死 25s（Proxy connection timed out）。
-        // 本机转发 / 比特窗走的是手工 socks5 握手，这里必须同一条。
-        return socks5ConnectOnSocket(raw, exit.user, exit.pass, destHost, destPort, 8_000);
+        let raw;
+        try {
+            raw = await connectViaJumpRetry(jumpRaw, exit.host, exit.port, 3);
+            // SocksClient + existing_socket 经 xray 跳板会卡死 25s（Proxy connection timed out）。
+            // 本机转发 / 比特窗走的是手工 socks5 握手，这里必须同一条。
+            return await socks5ConnectOnSocket(raw, exit.user, exit.pass, destHost, destPort, 8_000);
+        } catch (error) {
+            try { raw?.destroy(); } catch { /* */ }
+            throw error;
+        }
     }
     const r = await SocksClient.createConnection({
         proxy: {
@@ -269,6 +295,46 @@ export async function connectExitViaJump(exitUrl: string, jumpRaw: string, destH
         timeout: 25_000,
     });
     return r.socket;
+}
+
+/**
+ * 主 HTTP 进程的协议级代理预检：跳板连出口，再在同一条 socket 上完成 SOCKS CONNECT。
+ * 不创建本地转发端口，避免预检本身把主进程拖入高 RSS 或端口泄漏。
+ */
+export async function probeExitViaJump(exitUrl: string, jumpRaw: string, destHost: string, destPort: number, timeoutMs = 8_000) {
+    const exit = parseProxyEndpoint(exitUrl);
+    if (!exit || !exit.isSocks) return {ok: false, reason: "出口须是 socks5"};
+    let socket;
+    try {
+        if (jumpRaw) {
+            const raw = await connectViaJump(jumpRaw, exit.host, exit.port, timeoutMs);
+            try {
+                socket = await socks5ConnectOnSocket(raw, exit.user, exit.pass, destHost, destPort, timeoutMs);
+            } catch (error) {
+                try { raw.destroy(); } catch { /* */ }
+                throw error;
+            }
+        } else {
+            const result = await SocksClient.createConnection({
+                proxy: {
+                    host: exit.host,
+                    port: exit.port,
+                    type: 5,
+                    userId: exit.user || undefined,
+                    password: exit.pass || undefined,
+                },
+                command: "connect",
+                destination: {host: destHost, port: destPort},
+                timeout: timeoutMs,
+            });
+            socket = result.socket;
+        }
+        return {ok: true};
+    } catch (error) {
+        return {ok: false, reason: String(error?.message || error).slice(0, 160)};
+    } finally {
+        try { socket?.destroy(); } catch { /* */ }
+    }
 }
 
 export async function openNoAuthSocksToAuthedProxy(exitUrl: string, jumpRaw = "") {

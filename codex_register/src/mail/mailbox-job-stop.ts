@@ -7,6 +7,22 @@ const DATA_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../
 const STOP_PATH = path.join(DATA_DIR, "mailbox-job.stop");
 const PROG_PATH = path.join(DATA_DIR, "mailbox-job.json");
 
+export interface MailboxJobProgressInput {
+    running?: boolean;
+    kind?: string;
+    done?: number;
+    total?: number;
+    ok?: number;
+    fail?: number;
+    current?: unknown[];
+    lastLine?: string;
+    source?: string;
+}
+
+export interface MailboxJobProgress extends Required<MailboxJobProgressInput> {
+    ts: number;
+}
+
 export function mailboxJobStopPath() { return STOP_PATH; }
 export function mailboxJobProgressPath() { return PROG_PATH; }
 
@@ -56,7 +72,7 @@ export function isMailboxJobStopped() {
     return existsSync(STOP_PATH);
 }
 
-export function writeMailboxJobProgress(p = {}) {
+export function writeMailboxJobProgress(p: MailboxJobProgressInput = {}) {
     mkdirSync(DATA_DIR, {recursive: true});
     writeFileSync(PROG_PATH, JSON.stringify({
         running: !!p.running,
@@ -72,9 +88,9 @@ export function writeMailboxJobProgress(p = {}) {
     }), "utf8");
 }
 
-export function readMailboxJobProgress(maxAgeMs = 45 * 60 * 1000) {
+export function readMailboxJobProgress(maxAgeMs = 45 * 60 * 1000): MailboxJobProgress | null {
     try {
-        const j = JSON.parse(readFileSync(PROG_PATH, "utf8"));
+        const j = JSON.parse(readFileSync(PROG_PATH, "utf8")) as MailboxJobProgress;
         if (!j || Date.now() - Number(j.ts || 0) > maxAgeMs) return null;
         return j;
     } catch {

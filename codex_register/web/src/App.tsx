@@ -3,7 +3,8 @@ import {api, connectStream, type Account, type Stats, type Daily, type Mailbox} 
 import {MailboxPanel} from "./MailboxPanel";
 import {ClaudePanel} from "./ClaudePanel";
 import {RechargePanel} from "./RechargePanel";
-import {ProxyPoolPanel} from "./ProxyPoolPanel";
+import {ProxyPoolPage} from "./ProxyPoolPage";
+import {MailSendPanel} from "./MailSendPanel";
 import {generateTotp, totpRemain} from "./totp";
 
 const STATUS_STYLE: Record<string, string> = {
@@ -106,8 +107,6 @@ export default function App() {
     const [expDays, setExpDays] = useState(10); // 过期阈值:注册满 N 天视为过期(网页 token 约 10 天)
     const [otpSingle, setOtpSingle] = useState(true);
     const [chatSim, setChatSim] = useState(true);
-    const [showProxy, setShowProxy] = useState(false);
-    const [poolMeta, setPoolMeta] = useState({total: 0, leased: 0, jump: ""});
     const [showSms, setShowSms] = useState(false);
     const [smsText, setSmsText] = useState("");
     const [smsData, setSmsData] = useState<{list: any[]; stats: {free: number; used: number; bad: number; claimed: number; total: number}}>({list: [], stats: {free: 0, used: 0, bad: 0, claimed: 0, total: 0}});
@@ -166,7 +165,7 @@ export default function App() {
     const [allLogs, setAllLogs] = useState<{id: number; email: string; ts: number; line: string}[]>([]);
     const [logMode, setLogMode] = useState<"all" | "single">("all");
     const [panelOpen, setPanelOpen] = useState(true); // 右侧抽屉是否展开(收起则表格占满)
-    const [domain, setDomain] = useState<"gpt" | "mailbox" | "claude" | "recharge">("gpt"); // 顶层业务域:GPT注册 / 邮箱管理 / Claude注册 / 充值提交
+    const [domain, setDomain] = useState<"gpt" | "mailbox" | "mail-send" | "proxy" | "claude" | "recharge">("gpt"); // 顶层业务域
     const [mailJobOn, setMailJobOn] = useState(false);
     const [dark, setDark] = useState<boolean>(() => (localStorage.getItem("theme") ?? "dark") === "dark"); // 默认暗色
     useEffect(() => { document.documentElement.classList.toggle("dark", dark); localStorage.setItem("theme", dark ? "dark" : "light"); }, [dark]);
@@ -213,7 +212,7 @@ export default function App() {
 
     // 初次加载 + SSE
     useEffect(() => {
-        api.state().then((s) => { setPaused(s.state.paused); setInstanceId(s.state.instanceId || ""); setConcurrency(s.state.concurrency); setOtpSingle(s.state.otpSingle); setChatSim(s.state.simulateChat); setSmsEnabled(s.state.smsEnabled); setRtEnabled(s.state.rtEnabled); setMfaEnabled(s.state.mfaEnabled !== false); setDaily(s.state.daily); setRegEngine(s.state.regEngine || "http"); setBitBrowser(!!s.state.bitBrowser); setSmsLinkTemplate(s.state.smsLinkTemplate || ""); setSmsMaxBind(s.state.smsMaxBind ?? 3); if (s.state.defaultPassword) setDefaultGptPw(s.state.defaultPassword); setStats(s.stats); const snap = (s.state as any).gptProxyPoolSnap; if (snap) setPoolMeta({total: snap.total || 0, leased: snap.leased || 0, jump: String((s.state as any).gptProxyJump || "")}); }).catch(() => {});
+        api.state().then((s) => { setPaused(s.state.paused); setInstanceId(s.state.instanceId || ""); setConcurrency(s.state.concurrency); setOtpSingle(s.state.otpSingle); setChatSim(s.state.simulateChat); setSmsEnabled(s.state.smsEnabled); setRtEnabled(s.state.rtEnabled); setMfaEnabled(s.state.mfaEnabled !== false); setDaily(s.state.daily); setRegEngine(s.state.regEngine || "http"); setBitBrowser(!!s.state.bitBrowser); setSmsLinkTemplate(s.state.smsLinkTemplate || ""); setSmsMaxBind(s.state.smsMaxBind ?? 3); if (s.state.defaultPassword) setDefaultGptPw(s.state.defaultPassword); setStats(s.stats); }).catch(() => {});
         reloadAccounts(true, false);
         // 批次数据来自数据库(筛选/导出用;导入已迁至邮箱管理)
         api.batches().then(setBatches).catch(() => {});
@@ -247,7 +246,6 @@ export default function App() {
             }
             else if (event === "hello") {
                 setStats(data.stats); setPaused(data.state.paused); setConcurrency(data.state.concurrency); setOtpSingle(data.state.otpSingle); setChatSim(data.state.simulateChat);
-                if (data.state?.gptProxyPoolSnap) setPoolMeta({total: data.state.gptProxyPoolSnap.total || 0, leased: data.state.gptProxyPoolSnap.leased || 0, jump: String(data.state.gptProxyJump || "")});
                 if (data.state?.mfaEnabled !== undefined) setMfaEnabled(data.state.mfaEnabled !== false);
                 if (data.state?.defaultPassword) setDefaultGptPw(data.state.defaultPassword);
                 const bh = data.state?.batchHarden;
@@ -585,17 +583,24 @@ export default function App() {
 
     return (
         <div className="h-full flex flex-col bg-gray-50 text-gray-800">
-            {/* 顶层三域导航(架构 v2:GPT注册 / 邮箱管理 / Claude注册,三域邮箱物理隔离不可串) */}
-            <nav className="bg-white border-b px-6 py-2 flex items-center gap-2 shadow-sm">
+            {/* 顶层业务域导航；代理池作为独立基础设施域，不挂在具体业务页面内。 */}
+            <nav className="bg-white border-b px-6 py-2 flex flex-wrap items-center gap-2 shadow-sm">
                 <span className="text-sm font-bold text-gray-700 mr-3">🗂 多域账号系统</span>
                 <DomainTab active={domain === "gpt"} onClick={() => setDomain("gpt")}>⚡ GPT 注册</DomainTab>
                 <DomainTab active={domain === "mailbox"} onClick={() => setDomain("mailbox")}>📮 邮箱管理{mailJobOn ? <span className="ml-1 text-amber-500">●</span> : null}</DomainTab>
+                <DomainTab active={domain === "mail-send"} onClick={() => setDomain("mail-send")}>✉ 邮件发送</DomainTab>
+                <DomainTab active={domain === "proxy"} onClick={() => setDomain("proxy")}>🧩 代理池</DomainTab>
                 <DomainTab active={domain === "claude"} onClick={() => setDomain("claude")}>🧠 Claude 注册</DomainTab>
                 <DomainTab active={domain === "recharge"} onClick={() => setDomain("recharge")}>💳 充值提交</DomainTab>
             </nav>
             {domain === "mailbox" && (
                 <div className="flex-1 min-h-0 flex flex-col overflow-hidden">
                     <MailboxPanel notify={notify}/>
+                </div>
+            )}
+            {domain === "mail-send" && (
+                <div className="flex-1 min-h-0 flex flex-col overflow-hidden">
+                    <MailSendPanel notify={notify}/>
                 </div>
             )}
             {domain === "claude" && (
@@ -606,6 +611,11 @@ export default function App() {
             {domain === "recharge" && (
                 <div className="flex-1 min-h-0 flex flex-col overflow-hidden">
                     <RechargePanel notify={notify}/>
+                </div>
+            )}
+            {domain === "proxy" && (
+                <div className="flex-1 min-h-0 flex flex-col overflow-hidden">
+                    <ProxyPoolPage notify={notify}/>
                 </div>
             )}
             {domain === "gpt" && (<>
@@ -728,7 +738,6 @@ export default function App() {
                         : <button onClick={pause} className="px-4 py-1.5 bg-amber-500 text-white rounded-lg text-sm font-medium hover:bg-amber-600">⏸ 暂停</button>}
                     <button onClick={ctrl(api.stop, "已停止本实例注册，未完成任务退回队列（其他实例可接着跑）")} className="px-3 py-1.5 bg-red-500 text-white rounded-lg text-sm hover:bg-red-600" title="只停本机。正在跑的号退回等待，其他实例会认领">⏹ 停止</button>
                     <button onClick={ctrl(api.retryFailed, "已把失败项重置为等待")} className="px-3 py-1.5 bg-gray-200 rounded-lg text-sm hover:bg-gray-300">↻ 重试失败</button>
-                    <button onClick={() => { setShowProxy(true); notify("代理池已在下方展开"); }} className="px-3 py-1.5 bg-gray-200 rounded-lg text-sm hover:bg-gray-300">⚙ 代理池</button>
                     <button onClick={openPicker} title="从待分配里勾选可挂 GPT 的号：Gmail 仅显示已整备(2FA+IMAP)且有应用密码；mail.com 不限。可选批次/先改密后进注册队列" className="px-3 py-1.5 bg-emerald-600 text-white rounded-lg text-sm hover:bg-emerald-700">📥 从邮箱选号</button>
                     <button onClick={() => { setExportRange(selectedIds.size ? "selected" : batchFilter ? "batch" : "all"); setExportBatch(batchFilter); setShowExport(true); }} className="px-3 py-1.5 bg-indigo-600 text-white rounded-lg text-sm hover:bg-indigo-700">⬇ 导出…</button>
                     <button onClick={() => setShowRefreshAt(true)} className="px-3 py-1.5 bg-cyan-600 text-white rounded-lg text-sm hover:bg-cyan-700" title="粘贴邮箱列表,走浏览器登录重新获取 accessToken">🔄 批量刷新AT</button>
@@ -738,16 +747,13 @@ export default function App() {
 
             {/* 导入区 */}
             <div className="bg-white border-b px-6 py-2">
-                <button onClick={() => setShowProxy((v) => !v)} className="text-sm text-indigo-600 font-medium mr-4">
-                    {showProxy ? "▾ 收起代理池" : `⚙ 代理池${poolMeta.total ? `(${poolMeta.total}条${poolMeta.leased ? ` · 占用${poolMeta.leased}` : ""}${poolMeta.jump ? " · 链式" : ""})` : ""}`}
-                </button>
                 <button onClick={() => { setShowSms((v) => !v); refreshSms(); }} className="text-sm text-indigo-600 font-medium mr-4">
                     {showSms ? "▾ 收起接码池" : `📱 接码池(可用 ${smsData.stats.free})`}
                 </button>
                 <button onClick={() => setShowDaily((v) => !v)} className="text-sm text-indigo-600 font-medium mr-4">
                     {showDaily ? "▾ 收起定时任务" : `⏰ 定时任务${daily?.enabled ? "(已开)" : ""}`}
                 </button>
-                <button onClick={() => { setShowProxy(false); setShowSms(false); setShowDaily(false); }}
+                <button onClick={() => { setShowSms(false); setShowDaily(false); }}
                         className="text-sm text-gray-400 hover:text-gray-600 font-medium" title="收起上方所有展开的面板">⊟ 全部收起</button>
                 {showDaily && daily && (
                     <div className="mt-2 flex flex-col gap-2 bg-amber-50 p-3 rounded-lg text-sm">
@@ -782,16 +788,6 @@ export default function App() {
                             {daily.lastResult && <span className="ml-2 text-gray-400">（{daily.lastResult}）</span>}
                         </div>
                         <div className="text-xs text-gray-400">rt 续期只刷新已有的有效 rt；过期/无rt 的号不会自动重取(避免定时批量烧接码)，如需重取请点该行 rt「测」。</div>
-                    </div>
-                )}
-                {showProxy && (
-                    <div className="mt-2">
-                        <ProxyPoolPanel
-                            notify={notify}
-                            kind="gpt"
-                            title="GPT 注册代理池"
-                            onMeta={(m) => setPoolMeta({total: m.total, leased: m.leased, jump: m.jump})}
-                        />
                     </div>
                 )}
                 {showSms && (

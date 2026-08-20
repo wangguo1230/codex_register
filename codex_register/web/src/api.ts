@@ -73,6 +73,24 @@ export interface Mailbox {
     created_at: number;
 }
 
+export interface MailSendLog {
+    id: number;
+    mailbox_id: number;
+    email: string;
+    to_email: string;
+    subject: string;
+    status: "pending" | "sent" | "fail" | string;
+    http_status?: number;
+    location?: string;
+    error?: string;
+    proxy_url?: string;
+    proxy_session?: string;
+    proxy_ip?: string;
+    jump_url?: string;
+    reused?: number;
+    created_at: number;
+}
+
 export interface MailboxJobWindow {
     id: string;
     name: string;
@@ -195,15 +213,24 @@ export interface RechargeConfig {
     apiKey: string;
     forwardIp: string;
     concurrency: number;
+    rebindConcurrency: number;
     interval: number;
     rtProxy: string;
     rtConcurrency: number;
     instanceId?: string;
     rebindGmailAfterPaid?: boolean;
     rebindAfterPaid?: "off" | "gmail" | "mailcom";
+    rebindGmailProbeLogin?: boolean;
     gmailFreeImap?: number;
     mailcomFree?: number;
-    jobs?: {submit?: boolean; reloginSubmit?: boolean; relogin?: boolean; exportRt?: boolean};
+    jobs?: RechargeJobs;
+}
+
+export interface RechargeJobs {
+    submit?: boolean;
+    reloginSubmit?: boolean;
+    relogin?: boolean;
+    exportRt?: boolean;
 }
 
 export interface RechargeCardStats {
@@ -223,6 +250,12 @@ export interface RechargeQueueItem {
     auth_file: string;
     plan: string;
     batch: string;
+    /** 充值队列分组；batch 是兼容旧接口的同值字段 */
+    recharge_group?: string;
+    /** GPT 账号来源批次 */
+    source_batch?: string;
+    /** 邮箱管理分组，仅用于展示核对，不参与充值分组筛选 */
+    mailbox_group?: string;
     card_id: number;
     card_code: string;
     status: "pending" | "paired" | "submitting" | "submitted" | "done" | "error";
@@ -249,6 +282,8 @@ export interface RechargeQueueItem {
     submitted_at: number;
     finished_at?: number;
     instance_id?: string;
+    rebind_instance?: string;
+    rebind_attempt_stage?: string;
 }
 
 export interface RechargeQueueStats {
@@ -323,6 +358,20 @@ export interface JumpPoolSnap {
     items: JumpPoolItem[];
 }
 
+export interface SharedProxyPoolSnap {
+    ok: boolean;
+    urls: string[];
+    lines: string[];
+    total: number;
+    slots: number;
+    leased: number;
+    free: number;
+    items: {url: string; masked: string; leased: boolean; owner: string}[];
+    useForMail: boolean;
+    useForGpt: boolean;
+    jump: JumpPoolSnap & {lines: string[]; useForMail: boolean; useForGpt: boolean};
+}
+
 export interface Daily {
     enabled: boolean;
     hour: number;
@@ -346,6 +395,16 @@ async function j<T>(url: string, opts?: RequestInit): Promise<T> {
 }
 
 export const api = {
+    sharedProxyPool: () => j<SharedProxyPoolSnap>("/api/proxy-pool"),
+    setSharedProxyPool: (text: string, opts?: {append?: boolean; copies?: number; useForMail?: boolean; useForGpt?: boolean}) =>
+        j<SharedProxyPoolSnap & {inserted?: number; skipped?: number}>("/api/proxy-pool", {method: "POST", body: JSON.stringify({text, append: !!opts?.append, copies: opts?.copies || 1, ...(opts?.useForMail !== undefined ? {useForMail: opts.useForMail} : {}), ...(opts?.useForGpt !== undefined ? {useForGpt: opts.useForGpt} : {})})}),
+    setSharedProxyScopes: (scopes: {mail?: boolean; gpt?: boolean}) =>
+        j<SharedProxyPoolSnap>("/api/proxy-pool/scopes", {method: "POST", body: JSON.stringify(scopes)}),
+    setSharedJumpPool: (text: string, opts?: {check?: boolean; useForMail?: boolean; useForGpt?: boolean}) =>
+        j<SharedProxyPoolSnap>("/api/proxy-jump-pool", {method: "POST", body: JSON.stringify({text, check: !!opts?.check, ...(opts?.useForMail !== undefined ? {useForMail: opts.useForMail} : {}), ...(opts?.useForGpt !== undefined ? {useForGpt: opts.useForGpt} : {})})}),
+    setSharedJumpScopes: (scopes: {mail?: boolean; gpt?: boolean}) =>
+        j<SharedProxyPoolSnap>("/api/proxy-jump-pool/scopes", {method: "POST", body: JSON.stringify(scopes)}),
+    checkSharedJumpPool: () => j<SharedProxyPoolSnap>("/api/proxy-jump-pool/check", {method: "POST", body: JSON.stringify({})}),
     importAccounts: (text: string, defaultPassword?: string, batch?: string) =>
         j<{inserted: number; skipped: number; total: number}>("/api/accounts/import", {
             method: "POST",
@@ -466,7 +525,7 @@ export const api = {
         j<{ok: boolean; count: number; concurrency: number; proxies: number}>("/api/mailboxes/batch-google-harden", {method: "POST", body: JSON.stringify({ids})}),
     stopBatchHardenMailboxGoogle: () => j<{ok: boolean; closed?: number}>("/api/mailboxes/batch-google-harden/stop", {method: "POST"}),
     resumeHardenMailboxGoogle: (ids?: number[]) =>
-        j<{ok: boolean; count: number; skipped?: number; skippedDone?: number; msg?: string}>("/api/mailboxes/batch-google-harden/resume", {method: "POST", body: JSON.stringify(ids?.length ? {ids} : {})}),
+        j<{ok: boolean; count: number; recovered?: number; skipped?: number; skippedDone?: number; msg?: string}>("/api/mailboxes/batch-google-harden/resume", {method: "POST", body: JSON.stringify(ids?.length ? {ids} : {})}),
     retryFailedMailboxJobs: (ids?: number[]) =>
         j<{ok: boolean; count: number; skippedDone?: number; msg?: string}>("/api/mailboxes/jobs/retry-failed", {method: "POST", body: JSON.stringify(ids?.length ? {ids} : {})}),
     latestJobErrors: () =>
@@ -488,10 +547,13 @@ export const api = {
     sendMailcom: (body: {email?: string; mailboxId?: number; to: string | string[]; subject?: string; html?: string; text?: string; fromName?: string}) =>
         j<{ok: boolean; status?: number; location?: string; from?: string; proxySession?: string; proxyIp?: string; proxyMasked?: string; jumpMasked?: string; reused?: boolean; error?: string}>(
             "/api/mailcom/send", {method: "POST", body: JSON.stringify(body)}),
+    sendMailbox: (body: {email?: string; mailboxId?: number; to: string | string[]; subject: string; html?: string; text?: string; fromName?: string}) =>
+        j<{ok: boolean; status?: number; from?: string; to?: string[]; via?: string; proxySession?: string; proxyIp?: string; proxyMasked?: string; jumpMasked?: string; reused?: boolean; error?: string}>(
+            "/api/mail/send", {method: "POST", body: JSON.stringify(body)}),
     sendMailcomBatch: (items: any[], concurrency?: number) =>
         j<{ok: boolean; total: number; sent: number; failed: number; items: any[]}>("/api/mailcom/send-batch", {method: "POST", body: JSON.stringify({items, concurrency})}),
     mailSendLogs: (email?: string, limit = 50) =>
-        j<{ok: boolean; items: any[]}>(`/api/mailcom/send-logs?email=${encodeURIComponent(email || "")}&limit=${limit}`),
+        j<{ok: boolean; items: MailSendLog[]}>(`/api/mail/send-logs?email=${encodeURIComponent(email || "")}&limit=${limit}`),
     rechargeSendPreview: (ids: number[], to?: string) =>
         j<{ok: boolean; to: string; items: {id: number; queueEmail: string; from: string; rebound: boolean; to: string; subject: string; text: string; html: string; canSend: boolean; reason: string; group: string}[]}>(
             "/api/recharge/queue/send-preview", {method: "POST", body: JSON.stringify({ids, to: to || ""})}),
@@ -550,7 +612,8 @@ export const api = {
     },
     // ---- 充值提交域 ----
     rechargeConfig: () => j<RechargeConfig & {hasKey: boolean; instanceId?: string}>("/api/recharge/config"),
-    setRechargeConfig: (cfg: Partial<RechargeConfig>) => j<{ok: boolean; rebindGmailAfterPaid?: boolean; rebindAfterPaid?: "off" | "gmail" | "mailcom"; gmailFreeImap?: number; mailcomFree?: number}>("/api/recharge/config", {method: "POST", body: JSON.stringify(cfg)}),
+    rechargeJobs: () => j<RechargeJobs>("/api/recharge/jobs"),
+    setRechargeConfig: (cfg: Partial<RechargeConfig>) => j<{ok: boolean; rebindGmailAfterPaid?: boolean; rebindAfterPaid?: "off" | "gmail" | "mailcom"; rebindGmailProbeLogin?: boolean; gmailFreeImap?: number; mailcomFree?: number}>("/api/recharge/config", {method: "POST", body: JSON.stringify(cfg)}),
     // 卡密池
     rechargeCards: () => j<{list: RechargeCard[]; stats: RechargeCardStats}>("/api/recharge/cards"),
     importRechargeCards: (text: string, batch?: string) =>
@@ -583,14 +646,14 @@ export const api = {
     setRechargeQueueBatch: (ids: number[], batch: string) =>
         j<{ok: boolean}>("/api/recharge/queue/set-batch", {method: "POST", body: JSON.stringify({ids, batch})}),
     resetRechargeQueue: (ids: number[]) =>
-        j<{ok: boolean}>("/api/recharge/queue/reset", {method: "POST", body: JSON.stringify({ids})}),
+        j<{ok: boolean; reset: number; reclaimed: number; kept: number; skipped: number}>("/api/recharge/queue/reset", {method: "POST", body: JSON.stringify({ids})}),
     markRechargeQueueError: (ids: number[], reason?: string) =>
         j<{ok: boolean; count: number; reclaimed?: number; skipped?: number}>("/api/recharge/queue/mark-error", {method: "POST", body: JSON.stringify({ids, error: reason || ""})}),
     rechargeQueueRelogin: (ids: number[]) =>
         j<{ok: boolean; count: number; claimed?: number; skipped?: number; instanceId?: string}>("/api/recharge/queue/relogin", {method: "POST", body: JSON.stringify({ids})}),
     // 一条龙:浏览器重登刷新 session → 验卡 → 重置任务 → 用同一张卡密重提(卡密非 unused 则跳过)
     rechargeQueueReloginSubmit: (ids: number[]) =>
-        j<{ok: boolean; count: number; claimed?: number; skipped?: number; instanceId?: string}>("/api/recharge/queue/relogin-submit", {method: "POST", body: JSON.stringify({ids})}),
+        j<{ok: boolean; count: number; queued?: number; claimed?: number; skipped?: number; instanceId?: string}>("/api/recharge/queue/relogin-submit", {method: "POST", body: JSON.stringify({ids})}),
     stopRechargeQueueRelogin: () => j<{ok: boolean}>("/api/recharge/queue/relogin/stop", {method: "POST"}),
     reclaimCards: (ids: number[]) =>
         j<{ok: boolean; reclaimed: number; used: number; failed: number}>("/api/recharge/queue/reclaim-cards", {method: "POST", body: JSON.stringify({ids})}),
@@ -598,6 +661,19 @@ export const api = {
     submitRecharge: (queueIds: number[]) =>
         j<{ok: boolean; paired: number}>("/api/recharge/submit", {method: "POST", body: JSON.stringify({queueIds})}),
     stopRecharge: () => j<{ok: boolean}>("/api/recharge/stop", {method: "POST"}),
+    recoverRecharge: (ids: number[]) => j<{
+        ok: boolean;
+        selected: number;
+        notFound: number;
+        rechargeLeases: number;
+        pairedReset: number;
+        preserved: number;
+        review: number;
+        rebindLeases: number;
+        rebindUnknown: number;
+        rebindMailboxes: number;
+        activeSkipped: number;
+    }>("/api/recharge/recover", {method: "POST", body: JSON.stringify({ids})}),
     pollRecharge: (ids?: number[]) => j<{ok: boolean; updated: number}>("/api/recharge/poll", {method: "POST", body: JSON.stringify({ids})}),
     rebindGmailPool: () => j<RebindGmailPoolResponse>("/api/recharge/rebind-gmail/pool"),
     markRebindGmailUnavailable: (ids: number[], reason?: string) =>
@@ -605,17 +681,17 @@ export const api = {
             "/api/recharge/rebind-gmail/mark-unavailable",
             {method: "POST", body: JSON.stringify({ids, reason: reason || "登录不可用"})},
         ),
-    migrateToRebindGmailPool: (ids: number[]) =>
+    migrateToRebindGmailPool: (ids: number[], opts?: {concurrency?: number}) =>
         j<{ok: boolean; count: number; skipped?: {id: number; email: string; reason: string}[]; poolGrp?: string; gmailFreeImap?: number; mailcomFree?: number}>(
             "/api/recharge/rebind-gmail/migrate",
-            {method: "POST", body: JSON.stringify({ids})},
+            {method: "POST", body: JSON.stringify({ids, ...(opts || {})})},
         ),
     demoteFromRebindGmailPool: (ids: number[], grp?: string) =>
         j<{ok: boolean; count: number; gmailFreeImap?: number; mailcomFree?: number}>(
             "/api/recharge/rebind-gmail/demote",
             {method: "POST", body: JSON.stringify({ids, grp: grp ?? ""})},
         ),
-    rebindGmail: (ids: number[], target?: "gmail" | "mailcom", opts?: {emails?: string[]; grp?: string; text?: string}) =>
+    rebindGmail: (ids: number[], target?: "gmail" | "mailcom", opts?: {emails?: string[]; grp?: string; text?: string; allowDelivered?: boolean}) =>
         j<{ok: boolean; queued: number; skipped: {email: string; reason: string}[]; gmailFreeImap?: number; mailcomFree?: number}>("/api/recharge/rebind-gmail", {method: "POST", body: JSON.stringify({ids, target, ...(opts || {})})}),
     cancelRebindGmail: (ids: number[]) =>
         j<{ok: boolean; count: number}>("/api/recharge/rebind-gmail/cancel", {method: "POST", body: JSON.stringify({ids})}),
@@ -646,13 +722,19 @@ export const api = {
 };
 
 export type StreamHandler = (event: string, data: any) => void;
+export type StreamStateHandler = (connected: boolean) => void;
 
-export function connectStream(onEvent: StreamHandler): () => void {
+export function connectStream(onEvent: StreamHandler, onState?: StreamStateHandler): () => void {
     const es = new EventSource("/api/stream");
+    es.onopen = () => onState?.(true);
+    es.onerror = () => onState?.(false);
     for (const name of ["hello", "log", "status", "stats", "snapshot", "sms", "daily", "mailboxes", "mbLog", "claude", "claudeLog", "claudeScan", "batchAt", "batchPw", "batchHarden", "refreshAt", "batchRtAcquire", "recharge", "rechargeLog", "rechargeQueue", "rechargeExportReady", "rechargeSendDone", "rechargeJobs"]) {
         es.addEventListener(name, (e: MessageEvent) => {
             try { onEvent(name, JSON.parse(e.data)); } catch { /* ignore */ }
         });
     }
-    return () => es.close();
+    return () => {
+        onState?.(false);
+        es.close();
+    };
 }

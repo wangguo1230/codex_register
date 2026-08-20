@@ -1,0 +1,45 @@
+// @ts-nocheck
+
+export function buildMailJobSnapshot({progress, windows = [], instances = [], instanceId} = {}) {
+    const state = progress || {
+        running: false,
+        kind: "mail",
+        done: 0,
+        total: 0,
+        ok: 0,
+        fail: 0,
+        queued: 0,
+        runningCount: 0,
+        rate: 0,
+        current: [],
+        lastLine: "",
+        byKind: {},
+    };
+    return {
+        running: !!state.running,
+        kind: state.kind || "mail",
+        done: Number(state.done || 0),
+        total: Number(state.total || 0),
+        ok: Number(state.ok || 0),
+        fail: Number(state.fail || 0),
+        queued: Number(state.queued || 0),
+        runningCount: Number(state.runningCount || 0),
+        rate: Number(state.rate || 0),
+        current: state.current || [],
+        lastLine: state.lastLine || "",
+        byKind: state.byKind || {},
+        windows,
+        instances,
+        source: "queue",
+        instanceId,
+        stopped: !!state.paused,
+        startedAt: Number(state.startedAt || 0) || 0,
+        endedAt: Number(state.endedAt || 0) || 0,
+        elapsedMs: Number(state.elapsedMs || 0) || 0,
+        avgMs: Number(state.avgMs || 0) || 0,
+        etaMs: Number(state.etaMs || 0) || 0,
+        hourly: Array.isArray(state.hourly) ? state.hourly : [],
+        hourNow: state.hourNow || null,
+        failEmails: Array.isArray(state.failEmails) ? state.failEmails : [],
+    };
+}

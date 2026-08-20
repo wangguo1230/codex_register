@@ -6,6 +6,9 @@
   "scripts": {
     "dev": "tsx src/index.ts",
     "build": "tsup --config tsup.config.ts",
+    "build:server": "tsup --config tsup.server.config.ts && tsup --config tsup.workers.config.ts",
+    "build:all": "npm run build:server && npm run build && npm --prefix web run build",
+    "server": "node bundle/server.mjs",
     "start": "node bundle/index.cjs",
     "check": "node bundle/check-auth-quota.cjs",
     "check:cpa": "node bundle/check-auth-quota.cjs --cpa",

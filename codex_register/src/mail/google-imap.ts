@@ -386,7 +386,17 @@ export async function testGmailImap(email, imapPassword, {
 }
 
 // ---- 邮箱管理「收件箱」：Gmail 用应用专用密码走 IMAP 列表/正文 ----
-const gmailImapBodyCache = new Map(); // email -> {at, byId: Map<id, text>}
+const GMAIL_IMAP_CACHE_TTL_MS = Math.max(30_000, Number(process.env.GMAIL_IMAP_CACHE_TTL_MS || 10 * 60_000));
+const GMAIL_IMAP_CACHE_MAX_ACCOUNTS = Math.max(8, Number(process.env.GMAIL_IMAP_CACHE_MAX_ACCOUNTS || 128));
+const GMAIL_IMAP_CACHE_MAX_MESSAGES = Math.max(1, Number(process.env.GMAIL_IMAP_CACHE_MAX_MESSAGES || 50));
+const GMAIL_IMAP_CACHE_MAX_BODY_BYTES = Math.max(4 * 1024, Number(process.env.GMAIL_IMAP_CACHE_MAX_BODY_BYTES || 96 * 1024));
+const GMAIL_IMAP_CACHE_MAX_BYTES = Math.max(
+    GMAIL_IMAP_CACHE_MAX_BODY_BYTES,
+    Number(process.env.GMAIL_IMAP_CACHE_MAX_BYTES || 16 * 1024 * 1024),
+);
+const GMAIL_IMAP_MAX_RAW_BYTES = GMAIL_IMAP_CACHE_MAX_BODY_BYTES * 4;
+const gmailImapBodyCache = new Map(); // email -> {at, byId: Map<id, text>, bytes}
+let gmailImapCacheBytes = 0;
 
 function normalizeGmailKey(email) {
     return String(email || "").trim().toLowerCase();
@@ -402,8 +412,17 @@ function addrListToStr(list) {
     }).filter(Boolean).join(", ");
 }
 
+function limitTextBytes(text, maxBytes = GMAIL_IMAP_CACHE_MAX_BODY_BYTES) {
+    const src = String(text || "");
+    if (Buffer.byteLength(src, "utf8") <= maxBytes) return src;
+    return Buffer.from(src, "utf8").subarray(0, maxBytes).toString("utf8").replace(/\uFFFD$/, "") + "\n[正文已截断]";
+}
+
 function sourceToReadable(raw) {
-    let s = Buffer.isBuffer(raw) ? raw.toString("utf8") : String(raw || "");
+    const source = Buffer.isBuffer(raw)
+        ? raw.subarray(0, GMAIL_IMAP_MAX_RAW_BYTES)
+        : String(raw || "").slice(0, GMAIL_IMAP_MAX_RAW_BYTES);
+    let s = Buffer.isBuffer(source) ? source.toString("utf8") : String(source);
     // 粗拆 MIME：优先 text/plain，再 text/html
     const plain = s.match(/Content-Type:\s*text\/plain[\s\S]*?\r?\n\r?\n([\s\S]*?)(?=\r?\n--|\r?\nContent-Type:|$)/i);
     const html = s.match(/Content-Type:\s*text\/html[\s\S]*?\r?\n\r?\n([\s\S]*?)(?=\r?\n--|\r?\nContent-Type:|$)/i);
@@ -429,7 +448,59 @@ function sourceToReadable(raw) {
         .replace(/<[^>]+>/g, " ")
         .replace(/&nbsp;/gi, " ").replace(/&amp;/gi, "&").replace(/&lt;/gi, "<").replace(/&gt;/gi, ">")
         .replace(/&quot;/gi, '"').replace(/&#39;/gi, "'");
-    return body.split("\n").map((l) => l.replace(/[ \t]+/g, " ").trim()).join("\n").replace(/\n{3,}/g, "\n\n").trim();
+    return limitTextBytes(
+        body.split("\n").map((l) => l.replace(/[ \t]+/g, " ").trim()).join("\n").replace(/\n{3,}/g, "\n\n").trim(),
+    );
+}
+
+function cacheEntryBytes(entry) {
+    if (!entry?.byId) return 0;
+    let bytes = 0;
+    for (const text of entry.byId.values()) bytes += Buffer.byteLength(String(text || ""), "utf8");
+    return bytes;
+}
+
+function dropGmailCache(key) {
+    const old = gmailImapBodyCache.get(key);
+    if (!old) return;
+    gmailImapCacheBytes = Math.max(0, gmailImapCacheBytes - Number(old.bytes || cacheEntryBytes(old)));
+    gmailImapBodyCache.delete(key);
+}
+
+function trimGmailCache() {
+    while (gmailImapBodyCache.size > GMAIL_IMAP_CACHE_MAX_ACCOUNTS || gmailImapCacheBytes > GMAIL_IMAP_CACHE_MAX_BYTES) {
+        const oldest = gmailImapBodyCache.keys().next().value;
+        if (!oldest) break;
+        dropGmailCache(oldest);
+    }
+}
+
+function putGmailCache(key, byId, at = Date.now()) {
+    const limited = new Map();
+    for (const [id, text] of [...(byId || new Map()).entries()].slice(-GMAIL_IMAP_CACHE_MAX_MESSAGES)) {
+        const value = limitTextBytes(text || "");
+        const bytes = Buffer.byteLength(value, "utf8");
+        if (bytes <= GMAIL_IMAP_CACHE_MAX_BODY_BYTES) limited.set(String(id), value);
+    }
+    dropGmailCache(key);
+    const entry = {at, byId: limited, bytes: 0};
+    entry.bytes = cacheEntryBytes(entry);
+    gmailImapBodyCache.set(key, entry);
+    gmailImapCacheBytes += entry.bytes;
+    trimGmailCache();
+}
+
+function getGmailCache(key) {
+    const entry = gmailImapBodyCache.get(key);
+    if (!entry) return null;
+    if (Date.now() - Number(entry.at || 0) >= GMAIL_IMAP_CACHE_TTL_MS) {
+        dropGmailCache(key);
+        return null;
+    }
+    // Map 顺序作为轻量 LRU，不引入额外依赖。
+    gmailImapBodyCache.delete(key);
+    gmailImapBodyCache.set(key, entry);
+    return entry;
 }
 
 async function withGmailImap(email, imapPassword, fn, {proxy = ""} = {}) {
@@ -470,23 +541,21 @@ async function withGmailImap(email, imapPassword, fn, {proxy = ""} = {}) {
 /** 拉 Gmail INBOX 最近 amount 封（头信息），供邮箱管理收件箱。 */
 export async function fetchGmailImapInbox(email, imapPassword, amount = 30, {proxy = ""} = {}) {
     const key = normalizeGmailKey(email);
-    const n = Math.max(1, Math.min(100, Number(amount) || 30));
+    const n = Math.max(1, Math.min(GMAIL_IMAP_CACHE_MAX_MESSAGES, Number(amount) || 30));
     return withGmailImap(email, imapPassword, async (client) => {
         const lock = await client.getMailboxLock("INBOX");
         try {
             const status = await client.status("INBOX", {messages: true});
             const total = Number(status?.messages || 0);
             if (!total) {
-                gmailImapBodyCache.set(key, {at: Date.now(), byId: new Map()});
+                putGmailCache(key, new Map());
                 return [];
             }
             const start = Math.max(1, total - n + 1);
             const mails = [];
-            const byId = new Map();
             for await (const msg of client.fetch(`${start}:*`, {
                 uid: true,
                 envelope: true,
-                source: true,
             })) {
                 const env = msg.envelope || {};
                 const ts = env.date ? new Date(env.date).getTime() : 0;
@@ -499,11 +568,11 @@ export async function fetchGmailImapInbox(email, imapPassword, amount = 30, {pro
                     date: ts ? formatBeijingDateTime(ts) : "",
                 };
                 mails.push(head);
-                try { byId.set(id, sourceToReadable(msg.source)); } catch { byId.set(id, ""); }
             }
             // 新→旧
             mails.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
-            gmailImapBodyCache.set(key, {at: Date.now(), byId});
+            // 列表只取 envelope；正文按 UID 懒加载，避免一次把几十封 MIME 拉进 V8。
+            putGmailCache(key, new Map());
             return mails;
         } finally {
             try { lock.release(); } catch { /* */ }
@@ -515,8 +584,8 @@ export async function fetchGmailImapInbox(email, imapPassword, amount = 30, {pro
 export async function fetchGmailImapBody(email, mailId, imapPassword, {proxy = ""} = {}) {
     const key = normalizeGmailKey(email);
     const id = String(mailId || "");
-    const cached = gmailImapBodyCache.get(key);
-    if (cached?.byId?.has(id) && Date.now() - (cached.at || 0) < 10 * 60_000) {
+    const cached = getGmailCache(key);
+    if (cached?.byId?.has(id)) {
         return cached.byId.get(id) || "(无正文)";
     }
     return withGmailImap(email, imapPassword, async (client) => {
@@ -527,10 +596,10 @@ export async function fetchGmailImapBody(email, mailId, imapPassword, {proxy = "
                 text = sourceToReadable(msg.source);
                 break;
             }
-            if (!gmailImapBodyCache.has(key)) gmailImapBodyCache.set(key, {at: Date.now(), byId: new Map()});
-            const bag = gmailImapBodyCache.get(key);
-            bag.at = Date.now();
-            bag.byId.set(id, text || "(无正文)");
+            const bag = getGmailCache(key);
+            const next = new Map(bag?.byId || []);
+            next.set(id, text || "(无正文)");
+            putGmailCache(key, next);
             return text || "(无正文)";
         } finally {
             try { lock.release(); } catch { /* */ }

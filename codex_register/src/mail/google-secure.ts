@@ -227,7 +227,7 @@ export async function signOutOtherDevices(page, cred, log = () => {}) {
 /**
  * 完整整备。cred 会被就地更新为新密码 / 新 TOTP。
  */
-export async function hardenGoogleAccountOnPage(page, cred, log = () => {}, onCheckpoint = async () => {}) {
+export async function hardenGoogleAccountOnPage(page, cred, log = () => {}, onCheckpoint = async () => {}, {signal} = {}) {
     const out = {
         ok: true,
         password: "",
@@ -260,7 +260,7 @@ export async function hardenGoogleAccountOnPage(page, cred, log = () => {}, onCh
         try { return page.isClosed(); } catch { return true; }
     };
     const {isMailboxJobStopped} = await import("./mailbox-job-stop.js");
-    const stopNow = () => isMailboxJobStopped();
+    const stopNow = () => !!signal?.aborted || isMailboxJobStopped();
     const finalize = () => {
         if (!out.imapPassword && (skip.imap || String(cred.imapPassword || "").trim())) {
             out.imapPassword = cred.imapPassword || out.imapPassword || "kept";
@@ -284,12 +284,19 @@ export async function hardenGoogleAccountOnPage(page, cred, log = () => {}, onCh
 
     const runTimed = async (label, fn, ms = 90000, failOnTimeout = false) => {
         let timer;
+        let timedOut = false;
+        const work = Promise.resolve().then(fn);
+        // 页面操作没有统一的 AbortSignal 参数；超时时关闭当前 page，
+        // 让 Playwright 正在等待的 locator/navigation 尽快收到 Target closed。
+        work.catch(() => {});
         try {
             return await Promise.race([
-                fn(),
+                work,
                 new Promise((resolve) => {
-                    timer = setTimeout(() => {
+                    timer = setTimeout(async () => {
+                        timedOut = true;
                         log(`[邮箱管理] ${label} 超时 ${Math.round(ms / 1000)}s，先跳过`);
+                        try { await page.close({runBeforeUnload: false}); } catch { /* */ }
                         resolve(failOnTimeout
                             ? {ok: false, error: `${label}超时`, timeout: true}
                             : {ok: true, skipped: true, timeout: true});
@@ -298,6 +305,7 @@ export async function hardenGoogleAccountOnPage(page, cred, log = () => {}, onCh
             ]);
         } finally {
             clearTimeout(timer);
+            if (timedOut) work.catch(() => {});
         }
     };
 
@@ -485,7 +493,10 @@ async function openGoogleBitOnce({proxyUrl = "", jumpUrl, name = "gmail", remark
             if (host === "127.0.0.1" || host === "localhost") jumpNow = "";
         } catch { /* */ }
         log(jumpNow ? `[网络] 先测代理出口 / Google（经跳板 ${jumpNow}）` : "[网络] 先测代理出口 / Google（无跳板）");
-        const picked = await pickLiveMailProxy(liveProxy, {tries: 3, rotate: true, log: (m) => log(`[网络] ${m}`), jump: jumpNow});
+        const picked = await pickLiveMailProxy(liveProxy, {
+            tries: 3, rotate: true,
+            log: (m) => log(`[网络] ${m}`), jump: jumpNow, signal,
+        });
         if (!picked.ok) throw new Error(`代理不通，先别登 Google: ${picked.probe.reason || "未知"}`);
         liveProxy = picked.url;
         log(`[网络] 通 出口 ${picked.probe.ip} Google=${picked.probe.google} ${picked.probe.ms}ms ${maskProxyUrl(liveProxy)}`);
@@ -507,7 +518,9 @@ async function openGoogleBitOnce({proxyUrl = "", jumpUrl, name = "gmail", remark
         } else {
             bitProxy = liveProxy;
         }
-        const bitProbe = await pickLiveMailProxy(bitProxy, {tries: 1, rotate: false, log: (m) => log(`[网络] 比特将用的链 ${m}`), jump: ""});
+        const bitProbe = await pickLiveMailProxy(bitProxy, {
+            tries: 1, rotate: false, log: (m) => log(`[网络] 比特将用的链 ${m}`), jump: "", signal,
+        });
         if (!bitProbe.ok) {
             throw new Error(`代理不通 开窗前复测失败: ${bitProbe.probe.reason || "未知"}`);
         }
@@ -698,7 +711,7 @@ export async function runGoogleHardenWithBit(acc, {proxyUrl = "", jumpUrl = "", 
         const {enterMailJobCritical} = await import("./mailbox-job-stop.js");
         const leave = enterMailJobCritical();
         try {
-            const done = await hardenGoogleAccountOnPage(page, cred, log, onCheckpoint);
+            const done = await hardenGoogleAccountOnPage(page, cred, log, onCheckpoint, {signal});
             return {...done, login: true};
         } finally {
             leave();

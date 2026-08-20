@@ -62,7 +62,14 @@ export async function fetchChatGPTAccessTokenViaBrowser(
         executablePath: resolveBrowserExecutablePath(),
         proxy: proxyCfg,
     });
-    const _cleanup = () => { try { const p = browser?.process?.(); if (p?.pid) process.kill(p.pid, "SIGKILL"); } catch {} process.exit(1); };
+    let exiting = false;
+    const _cleanup = () => {
+        if (exiting) return;
+        exiting = true;
+        const forceExit = setTimeout(() => process.exit(1), 2000);
+        forceExit.unref();
+        void browser.close().finally(() => process.exit(1));
+    };
     process.on("SIGTERM", _cleanup); process.on("SIGINT", _cleanup);
 
     try {

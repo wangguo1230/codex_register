@@ -15,9 +15,9 @@ import {looksLikeTotpSecret} from "../mfa.js";
  */
 export const GOOGLE_STAGES = [
     "imported", "login_ok", "login_fail", "partial", "ready", "gpt_ok", "blocked",
-];
+] as const;
 
-export const GOOGLE_STAGE_LABEL = {
+export const GOOGLE_STAGE_LABEL: Record<string, string> = {
     imported: "刚导入",
     login_ok: "能登录",
     login_fail: "登不上",
@@ -27,7 +27,7 @@ export const GOOGLE_STAGE_LABEL = {
     blocked: "卡住",
 };
 
-export const GOOGLE_LOGIN_ERROR_LABEL = {
+export const GOOGLE_LOGIN_ERROR_LABEL: Record<string, string> = {
     wrong_password: "密码错误",
     interstitial_doritos: "登录后插页(doritos/通行密钥)",
     captcha: "图片/人机验证",
@@ -39,6 +39,68 @@ export const GOOGLE_LOGIN_ERROR_LABEL = {
     not_found: "找不到账号",
     disabled: "账号已停用",
 };
+
+export interface GoogleState {
+    [key: string]: unknown;
+    stage: string;
+    login: string;
+    login_at: number;
+    login_error: string;
+    phone: string;
+    recovery: string;
+    totp: string;
+    password: string;
+    devices: string;
+    imap: string;
+    gpt: string;
+    last_error: string;
+    updated_at: number;
+    totp_rotated?: boolean;
+    harden_attempts?: number;
+    proxy_rotates?: number;
+    imap_gen_fail?: number;
+    imap_next_try?: number;
+}
+
+export interface GoogleMailboxFacts {
+    [key: string]: unknown;
+    google_state?: unknown;
+    google_stage?: unknown;
+    totp_secret?: unknown;
+    imap_password?: unknown;
+    recovery_email?: unknown;
+    pw_status?: unknown;
+    gpt_status?: unknown;
+    gpt_error?: unknown;
+    usage?: unknown;
+}
+
+export interface HardenResult {
+    ok?: boolean;
+    totpRotated?: unknown;
+    totpSecret?: unknown;
+    totp?: unknown;
+    passwordChanged?: unknown;
+    password?: unknown;
+    imapPassword?: unknown;
+    imap?: unknown;
+    missing?: unknown[];
+    errors?: unknown[];
+    error?: unknown;
+}
+
+export type HardenStep = "phone" | "recovery" | "imap" | "totp" | "password" | "devices";
+
+export interface HardenSkipPlan extends Record<HardenStep, boolean> {
+    left: HardenStep[];
+    requiredLeft: HardenStep[];
+    all: boolean;
+    usable: boolean;
+}
+
+function asGoogleState(value: unknown): Partial<GoogleState> {
+    return value && typeof value === "object" ? value as Partial<GoogleState> : {};
+}
 
 const HARDEN_IP_RE = /代理中断|换 session|signin\/rejected|拒绝页|SSL\/代理|ERR_PROXY|ERR_SSL|ERR_CONNECTION|ERR_TUNNEL|邮箱页卡住|operation was aborted|比特API .+ 超时|开窗超时/i;
 const HARDEN_LOGIN_DEAD_RE = /登录失败|Wrong password|密码错误|Senha incorreta|找不到您的 Google|Couldn't find your Google|帐号已被停用|账号已停用|account has been disabled|尝试次数过多|Too many failed|This account cannot be accessed|账号已停用/i;
@@ -60,8 +122,8 @@ export function isHardenLoginDead(msg = "") {
 }
 
 /** 已经登进去并做成过改密/换 2FA 的号，后一轮笼统失败不能再打成登不上。 */
-export function hardenAlreadyProven(mb = {}, st = {}) {
-    const s = st && typeof st === "object" ? st : {};
+export function hardenAlreadyProven(mb: GoogleMailboxFacts = {}, st: Partial<GoogleState> = {}) {
+    const s = asGoogleState(st);
     return !!(s.totp_rotated || s.login === "ok" || s.password === "ok" || /^✅/.test(String(mb.pw_status || "")));
 }
 
@@ -79,7 +141,7 @@ export const HARDEN_PROXY_ROTATE_MAX = 2;
 /** 同一号整备最多开窗登录次数，避免反复撞 Google。 */
 export const HARDEN_ATTEMPT_MAX = 3;
 
-export function emptyGoogleState() {
+export function emptyGoogleState(): GoogleState {
     return {
         stage: "imported",
         login: "unknown",
@@ -97,11 +159,11 @@ export function emptyGoogleState() {
     };
 }
 
-function hasText(v) {
+function hasText(v: unknown): boolean {
     return String(v || "").trim().length > 0;
 }
 
-function pickStage(s) {
+function pickStage(s: GoogleState): string {
     if (s.gpt === "ok") return "gpt_ok";
     if (s.login === "fail") return s.login_error || s.last_error ? "blocked" : "login_fail";
     if (s.imap === "ok" && s.totp_rotated) return "ready";
@@ -115,12 +177,15 @@ function pickStage(s) {
 /**
  * 用库里的事实推导状态，再用 overlay 盖上跑批时亲眼看到的卡点。
  */
-export function deriveGoogleState(facts = {}, overlay = {}) {
-    const prev = facts.google_state && typeof facts.google_state === "object" ? facts.google_state : {};
-    const s = {...emptyGoogleState(), ...prev};
+export function deriveGoogleState(
+    facts: GoogleMailboxFacts = {},
+    overlay: Partial<GoogleState> = {},
+): GoogleState {
+    const prev = asGoogleState(facts.google_state);
+    const s = Object.assign(emptyGoogleState(), prev);
 
     s.totp_rotated = !!(prev.totp_rotated || overlay.totp_rotated);
-    s.totp = looksLikeTotpSecret(facts.totp_secret) ? "ok" : "none";
+    s.totp = looksLikeTotpSecret(String(facts.totp_secret || "")) ? "ok" : "none";
     s.imap = hasText(facts.imap_password) ? "ok" : (s.imap === "fail" ? "fail" : "none");
     s.recovery = hasText(facts.recovery_email) ? "fail" : "ok";
     if (/^✅改密/.test(String(facts.pw_status || ""))) s.password = "ok";
@@ -159,18 +224,18 @@ export function deriveGoogleState(facts = {}, overlay = {}) {
     return s;
 }
 
-function passwordChangedByUs(mb = {}, st = {}) {
+function passwordChangedByUs(mb: GoogleMailboxFacts = {}, st: Partial<GoogleState> = {}): boolean {
     if (st.password === "ok") return true;
     return /^✅(改密|整备)/.test(String(mb.pw_status || ""));
 }
 
 /** 整备失败但部分步骤已做成时，任务文案要带上已做成的项。 */
-export function formatHardenPartialError(r = {}) {
+export function formatHardenPartialError(r: HardenResult = {}): string {
     const done = [
-        (r.totpRotated || r.totpSecret || r.totp) && "已换2FA",
-        (r.passwordChanged || r.password) && "已改密",
-        (r.imapPassword || r.imap) && "已IMAP",
-    ].filter(Boolean);
+        r.totpRotated || r.totpSecret || r.totp ? "已换2FA" : "",
+        r.passwordChanged || r.password ? "已改密" : "",
+        r.imapPassword || r.imap ? "已IMAP" : "",
+    ].filter(Boolean) as string[];
     const miss = (r.missing || []).filter(Boolean);
     const raw = (r.errors || [r.error]).filter(Boolean).map((e) => String(e).split("\n")[0]).join("; ");
     if (r.ok) return raw;
@@ -179,9 +244,9 @@ export function formatHardenPartialError(r = {}) {
 }
 
 /** 再跑整备时跳过已经做成的步。换 2FA 只在本轮成功换过才跳（有卖家密钥不算）。 */
-export function planHardenSkip(mb = {}) {
-    const st = mb.google_state && typeof mb.google_state === "object" ? mb.google_state : {};
-    const skip = {
+export function planHardenSkip(mb: GoogleMailboxFacts = {}): HardenSkipPlan {
+    const st = asGoogleState(mb.google_state);
+    const checks: Record<HardenStep, boolean> = {
         totp: st.totp_rotated === true,
         password: passwordChangedByUs(mb, st),
         imap: String(mb.imap_password || "").trim().length > 0,
@@ -189,11 +254,16 @@ export function planHardenSkip(mb = {}) {
         phone: st.phone === "ok",
         devices: st.devices === "ok",
     };
-    skip.left = ["phone", "recovery", "imap", "totp", "password", "devices"].filter((k) => !skip[k]);
-    skip.requiredLeft = skip.left.filter((k) => k === "totp" || k === "imap");
-    skip.all = skip.left.length === 0;
-    skip.usable = skip.requiredLeft.length === 0;
-    return skip;
+    const steps: HardenStep[] = ["phone", "recovery", "imap", "totp", "password", "devices"];
+    const left = steps.filter((step) => !checks[step]);
+    const requiredLeft = left.filter((step) => step === "totp" || step === "imap");
+    return {
+        ...checks,
+        left,
+        requiredLeft,
+        all: left.length === 0,
+        usable: requiredLeft.length === 0,
+    };
 }
 
 /** 把整备失败收成列表上一眼能看懂的短句。 */
@@ -222,13 +292,13 @@ export function classifyHardenIssue(raw = "") {
 }
 
 /** 列表「改密状态」旁展示：缺哪一步 + 为什么。已齐则空。 */
-export function formatHardenListReason(mb = {}) {
-    const st = mb.google_state && typeof mb.google_state === "object" ? mb.google_state : {};
+export function formatHardenListReason(mb: GoogleMailboxFacts = {}): string {
+    const st = asGoogleState(mb.google_state);
     const skip = planHardenSkip(mb);
     if (String(mb.google_stage || "") === "gpt_ok" || skip.usable) return "";
     const classified = classifyHardenIssue(st.last_error || "") || classifyHardenIssue(st.login_error || "");
     const loginDead = st.login === "fail" || mb.google_stage === "login_fail" || mb.google_stage === "blocked";
-    if (loginDead) return classified || GOOGLE_LOGIN_ERROR_LABEL[st.login_error] || "登不上";
+    if (loginDead) return classified || GOOGLE_LOGIN_ERROR_LABEL[String(st.login_error || "")] || "登不上";
     const gap = classified.startsWith("登不上") ? "" : classified;
     const left = skip.requiredLeft || [];
     if (left.includes("imap") && left.includes("totp")) return (gap.startsWith("缺") ? gap : "") || "缺2FA和IMAP";
@@ -242,11 +312,11 @@ export function formatHardenListReason(mb = {}) {
 }
 
 /** 继续完成：还缺 2FA/IMAP 才进队。登录失败判死不再扣；出口被拒只换有限次 IP。 */
-export function needsHardenRetry(mb = {}) {
+export function needsHardenRetry(mb: GoogleMailboxFacts = {}): boolean {
     if (String(mb.google_stage || "") === "blocked") return false;
     if (String(mb.google_stage || "") === "gpt_ok") return false;
     if (String(mb.google_stage || "") === "login_fail") return false;
-    const st = mb.google_state && typeof mb.google_state === "object" ? mb.google_state : {};
+    const st = asGoogleState(mb.google_state);
     if (st.login === "fail") return false;
     if (Number(st.harden_attempts || 0) >= HARDEN_ATTEMPT_MAX) return false;
     if (Number(st.proxy_rotates || 0) >= HARDEN_PROXY_ROTATE_MAX) return false;
@@ -260,7 +330,7 @@ export function needsHardenRetry(mb = {}) {
 }
 
 /** 列表/详情用：按库里的 2FA+IMAP 事实出阶段，避免关窗后还停在「整备未齐」。 */
-export function liveGoogleStage(mb = {}) {
+export function liveGoogleStage(mb: GoogleMailboxFacts = {}): string {
     if (String(mb.google_stage || "") === "gpt_ok") return "gpt_ok";
     return deriveGoogleState(mb, {}).stage;
 }
@@ -268,8 +338,8 @@ export function liveGoogleStage(mb = {}) {
 /** 网页登录探活有效期：1 小时内不再开比特窗重登。只认显式 login_at，不用 IMAP 推断的 login=ok。 */
 export const GMAIL_WEB_LOGIN_TTL_MS = 60 * 60 * 1000;
 
-export function gmailWebLoginFresh(mb = {}, now = Date.now()) {
-    const st = mb?.google_state && typeof mb.google_state === "object" ? mb.google_state : {};
+export function gmailWebLoginFresh(mb: GoogleMailboxFacts = {}, now = Date.now()) {
+    const st = asGoogleState(mb.google_state);
     if (st.login !== "ok") return {fresh: false, ageMs: null};
     const at = Number(st.login_at || 0);
     if (!Number.isFinite(at) || at <= 0) return {fresh: false, ageMs: null};
@@ -277,15 +347,16 @@ export function gmailWebLoginFresh(mb = {}, now = Date.now()) {
     return {fresh: ageMs >= 0 && ageMs < GMAIL_WEB_LOGIN_TTL_MS, ageMs};
 }
 
-export function googleStageLabel(stage) {
-    return GOOGLE_STAGE_LABEL[stage] || stage || "未知";
+export function googleStageLabel(stage: unknown): string {
+    const key = String(stage || "");
+    return GOOGLE_STAGE_LABEL[key] || key || "未知";
 }
 
-export function googleStateSummary(state) {
-    const s = state && typeof state === "object" ? state : emptyGoogleState();
-    const bits = [];
+export function googleStateSummary(state: unknown): string {
+    const s = state && typeof state === "object" ? asGoogleState(state) : emptyGoogleState();
+    const bits: string[] = [];
     bits.push(googleStageLabel(s.stage));
-    if (s.login === "fail") bits.push(GOOGLE_LOGIN_ERROR_LABEL[s.login_error] || s.login_error || "登不上");
+    if (s.login === "fail") bits.push(GOOGLE_LOGIN_ERROR_LABEL[String(s.login_error || "")] || s.login_error || "登不上");
     if (s.imap === "ok") bits.push("IMAP");
     else if (s.imap === "none") bits.push("无IMAP");
     if (s.totp_rotated) bits.push("2FA已换");
@@ -301,16 +372,16 @@ export function googleStateSummary(state) {
     return bits.join(" · ");
 }
 
-export function googleChecklist(state) {
-    const s = state && typeof state === "object" ? state : emptyGoogleState();
-    const mark = (v, okText, failText, noneText) => {
+export function googleChecklist(state: unknown) {
+    const s = state && typeof state === "object" ? asGoogleState(state) : emptyGoogleState();
+    const mark = (v: unknown, okText: string, failText: string, noneText: string) => {
         if (v === "ok") return {ok: true, text: okText};
         if (v === "fail") return {ok: false, text: failText};
         if (v === "none") return {ok: false, text: noneText};
         return {ok: null, text: "未知"};
     };
     return [
-        {key: "login", label: "登录", ...mark(s.login, "能进", GOOGLE_LOGIN_ERROR_LABEL[s.login_error] || "失败", "未验证")},
+        {key: "login", label: "登录", ...mark(s.login, "能进", GOOGLE_LOGIN_ERROR_LABEL[String(s.login_error || "")] || "失败", "未验证")},
         {key: "phone", label: "恢复手机", ...mark(s.phone, "没有/已删", "还在", "未查")},
         {key: "recovery", label: "辅助邮箱", ...mark(s.recovery, "没有/已删", "还在", "未查")},
         {key: "totp", label: "Google 2FA", ...(s.totp_rotated
