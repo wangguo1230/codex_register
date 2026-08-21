@@ -58,6 +58,12 @@ export async function initializeApplicationInfrastructure({
     if (typeof scheduler.initializeSharedProxyPool === "function") {
         await runStage("shared-proxy-pool", () => scheduler.initializeSharedProxyPool(), {reportPhase, logger});
     }
+    if (typeof scheduler.releaseOwnProxyLeases === "function") {
+        await runStage("shared-proxy-lease-recovery", async () => {
+            const released = await scheduler.releaseOwnProxyLeases();
+            if (released) logger.log(`[server] 已清理本实例遗留代理租约 ${released} 个`);
+        }, {required: false, reportPhase, logger});
+    }
 
     // Xray 属于可选运行时能力，失败只降级代理能力，不阻塞 HTTP 和数据库服务。
     if (scheduler.claudeXrayVless) {

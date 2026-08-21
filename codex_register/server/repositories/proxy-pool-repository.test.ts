@@ -54,6 +54,21 @@ test("公共代理租约使用行锁和模板事务锁，并返回 fencing token
     assert.equal(insert?.values?.[7], 61_000);
 });
 
+test("startup releases this instance proxy leases", async () => {
+    const calls: Array<{text: string; values?: unknown[]}> = [];
+    const repository = createProxyPoolRepository({
+        instance: "node-a:3100",
+        queryFn: async (text, values) => {
+            calls.push({text, values});
+            return {rows: [], rowCount: 3};
+        },
+        transactionFn: async (fn) => fn({query: async () => ({rows: []})}),
+    });
+    assert.equal(await repository.releaseByInstance(), 3);
+    const release = calls.find(({text}) => /DELETE FROM proxy_pool_leases/.test(text));
+    assert.deepEqual(release?.values, ["node-a:3100:%"]);
+});
+
 test("公共代理租约达到模板并发上限时不认领", async () => {
     const {repository} = acquireHarness({activeCount: 1});
     const result = await repository.acquire({

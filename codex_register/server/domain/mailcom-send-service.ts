@@ -17,6 +17,7 @@ import {sendMailcomSmtp} from "../../src/mail/mailcom-smtp.js";
 const SAME_PROXY_TRIES = Math.max(2, Number(process.env.MAILCOM_SEND_PROXY_TRIES || 3));
 const FAIL_BEFORE_ROTATE = Math.max(2, Number(process.env.MAILCOM_SEND_PROXY_FAILS || 3));
 const PROBE_BUDGET_MS = Math.max(3000, Number(process.env.MAILCOM_SEND_PROBE_MS || 8000));
+const SEND_LEASE_MS = Math.max(60_000, Number(process.env.MAILCOM_SEND_LEASE_MS || 120_000));
 
 /** 邮箱跳板开关关闭后，忽略旧版 mailProxyJump 回退值和跳板池。 */
 export function selectMailJump(enabled: boolean, leasedUrl = "", fallback = "") {
@@ -53,7 +54,11 @@ async function withJump(owner, fn) {
     const enabled = scheduler.proxyJumpMailEnabled !== false;
     let jumpLease = null;
     if (enabled && mailJumpPool.urls.length) {
-        jumpLease = await mailJumpPool.lease(who, {timeoutMs: 45_000, maxPerJump: JUMP_MAX_EXITS});
+        try {
+            jumpLease = await mailJumpPool.lease(who, {timeoutMs: 45_000, leaseMs: SEND_LEASE_MS, maxPerJump: JUMP_MAX_EXITS});
+        } catch (error) {
+            throw new Error(`邮箱跳板池全忙（等待 45s）：${String(error?.message || error).slice(0, 160)}`);
+        }
     }
     const jumpUrl = selectMailJump(enabled, jumpLease?.url, scheduler.mailProxyJump);
     try {
@@ -70,6 +75,7 @@ async function leaseSendExit(owner, preferUrl = "") {
         freshSession: !preferUrl,
         preferUrl,
         timeoutMs: 45_000,
+        leaseMs: SEND_LEASE_MS,
     });
     try {
         const url = String(lease.url || "").trim();
@@ -216,7 +222,11 @@ export async function sendMailcomViaPool(opts: any = {}) {
         };
 
         try {
-            exitLease = await leaseSendExit(`send:${email}`, rememberedExit);
+            try {
+                exitLease = await leaseSendExit(`send:${email}`, rememberedExit);
+            } catch (error) {
+                throw new Error(`邮箱出口代理池全忙（等待 45s）：${String(error?.message || error).slice(0, 160)}`);
+            }
             exitUrl = exitLease.url;
             const changed = !rememberedExit || rememberedExit !== exitUrl;
             if (changed) {
@@ -244,7 +254,11 @@ export async function sendMailcomViaPool(opts: any = {}) {
                     throw new Error(`${msg}: ${String((e as Error)?.message || e).slice(0, 160)}`);
                 }
                 await releaseLease(exitLease);
-                exitLease = await leaseSendExit(`send-rotate:${email}`, nextSticky(exitUrl));
+                try {
+                    exitLease = await leaseSendExit(`send-rotate:${email}`, nextSticky(exitUrl));
+                } catch (error) {
+                    throw new Error(`邮箱出口代理池换出口失败（等待 45s）：${String(error?.message || error).slice(0, 160)}`);
+                }
                 const next = exitLease.url;
                 await rememberOnMailbox(mb, next, "", 0);
                 log(`出口连续 ${fails} 次不可用，更新邮箱粘性 ${maskProxyUrl(exitUrl)} → ${maskProxyUrl(next)} session=${kookeeySessionOf(next) || "-"}`);

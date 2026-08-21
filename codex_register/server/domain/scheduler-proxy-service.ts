@@ -69,6 +69,9 @@ export function createSchedulerProxyService({settings} = {}) {
         syncProxyPoolsFromSettings();
         syncJumpPoolsFromSettings();
     }
+    async function releaseOwnProxyLeases() {
+        return Number(await distributedBackend?.releaseByInstance?.() || 0);
+    }
     function hasGptJumpConfig() {
         if (settings.proxyJumpGptEnabled === false) return false;
         if (Array.isArray(settings.proxyJumpPool) && settings.proxyJumpPool.some((x) => String(x || "").trim())) return true;
@@ -462,5 +465,5 @@ export function createSchedulerProxyService({settings} = {}) {
         return {...local, total: remote.total, leased: remote.leased, items};
     }
 
-    return {configureDistributedBackend, initializeSharedConfiguration, publicProxyPoolSnap, publicJumpPoolSnapshot, hasGptJumpConfig, collectJumpLines, resolveJumpLine, jumpPoolSnapshot, ensureJumpFleet, syncProxyPoolsFromSettings, syncJumpPoolsFromSettings, setProxyPool, setProxyPoolScopes, proxyPoolSnap, proxyPoolEnabled, setMailProxyPool, mailProxyFallback, mailProxyPoolSnap, detectMailProxyJump, portListening, setMailProxyJump, setMailJumpPool, setGptJumpPool, setProxyJumpPool, setProxyJumpScopes, applyJumpSocks, setGptProxyPool, gptProxyPoolSnap, setGptProxyJump};
+    return {configureDistributedBackend, initializeSharedConfiguration, releaseOwnProxyLeases, publicProxyPoolSnap, publicJumpPoolSnapshot, hasGptJumpConfig, collectJumpLines, resolveJumpLine, jumpPoolSnapshot, ensureJumpFleet, syncProxyPoolsFromSettings, syncJumpPoolsFromSettings, setProxyPool, setProxyPoolScopes, proxyPoolSnap, proxyPoolEnabled, setMailProxyPool, mailProxyFallback, mailProxyPoolSnap, detectMailProxyJump, portListening, setMailProxyJump, setMailJumpPool, setGptJumpPool, setProxyJumpPool, setProxyJumpScopes, applyJumpSocks, setGptProxyPool, gptProxyPoolSnap, setGptProxyJump};
 }

@@ -135,6 +135,7 @@ class Scheduler extends EventEmitter {
     syncProxyPoolsFromSettings(...args) { return this.proxyService.syncProxyPoolsFromSettings(...args); }
     configureProxyPoolBackend(...args) { return this.proxyService.configureDistributedBackend(...args); }
     initializeSharedProxyPool(...args) { return this.proxyService.initializeSharedConfiguration(...args); }
+    releaseOwnProxyLeases(...args) { return this.proxyService.releaseOwnProxyLeases(...args); }
     normalizeRebindAfterPaid() {
         const v = String(this.rebindAfterPaid || "");
         if (v === "off" || v === "gmail" || v === "mailcom") {

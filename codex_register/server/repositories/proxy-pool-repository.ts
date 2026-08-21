@@ -175,6 +175,16 @@ export function createProxyPoolRepository({
         return (rowCount || 0) > 0;
     }
 
+    async function releaseByInstance(ownerInstance = instance) {
+        const prefix = `${String(ownerInstance || "").trim()}:`;
+        if (prefix === ":") return 0;
+        const {rowCount} = await queryFn(
+            `DELETE FROM proxy_pool_leases WHERE owner LIKE $1`,
+            [`${prefix}%`],
+        );
+        return rowCount || 0;
+    }
+
     async function renew({kind, leaseToken, leaseMs = 600_000} = {}) {
         const normalizedKind = kindOf(kind);
         const now = clock.now();
@@ -241,7 +251,7 @@ export function createProxyPoolRepository({
         });
     }
 
-    return {loadConfiguration, saveConfiguration, acquire, release, renew, snapshot, reserveExitIp};
+    return {loadConfiguration, saveConfiguration, acquire, release, releaseByInstance, renew, snapshot, reserveExitIp};
 }
 
 export const proxyPoolRepository = createProxyPoolRepository();
