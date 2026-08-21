@@ -74,6 +74,10 @@ export function createRechargeLogStore({
         return entries.slice();
     }
 
+    function entryKey(entry) {
+        return `${Number(entry?.ts) || 0}\u0000${String(entry?.line || "")}`;
+    }
+
     function clear() {
         entries = [];
         scheduleFlush();
@@ -81,7 +85,20 @@ export function createRechargeLogStore({
 
     async function listAll() {
         if (typeof sharedList === "function") {
-            try { return await sharedList(); } catch { return list(); }
+            try {
+                const shared = await sharedList();
+                if (!Array.isArray(shared)) return list();
+                // Keep local entries visible while a shared write is still in
+                // flight or when the database was briefly unavailable.
+                const seen = new Set(shared.map(entryKey));
+                const merged = [...shared];
+                for (const entry of entries) {
+                    if (seen.has(entryKey(entry))) continue;
+                    seen.add(entryKey(entry));
+                    merged.push(entry);
+                }
+                return merged.sort((a, b) => (Number(a?.ts) || 0) - (Number(b?.ts) || 0));
+            } catch { return list(); }
         }
         return list();
     }
