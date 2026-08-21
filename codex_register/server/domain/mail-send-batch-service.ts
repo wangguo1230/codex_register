@@ -4,9 +4,19 @@ import {scheduler} from "../scheduler.js";
 import {publicMailSendLog} from "./mail-send-policy.js";
 import {sendMailcomViaPool} from "./mailcom-send-service.js";
 
+// 一个 CATS 发信任务会启动独立 Chrome。默认串行，最多允许显式放宽到 2，避免多个浏览器同时把 RSS 推高。
+const MAIL_SEND_CONCURRENCY_LIMIT = Math.max(
+    1,
+    Math.min(2, Number(process.env.MAILCOM_SEND_CONCURRENCY || 1)),
+);
+
+export function resolveMailSendConcurrency(requested, configured = scheduler.pwConcurrency, limit = MAIL_SEND_CONCURRENCY_LIMIT) {
+    return Math.max(1, Math.min(Math.max(1, Number(limit) || 1), Number(requested || configured || 1)));
+}
+
 export async function sendMailcomBatch(items, {concurrency, log, shouldStop} = {} as any) {
     const list = Array.isArray(items) ? items : [];
-    const cap = Math.max(1, Math.min(8, Number(concurrency || scheduler.pwConcurrency || 1)));
+    const cap = Math.min(resolveMailSendConcurrency(concurrency, scheduler.pwConcurrency), list.length || 1);
     const out = [];
     let i = 0;
     const workers = Array.from({length: Math.min(cap, list.length || 1)}, async () => {
@@ -38,4 +48,3 @@ export async function listMailSendLogsPublic(opts = {}) {
     const rows = await db.listMailSendLogs(opts);
     return rows.map(publicMailSendLog);
 }
-

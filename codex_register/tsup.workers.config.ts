@@ -19,4 +19,5 @@ export default defineConfig({
     clean: false,
     dts: false,
     minify: false,
+    external: ['playwright', 'playwright-core', 'electron', 'pg'],
 });

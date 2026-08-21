@@ -1,7 +1,7 @@
 // @ts-nocheck
-// 子进程发信：Playwright + 跳板不能跑在 :3100 里，否则整站卡死，前端看到 500。
+// 子进程发信：CATS mailsubmission + Playwright。禁止跑在 :3100 主进程里（本地 socks relay 会把 RSS 打爆）。
 import {readFileSync} from "node:fs";
-import {sendMailcomSmtp} from "../src/mail/mailcom-smtp.ts";
+import {sendMailcomMail} from "../src/mail/mailcom.ts";
 
 const jobFile = process.argv[2] || "";
 if (!jobFile) {
@@ -12,9 +12,7 @@ if (!jobFile) {
 const job = JSON.parse(readFileSync(jobFile, "utf8"));
 
 try {
-    const r = await sendMailcomSmtp({
-        email: job.email,
-        password: job.password,
+    const r = await sendMailcomMail(job.email, job.password, {
         to: job.to,
         subject: job.subject,
         html: job.html,
@@ -23,7 +21,7 @@ try {
         headless: job.headless ?? true,
         proxy: job.proxy,
         jump: job.jump,
-        timeoutMs: Number(process.env.MAILCOM_SMTP_TIMEOUT_MS || 30_000),
+        profile: job.profile,
     });
     process.stdout.write("@@RESULT@@" + JSON.stringify({
         ok: true,

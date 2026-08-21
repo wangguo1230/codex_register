@@ -422,7 +422,7 @@ async function openBrowserProxy(exitUrl, jumpUrl = "") {
  * 成功一般为 HTTP 202/204。
  * 出口若带 socks 账密（kookeey），会经跳板起本机无账密 socks 再给 Playwright。
  */
-export async function sendMailcomMail(email, password, opts = {}) {
+async function sendMailcomMailOnce(email, password, opts = {}) {
     const key = normalizeEmail(email);
     const toList = (Array.isArray(opts.to) ? opts.to : [opts.to]).map((x) => String(x || "").trim()).filter(Boolean);
     if (!toList.length) throw new Error("sendMailcomMail: 缺少收件人");
@@ -440,16 +440,17 @@ export async function sendMailcomMail(email, password, opts = {}) {
         if (via.localPort) {
             console.log(`[mailcom] 发信链式 本机:${via.localPort}${jumpUrl ? " ←跳板" : ""} ← 粘性出口`);
         }
+        // 本地无账密转发环上的 SocksClient 预检会在部分出口上卡死事件循环（RSS 冲到几十 GB）。
+        // 发信改为直接把链式代理交给 Chrome；代理真挂了由登录/提交超时失败，而不是预检把进程拖死。
         if (via.url) {
-            const probe = await probeBrowserProxy(via.url, Number(process.env.MAILCOM_BROWSER_PROXY_PROBE_MS || 8000));
-            if (!probe.ok) throw new Error(`发信浏览器代理预检失败 ${probe.reason || "代理不可用"}（${probe.ms}ms）`);
-            console.log(`[mailcom] 发信浏览器代理预检通过 ${probe.ms}ms`);
+            console.log(`[mailcom] 发信跳过浏览器代理 TCP 预检，交给 Chrome 走链式出口`);
         }
         const {kookeeySessionOf} = await import("./proxy-pool.js");
         const profile = ensureMailcomProfile(opts.profile, exitUrl);
         session = await loginMailcom(key, password, {
             headless: opts.headless ?? true,
-            proxy: via.url || undefined,
+            // 发信直连必须覆盖进程级 MAILCOM_PROXY，避免空 opts.proxy 又回退到代理链。
+            proxy: via.url || "",
             skipInbox: true,
             timezone: profile.timezoneId,
             profile,
@@ -508,6 +509,24 @@ export async function sendMailcomMail(email, password, opts = {}) {
     } finally {
         try { if (session?.browser) await session.browser.close(); } catch { /* ignore */ }
         try { relayClose(); } catch { /* ignore */ }
+    }
+}
+
+/**
+ * 登录 mail.com 后按 CATS mailsubmission 协议发一封信。
+ * 成功一般为 HTTP 202/204。
+ * 出口若带 socks 账密（kookeey），会经跳板起本机无账密 socks 再给 Playwright。
+ * 代理链路卡住/启动失败时，自动降级直连再发一次（与当前收信 worker 行为对齐）。
+ */
+export async function sendMailcomMail(email, password, opts = {}) {
+    const exitUrl = String(opts.proxy || "").trim();
+    try {
+        return await sendMailcomMailOnce(email, password, opts);
+    } catch (error) {
+        if (!exitUrl) throw error;
+        const reason = String(error?.message || error).replace(/\s+/g, " ").slice(0, 180);
+        console.warn(`[mailcom] 代理发信失败，降级直连重试: ${reason}`);
+        return sendMailcomMailOnce(email, password, {...opts, proxy: "", jump: ""});
     }
 }
 

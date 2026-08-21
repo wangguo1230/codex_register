@@ -330,7 +330,7 @@ export async function probeExitViaJump(exitUrl: string, jumpRaw: string, destHos
             socket = result.socket;
         }
         return {ok: true};
-    } catch (error) {
+    } catch (error: any) {
         return {ok: false, reason: String(error?.message || error).slice(0, 160)};
     } finally {
         try { socket?.destroy(); } catch { /* */ }
@@ -341,37 +341,65 @@ export async function openNoAuthSocksToAuthedProxy(exitUrl: string, jumpRaw = ""
     assertRelayAllowed("无账密 socks 转发环");
     const exit = parseProxyEndpoint(exitUrl);
     if (!exit || !exit.isSocks) throw new Error("出口须是 socks5");
-    const clients = new Set<net.Socket>();
+    const maxConnections = Math.max(1, Math.min(32, Number(process.env.MAILCOM_RELAY_MAX_CONNECTIONS || 8)));
+    const connectionTimeoutMs = Math.max(5_000, Number(process.env.MAILCOM_RELAY_CONNECTION_TIMEOUT_MS || 45_000));
+    const connections = new Set<{client: net.Socket; upstream?: net.Socket; closed: boolean; timer?: NodeJS.Timeout}>();
+
+    const destroyConnection = (state: {client: net.Socket; upstream?: net.Socket; closed: boolean; timer?: NodeJS.Timeout}) => {
+        if (state.closed) return;
+        state.closed = true;
+        if (state.timer) clearTimeout(state.timer);
+        connections.delete(state);
+        try { state.upstream?.destroy(); } catch { /* ignore */ }
+        try { state.client.destroy(); } catch { /* ignore */ }
+    };
+
     const server = net.createServer((client) => {
-        clients.add(client);
-        client.on("close", () => clients.delete(client));
+        if (connections.size >= maxConnections) {
+            client.destroy();
+            return;
+        }
+        const state: {client: net.Socket; upstream?: net.Socket; closed: boolean; timer?: NodeJS.Timeout} = {client, closed: false};
+        connections.add(state);
+        state.timer = setTimeout(() => destroyConnection(state), connectionTimeoutMs);
+        state.timer.unref?.();
+        client.once("close", () => destroyConnection(state));
+        client.once("error", () => destroyConnection(state));
         (async () => {
-            const hello = await readExact(client, 2);
+            const hello = await readExact(client, 2, connectionTimeoutMs);
             if (hello[0] !== 0x05) throw new Error("不是 socks5");
-            await readExact(client, hello[1]);
+            await readExact(client, hello[1], connectionTimeoutMs);
+            if (state.closed) return;
             client.write(Buffer.from([0x05, 0x00]));
-            const hdr = await readExact(client, 4);
+            const hdr = await readExact(client, 4, connectionTimeoutMs);
             if (hdr[1] !== 0x01) throw new Error("只支持 CONNECT");
             let destHost = "";
             let destPort = 0;
             if (hdr[3] === 1) {
-                const rest = await readExact(client, 6);
+                const rest = await readExact(client, 6, connectionTimeoutMs);
                 destHost = `${rest[0]}.${rest[1]}.${rest[2]}.${rest[3]}`;
                 destPort = rest.readUInt16BE(4);
             } else if (hdr[3] === 3) {
-                const lb = await readExact(client, 1);
-                const rest = await readExact(client, lb[0] + 2);
+                const lb = await readExact(client, 1, connectionTimeoutMs);
+                const rest = await readExact(client, lb[0] + 2, connectionTimeoutMs);
                 destHost = rest.subarray(0, lb[0]).toString("utf8");
                 destPort = rest.readUInt16BE(lb[0]);
             } else if (hdr[3] === 4) {
-                const rest = await readExact(client, 18);
+                const rest = await readExact(client, 18, connectionTimeoutMs);
                 destHost = rest.subarray(0, 16).toString("hex");
                 destPort = rest.readUInt16BE(16);
             } else throw new Error("不支持的地址类型");
+            if (state.closed) return;
             let up: net.Socket;
+            let raw: net.Socket | undefined;
             if (jumpRaw) {
-                const raw = await connectViaJumpRetry(jumpRaw, exit.host, exit.port, 3);
-                up = await socks5ConnectOnSocket(raw, exit.user, exit.pass, destHost, destPort, 25_000);
+                try {
+                    raw = await connectViaJumpRetry(jumpRaw, exit.host, exit.port, 3);
+                    up = await socks5ConnectOnSocket(raw, exit.user, exit.pass, destHost, destPort, 25_000);
+                } catch (error) {
+                    try { raw?.destroy(); } catch { /* ignore */ }
+                    throw error;
+                }
             } else {
                 const r = await SocksClient.createConnection({
                     proxy: {
@@ -384,16 +412,24 @@ export async function openNoAuthSocksToAuthedProxy(exitUrl: string, jumpRaw = ""
                 });
                 up = r.socket;
             }
+            if (state.closed || client.destroyed) {
+                try { up.destroy(); } catch { /* ignore */ }
+                return;
+            }
+            state.upstream = up;
+            if (state.timer) clearTimeout(state.timer);
+            state.timer = undefined;
             client.write(Buffer.from([0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]));
-            client.on("error", () => { try { up.destroy(); } catch { /* */ } });
-            up.on("error", () => { try { client.destroy(); } catch { /* */ } });
-            client.on("close", () => { try { up.destroy(); } catch { /* */ } });
-            up.on("close", () => { try { client.destroy(); } catch { /* */ } });
+            client.once("error", () => destroyConnection(state));
+            up.once("error", () => destroyConnection(state));
+            up.once("close", () => destroyConnection(state));
             client.pipe(up);
             up.pipe(client);
         })().catch(() => {
-            try { client.write(Buffer.from([0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0])); } catch { /* */ }
-            try { client.destroy(); } catch { /* */ }
+            if (!state.closed) {
+                try { client.write(Buffer.from([0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0])); } catch { /* ignore */ }
+                destroyConnection(state);
+            }
         });
     });
     await new Promise((resolve, reject) => {
@@ -410,10 +446,7 @@ export async function openNoAuthSocksToAuthedProxy(exitUrl: string, jumpRaw = ""
         url: `socks5://127.0.0.1:${port}`,
         localPort: port,
         close() {
-            for (const c of [...clients]) {
-                try { c.destroy(); } catch { /* */ }
-            }
-            clients.clear();
+            for (const state of [...connections]) destroyConnection(state);
             try { server.close(); } catch { /* */ }
         },
     };

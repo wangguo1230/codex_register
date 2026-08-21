@@ -12,7 +12,7 @@ import {
     mintStickySession,
     pickLiveMailProxy,
 } from "../../src/mail/proxy-pool.js";
-import {sendMailcomSmtp} from "../../src/mail/mailcom-smtp.js";
+import {mailSendWorkerRunner} from "./mail-send-worker-runner.js";
 
 const SAME_PROXY_TRIES = Math.max(2, Number(process.env.MAILCOM_SEND_PROXY_TRIES || 3));
 const FAIL_BEFORE_ROTATE = Math.max(2, Number(process.env.MAILCOM_SEND_PROXY_FAILS || 3));
@@ -48,7 +48,8 @@ async function releaseLease(lease) {
     try { await lease?.release?.(); } catch { /* 释放失败不覆盖发信结果 */ }
 }
 
-async function withJump(owner, fn) {
+async function withJump(owner, fn, {skip = false} = {}) {
+    if (skip) return fn("");
     const who = String(owner || "mail-send");
     const enabled = scheduler.proxyJumpMailEnabled !== false;
     let jumpLease = null;
@@ -116,7 +117,14 @@ export async function sendMailcomViaPool(opts: any = {}) {
     if (!email || !password) throw new Error("发信缺少邮箱或密码");
     if (!mb) mb = {email, password, proxy_url: "", proxy_ip: "", proxy_fail: 0};
 
-    return withJump(`send:${email}`, async (jumpUrl) => {
+    // 直连模式不依赖跳板，避免代理池拥塞时无意义地等待租约。
+    const forceDirect = !/^(0|false|no)$/i.test(String(process.env.MAILCOM_SEND_DIRECT ?? "1"));
+    return withJump(`send:${email}`, async (leasedJump) => {
+        // 跳板租约和旧版 fallback 已由 withJump 统一解析；这里不能再次读取
+        // scheduler.mailProxyJump，否则会绕过“关闭邮箱跳板”开关。
+        const jumpUrl = String(leasedJump || "").trim();
+        // 当前带账密住宅代理的本地转发环会卡死 Chrome（RSS 冲到几十 GB），
+        // 与收信 worker 对齐：浏览器发信默认直连；粘性出口仍写入邮箱，供后续代理链路修好后复用。
         const rememberedExit = String(mb.proxy_url || "").trim();
         let exitLease = null;
         let exitUrl = "";
@@ -138,8 +146,8 @@ export async function sendMailcomViaPool(opts: any = {}) {
             });
             let lastErr;
             for (let i = 1; i <= SAME_PROXY_TRIES; i++) {
-                log(`发信${attemptTag} mail.com SMTP ${maskProxyUrl(exit)}${sess ? ` session=${sess}` : ""}${ip ? ` ip=${ip}` : ""}（${reused ? "邮箱已记出口" : "新出口"} · 第 ${i}/${SAME_PROXY_TRIES} 次）${jumpUrl ? ` · 跳板 ${maskProxyUrl(jumpUrl)}` : " · 无跳板"}`);
-                if (i === 1 || !ip) {
+                log(`发信${attemptTag} mail.com CATS ${maskProxyUrl(exit)}${sess ? ` session=${sess}` : ""}${ip ? ` ip=${ip}` : ""}（${reused ? "邮箱已记出口" : "新出口"} · 第 ${i}/${SAME_PROXY_TRIES} 次）${forceDirect ? " · 浏览器直连" : (jumpUrl ? ` · 跳板 ${maskProxyUrl(jumpUrl)}` : " · 无跳板")}`);
+                if (!forceDirect && (i === 1 || !ip)) {
                     const probeController = new AbortController();
                     try {
                         const live = await withTimeout(
@@ -148,8 +156,8 @@ export async function sendMailcomViaPool(opts: any = {}) {
                                 rotate: false,
                                 jump: jumpUrl,
                                 signal: probeController.signal,
-                                targetHost: "smtp.mail.com",
-                                targetPort: 465,
+                                targetHost: "webmail-cats-live.mail.com",
+                                targetPort: 443,
                                 log: (m) => log(`发信探测 ${m}`),
                             }),
                             PROBE_BUDGET_MS,
@@ -167,12 +175,23 @@ export async function sendMailcomViaPool(opts: any = {}) {
                     }
                 }
                 try {
-                    const r = await sendMailcomSmtp({
-                        email, password, to, subject, html, text, fromName,
-                        proxy: exit,
-                        jump: jumpUrl,
-                        timeoutMs: Math.max(10_000, Number(process.env.MAILCOM_SMTP_TIMEOUT_MS || 30_000)),
-                    });
+                    // CATS mailsubmission 必须在 worker 子进程跑。
+                    if (forceDirect) {
+                        log(`发信${attemptTag} CATS 浏览器走直连（MAILCOM_SEND_DIRECT=1；出口 ${maskProxyUrl(exit)} 仅记账）`);
+                    }
+                    const r = await mailSendWorkerRunner.run({
+                        email,
+                        password,
+                        to,
+                        subject,
+                        html,
+                        text,
+                        fromName,
+                        headless: true,
+                        proxy: forceDirect ? "" : exit,
+                        jump: forceDirect ? "" : jumpUrl,
+                        profile: mb?.browser_fp || undefined,
+                    }, log);
                     if (mb.id) {
                         await db.resetMailboxProxyFail(mb.id).catch(() => {});
                         if (ip && ip !== mb.proxy_ip) await db.setMailboxProxy(mb.id, exit, ip);
@@ -256,5 +275,5 @@ export async function sendMailcomViaPool(opts: any = {}) {
         } finally {
             await releaseLease(exitLease);
         }
-    });
+    }, {skip: forceDirect});
 }
