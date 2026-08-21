@@ -241,24 +241,30 @@ export async function sendMailcomViaPool(opts: any = {}) {
         };
 
         try {
-            try {
-                exitLease = await leaseSendExit(`send:${email}`, rememberedExit);
-            } catch (error) {
-                throw new Error(`邮箱出口代理池全忙（等待 45s）：${String(error?.message || error).slice(0, 160)}`);
-            }
-            exitUrl = exitLease.url;
-            const changed = !rememberedExit || rememberedExit !== exitUrl;
-            if (changed) {
-                await rememberOnMailbox(mb, exitUrl, "", 0);
-                log(rememberedExit
-                    ? `邮箱粘性出口不在当前代理池，已切换 ${maskProxyUrl(rememberedExit)} → ${maskProxyUrl(exitUrl)}`
-                    : `发信首次从公共代理池租用出口 ${maskProxyUrl(exitUrl)}（写入邮箱管理）`);
+            if (forceDirect) {
+                exitUrl = "";
+                log("发信使用 CATS 浏览器直连，跳过出口代理租约");
             } else {
-                log(`发信从公共代理池复用粘性出口 ${maskProxyUrl(exitUrl)}`);
+                try {
+                    exitLease = await leaseSendExit(`send:${email}`, rememberedExit);
+                } catch (error) {
+                    throw new Error(`邮箱出口代理池全忙（等待 45s）：${String(error?.message || error).slice(0, 160)}`);
+                }
+                exitUrl = exitLease.url;
+                const changed = !rememberedExit || rememberedExit !== exitUrl;
+                if (changed) {
+                    await rememberOnMailbox(mb, exitUrl, "", 0);
+                    log(rememberedExit
+                        ? `邮箱粘性出口不在当前代理池，已切换 ${maskProxyUrl(rememberedExit)} → ${maskProxyUrl(exitUrl)}`
+                        : `发信首次从公共代理池租用出口 ${maskProxyUrl(exitUrl)}（写入邮箱管理）`);
+                } else {
+                    log(`发信从公共代理池复用粘性出口 ${maskProxyUrl(exitUrl)}`);
+                }
             }
             try {
-                return await runSend(exitUrl, !changed, changed ? "绑定后" : "");
+                return await runSend(exitUrl, !forceDirect && !!rememberedExit && rememberedExit === exitUrl, forceDirect ? "直连" : "");
             } catch (e) {
+                if (forceDirect) throw e;
                 if (!isProxySessionDead(e) && !isRetryableSend(e)) throw e;
                 let fails = Number(mb.proxy_fail || 0) + 1;
                 if (mb.id) {
