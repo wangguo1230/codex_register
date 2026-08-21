@@ -32,7 +32,7 @@ const fmtDur = (start?: number, end?: number) => {
     return `${Math.floor(m / 60)}小时${m % 60}分`;
 };
 
-const Q_LABEL: Record<string, string> = {pending: "待提交", paired: "已配对", submitting: "提交中", submitted: "已提交", done: "完成", error: "失败"};
+const Q_LABEL: Record<string, string> = {pending: "待提交", paired: "已配对", submitting: "提交中", submitted: "已提交", done: "充值完成", error: "失败"};
 const Q_COLOR: Record<string, string> = {pending: "#6b7280", paired: "#2563eb", submitting: "#f59e0b", submitted: "#8b5cf6", done: "#16a34a", error: "#dc2626"};
 const TASK_COLOR: Record<string, string> = {pending: "#6b7280", leased: "#2563eb", running: "#2563eb", paid: "#16a34a", failed: "#dc2626", canceled: "#dc2626", returned: "#f59e0b", manual_review: "#f59e0b"};
 const EMPTY_Q: RechargeQueueStats = {pending: 0, paired: 0, submitting: 0, submitted: 0, done: 0, error: 0, total: 0, undelivered: 0, delivered: 0, failed: 0, working: 0, ready: 0};
@@ -1428,7 +1428,6 @@ export function RechargePanel({notify}: {notify?: (m: string, ms?: number) => vo
                     )}
                     {isWorkingTab && (
                         <>
-                            <Btn onClick={() => setShowBatchRt(true)} className="bg-amber-600 text-white border-amber-600 hover:bg-amber-700" title="按邮箱密码文本单独获取 RT，不使用当前换绑队列">按文本获取 RT</Btn>
                             <Btn onClick={openSub2json} className="bg-violet-600 text-white border-violet-600 hover:bg-violet-700" title="勾选后打开会自动填充；支持 Gmail（用 GPT 密码 + RT）">导出sub2json</Btn>
                             <Btn onClick={doProbePlan}>查询套餐</Btn>
                         </>
@@ -1438,7 +1437,7 @@ export function RechargePanel({notify}: {notify?: (m: string, ms?: number) => vo
                         {isWorkingTab && [{k: "all", l: "全部", n: qStats.total}, {k: "undone", l: "未完成", n: qStats.pending + qStats.submitted},
                           {k: "pending", l: "待提交", n: qStats.pending},
                           {k: "submitted", l: "已提交", n: qStats.submitted},
-                          {k: "done", l: "完成", n: qStats.done},
+                          {k: "done", l: "充值完成", n: qStats.done},
                           {k: "error", l: "提交失败", n: qStats.error}]
                           .map(({k, l, n}) => (
                             <button key={k} onClick={() => setQFilter(k)}
@@ -1627,7 +1626,7 @@ export function RechargePanel({notify}: {notify?: (m: string, ms?: number) => vo
                                 <tr>
                                     <td colSpan={isDeliveredTab ? 11 : isFailedTab ? 12 : isReadyTab ? 13 : 14} className="text-center py-8 text-gray-400">
                                         {isDeliveredTab ? "暂无已交付账号；在「可交付」中点「标记已交付」后会出现在这里"
-                                            : isReadyTab ? "没有可交付的号。充值完成（状态=完成）后会出现在这里"
+                                            : isReadyTab ? "没有可交付的号。充值完成后会出现在这里"
                                             : isFailedTab ? "没有人工标记失败的号。提交失败仍在「未交付」"
                                             : "队列为空，点击「选择账号入队」添加"}
                                     </td>

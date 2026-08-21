@@ -744,7 +744,6 @@ export default function App() {
                     <button onClick={openPicker} title="从待分配里勾选可挂 GPT 的号：Gmail 仅显示已整备(2FA+IMAP)且有应用密码；mail.com 不限。可选批次/先改密后进注册队列" className="px-3 py-1.5 bg-emerald-600 text-white rounded-lg text-sm hover:bg-emerald-700">📥 从邮箱选号</button>
                     <button onClick={() => { setExportRange(selectedIds.size ? "selected" : batchFilter ? "batch" : "all"); setExportBatch(batchFilter); setShowExport(true); }} className="px-3 py-1.5 bg-indigo-600 text-white rounded-lg text-sm hover:bg-indigo-700">⬇ 导出…</button>
                     <button onClick={() => setShowRefreshAt(true)} className="px-3 py-1.5 bg-cyan-600 text-white rounded-lg text-sm hover:bg-cyan-700" title="粘贴邮箱列表,走浏览器登录重新获取 accessToken">🔄 批量刷新AT</button>
-                    <button onClick={() => setShowAcquireRt(true)} className="px-3 py-1.5 bg-amber-600 text-white rounded-lg text-sm hover:bg-amber-700" title="粘贴邮箱----密码，按文本单独获取全新 refresh_token">🔑 按文本获取 RT</button>
                 </div>
             </header>
 
