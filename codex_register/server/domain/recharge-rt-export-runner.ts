@@ -43,20 +43,26 @@ export function createRechargeRtExportRunner({store, formatLine, formatRt = (row
         try {
             if (isStopped()) {
                 effects.log((forceRelogin ? "重登导出" : "导出含RT") + "已停止: 已完成 " + (result.ok || 0) + " / 失败 " + (result.fail || 0));
-                notifyReady({stopped: true, relogin: forceRelogin});
+                notifyReady({stopped: true, relogin: forceRelogin, ok: result.ok || 0, fail: result.fail || 0, total: result.total || work.length});
                 return;
             }
             effects.log((forceRelogin ? "重登导出" : "RT 获取")
                 + (result.timedOut ? "等待超时，已输出当前结果" : "完成")
                 + ": 成功 " + result.ok + " / 失败 " + result.fail);
             fresh ||= await store.listFull(ids.length ? ids : undefined, batch || undefined);
-            notifyReady({text: fresh.map((row) => formatLine(row, {rt: formatRt(row), sep: "----"})).join("\n"), relogin: forceRelogin});
+            notifyReady({
+                text: fresh.map((row) => formatLine(row, {rt: formatRt(row), sep: "----"})).join("\n"),
+                relogin: forceRelogin,
+                ok: result.ok || 0,
+                fail: result.fail || 0,
+                total: result.total || work.length,
+            });
             effects.log(forceRelogin
                 ? "重登取 RT 完成，共 " + fresh.length + " 条，点「导出含RT」即可复制"
                 : "导出含RT 已就绪，共 " + fresh.length + " 条");
         } catch (error) {
             effects.log((forceRelogin ? "重登导出" : "导出含RT") + "收尾失败: " + String(error?.message || error).slice(0, 140));
-            notifyReady({error: String(error?.message || error).slice(0, 200), relogin: forceRelogin});
+            notifyReady({error: String(error?.message || error).slice(0, 200), relogin: forceRelogin, ok: 0, fail: result?.total || work.length, total: result?.total || work.length});
         } finally {
             setRunning(false);
         }

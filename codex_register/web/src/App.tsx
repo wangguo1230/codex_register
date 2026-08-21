@@ -1350,12 +1350,26 @@ export default function App() {
                                     if (!emails.length) { notify("请粘贴邮箱----密码列表"); return; }
                                     setAcquireRtRunning(true);
                                     setAcquireRtResults(emails.map((e, i) => ({email: e, ok: false, status: i === 0 ? "running" as const : "pending" as const, reason: i === 0 ? "已提交，正在登录…" : ""})));
-                                    try { await api.batchAcquireRt(acquireRtInput); } catch (e: any) { notify("请求失败: " + e.message); setAcquireRtRunning(false); }
+                                    try { await api.batchAcquireRt(acquireRtInput); } catch (e: any) {
+                                        notify("请求失败: " + e.message);
+                                        setAcquireRtResults((previous) => previous.map((item) => item.status === "done" ? item : {...item, status: "done", ok: false, reason: e.message || "请求失败"}));
+                                        setAcquireRtRunning(false);
+                                    }
                                 }} disabled={acquireRtRunning} className={`px-4 py-1.5 rounded text-sm font-medium text-white ${acquireRtRunning ? "bg-gray-400 cursor-not-allowed" : "bg-amber-600 hover:bg-amber-700"}`}>
                                     {acquireRtRunning ? "获取中(OAuth登录)…" : "▶ 开始获取"}
                                 </button>
                                 {acquireRtRunning && <button onClick={() => { api.stopBatchAcquireRt(); setAcquireRtRunning(false); }} className="px-3 py-1.5 rounded text-sm font-medium text-white bg-red-500 hover:bg-red-600">⏹ 停止</button>}
-                                {acquireRtResults.length > 0 && <span className="text-xs text-gray-500">成功 {acquireRtResults.filter(r => r.ok).length}/{acquireRtResults.length}</span>}
+                                {acquireRtResults.length > 0 && (() => {
+                                    const finished = acquireRtResults.filter((r) => r.status === "done").length;
+                                    const success = acquireRtResults.filter((r) => r.status === "done" && r.ok).length;
+                                    const failed = finished - success;
+                                    const total = acquireRtResults.length;
+                                    const percent = total ? Math.round((finished / total) * 100) : 0;
+                                    return <div className="min-w-[250px] flex-1 max-w-[420px] space-y-1" aria-live="polite">
+                                        <div className="flex justify-between text-xs tabular-nums"><span className="font-semibold text-gray-700">已完成 {finished}/{total}</span><span className="text-gray-500">成功 {success} · 失败 {failed} · 进行中 {total - finished}</span></div>
+                                        <div className="h-2.5 rounded-full bg-gray-100 overflow-hidden" role="progressbar" aria-valuemin={0} aria-valuemax={total} aria-valuenow={finished}><div className="h-full bg-amber-500 transition-all" style={{width: `${percent}%`}}/></div>
+                                    </div>;
+                                })()}
                                 {acquireRtResults.some(r => !r.ok) && !acquireRtRunning && <button onClick={async () => { setAcquireRtRunning(true); try { const r = await api.retryFailedBatchAcquireRt(); notify(r.count ? `仅重试失败项 ${r.count} 个` : "没有失败项需要重试"); } catch (e: any) { notify("重试失败: " + e.message); setAcquireRtRunning(false); } }} className="px-3 py-1.5 rounded text-sm font-medium text-white bg-amber-500 hover:bg-amber-600">仅重试失败</button>}
                             </div>
                             {acquireRtResults.length > 0 && (

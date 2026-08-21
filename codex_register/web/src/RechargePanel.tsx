@@ -38,6 +38,16 @@ const EMPTY_Q: RechargeQueueStats = {pending: 0, paired: 0, submitting: 0, submi
 const TEST_SEND_TO = "wangguodong194@163.com";
 const EMPTY_C: RechargeCardStats = {unused: 0, paired: 0, submitting: 0, submitted: 0, done: 0, error: 0, total: 0};
 type RechargeLogEntry = {ts: number; line: string; instance_id?: string; scope?: string};
+type TrackedOperationKind = "rebind" | "submit" | "reloginSubmit" | "rtExport" | "reloginRt" | "sub2json";
+type TrackedOperation = {
+    kind: TrackedOperationKind;
+    label: string;
+    ids: number[];
+    total: number;
+    skipped: number;
+    startedAt: number;
+    final?: {done: number; failed: number; total: number};
+};
 
 /** 官方 24h 换绑上限还剩多久解禁，<=0 表示没在冷却 */
 function rebindCooldownLeft(q: RechargeQueueItem): number {
@@ -158,6 +168,7 @@ export function RechargePanel({notify}: {notify?: (m: string, ms?: number) => vo
     const [batchRtInput, setBatchRtInput] = useState("");
     const [batchRtResults, setBatchRtResults] = useState<{email: string; password?: string; rt?: string; accessToken?: string; ok: boolean; reason?: string; status: "pending"|"running"|"done"}[]>([]);
     const [batchRtRunning, setBatchRtRunning] = useState(false);
+    const [trackedOperation, setTrackedOperation] = useState<TrackedOperation | null>(null);
     // 状态
     const [busy, setBusy] = useState(false);
     const [logs, setLogs] = useState<RechargeLogEntry[]>([]);
@@ -218,6 +229,43 @@ export function RechargePanel({notify}: {notify?: (m: string, ms?: number) => vo
     const refreshJobs = () => api.rechargeJobs().then(applyJobs).catch(() => {});
     const loadConfig = () => api.rechargeConfig().then((c) => { setConfigBase(c.baseUrl); setConfigAppId(c.appId || ""); setConfigKey(c.apiKey); setConfigIp(c.forwardIp); setConfigConcurrency(c.concurrency || 3); setConfigRebindConcurrency(c.rebindConcurrency || 3); setConfigInterval(c.interval ?? 3); setConfigRtProxy(c.rtProxy || ""); setConfigRtConcurrency(c.rtConcurrency || 4); applyRebindCounts(c); setHasKey(!!c.hasKey); setInstanceId(c.instanceId || ""); applyJobs(c.jobs); }).catch(() => {});
     const loadLogs = () => api.rechargeLogs().then((rows) => setLogs(Array.isArray(rows) ? rows.slice(-5000) : [])).catch(() => {});
+    const trackedProgress = useMemo(() => {
+        const operation = trackedOperation;
+        if (!operation) return null;
+        if (operation.final) {
+            const total = Math.max(1, operation.final.total || operation.total);
+            const done = Math.min(total, Math.max(0, operation.final.done));
+            const failed = Math.min(total - done, Math.max(0, operation.final.failed));
+            return {label: operation.label, total, done, success: Math.max(0, done - failed), failed, waiting: Math.max(0, total - done), percent: Math.round((done / total) * 100), active: false};
+        }
+        if (operation.kind === "rtExport" || operation.kind === "reloginRt" || operation.kind === "sub2json") {
+            const terminal = new Map<string, boolean>();
+            for (const entry of logs) {
+                if (Number(entry.ts) < operation.startedAt) continue;
+                const line = String(entry.line || "");
+                const distributed = line.match(/RT任务\s+([^\s]+)\s+→\s+(success|failed|canceled)/i);
+                if (distributed) terminal.set(distributed[1], distributed[2].toLowerCase() !== "success");
+                const indexed = line.match(/\[(\d+)\/\d+\].*(?:✓|✗|失败|成功)/);
+                if (indexed) terminal.set(`index:${indexed[1]}`, /✗|失败/.test(line));
+            }
+            const failed = [...terminal.values()].filter(Boolean).length;
+            const done = Math.min(operation.total, terminal.size);
+            return {label: operation.label, total: operation.total, done, success: Math.max(0, done - failed), failed, waiting: Math.max(0, operation.total - done), percent: operation.total ? Math.round((done / operation.total) * 100) : 0, active: true};
+        }
+        const rows = operation.ids.map((id) => queue.find((item) => item.id === id)).filter(Boolean) as RechargeQueueItem[];
+        let success = 0;
+        let observedFailed = 0;
+        if (operation.kind === "rebind") {
+            success = rows.filter((item) => item.rebind_status === "ok").length;
+            observedFailed = rows.filter((item) => item.rebind_status === "fail").length;
+        } else {
+            success = rows.filter((item) => item.status === "done" || item.task_status === "paid").length;
+            observedFailed = rows.filter((item) => item.status === "error" || /failed|error/i.test(String(item.task_status || ""))).length;
+        }
+        const failed = Math.min(operation.total - success, Math.max(operation.skipped, observedFailed));
+        const done = Math.min(operation.total, success + failed);
+        return {label: operation.label, total: operation.total, done, success, failed, waiting: Math.max(0, operation.total - done), percent: operation.total ? Math.round((done / operation.total) * 100) : 0, active: true};
+    }, [trackedOperation, queue, logs]);
     const detailLogKeys = (item: RechargeQueueItem) => {
         const card = String(item.card_code || "").trim();
         return [...new Set([
@@ -277,6 +325,10 @@ export function RechargePanel({notify}: {notify?: (m: string, ms?: number) => vo
             if (ev === "rechargeJobs") applyJobs(data);
             if (ev === "rechargeExportReady") {
                 setExportRtRunning(false);
+                setTrackedOperation((previous) => {
+                    if (!previous || !["rtExport", "reloginRt", "sub2json"].includes(previous.kind)) return previous;
+                    return {...previous, final: {done: (Number(data.ok) || 0) + (Number(data.fail) || 0), failed: Number(data.fail) || 0, total: Number(data.total) || previous.total}};
+                });
                 void refreshJobs();
                 if (data?.stopped) toast("导出已停止");
                 else if (data?.format === "sub2json" && data?.text) {
@@ -534,6 +586,7 @@ export function RechargePanel({notify}: {notify?: (m: string, ms?: number) => vo
         setBusy(true);
         try {
             await api.submitRecharge(pendingIds);
+            setTrackedOperation({kind: "submit", label: "充值提交", ids: pendingIds, total: pendingIds.length, skipped: 0, startedAt: Date.now()});
             setJobSubmit(true);
             toast(`已开始提交 ${pendingIds.length} 个充值任务`);
         } catch (e: any) { toast("提交失败: " + e.message); } finally { setBusy(false); }
@@ -591,6 +644,7 @@ export function RechargePanel({notify}: {notify?: (m: string, ms?: number) => vo
         if (!confirm(`确认对 ${ids.length} 个账号「重新登录并提交」？\n任务会进入分布式队列，由各实例按并发自动分片执行。\n会重新登录、查卡密、用原卡密再提；卡密若已被消费会跳过，避免重复扣卡。`)) return;
         try {
             const r = await api.rechargeQueueReloginSubmit(ids);
+            setTrackedOperation({kind: "reloginSubmit", label: "重登提交", ids, total: (r.claimed ?? ids.length) + (r.skipped ?? 0), skipped: r.skipped ?? 0, startedAt: Date.now()});
             setJobReloginSubmit(true);
             toast(`已入队重新登录并提交 ${r.claimed ?? r.count} 个${r.skipped ? `，跳过 ${r.skipped} 个` : ""}，各实例会自动分片执行`);
         } catch (e: any) { toast(e.message); }
@@ -688,6 +742,7 @@ export function RechargePanel({notify}: {notify?: (m: string, ms?: number) => vo
                 ...(opts || {}),
                 ...(target === "gmail" && isDeliveredTab ? {allowDelivered: true} : {}),
             });
+            setTrackedOperation({kind: "rebind", label: `换绑 ${label}`, ids, total: ids.length, skipped: (r.skipped || []).length, startedAt: Date.now()});
             applyRebindCounts(r);
             const skip = (r.skipped || []).map((s) => `${s.email}: ${s.reason}`).join("；");
             toast(`换绑 ${label} 已排队 ${r.queued} 个${skip ? `，跳过 ${r.skipped.length}（${skip}）` : ""}`);
@@ -932,6 +987,7 @@ export function RechargePanel({notify}: {notify?: (m: string, ms?: number) => vo
         if (!ids.length) { toast("请先勾选账号，或当前列表不能为空"); return; }
         const conc = Math.max(1, Math.floor(Number(configRtConcurrency || sub2jsonConc) || 4));
         if (!confirm(`导出 ${ids.length} 个账号的 sub2json？\n缺 RT 的会先按并发 ${conc} 获取，再刷新 token，最后下一个 JSON。`)) return;
+        setTrackedOperation({kind: "sub2json", label: "sub2json", ids, total: ids.length, skipped: 0, startedAt: Date.now()});
         setExportRtRunning(true);
         try {
             const r = await api.exportRechargeSub2json({ids, concurrency: conc});
@@ -944,6 +1000,7 @@ export function RechargePanel({notify}: {notify?: (m: string, ms?: number) => vo
             }
         } catch (e: any) {
             setExportRtRunning(false);
+            setTrackedOperation(null);
             void refreshJobs();
             toast("导出失败: " + (e?.message || e));
         }
@@ -951,6 +1008,9 @@ export function RechargePanel({notify}: {notify?: (m: string, ms?: number) => vo
     const doExport = async (format: "account" | "full" | "card" | "session", opts?: {relogin?: boolean}) => {
         const picked = selQIds();
         const ids = picked.length ? picked : filteredQueue.map((item) => item.id);
+        if (format === "full" && ids.length) {
+            setTrackedOperation({kind: opts?.relogin ? "reloginRt" : "rtExport", label: opts?.relogin ? "重登取 RT" : "获取 RT", ids, total: ids.length, skipped: 0, startedAt: Date.now()});
+        }
         if (!ids.length) { toast("当前筛选没有可导出账号"); return; }
         setExportRtRunning(true);
         try {
@@ -960,9 +1020,11 @@ export function RechargePanel({notify}: {notify?: (m: string, ms?: number) => vo
                 relogin: !!opts?.relogin,
             });
             if (r.text) {
+                if (format === "full") setTrackedOperation(null);
                 setExportRtRunning(false);
                 await deliverExportText(r.text, format);
             } else if (r.async) {
+                if (format === "full") setTrackedOperation((previous) => previous ? {...previous, total: Number(r.needRt || r.total) || previous.total} : previous);
                 setExportRtRunning(true);
                 void refreshJobs();
                 toast(opts?.relogin
@@ -971,6 +1033,7 @@ export function RechargePanel({notify}: {notify?: (m: string, ms?: number) => vo
             }
         } catch (e: any) {
             setExportRtRunning(false);
+            if (format === "full") setTrackedOperation(null);
             void refreshJobs();
             toast("导出失败: " + e.message);
         }
@@ -1103,6 +1166,28 @@ export function RechargePanel({notify}: {notify?: (m: string, ms?: number) => vo
                 </span>
                 {!hasKey && <span className="text-xs text-amber-600 bg-amber-50 px-2 py-0.5 rounded">未配置 API Key</span>}
             </div>
+
+            {trackedProgress && (
+                <div className="bg-white rounded-lg border border-blue-100 shadow-sm px-4 py-3 space-y-2" aria-live="polite">
+                    <div className="flex items-center justify-between gap-3 flex-wrap">
+                        <div className="flex items-center gap-2">
+                            <span className={`h-2.5 w-2.5 rounded-full ${trackedProgress.active ? "bg-blue-500 animate-pulse" : "bg-emerald-500"}`}/>
+                            <span className="font-semibold text-sm text-gray-800">{trackedProgress.label}</span>
+                            <span className="text-xs text-gray-500">{trackedProgress.active ? "进行中" : "已结束"}</span>
+                        </div>
+                        <span className="text-lg font-bold tabular-nums text-gray-800">{trackedProgress.done} / {trackedProgress.total}</span>
+                    </div>
+                    <div className="h-3 rounded-full bg-gray-100 overflow-hidden" role="progressbar" aria-valuemin={0} aria-valuemax={trackedProgress.total} aria-valuenow={trackedProgress.done}>
+                        <div className={`h-full transition-all ${trackedProgress.failed ? "bg-gradient-to-r from-blue-500 to-amber-400" : "bg-blue-500"}`} style={{width: `${trackedProgress.percent}%`}}/>
+                    </div>
+                    <div className="flex flex-wrap gap-x-5 gap-y-1 text-xs tabular-nums">
+                        <span className="text-green-700">成功 {trackedProgress.success}</span>
+                        <span className="text-red-600">失败 {trackedProgress.failed}</span>
+                        <span className="text-gray-500">进行中 {trackedProgress.waiting}</span>
+                        <span className="text-gray-400">{trackedProgress.percent}%</span>
+                    </div>
+                </div>
+            )}
 
             {/* 配置区 */}
             {showConfig && (
@@ -2085,7 +2170,16 @@ export function RechargePanel({notify}: {notify?: (m: string, ms?: number) => vo
                                     {batchRtRunning ? "获取中(OAuth登录)…" : "开始获取"}
                                 </button>
                                 {batchRtRunning && <button onClick={() => { api.stopBatchAcquireRt(); setBatchRtRunning(false); }} className="px-3 py-1.5 rounded text-sm font-medium text-white bg-red-500 hover:bg-red-600">停止</button>}
-                                {batchRtResults.length > 0 && <span className="text-xs text-gray-500">成功 {batchRtResults.filter(r => r.ok).length}/{batchRtResults.length}</span>}
+                                {batchRtResults.length > 0 && (() => {
+                                    const finished = batchRtResults.filter((r) => r.status === "done").length;
+                                    const success = batchRtResults.filter((r) => r.status === "done" && r.ok).length;
+                                    const failed = finished - success;
+                                    const percent = Math.round((finished / batchRtResults.length) * 100);
+                                    return <div className="min-w-[250px] flex-1 max-w-[420px] space-y-1" aria-live="polite">
+                                        <div className="flex justify-between text-xs tabular-nums"><span className="font-semibold text-gray-700">已完成 {finished}/{batchRtResults.length}</span><span className="text-gray-500">成功 {success} · 失败 {failed} · 进行中 {batchRtResults.length - finished}</span></div>
+                                        <div className="h-2.5 rounded-full bg-gray-100 overflow-hidden"><div className="h-full bg-amber-500 transition-all" style={{width: `${percent}%`}}/></div>
+                                    </div>;
+                                })()}
                             </div>
                             {batchRtResults.length > 0 && (
                                 <>

@@ -230,7 +230,7 @@ export function createRechargeExportService({store, credentials, formatLine, rtA
         try {
             if (stopped) {
                 effects.log(`导出 sub2json 已停止：成功 ${result.ok || 0} / 失败 ${result.fail || 0}`);
-                notifyReady({stopped: true, format: "sub2json"});
+                notifyReady({stopped: true, format: "sub2json", ok: result.ok || 0, fail: result.fail || 0, total: result.total || rows.length});
                 return;
             }
             const payload = {exported_at: now().toISOString(), proxies: [], accounts: result.accounts};
@@ -244,7 +244,7 @@ export function createRechargeExportService({store, credentials, formatLine, rtA
             });
         } catch (error) {
             effects.log(`导出 sub2json 收尾失败: ${String(error?.message || error).slice(0, 140)}`);
-            notifyReady({error: String(error?.message || error).slice(0, 200), format: "sub2json"});
+            notifyReady({error: String(error?.message || error).slice(0, 200), format: "sub2json", ok: result?.ok || 0, fail: result?.fail || rows.length, total: result?.total || rows.length});
         } finally {
             if (ownsLock) setRunning(false);
         }
