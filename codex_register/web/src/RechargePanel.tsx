@@ -37,7 +37,7 @@ const TASK_COLOR: Record<string, string> = {pending: "#6b7280", leased: "#2563eb
 const EMPTY_Q: RechargeQueueStats = {pending: 0, paired: 0, submitting: 0, submitted: 0, done: 0, error: 0, total: 0, undelivered: 0, delivered: 0, failed: 0, working: 0, ready: 0};
 const TEST_SEND_TO = "wangguodong194@163.com";
 const EMPTY_C: RechargeCardStats = {unused: 0, paired: 0, submitting: 0, submitted: 0, done: 0, error: 0, total: 0};
-type RechargeLogEntry = {ts: number; line: string};
+type RechargeLogEntry = {ts: number; line: string; instance_id?: string; scope?: string};
 
 /** 官方 24h 换绑上限还剩多久解禁，<=0 表示没在冷却 */
 function rebindCooldownLeft(q: RechargeQueueItem): number {
@@ -217,7 +217,7 @@ export function RechargePanel({notify}: {notify?: (m: string, ms?: number) => vo
     };
     const refreshJobs = () => api.rechargeJobs().then(applyJobs).catch(() => {});
     const loadConfig = () => api.rechargeConfig().then((c) => { setConfigBase(c.baseUrl); setConfigAppId(c.appId || ""); setConfigKey(c.apiKey); setConfigIp(c.forwardIp); setConfigConcurrency(c.concurrency || 3); setConfigRebindConcurrency(c.rebindConcurrency || 3); setConfigInterval(c.interval ?? 3); setConfigRtProxy(c.rtProxy || ""); setConfigRtConcurrency(c.rtConcurrency || 4); applyRebindCounts(c); setHasKey(!!c.hasKey); setInstanceId(c.instanceId || ""); applyJobs(c.jobs); }).catch(() => {});
-    const loadLogs = () => api.rechargeLogs().then((rows) => setLogs(Array.isArray(rows) ? rows.slice(-500) : [])).catch(() => {});
+    const loadLogs = () => api.rechargeLogs().then((rows) => setLogs(Array.isArray(rows) ? rows.slice(-5000) : [])).catch(() => {});
     const detailLogKeys = (item: RechargeQueueItem) => {
         const card = String(item.card_code || "").trim();
         return [...new Set([
@@ -266,7 +266,7 @@ export function RechargePanel({notify}: {notify?: (m: string, ms?: number) => vo
             }
             if (ev === "recharge") { setCards(data.list || []); setCStats(data.stats || EMPTY_C); }
             if (ev === "rechargeLog") {
-                setLogs((prev) => [...prev.slice(-500), data]);
+                setLogs((prev) => [...prev.slice(-5000), data]);
                 const currentDetail = detailItemRef.current;
                 if (currentDetail && detailLogKeys(currentDetail).some((key) => String(data?.line || "").includes(key))) {
                     setDetailLogs((prev) => prev.some((entry) => entry.ts === data.ts && entry.line === data.line) ? prev : [...prev, data]);
@@ -305,10 +305,9 @@ export function RechargePanel({notify}: {notify?: (m: string, ms?: number) => vo
         const poll = setInterval(() => {
             // 任务状态是轻量内存状态；即使 SSE 丢了完成事件，也不能让停止按钮永久残留。
             refreshJobs();
-            if (!streamConnectedRef.current) {
-                loadLogs();
-                loadQueue();
-            }
+            // 操作日志来自共享 PostgreSQL，SSE 只覆盖本实例；定时拉取可看到其他实例的新日志。
+            loadLogs();
+            if (!streamConnectedRef.current) loadQueue();
             if (!testSendBusyRef.current) return;
             api.rechargeTestSendStatus().then((s) => {
                 if (!testSendBusyRef.current || s.running || !s.finishedAt) return;
@@ -506,15 +505,15 @@ export function RechargePanel({notify}: {notify?: (m: string, ms?: number) => vo
         } catch (e: any) { toast("标记已交付失败: " + e.message); }
     };
 
-    /** 已交付 → 退回未交付 */
+    /** 已交付 → 退回可交付 */
     const doUndeliver = async () => {
         const ids = selQIds();
         if (!ids.length) return;
-        if (!confirm(`确认将 ${ids.length} 个账号退回未交付？\n会重新出现在作业队列。`)) return;
+        if (!confirm(`确认将 ${ids.length} 个账号退回可交付？\n充值已完成的账号会回到「可交付」列表，不会重新进入作业中。`)) return;
         try {
             const r = await api.undeliverRechargeQueue(ids);
-            setQSel(new Set()); loadQueue(); toast(`已退回未交付 ${r.count ?? ids.length} 个`);
-        } catch (e: any) { toast("退回失败: " + e.message); }
+            setQSel(new Set()); loadQueue(); toast(`已退回可交付 ${r.count ?? ids.length} 个`);
+        } catch (e: any) { toast("退回可交付失败: " + e.message); }
     };
 
     const doSetBatch = async () => {
@@ -1283,7 +1282,7 @@ export function RechargePanel({notify}: {notify?: (m: string, ms?: number) => vo
                     )}
                     {isDeliveredTab && (
                         <>
-                            <Btn onClick={doUndeliver} className="bg-white border-blue-200 text-blue-700 hover:bg-blue-50">退回未交付</Btn>
+                            <Btn onClick={doUndeliver} title="将已交付记录退回「可交付」列表，不重新进入作业中" className="bg-white border-blue-200 text-blue-700 hover:bg-blue-50">退回可交付</Btn>
                             <Btn onClick={() => doRebind("gmail")} title="对已交付且已支付项人工换绑 Gmail">换绑 Gmail</Btn>
                             <button type="button" onClick={() => { void openTestSend(); }}
                                     className="px-3 py-1.5 rounded text-xs font-medium border bg-violet-600 text-white border-violet-600 hover:bg-violet-700">
@@ -1308,7 +1307,7 @@ export function RechargePanel({notify}: {notify?: (m: string, ms?: number) => vo
                             <div className="absolute left-0 top-full mt-1 z-20 min-w-[200px] rounded-lg border border-gray-200 bg-white shadow-lg py-1 text-xs">
                                 <button type="button" className="block w-full text-left px-3 py-1.5 hover:bg-gray-50" onClick={() => { setShowExportMenu(false); void doExport("account"); }}>账密</button>
                                 <button type="button" className="block w-full text-left px-3 py-1.5 hover:bg-gray-50" title="缺 RT 的会自动补，完成后复制/下载" onClick={() => { setShowExportMenu(false); void doExport("full"); }}>含 RT（缺的自动补）</button>
-                                <button type="button" className="block w-full text-left px-3 py-1.5 hover:bg-gray-50" title="每个号先强制重登再取 RT，完成后自动复制/下载" onClick={() => { setShowExportMenu(false); void doExport("full", {relogin: true}); }}>含 RT（先重登再取）</button>
+                                <button type="button" className="block w-full text-left px-3 py-1.5 hover:bg-gray-50" title="每个号直接登录获取新 RT，完成后自动复制/下载" onClick={() => { setShowExportMenu(false); void doExport("full", {relogin: true}); }}>含 RT（直接获取新 RT）</button>
                                 <button type="button" className="block w-full text-left px-3 py-1.5 hover:bg-gray-50" onClick={() => { setShowExportMenu(false); void doExport("card"); }}>复制卡密</button>
                                 <button type="button" className="block w-full text-left px-3 py-1.5 hover:bg-gray-50" onClick={() => { setShowExportMenu(false); void doExport("session"); }}>复制 session</button>
                                 <button type="button" className="block w-full text-left px-3 py-1.5 hover:bg-gray-50" title="缺 RT 先获取，再刷新，导出一个 JSON" onClick={() => { setShowExportMenu(false); void doExportSub2json(); }}>sub2json（缺 RT 自动补）</button>
@@ -1602,6 +1601,7 @@ export function RechargePanel({notify}: {notify?: (m: string, ms?: number) => vo
                         return (
                         <div key={`${l.ts}-${i}`} className="flex gap-2">
                             <span className="text-gray-400 shrink-0">{fmtLogTime(l.ts)}</span>
+                            {l.instance_id && <span className="text-gray-400 shrink-0" title={l.instance_id}>[{l.instance_id}]</span>}
                             <span className={cls}>{line}</span>
                         </div>
                         );

@@ -15,9 +15,10 @@ export function parseEmailPasswordLines(text) {
     return rows;
 }
 
-export function createTokenToolService({store, workers, tokens, runPool, effects, config} = {}) {
+export function createTokenToolService({store, workers, tokens, runPool, effects, config, refreshRtViaPool = null} = {}) {
     const atState = {running: false, stopped: false, generation: 0};
     const rtState = {running: false, stopped: false, generation: 0};
+    let lastRtResults = [];
     const publicAtResults = (results) => results.map(({accId, ...result}) => result);
 
     function normalizeItems(input = {}) {
@@ -134,7 +135,16 @@ export function createTokenToolService({store, workers, tokens, runPool, effects
                 results[index] = {email: item.email, ok: false, reason: "无rt"};
                 return;
             }
-            const refreshed = await tokens.refreshRt(item.rt, dispatcher);
+            let refreshed;
+            try {
+                const account = await store.getAccountByEmail?.(item.email);
+                refreshed = account && typeof refreshRtViaPool === "function"
+                    ? await refreshRtViaPool(account, item.rt, (message) => effects.log("RT", item.email, message))
+                    : await tokens.refreshRt(item.rt, dispatcher);
+            } catch (error) {
+                results[index] = {email: item.email, ok: false, reason: String(error?.message || error).slice(0, 160)};
+                return;
+            }
             results[index] = refreshed.ok && refreshed.tokens
                 ? {email: item.email, password: item.password, ok: true, tokens: refreshed.tokens}
                 : {email: item.email, ok: false, reason: refreshed.reason || "刷新失败"};
@@ -142,17 +152,24 @@ export function createTokenToolService({store, workers, tokens, runPool, effects
         return {results};
     }
 
-    async function startRt(lines) {
+    async function startRt(lines, {retryFailed = false} = {}) {
         const items = parseEmailPasswordLines(lines);
         if (!items.length) return {error: "未提供邮箱列表", status: 400};
         if (rtState.running) return {error: "已有批量 RT 获取任务在运行", status: 409};
-        const results = items.map((item) => ({...item, ok: false, reason: "", status: "pending"}));
+        const previous = retryFailed ? new Map(lastRtResults.map((item) => [item.email, item])) : new Map();
+        const results = items.map((item) => {
+            const old = previous.get(item.email);
+            if (old?.ok) return {...old, status: "done"};
+            return {...item, ok: false, reason: old ? "等待重试" : "", status: "pending"};
+        });
+        lastRtResults = results;
         const generation = ++rtState.generation;
         rtState.running = true;
         rtState.stopped = false;
         void (async () => {
             try {
                 for (const result of results) {
+                    if (retryFailed && result.ok) continue;
                     if (rtState.stopped || generation !== rtState.generation) {
                         result.reason = "已停止";
                         result.status = "done";
@@ -214,7 +231,19 @@ export function createTokenToolService({store, workers, tokens, runPool, effects
                 }
             }
         })();
-        return {ok: true, count: results.length};
+        return {ok: true, count: retryFailed ? results.filter((result) => !result.ok).length : results.length};
+    }
+
+    async function retryFailedRt() {
+        if (rtState.running) return {error: "已有批量 RT 获取任务在运行", status: 409};
+        if (!lastRtResults.length) return {error: "没有可恢复的 RT 批次", status: 400};
+        const failed = lastRtResults.filter((result) => !result.ok);
+        if (!failed.length) {
+            effects.broadcast("batchRtAcquire", {results: lastRtResults, done: true});
+            return {ok: true, count: 0, skipped: lastRtResults.length};
+        }
+        const lines = lastRtResults.map((result) => `${result.email}----${result.password || ""}`).join("\n");
+        return startRt(lines, {retryFailed: true});
     }
 
     function stopRt() {
@@ -223,5 +252,5 @@ export function createTokenToolService({store, workers, tokens, runPool, effects
         return {ok: true};
     }
 
-    return {startAt, stopAt, refreshTokens, startRt, stopRt};
+    return {startAt, stopAt, refreshTokens, startRt, retryFailedRt, stopRt};
 }

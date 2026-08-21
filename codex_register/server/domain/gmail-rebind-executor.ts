@@ -16,11 +16,21 @@ export function createGmailRebindExecutor({
     credentialStore,
     policy,
     runtime,
-    effects,
+    effects: baseEffects,
     getAuthData,
     now = () => Date.now(),
 } = {}) {
     return async function runGmailRebind(queueId, {signal, metadata} = {}) {
+        let accountIdForLog = 0;
+        const effects = {
+            ...baseEffects,
+            log: (line) => {
+                baseEffects.log(line);
+                if (accountIdForLog && typeof baseEffects.accountLog === "function") {
+                    try { baseEffects.accountLog(accountIdForLog, line); } catch { /* 账号日志不影响换绑 */ }
+                }
+            },
+        };
         const queueItem = await queueStore.claimExecution(queueId);
         if (!queueItem) {
             effects.log(`换绑跳过 ${queueId}: 已由其他实例处理或状态已变化`);
@@ -47,6 +57,7 @@ export function createGmailRebindExecutor({
             await effects.syncQueue();
             return;
         }
+        accountIdForLog = Number(account.id) || 0;
 
         let claimed = null;
         let claimedKept = false;

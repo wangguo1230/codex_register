@@ -40,3 +40,18 @@ test("内存日志窗口保持上限", () => {
 
     assert.deepEqual(store.list().map((entry) => entry.line), ["two", "three"]);
 });
+
+test("追加日志同时写入共享日志，读取优先使用共享来源", async () => {
+    const shared = [];
+    const store = createRechargeLogStore({
+        filePath: "recharge.jsonl",
+        sharedAppend: async (entry) => { shared.push(entry); },
+        sharedList: async () => [{ts: 1, line: "来自其他实例", instance_id: "other:3100"}],
+        writeFile: async () => {},
+    });
+
+    store.append("本实例");
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(shared[0].line, "本实例");
+    assert.deepEqual(await store.listAll(), [{ts: 1, line: "来自其他实例", instance_id: "other:3100"}]);
+});

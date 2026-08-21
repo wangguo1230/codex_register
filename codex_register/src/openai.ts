@@ -1,4 +1,4 @@
-import {closeSync, openSync, unlinkSync, writeFileSync, statSync} from "node:fs";
+import {closeSync, openSync, unlinkSync, writeFileSync, statSync, readFileSync} from "node:fs";
 import {mkdir, writeFile} from "node:fs/promises";
 import {createInterface} from "node:readline/promises";
 import net from "node:net";
@@ -7,7 +7,7 @@ import {stdin as input, stdout as output} from "node:process";
 import tls from "node:tls";
 import {URLSearchParams} from "node:url";
 import path from "node:path";
-import {Agent, ProxyAgent, setGlobalDispatcher, type Dispatcher} from "undici";
+import {Agent, ProxyAgent, fetch as undiciFetch, setGlobalDispatcher, type Dispatcher} from "undici";
 import {SocksClient} from "socks";
 import makeFetchCookie from "fetch-cookie";
 import {CookieJar} from "tough-cookie";
@@ -59,6 +59,7 @@ let lastAuthorizeAtMs = 0;
 let authorizeMinGapMs = 6_000;
 let authorizeCooldownUntilMs = 0;
 const AUTHORIZE_LOCK_PATH = path.join(os.tmpdir(), "codex-openai-authorize.lock");
+const AUTHORIZE_STATE_PATH = path.join(os.tmpdir(), "codex-openai-authorize-state");
 const AUTHORIZE_LOCK_STALE_MS = 120_000;
 /** ChatGPT 网页 OAuth client（抓包 session.client_id） */
 const CHATGPT_WEB_CLIENT_ID = "app_X8zY6vW2pQ9tR3dE7nK1jL5gH";
@@ -332,7 +333,10 @@ export class OpenAIClient {
         this.signupScreenHint = options.signupScreenHint?.trim() || "login_or_signup";
         this.jar = new CookieJar();
         setGlobalDispatcher(createDispatcher(resolveProxyUrl(), shouldAllowInsecureTLS()));
-        const cookieFetch = makeFetchCookie(fetch, this.jar) as FetchLike;
+        // Use the same Undici instance whose dispatcher is configured above.
+        // Node's global fetch has a separate bundled Undici and would bypass
+        // the SOCKS/HTTP proxy, falling back to direct DNS connections.
+        const cookieFetch = makeFetchCookie(undiciFetch, this.jar) as unknown as FetchLike;
         this.fetch = ((input: Parameters<FetchLike>[0], init?: Parameters<FetchLike>[1]) =>
             this.fetchWithRetry(cookieFetch, input, init)) as FetchLike;
     }
@@ -1011,59 +1015,48 @@ export class OpenAIClient {
         // 自动检测 username kind：以 + 开头视为 phone_number
         const isPhone = this.email.startsWith("+");
         const usernameKind = isPhone ? "phone_number" : "email";
-        const response = await this.fetch(AUTH_AUTHORIZE_CONTINUE_URL, {
-            method: "POST",
-            headers: {
-                "content-type": "application/json",
-                "openai-sentinel-token": sentinelToken,
-                "user-agent": this.userAgent,
-                "accept-language": this.deviceProfile.acceptLanguage,
-                "sec-ch-ua": this.clientHints.secChUa,
-                "sec-ch-ua-full-version-list": this.clientHints.secChUaFullVersionList,
-                "sec-ch-ua-mobile": this.clientHints.secChUaMobile,
-                "sec-ch-ua-platform": this.clientHints.secChUaPlatform,
-                "sec-ch-ua-platform-version": this.clientHints.secChUaPlatformVersion,
-                "sec-ch-viewport-width": this.clientHints.secChViewportWidth,
-            },
-            body: JSON.stringify({
-                username: {
-                    kind: usernameKind,
-                    value: this.email,
+        return withAuthorizeSlot(async () => {
+            const response = await this.fetch(AUTH_AUTHORIZE_CONTINUE_URL, {
+                method: "POST",
+                headers: {
+                    "content-type": "application/json",
+                    "openai-sentinel-token": sentinelToken,
+                    "user-agent": this.userAgent,
+                    "accept-language": this.deviceProfile.acceptLanguage,
+                    "sec-ch-ua": this.clientHints.secChUa,
+                    "sec-ch-ua-full-version-list": this.clientHints.secChUaFullVersionList,
+                    "sec-ch-ua-mobile": this.clientHints.secChUaMobile,
+                    "sec-ch-ua-platform": this.clientHints.secChUaPlatform,
+                    "sec-ch-ua-platform-version": this.clientHints.secChUaPlatformVersion,
+                    "sec-ch-viewport-width": this.clientHints.secChViewportWidth,
                 },
-            }),
+                body: JSON.stringify({username: {kind: usernameKind, value: this.email}}),
+            });
+            if (!response.ok) {
+                throw new Error(`AuthorizeContinue请求失败: ${await this.formatErrorResponse(response)}`);
+            }
+            const payload = (await response.json()) as ContinueResponse;
+            return payload.continue_url;
         });
-        if (!response.ok) {
-            throw new Error(
-                `AuthorizeContinue请求失败: ${await this.formatErrorResponse(response)}`,
-            );
-        }
-        const payload = (await response.json()) as ContinueResponse;
-        return payload.continue_url;
     }
 
     async authorizeContinueForSignup(screenHint = "login_or_signup"): Promise<string> {
         const sentinelToken = await this.fetchSentinelToken("authorize_continue");
-        const response = await this.postJSON(
-            AUTH_AUTHORIZE_CONTINUE_URL,
-            {
-                username: {
-                    kind: "email",
-                    value: this.email,
+        return withAuthorizeSlot(async () => {
+            const response = await this.postJSON(
+                AUTH_AUTHORIZE_CONTINUE_URL,
+                {username: {kind: "email", value: this.email}, screen_hint: screenHint},
+                {
+                    referer: `${AUTH_BASE_URL}/log-in-or-create-account?usernameKind=email`,
+                    sentinelToken,
                 },
-                screen_hint: screenHint,
-            },
-            {
-                referer: `${AUTH_BASE_URL}/log-in-or-create-account?usernameKind=email`,
-                sentinelToken,
-            },
-        );
-        if (!response.ok) {
-            throw new Error(
-                `AuthorizeContinue注册请求失败: ${await this.formatErrorResponse(response)}`,
             );
-        }
-        const payload = (await response.json()) as ContinueResponse;
-        return payload.continue_url;
+            if (!response.ok) {
+                throw new Error(`AuthorizeContinue注册请求失败: ${await this.formatErrorResponse(response)}`);
+            }
+            const payload = (await response.json()) as ContinueResponse;
+            return payload.continue_url;
+        });
     }
 
     async passwordVerify(): Promise<string> {
@@ -1943,6 +1936,7 @@ export class OpenAIClient {
         const maxAttempts = 8;
         let lastStatus = 0;
         let lastDetail = "";
+        let headerTooLargeRetries = 0;
 
         for (let attempt = 0; attempt < maxAttempts; attempt++) {
             if (attempt) {
@@ -1985,6 +1979,17 @@ export class OpenAIClient {
                 const m = msg.match(/status=(\d+)/);
                 lastStatus = m ? Number(m[1]) : 0;
                 lastDetail = msg.slice(0, 80);
+                if (lastStatus === 431 && headerTooLargeRetries++ < 2) {
+                    console.log("authorize 返回 431，清理 cookie/device session 后重试");
+                    try {
+                        await this.jar.removeAllCookies();
+                        this.deviceID = "";
+                        await this.bootChatGPTSession();
+                    } catch (refreshError) {
+                        console.log(`431 重试前刷新 session 失败: ${String((refreshError as Error)?.message || refreshError).slice(0, 80)}`);
+                    }
+                    continue;
+                }
                 if (lastStatus === 429 || lastStatus >= 500 || /429|ECONN|ETIMEDOUT|fetch failed/i.test(msg)) {
                     if (lastStatus === 429) noteAuthorize429();
                     continue;
@@ -2408,6 +2413,31 @@ function releaseAuthorizeLock(fd: number): void {
  * 跨 worker 进程串行打开 authorize（文件锁 + 间隔）。
  * 换绑/重登多开时，否则同一 socks 出口会连拿 429。
  */
+function readSharedAuthorizeState(): {lastAt: number; minGapMs: number; cooldownUntilMs: number} {
+    try {
+        const values = readFileSync(AUTHORIZE_STATE_PATH, "utf8").trim().split(/\s+/).map(Number);
+        return {
+            lastAt: Number.isFinite(values[0]) ? values[0] : 0,
+            minGapMs: Number.isFinite(values[1]) ? values[1] : 6_000,
+            cooldownUntilMs: Number.isFinite(values[2]) ? values[2] : 0,
+        };
+    } catch {
+        return {lastAt: 0, minGapMs: 6_000, cooldownUntilMs: 0};
+    }
+}
+
+function writeSharedAuthorizeState(): void {
+    try {
+        writeFileSync(
+            AUTHORIZE_STATE_PATH,
+            `${lastAuthorizeAtMs} ${authorizeMinGapMs} ${authorizeCooldownUntilMs}\n`,
+            "utf8",
+        );
+    } catch {
+        /* local throttling remains active if the shared state file is unavailable */
+    }
+}
+
 async function withAuthorizeSlot<T>(fn: () => Promise<T>): Promise<T> {
     const deadline = Date.now() + 180_000;
     let fd: number | null = null;
@@ -2425,6 +2455,12 @@ async function withAuthorizeSlot<T>(fn: () => Promise<T>): Promise<T> {
             continue;
         }
         try {
+            const shared = readSharedAuthorizeState();
+            lastAuthorizeAtMs = Math.max(lastAuthorizeAtMs, shared.lastAt);
+            authorizeMinGapMs = Math.max(authorizeMinGapMs, shared.minGapMs);
+            authorizeCooldownUntilMs = Math.max(authorizeCooldownUntilMs, shared.cooldownUntilMs);
+            const sharedCool = authorizeCooldownUntilMs - Date.now();
+            if (sharedCool > 0) await sleepWithHeartbeat(sharedCool);
             const gap = lastAuthorizeAtMs + authorizeMinGapMs - Date.now();
             if (gap > 0) {
                 console.log(`authorize 节流，间隔 ${Math.ceil(gap / 1000)}s…`);
@@ -2432,10 +2468,13 @@ async function withAuthorizeSlot<T>(fn: () => Promise<T>): Promise<T> {
             }
             const result = await fn();
             lastAuthorizeAtMs = Date.now();
+            writeSharedAuthorizeState();
             // 成功后慢慢把间隔收回正常
             authorizeMinGapMs = Math.max(6_000, Math.floor(authorizeMinGapMs * 0.85));
             return result;
         } finally {
+            lastAuthorizeAtMs = Date.now();
+            writeSharedAuthorizeState();
             releaseAuthorizeLock(fd);
             fd = null;
         }

@@ -336,6 +336,7 @@ export async function changeChatgptEmail({
                 proxy: imapProxyUrl,
                 skipDirect: !!imapProxyUrl,
                 includeLocals: !imapProxyUrl,
+                failFastProxy: !!imapProxyUrl,
             });
         } else {
             const {createMailcomProvider, rememberMailcomPassword} = await import("./mail/mailcom.js");

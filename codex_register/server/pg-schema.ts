@@ -91,6 +91,41 @@ export async function ensureSchemaWithPool(databasePool, {
             )
         `);
         await client.query(`CREATE INDEX IF NOT EXISTS idx_logs_account ON logs(account_id, id)`);
+        const accountLogLimit = Math.max(100, Math.min(10_000, Number(process.env.ACCOUNT_LOG_MAX_ENTRIES || 5_000) || 5_000));
+        await client.query(
+            `DELETE FROM logs WHERE id IN (
+                SELECT id FROM (
+                    SELECT id, ROW_NUMBER() OVER (PARTITION BY account_id ORDER BY id DESC) AS row_no
+                    FROM logs
+                ) ranked
+                WHERE row_no > $1
+            )`,
+            [accountLogLimit],
+        );
+
+        await client.query(`
+            CREATE TABLE IF NOT EXISTS operation_logs (
+                id BIGSERIAL PRIMARY KEY,
+                ts BIGINT NOT NULL,
+                instance_id TEXT NOT NULL DEFAULT '',
+                scope TEXT NOT NULL DEFAULT 'recharge',
+                account_id INTEGER,
+                line TEXT NOT NULL
+            )
+        `);
+        await client.query(`CREATE INDEX IF NOT EXISTS idx_operation_logs_scope ON operation_logs(scope, id DESC)`);
+        await client.query(`CREATE INDEX IF NOT EXISTS idx_operation_logs_account ON operation_logs(account_id, id DESC)`);
+        const operationLogLimit = Math.max(5_000, Math.min(100_000, Number(process.env.OPERATION_LOG_MAX_ENTRIES || 50_000) || 50_000));
+        await client.query(
+            `DELETE FROM operation_logs WHERE id IN (
+                SELECT id FROM (
+                    SELECT id, ROW_NUMBER() OVER (PARTITION BY scope ORDER BY id DESC) AS row_no
+                    FROM operation_logs
+                ) ranked
+                WHERE row_no > $1
+            )`,
+            [operationLogLimit],
+        );
 
         await client.query(`
             CREATE TABLE IF NOT EXISTS mailbox_logs (
@@ -408,6 +443,15 @@ export async function ensureSchemaWithPool(databasePool, {
         await client.query(`CREATE INDEX IF NOT EXISTS idx_proxy_pool_leases_active ON proxy_pool_leases(kind, resource_key, lease_until)`);
         await client.query(`CREATE INDEX IF NOT EXISTS idx_proxy_pool_leases_template ON proxy_pool_leases(kind, template_key, lease_until)`);
         await client.query(`CREATE INDEX IF NOT EXISTS idx_proxy_pool_leases_expire ON proxy_pool_leases(lease_until)`);
+        await client.query(`
+            CREATE TABLE IF NOT EXISTS proxy_exit_ip_usage (
+                ip TEXT PRIMARY KEY,
+                owner TEXT NOT NULL DEFAULT '',
+                used_until BIGINT NOT NULL,
+                updated_at BIGINT NOT NULL
+            )
+        `);
+        await client.query(`CREATE INDEX IF NOT EXISTS idx_proxy_exit_ip_usage_until ON proxy_exit_ip_usage(used_until)`);
         // 发信：每次使用的粘性代理 session（一号一出口，日志可回放）
         await client.query(`
             CREATE TABLE IF NOT EXISTS mail_send_logs (

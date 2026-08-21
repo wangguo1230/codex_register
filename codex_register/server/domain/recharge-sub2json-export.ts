@@ -48,16 +48,6 @@ export function createSub2jsonExportService({
         const record = getRtData(live) || {};
         const stored = extractTokens(record);
         const refreshToken = String(result?.refresh_token || stored?.refreshToken || "").trim();
-        if (stored?.accessToken && refreshToken) {
-            return {
-                ok: true,
-                tokens: {
-                    access_token: stored.accessToken,
-                    refresh_token: refreshToken,
-                    id_token: record.id_token || "",
-                },
-            };
-        }
         if (!refreshToken) return {ok: false, reason: result?.reason || "无rt"};
 
         const refreshed = await refreshRtViaPool(live, refreshToken, log);

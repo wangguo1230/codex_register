@@ -221,7 +221,27 @@ export function createProxyPoolRepository({
         };
     }
 
-    return {loadConfiguration, saveConfiguration, acquire, release, renew, snapshot};
+    async function reserveExitIp({ip = "", owner = "", cooldownMs = 24 * 60 * 60 * 1000} = {}) {
+        const value = String(ip || "").trim();
+        if (!/^\d{1,3}(\.\d{1,3}){3}$/.test(value)) return true;
+        const now = clock.now();
+        const until = now + Math.max(30_000, Number(cooldownMs) || 24 * 60 * 60 * 1000);
+        return transactionFn(async (client) => {
+            await client.query(`SELECT pg_advisory_xact_lock(hashtext($1)::bigint)`, [`codex:proxy-exit-ip:${value}`]);
+            await client.query(`DELETE FROM proxy_exit_ip_usage WHERE used_until <= $1`, [now]);
+            const {rows} = await client.query(`SELECT used_until FROM proxy_exit_ip_usage WHERE ip=$1 FOR UPDATE`, [value]);
+            if (rows[0] && Number(rows[0].used_until || 0) > now) return false;
+            await client.query(
+                `INSERT INTO proxy_exit_ip_usage(ip, owner, used_until, updated_at)
+                 VALUES($1,$2,$3,$4)
+                 ON CONFLICT (ip) DO UPDATE SET owner=EXCLUDED.owner, used_until=EXCLUDED.used_until, updated_at=EXCLUDED.updated_at`,
+                [value, String(owner || ""), until, now],
+            );
+            return true;
+        });
+    }
+
+    return {loadConfiguration, saveConfiguration, acquire, release, renew, snapshot, reserveExitIp};
 }
 
 export const proxyPoolRepository = createProxyPoolRepository();

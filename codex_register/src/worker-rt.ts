@@ -59,7 +59,12 @@ async function main() {
             rt = rec.refresh_token || sess.refresh_token || "";
             authFile = sess.authFile || "";
         } catch (e) {
-            emit({type: "progress", stage: "rt", message: `会话换 rt 失败(${String(e?.message || e).slice(0, 80)})，回退 OAuth+接码`});
+            const reason = String(e?.message || e);
+            if (/429|rate_limit_exceeded|too many requests|Retry-After/i.test(reason)) {
+                emit({type: "progress", stage: "rt", message: `会话换 rt 遇官方限流(${reason.slice(0, 100)})，停止回退 OAuth，等待冷却后重试`});
+                throw e;
+            }
+            emit({type: "progress", stage: "rt", message: `会话换 rt 失败(${reason.slice(0, 80)})，回退 OAuth+接码`});
         }
     }
 

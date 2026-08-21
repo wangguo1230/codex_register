@@ -49,7 +49,9 @@ export function isMfaContinueUrl(url: string): boolean {
 export function generateTotpCandidates(secret: string, atMs = Date.now()): string[] {
     const seen = new Set<string>();
     const out: string[] = [];
-    for (const delta of [-30000, 0, 30000]) {
+    // Try the code for the current time window first. Submitting the previous
+    // window first creates an avoidable incorrect_code on every normal login.
+    for (const delta of [0, -30000, 30000]) {
         const c = generateTotp(secret, atMs + delta);
         if (c && !seen.has(c)) { seen.add(c); out.push(c); }
     }

@@ -248,8 +248,8 @@ export function createRechargeAdminService({settings, store, logs, api, effects,
     }
 
     return {
-        listLogs: () => logs.list(),
-        clearLogs: () => { logs.clear(); return {ok: true}; },
+        listLogs: () => logs.listAll ? logs.listAll() : logs.list(),
+        clearLogs: () => logs.clearAll ? logs.clearAll() : (logs.clear(), {ok: true}),
         getConfig,
         getJobs: () => getJobState(),
         updateConfig,

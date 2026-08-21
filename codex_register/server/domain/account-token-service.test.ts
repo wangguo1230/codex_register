@@ -34,6 +34,7 @@ function createHarness(overrides = {}) {
             refreshRt: overrides.refreshRt || (async () => { refreshCalls++; return {ok: true, tokens: {access_token: "new-at", refresh_token: "new-rt"}}; }),
             probePlan: async () => ({ok: false}),
         },
+        proxy: overrides.proxy,
         settings: {
             tokenProxy: () => "http://127.0.0.1:10808",
             rechargeProxy: () => "http://127.0.0.1:10808",
@@ -77,11 +78,43 @@ test("RT 首次刷新失败后重试并写回独立 RT 数据", async () => {
     assert.equal(harness.updates[0].refresh_token, "new-rt");
 });
 
+test("RT 刷新启用 GPT 代理池时不使用固定本机出口", async () => {
+    let leaseCalls = 0;
+    const harness = createHarness({
+        account: {id: 1, rt_data: {refresh_token: "rt"}},
+        proxy: {
+            usePool: () => true,
+            withLease: async (_owner, task, options) => {
+                leaseCalls++;
+                assert.equal(options.noEmptyFallback, true);
+                return task("socks5://pool-exit:1111");
+            },
+        },
+    });
+    const result = await harness.service.testRt(harness.account);
+    assert.equal(result.ok, true);
+    assert.equal(leaseCalls, 1);
+});
+
 test("无 RT 且允许获取时委托 RT Worker", async () => {
     const harness = createHarness({account: {id: 1, phone: "+1000"}});
 
     const result = await harness.service.testRt(harness.account, {acquire: true});
 
     assert.equal(result.refresh_token, "acquired");
+    assert.equal(harness.workerRuns(), 1);
+});
+
+test("强制获取新 RT 时跳过旧 RT 刷新且不回退旧值", async () => {
+    let refreshed = 0;
+    const harness = createHarness({
+        account: {id: 1, rt_data: {refresh_token: "old-rt"}},
+        refreshRt: async () => { refreshed++; return {ok: true, tokens: {refresh_token: "old-rt"}}; },
+    });
+
+    const result = await harness.service.testRt(harness.account, {forceAcquire: true});
+
+    assert.equal(result.refresh_token, "acquired");
+    assert.equal(refreshed, 0);
     assert.equal(harness.workerRuns(), 1);
 });

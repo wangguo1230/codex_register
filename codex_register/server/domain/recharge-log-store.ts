@@ -8,6 +8,9 @@ export function createRechargeLogStore({
     maxEntries = 2000,
     flushDelayMs = 400,
     onAppend = () => {},
+    sharedAppend = null,
+    sharedList = null,
+    sharedClear = null,
     writeFile = writeFileAsync,
 } = {}) {
     let entries = [];
@@ -63,6 +66,7 @@ export function createRechargeLogStore({
         if (entries.length > maxEntries) entries = entries.slice(-maxEntries);
         scheduleFlush();
         try { onAppend(entry); } catch { /* SSE 不影响日志记录 */ }
+        try { Promise.resolve(sharedAppend?.(entry)).catch(() => {}); } catch { /* 共享日志不可用时保留本地日志 */ }
         return entry;
     }
 
@@ -75,5 +79,18 @@ export function createRechargeLogStore({
         scheduleFlush();
     }
 
-    return {load, append, list, clear, flush};
+    async function listAll() {
+        if (typeof sharedList === "function") {
+            try { return await sharedList(); } catch { return list(); }
+        }
+        return list();
+    }
+
+    async function clearAll() {
+        clear();
+        if (typeof sharedClear === "function") await sharedClear();
+        return {ok: true};
+    }
+
+    return {load, append, list, listAll, clear, clearAll, flush};
 }

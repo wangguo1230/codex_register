@@ -86,6 +86,7 @@ export async function waitGoogleImapOtp(cred, {
     extraProxies = [],
     skipDirect = false,
     includeLocals = true,
+    failFastProxy = false,
 } = {}) {
     const c = rememberGoogleCred(cred) || cred;
     let lastErr = "";
@@ -111,6 +112,7 @@ export async function waitGoogleImapOtp(cred, {
             imapLog(`[google] IMAP 本轮没有新验证码，${Math.round(intervalMs / 1000)}s 后再看`);
         } catch (e) {
             lastErr = String(e?.message || e);
+            if (failFastProxy && isProxySetupFailure(lastErr)) throw e;
             imapLog(`[google] IMAP 不可用(${lastErr.slice(0, 100)})，${Math.round(intervalMs / 1000)}s 后换出口重试`);
         }
         if (i < n - 1 && !overBudget()) await new Promise((r) => setTimeout(r, intervalMs));
@@ -119,6 +121,10 @@ export async function waitGoogleImapOtp(cred, {
         throw new Error(`IMAP 取码超预算，未拿到 ChatGPT 验证码${lastErr ? `(${lastErr.slice(0, 80)})` : ""}: ${c.email}`);
     }
     throw new Error(`IMAP 未拿到 ChatGPT 验证码${lastErr ? `(${lastErr.slice(0, 80)})` : ""}: ${c.email}`);
+}
+
+function isProxySetupFailure(value) {
+    return /failed to setup proxy connection|proxy connection|econnrefused|ehostunreach|enetunreach|socket timeout|connect timeout/i.test(String(value || ""));
 }
 
 let livePage = null;

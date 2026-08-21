@@ -25,6 +25,7 @@ import {registerRechargeExportRoutes} from "../routes/recharge-export-routes.js"
 import {createRechargeOperationFactory} from "./recharge-operation-factory.js";
 import {createRechargeExportFactory} from "./recharge-export-factory.js";
 import {createRechargeRebindFactory} from "./recharge-rebind-factory.js";
+import {appendOperationLog, clearOperationLogs, listOperationLogs} from "../repositories/operation-log-repository.js";
 
 export function createRechargeModule({
     app,
@@ -43,7 +44,15 @@ export function createRechargeModule({
     const rechargeProxy = token.rechargeProxy;
     const logStore = createRechargeLogStore({
         filePath: path.resolve(rootDir, "data", "recharge-logs.jsonl"),
-        onAppend: (entry) => broadcast("rechargeLog", entry),
+        onAppend: (entry) => broadcast("rechargeLog", {...entry, instance_id: db.instanceId, scope: "recharge"}),
+        sharedAppend: (entry) => appendOperationLog({
+            instanceId: db.instanceId,
+            scope: "recharge",
+            line: entry.line,
+            ts: entry.ts,
+        }),
+        sharedList: () => listOperationLogs({scope: "recharge", limit: 5000}),
+        sharedClear: () => clearOperationLogs("recharge"),
     });
     logStore.load();
     const log = logStore.append;

@@ -368,7 +368,9 @@ export function createAccountReloginRunner({runtime, store, files, settings, pro
             }
         }
 
-        if (allowBrowser && !last.ok && !isAuthorizeRateLimited(last.reason)) {
+        // With GPT pool enabled, keep the whole relogin operation on the
+        // leased pool path so browser fallback cannot bypass IP cooldown.
+        if (allowBrowser && !poolSize && !last.ok && !isAuthorizeRateLimited(last.reason)) {
             const browserProxy = await proxy.pickXray(settings.rechargeProxy(), settings.rtProxy(), settings.regProxy()) || "";
             if (browserProxy) {
                 note(`③ 浏览器回退 xray ${proxy.mask(browserProxy)}`);

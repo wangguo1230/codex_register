@@ -1,6 +1,7 @@
 // 邮箱整备/换2FA/改密用的代理池。默认 1 个代理同一时刻只绑 1 个比特指纹窗口。
 import {execFile} from "node:child_process";
 import net from "node:net";
+import tls from "node:tls";
 
 export type MailProxyLease = {
     url: string;
@@ -335,19 +336,23 @@ export async function probeMailProxy(rawUrl: string, {
     signal,
     targetHost = "",
     targetPort = 0,
+    ipOnly = false,
 }: {
     timeoutSec?: number;
     jump?: string;
     signal?: AbortSignal;
     targetHost?: string;
     targetPort?: number;
+    ipOnly?: boolean;
 } = {}): Promise<{
     ok: boolean; ip: string; google: number; accounts: number; ms: number; reason?: string;
 }> {
     const url = normalizeProxyUrl(rawUrl) || String(rawUrl || "").trim();
     const started = Date.now();
     const curlSec = Math.max(8, Number(timeoutSec) || 12);
-    const budgetMs = Math.max(25000, 10_000 + curlSec * 3000);
+    const budgetMs = ipOnly
+        ? Math.max(12_000, 4_000 + curlSec * 1_500)
+        : Math.max(25_000, 10_000 + curlSec * 3000);
     const controller = new AbortController();
     let timedOut = false;
     const onAbort = () => controller.abort();
@@ -358,7 +363,7 @@ export async function probeMailProxy(rawUrl: string, {
         controller.abort();
     }, budgetMs);
     try {
-        const result = await probeMailProxyOnce(url, curlSec, jump, started, controller.signal, targetHost, targetPort);
+        const result = await probeMailProxyOnce(url, curlSec, jump, started, controller.signal, targetHost, targetPort, ipOnly);
         if (timedOut && !result.ok) result.reason = `探测超时 ${budgetMs}ms`;
         if (signal?.aborted && !timedOut && !result.ok) result.reason = "探测已取消";
         return result;
@@ -376,6 +381,7 @@ async function probeMailProxyOnce(
     signal?: AbortSignal,
     targetHost = "",
     targetPort = 0,
+    ipOnly = false,
 ): Promise<{
     ok: boolean; ip: string; google: number; accounts: number; ms: number; reason?: string;
 }> {
@@ -422,21 +428,20 @@ async function probeMailProxyOnce(
     }
     if (viaJump) {
         if (process.env.CODEX_HTTP === "1") {
-            const {probeExitViaJump} = await import("./proxy-chain.js");
-            const chained = await probeExitViaJump(url, viaJump, "www.google.com", 443, Math.min(8000, timeoutSec * 1000));
-            if (!chained.ok) {
+            const ipResult = await probeIpViaJump(url, viaJump, Math.min(8000, timeoutSec * 1000), signal);
+            if (!ipResult.ok) {
                 return {
                     ok: false,
                     ip: "",
                     google: 0,
                     accounts: 0,
                     ms: Date.now() - started,
-                    reason: `出口链路失败 ${chained.reason || "跳板/出口 CONNECT 失败"}`,
+                    reason: `出口链路失败 ${ipResult.reason || "跳板/出口 HTTPS 探测失败"}`,
                 };
             }
             return {
                 ok: true,
-                ip: "?",
+                ip: ipResult.ip,
                 google: 200,
                 accounts: 0,
                 ms: Date.now() - started,
@@ -453,18 +458,24 @@ async function probeMailProxyOnce(
     }
     let ipR, gR, aR, ip = "";
     try {
-        [ipR, gR, aR] = await Promise.all([
-            curlVia(curlUrl, "https://api.ipify.org", [], timeoutSec, signal),
-            curlVia(curlUrl, "https://www.google.com/generate_204", ["-o", "/dev/null", "-w", "%{http_code}"], timeoutSec, signal),
-            curlVia(curlUrl, "https://accounts.google.com/ServiceLogin?hl=en", ["-o", "/dev/null", "-w", "%{http_code}"], timeoutSec, signal),
-        ]);
+        if (ipOnly) {
+            ipR = await curlVia(curlUrl, "https://api.ipify.org", [], timeoutSec, signal);
+            gR = {ok: false, stdout: ""};
+            aR = {ok: false, stdout: ""};
+        } else {
+            [ipR, gR, aR] = await Promise.all([
+                curlVia(curlUrl, "https://api.ipify.org", [], timeoutSec, signal),
+                curlVia(curlUrl, "https://www.google.com/generate_204", ["-o", "/dev/null", "-w", "%{http_code}"], timeoutSec, signal),
+                curlVia(curlUrl, "https://accounts.google.com/ServiceLogin?hl=en", ["-o", "/dev/null", "-w", "%{http_code}"], timeoutSec, signal),
+            ]);
+        }
         ip = ipR.ok && /^\d{1,3}(\.\d{1,3}){3}$/.test(ipR.stdout) ? ipR.stdout : "";
     } finally {
         relayClose();
     }
     const google = Number(gR.stdout || 0) || 0;
     const accounts = Number(aR.stdout || 0) || 0;
-    const googleOk = google === 204 || google === 200 || (accounts >= 200 && accounts < 400);
+    const googleOk = ipOnly || google === 204 || google === 200 || (accounts >= 200 && accounts < 400);
     const ms = Date.now() - started;
     if (!ip && !googleOk) {
         return {ok: false, ip: "", google, accounts, ms, reason: `出口失败 ${ipR.reason || ipR.stdout || "无IP"} google=${google || gR.reason || "?"}`};
@@ -473,6 +484,55 @@ async function probeMailProxyOnce(
         return {ok: false, ip, google, accounts, ms, reason: `Google 不通 generate_204=${google || gR.reason || "?"} accounts=${accounts || aR.reason || "?"}`};
     }
     return {ok: true, ip: ip || "?", google: google || accounts, accounts, ms};
+}
+
+async function probeIpViaJump(exitUrl: string, jumpUrl: string, timeoutMs: number, signal?: AbortSignal) {
+    const {connectExitViaJump} = await import("./proxy-chain.js");
+    const socket = await connectExitViaJump(exitUrl, jumpUrl, "api.ipify.org", 443);
+    let secure;
+    let timer;
+    let buffer = "";
+    let settled = false;
+    const finish = (value) => {
+        if (settled) return;
+        settled = true;
+        if (timer) clearTimeout(timer);
+        signal?.removeEventListener?.("abort", onAbort);
+        try { secure?.destroy(); } catch { /* */ }
+        try { socket.destroy(); } catch { /* */ }
+        value.ip = String(value.ip || "").trim();
+        value.ok = /^\d{1,3}(\.\d{1,3}){3}$/.test(value.ip);
+        if (!value.ok && !value.reason) value.reason = "公网 IP 响应无效";
+        return value;
+    };
+    const onAbort = () => finish({ok: false, ip: "", reason: "探测已取消"});
+    if (signal?.aborted) return finish({ok: false, ip: "", reason: "探测已取消"});
+    return await new Promise((resolve) => {
+        const resolveOnce = (value) => resolve(finish(value));
+        timer = setTimeout(() => resolveOnce({ok: false, ip: "", reason: `HTTPS 探测超时 ${timeoutMs}ms`}), timeoutMs);
+        timer?.unref?.();
+        signal?.addEventListener?.("abort", onAbort, {once: true});
+        const extractIp = () => {
+            const body = buffer.split("\r\n\r\n").slice(1).join("\r\n\r\n");
+            return body.match(/\b\d{1,3}(?:\.\d{1,3}){3}\b/)?.[0] || "";
+        };
+        try {
+            secure = tls.connect({socket, servername: "api.ipify.org"});
+            secure.setTimeout(timeoutMs, () => resolveOnce({ok: false, ip: "", reason: "TLS 探测超时"}));
+            secure.once("secureConnect", () => {
+                secure.write("GET / HTTP/1.1\r\nHost: api.ipify.org\r\nConnection: close\r\n\r\n");
+            });
+            secure.on("data", (chunk) => {
+                buffer += String(chunk || "");
+                const ip = extractIp();
+                if (ip) resolveOnce({ok: true, ip});
+            });
+            secure.once("error", (error) => resolveOnce({ok: false, ip: "", reason: String(error?.message || error).slice(0, 120)}));
+            secure.once("close", () => resolveOnce({ok: false, ip: extractIp(), reason: "TLS 连接关闭"}));
+        } catch (error) {
+            resolveOnce({ok: false, ip: "", reason: String(error?.message || error).slice(0, 120)});
+        }
+    });
 }
 
 export async function pickLiveMailProxy(rawUrl: string, {

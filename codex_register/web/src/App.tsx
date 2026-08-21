@@ -289,10 +289,13 @@ export default function App() {
     // 选中账号 → 历史日志 + 详情全量（补 token 等列表未下发字段）
     useEffect(() => {
         if (selectedId == null) { setLogs([]); return; }
-        api.logs(selectedId).then((rows) => setLogs(rows.map((r) => ({ts: r.ts, line: r.line})))).catch(() => setLogs([]));
+        const loadSelectedLogs = () => api.logs(selectedId).then((rows) => setLogs(rows.map((r) => ({ts: r.ts, line: r.line})))).catch(() => {});
+        loadSelectedLogs();
+        const timer = setInterval(loadSelectedLogs, 4000);
         api.getAccount(selectedId).then((full) => {
             setAccounts((prev) => prev.map((a) => (a.id === full.id ? {...a, ...full} : a)));
         }).catch(() => {});
+        return () => clearInterval(timer);
     }, [selectedId]);
 
     useEffect(() => { logStickBottomRef.current = true; }, [selectedId, logMode]);
@@ -917,7 +920,8 @@ export default function App() {
                         >强制结束重登 AT</button>
                         )}
                         <button onClick={() => api.batchTestRt(selectedIds.size ? [...selectedIds] : actionable.map((a) => a.id)).then((r) => notify(`批量测 rt：${r.count} 个(只刷新有效的)`)).catch((e) => notify(e.message))} title="只刷新有效 rt、标记失效的;不重登、不耗接码" className="px-2 py-1 bg-teal-600 text-white rounded text-xs">批量测 rt</button>
-                        <button onClick={() => { const ids = selectedIds.size ? [...selectedIds] : actionable.map((a) => a.id); if (!ids.length) { notify("无账号"); return; } if (!window.confirm(`对 ${ids.length} 个号批量测 rt，过期/无rt 的会【重登获取 rt】(走 codex OAuth + add-phone 接码，每号消耗一个接码号、有成本、较慢)。开始？`)) return; api.batchTestRt(ids, true).then((r) => notify(`已开始批量重取 rt ${r.count} 个(过期/无rt 会重登获取)`)).catch((e) => notify(e.message)); }} title="过期/无rt 的号重登获取 rt(codex OAuth+接码,有成本)" className="px-2 py-1 bg-teal-700 text-white rounded text-xs">批量重取rt(耗接码)</button>
+                        <button onClick={() => { const ids = selectedIds.size ? [...selectedIds] : actionable.map((a) => a.id); if (!ids.length) { notify("无账号"); return; } if (!window.confirm(`对 ${ids.length} 个号批量测 rt，过期/无rt 的会【重登获取 rt】(走 codex OAuth + add-phone 接码，每号消耗一个接码号、有成本、较慢)。开始？`)) return; api.batchTestRt(ids, true, true).then((r) => notify(`已开始批量重取 rt ${r.count} 个(过期/无rt 会重登获取)`)).catch((e) => notify(e.message)); }} title="过期/无rt 的号重登获取 rt(codex OAuth+接码,有成本)" className="px-2 py-1 bg-teal-700 text-white rounded text-xs">批量重取rt(耗接码)</button>
+                        <button onClick={() => { const ids = selectedIds.size ? [...selectedIds] : actionable.map((a) => a.id); if (!ids.length) { notify("无账号"); return; } api.batchTestRt(ids, true, true, true).then((r) => notify(r.count ? `仅重试失败 RT：${r.count} 个，跳过成功 ${r.skipped || 0} 个` : `没有失败 RT，需要重试的为 0 个`)).catch((e) => notify(e.message)); }} title="只重试最近一次失败的 RT 任务，跳过最近成功的账号" className="px-2 py-1 bg-amber-600 text-white rounded text-xs">仅重试失败RT</button>
                         <button onClick={() => api.batchTestChat(selectedIds.size ? [...selectedIds] : actionable.map((a) => a.id)).then((r) => notify(`批量测聊天：${r.count} 个（逐个开浏览器）`)).catch((e) => notify(e.message))} className="px-2 py-1 bg-fuchsia-600 text-white rounded text-xs">批量测聊天</button>
                         <button onClick={() => { const ids = selectedIds.size ? [...selectedIds] : actionable.map((a) => a.id); if (!ids.length) { notify("无账号"); return; } api.enrollMfa(ids).then((r) => notify(`开始绑 2FA ${r.count} 个(需有效 AT)`)).catch((e) => notify(e.message)); }} title="用现有 AT 绑定 TOTP，之后重登走密码+验证器" className="px-2 py-1 bg-emerald-700 text-white rounded text-xs">批量绑2FA</button>
                         {/* 已售出改回未售出:误标/退回重新上架。只对已售出的号生效 */}
@@ -1352,6 +1356,7 @@ export default function App() {
                                 </button>
                                 {acquireRtRunning && <button onClick={() => { api.stopBatchAcquireRt(); setAcquireRtRunning(false); }} className="px-3 py-1.5 rounded text-sm font-medium text-white bg-red-500 hover:bg-red-600">⏹ 停止</button>}
                                 {acquireRtResults.length > 0 && <span className="text-xs text-gray-500">成功 {acquireRtResults.filter(r => r.ok).length}/{acquireRtResults.length}</span>}
+                                {acquireRtResults.some(r => !r.ok) && !acquireRtRunning && <button onClick={async () => { setAcquireRtRunning(true); try { const r = await api.retryFailedBatchAcquireRt(); notify(r.count ? `仅重试失败项 ${r.count} 个` : "没有失败项需要重试"); } catch (e: any) { notify("重试失败: " + e.message); setAcquireRtRunning(false); } }} className="px-3 py-1.5 rounded text-sm font-medium text-white bg-amber-500 hover:bg-amber-600">仅重试失败</button>}
                             </div>
                             {acquireRtResults.length > 0 && (
                                 <>

@@ -4,13 +4,14 @@ import {existsSync} from "node:fs";
 import path from "node:path";
 import {spawn} from "node:child_process";
 import {cleanSpawnEnv} from "../strip-env-proxy.js";
-import {gptJumpPool, gptProxyPool, maskProxyUrl, JUMP_MAX_EXITS} from "../../src/mail/proxy-pool.js";
+import {gptJumpPool, gptProxyPool, maskProxyUrl, probeMailProxy, JUMP_MAX_EXITS} from "../../src/mail/proxy-pool.js";
 import {bitHealth} from "../../src/bitbrowser.js";
 import {peekSms, buildSmsLink, classifySms} from "../../src/sms-broker.js";
 import {probeAt, probePlan, refreshRt, buildProxyDispatcher, decodeJwt} from "../../src/token-check.js";
 import {enrollTotp} from "../../src/mfa.js";
 import {setMailProxy} from "../domain/mailbox-service.js";
 import {createTokenCredentials} from "../domain/token-credentials.js";
+import {proxyPoolRepository} from "../repositories/proxy-pool-repository.js";
 import {createGptProxyLease, pickBrowserCompatibleProxy as pickMailcomBrowserProxy, proxyHasSocksAuth, resolveReloginProxy} from "../domain/gpt-proxy-lease.js";
 import {pipeWorkerOutput} from "../domain/worker-output.js";
 import {createAccountRtWorker} from "../domain/account-rt-worker.js";
@@ -97,6 +98,12 @@ export function createTokenModule({
         },
         maskProxyUrl,
         maxJumpExits: JUMP_MAX_EXITS,
+        probeExit: (url, options = {}) => probeMailProxy(url, {
+            ...options,
+            ipOnly: true,
+            timeoutSec: 5,
+        }),
+        reserveExitIp: proxyPoolRepository.reserveExitIp,
     });
     const resolveReloginExitProxy = (explicit) => resolveReloginProxy(
         explicit,
@@ -207,6 +214,10 @@ export function createTokenModule({
             rechargeProxy,
             maskProxy: maskProxyUrl,
         },
+        proxy: {
+            withLease: withLeasedGptProxy,
+            usePool: () => scheduler.proxyPoolEnabled?.("gpt") !== false && gptProxyPool.urls.length > 0,
+        },
         files: {writeRt: credentialFiles.writeJson},
         relogin: {run: runRelogin},
         rtWorker: accountRtWorker,
@@ -258,6 +269,7 @@ export function createTokenModule({
         taskStore: {
             enqueue: (id, payload) => db.enqueueWorkTask("rt_account", id, payload, {priority: 5}),
             enqueueMany: (items) => db.enqueueWorkTasks("rt_account", items),
+            listLatest: (ids) => db.listLatestWorkTasks("rt_account", ids),
         },
     });
     const distributedRtWorker = createPersistentTaskWorker({
@@ -401,6 +413,7 @@ export function createTokenModule({
 
     return {
         extractTokens,
+        withLeasedGptProxy,
         runRelogin,
         testRt,
         refreshRtViaPool,

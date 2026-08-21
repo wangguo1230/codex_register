@@ -5,8 +5,8 @@ export function registerRechargeAdminRoutes(app, {admin} = {}) {
         ? res.status(result.status || 400).json({error: result.error})
         : res.json(result);
 
-    app.get("/api/recharge/logs", (_req, res) => res.json(admin.listLogs()));
-    app.post("/api/recharge/logs/clear", (_req, res) => res.json(admin.clearLogs()));
+    app.get("/api/recharge/logs", async (_req, res) => res.json(await admin.listLogs()));
+    app.post("/api/recharge/logs/clear", async (_req, res) => res.json(await admin.clearLogs()));
     app.get("/api/recharge/config", async (_req, res) => res.json(await admin.getConfig()));
     app.get("/api/recharge/jobs", (_req, res) => res.json(admin.getJobs()));
     app.post("/api/recharge/config", async (req, res) => res.json(await admin.updateConfig(req.body || {})));

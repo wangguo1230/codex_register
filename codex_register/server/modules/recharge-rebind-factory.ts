@@ -66,6 +66,15 @@ export function createRechargeRebindFactory({
         tsxBin: token.tsxBin,
         timeoutMs: changeEmailTimeoutMs,
         pickProxy: () => pickXrayBrowserProxy(rechargeProxy(), scheduler.rtProxy, scheduler.regProxy),
+        leaseGptProxy: typeof token.withLeasedGptProxy === "function"
+            ? async (owner, task, options = {}) => {
+                if (scheduler.proxyPoolEnabled("gpt")) {
+                    return token.withLeasedGptProxy(owner, task, options);
+                }
+                const fallback = await pickXrayBrowserProxy(rechargeProxy(), scheduler.rtProxy, scheduler.regProxy) || "";
+                return task(fallback, "");
+            }
+            : null,
         maskProxy: maskProxyUrl,
         leaseImapProxy: scheduler.proxyPoolEnabled("mail") ? withLeasedImapProxy : null,
     });
@@ -211,6 +220,7 @@ export function createRechargeRebindFactory({
         },
         effects: {
             log,
+            accountLog: (id, line) => db.appendLog(id, line).catch(() => {}),
             syncQueue,
             scheduleReconcile: requestReconcile,
             syncSuccess: async () => {

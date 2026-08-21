@@ -13,7 +13,9 @@ export function createMailProxyLease({
 } = {}) {
     return async function withLeasedMailProxy(owner, task, mailbox = null, options = {}) {
         const who = String(owner || "mail");
-        const preferredUrl = String(mailbox?.proxy_url || "").trim();
+        const preferredUrl = options?.preferMailboxProxy === false
+            ? ""
+            : String(mailbox?.proxy_url || "").trim();
         const skipJump = options?.skipJump === true;
         const signal = options?.signal;
         let proxyLease = null;

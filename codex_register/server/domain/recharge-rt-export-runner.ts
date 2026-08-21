@@ -4,7 +4,7 @@ export function createRechargeRtExportRunner({store, formatLine, formatRt = (row
     async function run({rows, work, ids, batch, forceRelogin, concurrency, isStopped}) {
         effects.log((forceRelogin ? "重登导出含RT: " : "导出含RT: ")
             + work.length + (forceRelogin
-                ? " 个账号将先重登再取 RT，并发" + concurrency + "执行…"
+                ? " 个账号将直接登录获取 RT，并发" + concurrency + "执行…"
                 : "/" + rows.length + " 个账号缺少 RT，并发" + concurrency + "获取中..."));
         let result;
         let fresh = null;

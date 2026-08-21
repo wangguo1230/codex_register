@@ -26,7 +26,7 @@ export function createRechargeQueueService({store, api, cardPolicy, effects} = {
 
     async function undeliver(ids) {
         const result = await store.undeliver(ids);
-        effects.log(`退回未交付 ${result.count} 个`);
+        effects.log(`退回可交付 ${result.count} 个`);
         await effects.syncQueue();
         return {ok: true, ...result};
     }

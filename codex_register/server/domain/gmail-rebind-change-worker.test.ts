@@ -66,3 +66,38 @@ test("verify 阶段取消标记为状态不确定", async () => {
     assert.deepEqual(stages, ["verify"]);
     child.emit("close");
 });
+
+test("官方换绑复用 GPT 代理租约并透传跳板", async () => {
+    const child = fakeChild();
+    const controller = new AbortController();
+    let leaseOwner = "";
+    let leaseOptions = null;
+    let workerEnv = null;
+    const run = createGmailRebindChangeWorker({
+        root: process.cwd(),
+        tsxBin: "tsx",
+        timeoutMs: 60_000,
+        pickProxy: async () => "http://127.0.0.1:10808",
+        leaseGptProxy: async (owner, task, options) => {
+            leaseOwner = owner;
+            leaseOptions = options;
+            return task("socks5://pool-exit:1111", "socks5://jump:2222");
+        },
+        maskProxy: (value) => value,
+        spawnProcess: (_command, _args, options) => {
+            workerEnv = options.env;
+            return child;
+        },
+    });
+
+    const pending = run({accessToken: "at", accountId: "7", newEmail: "target@example.com", imapPassword: "imap", signal: controller.signal});
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(leaseOwner, "rebind:7");
+    assert.equal(leaseOptions.noEmptyFallback, true);
+    assert.equal(workerEnv.PROXY_URL, "socks5://pool-exit:1111");
+    assert.equal(workerEnv.MAIL_PROXY_JUMP, "socks5://jump:2222");
+    controller.abort();
+    const result = await pending;
+    assert.equal(result.cancelled, true);
+    child.emit("close");
+});

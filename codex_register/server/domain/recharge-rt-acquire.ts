@@ -51,7 +51,9 @@ export function createRechargeRtAcquireService({
                 return;
             }
 
-            if (forceRelogin) {
+            if (forceRelogin) log(`[${index}/${total}] RT 优先：跳过前置重登，由 RT worker 一次登录并获取 RT ${row.email}`);
+            // Legacy two-step mode is opt-in only; the normal RT export must log in once.
+            if (forceRelogin && process.env.CODEX_LEGACY_RT_PRERELOGIN === "1") {
                 log(`[${index}/${total}] 重登 ${row.email}…`);
                 try {
                     const result = await relogin(account, {
@@ -73,7 +75,7 @@ export function createRechargeRtAcquireService({
                     log(`[${index}/${total}] ✗ ${row.email} 重登异常 ${error?.message || error}`);
                     return;
                 }
-            } else {
+            } else if (!forceRelogin) {
                 const existing = extractTokens(getRtData(account) || getAuthData(account));
                 if (existing?.refreshToken) {
                     ok++;
@@ -86,6 +88,7 @@ export function createRechargeRtAcquireService({
             try {
                 const result = await acquireRt(account, {
                     acquire: true,
+                    forceAcquire: forceRelogin,
                     onProgress: (message) => log(`  ${row.email}: ${String(message || "").slice(0, 120)}`),
                     onChild: attachChild,
                 });

@@ -71,6 +71,7 @@ export function createTokenToolFactory({
             buildDispatcher: buildProxyDispatcher,
             syncPlan: accountTokens.syncPlan,
         },
+        refreshRtViaPool: accountTokens.refreshRtViaPool,
         runPool,
         effects: {
             broadcast,

@@ -119,28 +119,36 @@ export function createTokenBatchService({scheduler, store, testAt, testRt, pickA
         return {ok: true, msg: "已强制结束批量重登", forced: true, running: false, killed};
     }
 
-    async function startRt(ids, {updateRt = true, acquire = false} = {}) {
-        const accounts = await pickAccounts(ids);
+    async function startRt(ids, {updateRt = true, acquire = false, forceAcquire = false, retryFailed = false} = {}) {
+        let accounts = await pickAccounts(ids);
+        let skipped = 0;
+        if (retryFailed && taskStore?.listLatest) {
+            const latest = await taskStore.listLatest(accounts.map((account) => Number(account.id)));
+            const latestById = new Map((latest || []).map((task) => [Number(task.entity_id), task]));
+            const pending = accounts.filter((account) => latestById.get(Number(account.id))?.status !== "success");
+            skipped = accounts.length - pending.length;
+            accounts = pending;
+        }
         if (taskStore && distributedRtWorker) {
-            if (!accounts.length) return {error: "没有可处理的账号", status: 400};
+            if (!accounts.length) return {ok: true, count: 0, skipped, queued: true};
             const tasks = taskStore.enqueueMany
                 ? await taskStore.enqueueMany(accounts.map((account) => ({
                     entityId: Number(account.id),
-                    payload: {updateRt, acquire},
+                    payload: {updateRt, acquire, forceAcquire},
                     priority: 5,
                 })))
-                : (await Promise.all(accounts.map((account) => taskStore.enqueue(Number(account.id), {updateRt, acquire})))).filter(Boolean);
+                : (await Promise.all(accounts.map((account) => taskStore.enqueue(Number(account.id), {updateRt, acquire, forceAcquire})))).filter(Boolean);
             const queued = tasks.map((task) => Number(task.entity_id ?? task.id));
             distributedRtStopped = false;
             distributedRtWorker.start();
             distributedRtWorker.wake();
             log(`[批量RT] 已入分布式队列 ${queued.length}/${accounts.length} 个，并发由各实例自动分片`);
-            return {ok: true, count: queued.length, active: accounts.length - queued.length, queued: true};
+            return {ok: true, count: queued.length, active: accounts.length - queued.length, skipped, queued: true};
         }
         if (!acquire) {
-            void runPool(accounts, (account) => testRt(account, {updateRt, acquire: false}), 6)
+            void runPool(accounts, (account) => testRt(account, {updateRt, acquire: false, forceAcquire}), 6)
                 .catch((error) => effects.warn("[批量RT] 探测异常:", error?.message || error));
-            return {ok: true, count: accounts.length};
+            return {ok: true, count: accounts.length, skipped};
         }
         if (scheduler.maintLock) return {error: `有浏览器任务在跑(${scheduler.maintLock}),请等待完成`, status: 409};
         scheduler.acquireLock("batch-rt-acquire");
@@ -151,7 +159,7 @@ export function createTokenBatchService({scheduler, store, testAt, testRt, pickA
                     await scheduler.waitRegistrationIdle();
                 }
                 log(`[rt获取] 开始批量获取 ${accounts.length} 个(并发${scheduler.concurrency})`);
-                await runPool(accounts, (account) => testRt(account, {updateRt, acquire: true}), scheduler.concurrency);
+                await runPool(accounts, (account) => testRt(account, {updateRt, acquire: true, forceAcquire}), scheduler.concurrency);
                 log("[rt获取] 完成");
             } catch (error) {
                 effects.warn("[批量RT] 获取异常:", error?.message || error);
@@ -160,7 +168,7 @@ export function createTokenBatchService({scheduler, store, testAt, testRt, pickA
                 scheduler.tick();
             }
         })();
-        return {ok: true, count: accounts.length, willWaitReg: scheduler.running.size > 0};
+        return {ok: true, count: accounts.length, skipped, willWaitReg: scheduler.running.size > 0};
     }
 
     async function processDistributedRtTask(task, {signal} = {}) {
@@ -171,6 +179,7 @@ export function createTokenBatchService({scheduler, store, testAt, testRt, pickA
         return testRt(account, {
             updateRt: payload.updateRt !== false,
             acquire: payload.acquire === true,
+            forceAcquire: payload.forceAcquire === true,
             onProgress: (message) => log(`[批量RT] ${account.email}: ${String(message || "").slice(0, 120)}`),
         });
     }

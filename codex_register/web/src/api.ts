@@ -461,6 +461,7 @@ export const api = {
     peekSms: (id: number) => j<{text: string}>(`/api/sms/${id}/peek`),
     batchRefreshAt: (lines: string) => j<{ok: boolean; count: number}>("/api/tools/batch-refresh-at", {method: "POST", body: JSON.stringify({lines})}),
     batchAcquireRt: (lines: string) => j<{ok: boolean; count: number}>("/api/tools/batch-acquire-rt", {method: "POST", body: JSON.stringify({lines})}),
+    retryFailedBatchAcquireRt: () => j<{ok: boolean; count: number; skipped?: number}>("/api/tools/batch-acquire-rt/retry-failed", {method: "POST", body: JSON.stringify({})}),
     stopBatchAcquireRt: () => j<{ok: boolean}>("/api/tools/batch-acquire-rt/stop", {method: "POST"}),
     refreshTokens: (items: {email: string; password: string; rt: string}[]) =>
         j<{results: {email: string; password?: string; ok: boolean; reason?: string; tokens?: {access_token: string; refresh_token: string; id_token?: string; account_id?: string}}[]}>("/api/tools/refresh-tokens", {method: "POST", body: JSON.stringify({items})}),
@@ -473,7 +474,7 @@ export const api = {
     batchAtStatus: () => j<{ok: boolean; running: boolean; done: number; total: number; lock?: string}>("/api/control/test-at/status"),
     stopBatchAt: (force = false) => j<{ok: boolean; msg?: string; forced?: boolean; running?: boolean}>("/api/control/test-at/stop", {method: "POST", body: JSON.stringify({force: !!force})}),
     // acquire=true:过期/无rt 的号重登获取 rt(走 codex OAuth+接码,有成本);false:只刷新有效 rt、标记失效
-    batchTestRt: (ids: number[], acquire = false) => j<{count: number}>("/api/control/test-rt", {method: "POST", body: JSON.stringify({ids, acquire})}),
+    batchTestRt: (ids: number[], acquire = false, forceAcquire = false, retryFailed = false) => j<{count: number; skipped?: number}>("/api/control/test-rt", {method: "POST", body: JSON.stringify({ids, acquire, forceAcquire, retryFailed})}),
     batchTestChat: (ids: number[]) => j<{count: number}>("/api/control/test-chat", {method: "POST", body: JSON.stringify({ids})}),
     retryFailed: () => j("/api/control/retry-failed", {method: "POST"}),
     state: () => j<{state: {instanceId?: string; paused: boolean; pausedClaude?: boolean; claudeProxy?: string; claudeXrayVless?: string; claudeXray?: XrayStatus; regProxyPort?: number; claudeProxyPort?: number; runningClaude?: number[]; concurrency: number; otpSingle: boolean; simulateChat: boolean; smsEnabled: boolean; rtEnabled: boolean; mfaEnabled?: boolean; bitBrowser?: boolean; smsMaxBind: number; regEngine: string; daily: Daily; xray: XrayStatus; smsLinkTemplate: string; regProxy: string; mailProxy: string; mailProxyEnabled?: boolean; mailSeparator?: string; xrayBinPath?: string; xrayVless?: string; pwConcurrency?: number; defaultPassword?: string; running: number[]; batchPw?: {running: boolean; done: number; total: number}}; stats: Stats}>("/api/state"),
@@ -640,7 +641,7 @@ export const api = {
     /** cardsRemoved：交付时顺带从卡密池删掉的已用卡数量 */
     deliverRechargeQueue: (ids: number[]) =>
         j<{ok: boolean; count: number; skipped?: number; cardsRemoved?: number}>("/api/recharge/queue/deliver", {method: "POST", body: JSON.stringify({ids})}),
-    /** 已交付 → 退回未交付（误点恢复） */
+    /** 已交付 → 退回可交付（保留充值完成状态） */
     undeliverRechargeQueue: (ids: number[]) =>
         j<{ok: boolean; count: number}>("/api/recharge/queue/undeliver", {method: "POST", body: JSON.stringify({ids})}),
     setRechargeQueueBatch: (ids: number[], batch: string) =>

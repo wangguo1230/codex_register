@@ -96,3 +96,38 @@ test("RT 刷新并发执行但保持输入结果顺序", async () => {
     assert.deepEqual(result.results.map((item) => item.email), ["a@example.com", "b@example.com"]);
     assert.deepEqual(result.results.map((item) => item.tokens.refresh_token), ["slow", "fast"]);
 });
+
+test("RT 批次重试只执行失败项，成功项不会重复获取", async () => {
+    const calls = [];
+    let firstPass = true;
+    const h = createHarness({
+        workers: {
+            runRt: async (email) => {
+                calls.push(email);
+                if (email === "b@example.com" && firstPass) return {ok: false, reason: "temporary"};
+                return {ok: true, rt: `rt-${email}`};
+            },
+        },
+    });
+    const waitDone = async (after = 0) => {
+        for (let i = 0; i < 100; i++) {
+            if (h.events.filter((event) => event.type === "batchRtAcquire" && event.payload.done).length > after) return;
+            await new Promise((resolve) => setTimeout(resolve, 2));
+        }
+        throw new Error("RT 批次未完成");
+    };
+
+    await h.service.startRt("a@example.com----pw\nb@example.com----pw\nc@example.com----pw");
+    await waitDone();
+    assert.deepEqual(calls, ["a@example.com", "b@example.com", "c@example.com"]);
+
+    firstPass = false;
+    const retry = await h.service.retryFailedRt();
+    assert.equal(retry.count, 1);
+    await waitDone(1);
+    assert.deepEqual(calls, ["a@example.com", "b@example.com", "c@example.com", "b@example.com"]);
+
+    const noRetry = await h.service.retryFailedRt();
+    assert.equal(noRetry.count, 0);
+    assert.deepEqual(calls, ["a@example.com", "b@example.com", "c@example.com", "b@example.com"]);
+});

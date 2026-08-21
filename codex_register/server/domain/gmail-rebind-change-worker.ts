@@ -16,6 +16,7 @@ export function createGmailRebindChangeWorker({
     tsxBin,
     timeoutMs,
     pickProxy,
+    leaseGptProxy = null,
     leaseImapProxy = null,
     maskProxy,
     spawnProcess = spawn,
@@ -33,7 +34,7 @@ export function createGmailRebindChangeWorker({
         worker.args = [];
     }
 
-    function spawnWorker({accessToken, accountId, cookie, newEmail, imapPassword, mailPassword, totpSecret, proxyUrl, imapProxyUrl = "", imapProxyJump = "", note, onStage, signal}) {
+    function spawnWorker({accessToken, accountId, cookie, newEmail, imapPassword, mailPassword, totpSecret, proxyUrl, proxyJump = "", imapProxyUrl = "", imapProxyJump = "", note, onStage, signal}) {
         if (signal?.aborted) {
             return Promise.resolve({ok: false, cancelled: true, indeterminate: false, reason: "已取消换绑", stage: "precheck"});
         }
@@ -58,7 +59,7 @@ export function createGmailRebindChangeWorker({
                     cwd: root,
                     env: cleanSpawnEnv({
                         PROXY_URL: proxyUrl || "",
-                        MAIL_PROXY_JUMP: "",
+                        MAIL_PROXY_JUMP: proxyJump || "",
                         IMAP_PROXY: imapProxyUrl || "",
                         IMAP_PROXY_JUMP: imapProxyJump || "",
                         ...(imapProxyUrl && imapProxyJump ? {ALLOW_LOCAL_SOCKS_RELAY: "1"} : {}),
@@ -153,11 +154,12 @@ export function createGmailRebindChangeWorker({
     } = {}) {
         const note = (message) => { try { log(message); } catch { /* 观测不影响换绑 */ } };
         if (signal?.aborted) return {ok: false, cancelled: true, indeterminate: false, reason: "已取消换绑", stage: "precheck"};
-        const proxyUrl = await pickProxy() || "";
-        if (signal?.aborted) return {ok: false, cancelled: true, indeterminate: false, reason: "已取消换绑", stage: "precheck"};
-        if (!proxyUrl) return {ok: false, reason: "官方换绑需要本机 10808（chatgpt.com HTTP）"};
-        note(`官方换绑走 ${maskProxy(proxyUrl)}（chatgpt.com HTTP，不走 kookeey）`);
-        const runWorker = (imapProxyUrl = "", imapProxyJump = "") => spawnWorker({
+        const runWithGptProxy = async (proxyUrl, proxyJump = "", sourceLabel = "GPT 代理池") => {
+            if (signal?.aborted) return {ok: false, cancelled: true, indeterminate: false, reason: "已取消换绑", stage: "precheck"};
+            const selectedProxy = String(proxyUrl || "").trim();
+            if (!selectedProxy) return {ok: false, reason: "官方换绑缺少 GPT 代理池出口"};
+            note(`官方换绑走 ${maskProxy(selectedProxy)}（${sourceLabel}，chatgpt.com）`);
+            const runWorker = (imapProxyUrl = "", imapProxyJump = "") => spawnWorker({
             accessToken,
             accountId,
             cookie,
@@ -165,17 +167,38 @@ export function createGmailRebindChangeWorker({
             imapPassword,
             mailPassword,
             totpSecret,
-            proxyUrl,
+            proxyUrl: selectedProxy,
+            proxyJump,
             imapProxyUrl,
             imapProxyJump,
             note,
             onStage,
             signal,
-        });
-        const needsImapProxy = /@(gmail|googlemail)\.com$/i.test(String(newEmail || ""));
-        if (needsImapProxy && typeof leaseImapProxy === "function") {
-            return leaseImapProxy(`imap:${newEmail}`, (imapProxyUrl, imapProxyJump) => runWorker(imapProxyUrl, imapProxyJump));
+            });
+            const needsImapProxy = /@(gmail|googlemail)\.com$/i.test(String(newEmail || ""));
+            if (needsImapProxy && typeof leaseImapProxy === "function") {
+                const maxProxyAttempts = Math.max(1, Math.min(3, Number(process.env.REBIND_IMAP_PROXY_RETRIES || 3) || 3));
+                let last = null;
+                for (let attempt = 1; attempt <= maxProxyAttempts; attempt++) {
+                    last = await leaseImapProxy(`imap:${newEmail}`, (imapProxyUrl, imapProxyJump) => runWorker(imapProxyUrl, imapProxyJump), null, {preferMailboxProxy: false, signal});
+                    const reason = String(last?.reason || "");
+                    const proxySetupFailed = /failed to setup proxy connection|proxy connection|econnrefused|ehostunreach|enetunreach|socket timeout|connect timeout/i.test(reason);
+                    if (!proxySetupFailed || attempt >= maxProxyAttempts || last?.cancelled) return last;
+                    note(`Gmail IMAP 代理连接失败，释放当前租约并切换代理池出口 (${attempt + 1}/${maxProxyAttempts})`);
+                }
+                return last;
+            }
+            return runWorker();
+        };
+        if (typeof leaseGptProxy === "function") {
+            return leaseGptProxy(`rebind:${accountId || newEmail}`, (proxyUrl, proxyJump) => runWithGptProxy(proxyUrl, proxyJump), {
+                log: note,
+                noEmptyFallback: true,
+                signal,
+                timeoutMs: Math.min(45_000, Math.max(5_000, Number(timeoutMs) || 45_000)),
+            });
         }
-        return runWorker();
+        const proxyUrl = await pickProxy() || "";
+        return runWithGptProxy(proxyUrl, "", "兼容出口");
     };
 }

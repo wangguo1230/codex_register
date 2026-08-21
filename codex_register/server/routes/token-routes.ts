@@ -13,6 +13,7 @@ export function registerTokenRoutes(app, {store, tokens, batch, mfa, chat} = {})
         res.json(await tokens.testRt(account, {
             updateRt: req.body?.updateRt !== false,
             acquire: req.body?.acquire !== false,
+            forceAcquire: req.body?.forceAcquire === true,
         }));
     });
 
@@ -39,6 +40,8 @@ export function registerTokenRoutes(app, {store, tokens, batch, mfa, chat} = {})
         const result = await batch.startRt(req.body?.ids, {
             updateRt: req.body?.updateRt !== false,
             acquire: req.body?.acquire === true,
+            forceAcquire: req.body?.forceAcquire === true,
+            retryFailed: req.body?.retryFailed === true,
         });
         if (result.error) return res.status(result.status || 400).json({error: result.error});
         res.json(result);

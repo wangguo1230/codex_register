@@ -1,6 +1,6 @@
 // @ts-nocheck
 
-export function createAccountTokenService({store, credentials, http, settings, files, relogin, rtWorker, effects, delay = setTimeout, now = () => new Date()} = {}) {
+export function createAccountTokenService({store, credentials, http, settings, files, relogin, rtWorker, effects, proxy = {}, delay = setTimeout, now = () => new Date()} = {}) {
     async function setStatus(id, kind, status) {
         await store.setTestStatus(id, kind, status);
         await effects.status(id, await store.getAccount(id));
@@ -23,7 +23,21 @@ export function createAccountTokenService({store, credentials, http, settings, f
     }
 
     const probeAtViaPool = (_account, accessToken, accountId, log) => http.probeAt(accessToken, accountId, dispatcher(log, "AT"));
-    const refreshRtViaPool = (_account, refreshToken, log) => http.refreshRt(refreshToken, dispatcher(log, "RT"));
+    const refreshRtViaPool = async (account, refreshToken, log) => {
+        if (typeof proxy.withLease === "function" && proxy.usePool?.()) {
+            return proxy.withLease(
+                `rt-refresh:${account?.id || account?.email || "account"}`,
+                async (proxyUrl) => {
+                    const selected = String(proxyUrl || "").trim();
+                    if (!selected) throw new Error("GPT 代理池未提供 RT 出口");
+                    try { log?.(`RT 走 GPT 代理池 ${settings.maskProxy(selected)}`); } catch { /* */ }
+                    return http.refreshRt(refreshToken, http.buildDispatcher(selected));
+                },
+                {log, noEmptyFallback: true},
+            );
+        }
+        return http.refreshRt(refreshToken, dispatcher(log, "RT"));
+    };
 
     async function testAt(account, {relogin: shouldRelogin = false, onChild} = {}) {
         await setStatus(account.id, "at", "测试中…");
@@ -81,7 +95,7 @@ export function createAccountTokenService({store, credentials, http, settings, f
         }
     }
 
-    async function testRt(account, {updateRt = true, acquire = false, onProgress, onChild} = {}) {
+    async function testRt(account, {updateRt = true, acquire = false, forceAcquire = false, onProgress, onChild} = {}) {
         await setStatus(account.id, "rt", "测试中…");
         const rtData = credentials.readRt(account);
         const tokens = credentials.extract(rtData || credentials.readAuth(account));
@@ -89,6 +103,11 @@ export function createAccountTokenService({store, credentials, http, settings, f
             effects.logAccount(account.id, `[rt] ${message}`);
             try { onProgress?.(message); } catch { /* */ }
         };
+        if (forceAcquire) {
+            await setStatus(account.id, "rt", "强制获取新 RT 中…");
+            // Explicit fresh acquisition must never fall back to the existing RT.
+            return rtWorker.run(account, account.phone || "", {onProgress: note, onChild});
+        }
         if (tokens?.refreshToken) {
             let result = await refreshRtViaPool(account, tokens.refreshToken, note);
             if (!result.ok) {
@@ -121,14 +140,14 @@ export function createAccountTokenService({store, credentials, http, settings, f
                 return result;
             }
             await setStatus(account.id, "rt", "过期,重新获取中…");
-            return rtWorker.run(account, account.phone || "", {onProgress, onChild});
+            return rtWorker.run(account, account.phone || "", {onProgress: note, onChild});
         }
         if (!acquire) {
             await setStatus(account.id, "rt", "无rt");
             return {ok: false, reason: "无rt"};
         }
         await setStatus(account.id, "rt", "无rt,获取中…");
-        return rtWorker.run(account, account.phone || "", {onProgress, onChild});
+        return rtWorker.run(account, account.phone || "", {onProgress: note, onChild});
     }
 
     return {setStatus, testAt, testRt, syncPlan, probeAtViaPool, refreshRtViaPool};

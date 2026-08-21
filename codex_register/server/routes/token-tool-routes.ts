@@ -22,5 +22,11 @@ export function registerTokenToolRoutes(app, {tools} = {}) {
         res.json(result);
     });
 
+    app.post("/api/tools/batch-acquire-rt/retry-failed", async (_req, res) => {
+        const result = await tools.retryFailedRt();
+        if (result.error) return res.status(result.status || 400).json({error: result.error});
+        res.json(result);
+    });
+
     app.post("/api/tools/batch-acquire-rt/stop", (_req, res) => res.json(tools.stopRt()));
 }

@@ -3,6 +3,30 @@ import test from "node:test";
 import {createRechargeRtAcquireService} from "./recharge-rt-acquire.js";
 import {createSub2jsonExportService} from "./recharge-sub2json-export.js";
 
+test("RT force export uses one worker login", async () => {
+    let reloginCalls = 0;
+    let acquireCalls = 0;
+    let acquireOptions = null;
+    const logs = [];
+    const acquire = createRechargeRtAcquireService({
+        getAccounts: async () => [{id: 1, email: "a@example.com", rt_data: null, auth_data: null}],
+        getAuthData: (account) => account.auth_data,
+        getRtData: (account) => account.rt_data,
+        extractTokens: () => null,
+        relogin: async () => { reloginCalls++; return {ok: true}; },
+        acquireRt: async (_account, options) => { acquireCalls++; acquireOptions = options; return {ok: true}; },
+    });
+    const result = await acquire([{account_id: 1, email: "a@example.com"}], {
+        forceRelogin: true,
+        log: (line) => logs.push(line),
+    });
+    assert.deepEqual(result, {ok: 1, fail: 0, total: 1});
+    assert.equal(reloginCalls, 0);
+    assert.equal(acquireCalls, 1);
+    assert.equal(acquireOptions.forceAcquire, true);
+    assert.match(logs[0], /RT/);
+});
+
 test("RT 导出批量预取账号避免逐条数据库查询", async () => {
     let batchCalls = 0;
     let singleCalls = 0;
