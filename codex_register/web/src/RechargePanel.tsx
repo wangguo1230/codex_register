@@ -1008,10 +1008,11 @@ export function RechargePanel({notify}: {notify?: (m: string, ms?: number) => vo
     const doExport = async (format: "account" | "full" | "card" | "session", opts?: {relogin?: boolean}) => {
         const picked = selQIds();
         const ids = picked.length ? picked : filteredQueue.map((item) => item.id);
-        if (format === "full" && ids.length) {
-            setTrackedOperation({kind: opts?.relogin ? "reloginRt" : "rtExport", label: opts?.relogin ? "重登取 RT" : "获取 RT", ids, total: ids.length, skipped: 0, startedAt: Date.now()});
-        }
         if (!ids.length) { toast("当前筛选没有可导出账号"); return; }
+        if (format === "full" && opts?.relogin && !confirm(`处理 ${ids.length} 个账号：没有 RT 的直接获取，已有 RT 的重新登录获取新 RT，完成后复制结果。\n这会产生新的登录请求，是否继续？`)) return;
+        if (format === "full" && ids.length) {
+            setTrackedOperation({kind: opts?.relogin ? "reloginRt" : "rtExport", label: opts?.relogin ? "获取 / 刷新 RT" : "获取 RT", ids, total: ids.length, skipped: 0, startedAt: Date.now()});
+        }
         setExportRtRunning(true);
         try {
             const r = await api.exportRechargeQueue({
@@ -1028,7 +1029,7 @@ export function RechargePanel({notify}: {notify?: (m: string, ms?: number) => vo
                 setExportRtRunning(true);
                 void refreshJobs();
                 toast(opts?.relogin
-                    ? `正在重登取 RT（${r.needRt} 个），完成后自动复制/下载`
+                    ? `正在获取 / 刷新 RT（${r.needRt} 个），完成后自动复制/下载`
                     : `${r.needRt} 个账号缺少 RT，正在自动获取，完成后自动复制/下载`, 6000);
             }
         } catch (e: any) {
@@ -1387,18 +1388,19 @@ export function RechargePanel({notify}: {notify?: (m: string, ms?: number) => vo
                         </>
                     )}
                     <div ref={exportMenuRef} className="relative">
-                        <Btn onClick={() => setShowExportMenu((v) => !v)} title="导出账密 / 含 RT / 卡密 / session">导出 ▾</Btn>
+                        <Btn onClick={() => setShowExportMenu((v) => !v)} title="导出账号数据、卡密或 session">导出 ▾</Btn>
                         {showExportMenu && (
                             <div className="absolute left-0 top-full mt-1 z-20 min-w-[200px] rounded-lg border border-gray-200 bg-white shadow-lg py-1 text-xs">
                                 <button type="button" className="block w-full text-left px-3 py-1.5 hover:bg-gray-50" onClick={() => { setShowExportMenu(false); void doExport("account"); }}>账密</button>
-                                <button type="button" className="block w-full text-left px-3 py-1.5 hover:bg-gray-50" title="缺 RT 的会自动补，完成后复制/下载" onClick={() => { setShowExportMenu(false); void doExport("full"); }}>含 RT（缺的自动补）</button>
-                                <button type="button" className="block w-full text-left px-3 py-1.5 hover:bg-gray-50" title="每个号直接登录获取新 RT，完成后自动复制/下载" onClick={() => { setShowExportMenu(false); void doExport("full", {relogin: true}); }}>含 RT（直接获取新 RT）</button>
                                 <button type="button" className="block w-full text-left px-3 py-1.5 hover:bg-gray-50" onClick={() => { setShowExportMenu(false); void doExport("card"); }}>复制卡密</button>
                                 <button type="button" className="block w-full text-left px-3 py-1.5 hover:bg-gray-50" onClick={() => { setShowExportMenu(false); void doExport("session"); }}>复制 session</button>
                                 <button type="button" className="block w-full text-left px-3 py-1.5 hover:bg-gray-50" title="缺 RT 先获取，再刷新，导出一个 JSON" onClick={() => { setShowExportMenu(false); void doExportSub2json(); }}>sub2json（缺 RT 自动补）</button>
                             </div>
                         )}
                     </div>
+                    <Btn onClick={() => void doExport("full", {relogin: true})} disabled={exportRtRunning} className="bg-amber-600 text-white border-amber-600 hover:bg-amber-700" title="没有 RT 的账号直接获取；已有 RT 的账号重新登录获取新 RT，完成后自动复制或下载">
+                        获取 / 刷新 RT
+                    </Btn>
                     {exportRtRunning && (
                         <Btn onClick={async () => {
                             try {
@@ -1413,7 +1415,7 @@ export function RechargePanel({notify}: {notify?: (m: string, ms?: number) => vo
                     )}
                     {isWorkingTab && (
                         <>
-                            <Btn onClick={() => setShowBatchRt(true)} className="bg-amber-600 text-white border-amber-600 hover:bg-amber-700">批量获取RT</Btn>
+                            <Btn onClick={() => setShowBatchRt(true)} className="bg-amber-600 text-white border-amber-600 hover:bg-amber-700" title="按邮箱密码文本单独获取 RT，不使用当前换绑队列">按文本获取 RT</Btn>
                             <Btn onClick={openSub2json} className="bg-violet-600 text-white border-violet-600 hover:bg-violet-700" title="勾选后打开会自动填充；支持 Gmail（用 GPT 密码 + RT）">导出sub2json</Btn>
                             <Btn onClick={doProbePlan}>查询套餐</Btn>
                         </>
