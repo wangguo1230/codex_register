@@ -1,6 +1,7 @@
 import {useEffect, useState, useMemo, useRef, type Dispatch, type SetStateAction} from "react";
 import {api, connectStream, type Account, type RebindGmailPoolItem, type RechargeCard, type RechargeCardStats, type RechargeQueueItem, type RechargeQueueStats} from "./api";
 import {filterRechargeQueue} from "./recharge-queue-filter";
+import {ConfirmDialog} from "./ConfirmDialog";
 
 const BJ_TIME_FORMATTERS = {
     minute: new Intl.DateTimeFormat("en-CA", {
@@ -158,6 +159,8 @@ export function RechargePanel({notify}: {notify?: (m: string, ms?: number) => vo
     const [jobReloginSubmit, setJobReloginSubmit] = useState(false);
     const [showExportMenu, setShowExportMenu] = useState(false);
     const exportMenuRef = useRef<HTMLDivElement>(null);
+    const [rtConfirm, setRtConfirm] = useState<{count: number} | null>(null);
+    const rtConfirmResolverRef = useRef<((confirmed: boolean) => void) | null>(null);
     // 导出 sub2json
     const [showSub2json, setShowSub2json] = useState(false);
     const [sub2jsonInput, setSub2jsonInput] = useState("");
@@ -199,6 +202,16 @@ export function RechargePanel({notify}: {notify?: (m: string, ms?: number) => vo
     }>({poolGrp: "换绑池", staging: [], ready: [], groups: [], stagingCount: 0, readyCount: 0});
 
     const toast = (m: string, ms?: number) => notify?.(m, ms);
+    const askRtRefreshConfirm = (count: number) => new Promise<boolean>((resolve) => {
+        rtConfirmResolverRef.current = resolve;
+        setRtConfirm({count});
+    });
+    const finishRtRefreshConfirm = (confirmed: boolean) => {
+        const resolve = rtConfirmResolverRef.current;
+        rtConfirmResolverRef.current = null;
+        setRtConfirm(null);
+        resolve?.(confirmed);
+    };
     const isDeliveredTab = deliveryTab === "delivered";
     const isFailedTab = deliveryTab === "error";
     const isReadyTab = deliveryTab === "ready";
@@ -1009,7 +1022,7 @@ export function RechargePanel({notify}: {notify?: (m: string, ms?: number) => vo
         const picked = selQIds();
         const ids = picked.length ? picked : filteredQueue.map((item) => item.id);
         if (!ids.length) { toast("当前筛选没有可导出账号"); return; }
-        if (format === "full" && opts?.relogin && !confirm(`处理 ${ids.length} 个账号：没有 RT 的直接获取，已有 RT 的重新登录获取新 RT，完成后复制结果。\n这会产生新的登录请求，是否继续？`)) return;
+        if (format === "full" && opts?.relogin && !(await askRtRefreshConfirm(ids.length))) return;
         if (format === "full" && ids.length) {
             setTrackedOperation({kind: opts?.relogin ? "reloginRt" : "rtExport", label: opts?.relogin ? "获取 / 刷新 RT" : "获取 RT", ids, total: ids.length, skipped: 0, startedAt: Date.now()});
         }
@@ -2304,6 +2317,16 @@ export function RechargePanel({notify}: {notify?: (m: string, ms?: number) => vo
                     </div>
                 </div>
             )}
+            <ConfirmDialog
+                open={!!rtConfirm}
+                title="获取 / 刷新 RT"
+                message={rtConfirm ? `本次处理 ${rtConfirm.count} 个账号。\n没有 RT 的账号会直接获取；已有 RT 的账号会重新登录获取新 RT，完成后自动复制或下载结果。\n这会产生新的登录请求。` : ""}
+                confirmLabel="开始获取"
+                cancelLabel="取消"
+                tone="warning"
+                onConfirm={() => finishRtRefreshConfirm(true)}
+                onCancel={() => finishRtRefreshConfirm(false)}
+            />
         </div>
     );
 }
